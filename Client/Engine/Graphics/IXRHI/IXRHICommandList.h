@@ -90,12 +90,45 @@ public:
     // Full-subresource same-size copy. Both textures must already be in
     // TransferSrc (src) / TransferDst (dst); aspects derive from formats.
     virtual void CopyTexture(const IXRHITexture& src, IXRHITexture& dst) = 0;
+    // One array layer (mip 0) into a layer of a texture of the same size and format, in the same
+    // layouts as CopyTexture.
+    virtual void CopyTextureLayer(const IXRHITexture& src,
+                                  std::uint32_t srcLayer,
+                                  IXRHITexture& dst,
+                                  std::uint32_t dstLayer) = 0;
+    // A rectangle of one array layer (mip 0) to a place in a layer of a texture of the same format,
+    // in the same layouts as CopyTexture.
+    virtual void CopyTextureLayerRegion(const IXRHITexture& src,
+                                        std::uint32_t srcLayer,
+                                        std::uint32_t srcX,
+                                        std::uint32_t srcY,
+                                        IXRHITexture& dst,
+                                        std::uint32_t dstLayer,
+                                        std::uint32_t dstX,
+                                        std::uint32_t dstY,
+                                        std::uint32_t width,
+                                        std::uint32_t height) = 0;
 
     // Whole- or part-buffer copy. Ordering with surrounding commands follows
     // recording order (same queue); explicit state transitions still apply.
     virtual void CopyBuffer(const IXRHIBuffer& src,
                             IXRHIBuffer& dst,
                             std::uint64_t byteCount) = 0;
+
+    // Copies a texel rectangle from a buffer into one mip level / array layer
+    // of a texture that is in TransferDst. srcRowTexels is the buffer's row
+    // pitch in texels (>= width), so a sub-rectangle of a whole image held in
+    // the buffer copies in place; srcOffsetBytes addresses its first texel.
+    virtual void CopyBufferToTexture(const IXRHIBuffer& src,
+                                     std::uint64_t srcOffsetBytes,
+                                     std::uint32_t srcRowTexels,
+                                     IXRHITexture& dst,
+                                     std::uint32_t mipLevel,
+                                     std::uint32_t arrayLayer,
+                                     std::uint32_t x,
+                                     std::uint32_t y,
+                                     std::uint32_t width,
+                                     std::uint32_t height) = 0;
 
     // Explicit buffer layout/access transition (backend inserts the barrier).
     // Unlocks compute->graphics (ShaderWrite -> VertexRead) and
@@ -104,6 +137,9 @@ public:
     virtual void TransitionBuffer(IXRHIBuffer& buffer,
                                   IXRHIBufferState from,
                                   IXRHIBufferState to) = 0;
+    // The same for every buffer at once: one barrier after many writes (e.g. the frame's
+    // skinning dispatches) instead of one per buffer.
+    virtual void BufferMemoryBarrier(IXRHIBufferState from, IXRHIBufferState to) = 0;
 };
 
 } // namespace ixrhi

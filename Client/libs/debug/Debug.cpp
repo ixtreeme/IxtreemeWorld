@@ -2,6 +2,9 @@
 
 #include <cstdarg>
 #include <cstdio>
+#if defined(_MSC_VER)
+#include <share.h>
+#endif
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -33,7 +36,16 @@ void LogLine(const char* text)
     static std::FILE* s_logFile = []() -> std::FILE* {
         std::FILE* file = nullptr;
 #if defined(_MSC_VER)
-        fopen_s(&file, "ixtreeme_engine.log", "w");
+        // The MSVC CRT's fopen_s opens the file exclusively. Share it for reading (so the log can be
+        // tailed while the engine runs); a second instance in the same directory, denied write
+        // access, logs to the next free numbered file instead.
+        file = _fsopen("ixtreeme_engine.log", "w", _SH_DENYWR);
+        for (int index = 2; file == nullptr && index <= 9; ++index)
+        {
+            char name[32]{};
+            std::snprintf(name, sizeof(name), "ixtreeme_engine-%d.log", index);
+            file = _fsopen(name, "w", _SH_DENYWR);
+        }
 #else
         file = std::fopen("ixtreeme_engine.log", "w");
 #endif

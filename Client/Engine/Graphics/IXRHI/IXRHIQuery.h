@@ -58,6 +58,23 @@ struct IXRHITimestampResults
     std::uint64_t pointNanoseconds[IXRHI_MAX_TIMESTAMP_POINTS]{};
 };
 
+// Occlusion queries: whether any sample of the draws between Begin and End passed the depth test
+// (the count is approximate: zero or not is what it tells). Results come back frames later;
+// TryGetResult never waits for them.
+class IXRHIOcclusionQueries
+{
+public:
+    virtual ~IXRHIOcclusionQueries() = default;
+    virtual std::uint32_t Count() const = 0;
+    // Outside any render pass, before the queries are begun again.
+    virtual void Reset(IXRHICommandList& cmd, std::uint32_t first, std::uint32_t count) = 0;
+    // Inside a render pass; one query is begun once between resets.
+    virtual void Begin(IXRHICommandList& cmd, std::uint32_t index) = 0;
+    virtual void End(IXRHICommandList& cmd, std::uint32_t index) = 0;
+    // The samples counted by query `index` once the GPU has finished it; false until then.
+    virtual bool TryGetResult(std::uint32_t index, std::uint64_t& samples) = 0;
+};
+
 struct IXRHICpuFrameTiming
 {
     bool valid = false;

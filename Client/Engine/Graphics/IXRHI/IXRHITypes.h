@@ -10,32 +10,41 @@
 namespace ixrhi
 {
 
-// Minimal format set covering: vertex attributes (pos3/color4/normal/uv),
-// font-atlas + sampled color (RGBA8), swapchain (BGRA8 + sRGB), offscreen depth.
+// Minimal format set covering: vertex attributes (pos3/color4/normal/uv,
+// single-float data), font-atlas + sampled color (RGBA8), terrain splat/mask
+// arrays (R8), swapchain (BGRA8 + sRGB), offscreen/shadow depth.
 enum class IXRHIFormat : std::uint32_t
 {
     Undefined = 0,
+    R8Unorm,
     R8G8B8A8Unorm,
     R8G8B8A8Srgb,
     B8G8R8A8Unorm,
     B8G8R8A8Srgb,
+    R32Float,
     R32G32Float,
     R32G32B32Float,
     R32G32B32A32Float,
     D32Float,
     D24UnormS8Uint,
+    R16G16B16A16Float,  // HDR colour at half the size of RGBA32F (sky panoramas)
+    D32FloatS8Uint,     // depth + stencil where D24S8 is missing (AMD GPUs)
 };
 
 inline std::uint32_t IXRHIFormatByteSize(IXRHIFormat format)
 {
     switch (format)
     {
+    case IXRHIFormat::R8Unorm: return 1;
     case IXRHIFormat::R8G8B8A8Unorm:
     case IXRHIFormat::R8G8B8A8Srgb:
     case IXRHIFormat::B8G8R8A8Unorm:
     case IXRHIFormat::B8G8R8A8Srgb:
     case IXRHIFormat::D24UnormS8Uint: return 4;
-    case IXRHIFormat::R32G32Float: return 8;
+    case IXRHIFormat::R32Float: return 4;
+    case IXRHIFormat::R32G32Float:
+    case IXRHIFormat::R16G16B16A16Float:
+    case IXRHIFormat::D32FloatS8Uint: return 8;
     case IXRHIFormat::R32G32B32Float: return 12;
     case IXRHIFormat::R32G32B32A32Float:
     case IXRHIFormat::D32Float: return 16;
@@ -215,6 +224,10 @@ enum class IXRHISamplerAddress : std::uint8_t
 {
     ClampToEdge = 0,
     Repeat,
+    // Border clamp with opaque-white border (shadow-map sampling outside the
+    // cascades). D3D12: BORDER_COLOR_OPAQUE_WHITE; see portability notes for
+    // MoltenVK border-color constraints.
+    ClampToBorder,
 };
 
 } // namespace ixrhi

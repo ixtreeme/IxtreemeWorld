@@ -15,6 +15,7 @@
 
 #include "AssetDatabase.h"
 #include "MapEditorTypes.h"
+#include "SunShadow.h"
 #include "WorldCamera.h"
 
 #include "IXRHIBinding.h"
@@ -44,6 +45,7 @@
 namespace client::asset {
 class IAssetReader;
 }
+namespace tree_tool { struct TreeImpostorSettings; }
 
 class StaticMeshRenderer
 {
@@ -76,7 +78,11 @@ public:
         std::string alphaMode = "opaque";
         float alphaCutoff = 0.5f;
         bool unlit = false;
+        float uvTiling[2] = {1.0f, 1.0f}; // the material asset's UV transform (overrides replace it)
+        float uvOffset[2] = {0.0f, 0.0f};
     };
+
+    struct PreparedInstance;
 
     struct Instance
     {
@@ -88,7 +94,18 @@ public:
         bool selectedForOutline = false;
         std::vector<std::string> materialSlots;
         std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
+        // Optional: what this instance's records hold that no view changes (PrepareInstance), kept
+        // by the caller while the instance is unchanged. Draws then skip building its matrix and
+        // looking up its materials; one made by another renderer, or before the material assets
+        // changed, is not used.
+        const PreparedInstance* prepared = nullptr;
+        // Screen-space coverage interval for LOD fades; [0,1] keeps every pixel.
+        float coverageMin = 0.0f;
+        float coverageMax = 1.0f;
     };
+    // The instances of one batch draw. Pointers: the caller keeps its instances (and their material
+    // lists) where they are instead of copying them into every batch of every pass.
+    using InstanceList = std::vector<const Instance*>;
 
     struct LodDiagnostics
     {
@@ -120,19 +137,58 @@ public:
         float materialParams[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         float materialEmissive[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         float materialUv[4] = {1.0f, 1.0f, 0.0f, 0.0f};
-        float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 0.0f};
+        float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 1.0f};
     };
 
-    StaticMeshRenderer() = default;
+    struct PreparedInstance
+    {
+        const StaticMeshRenderer* renderer = nullptr;  // whose material slots these are
+        std::uint64_t materialRevision = 0;            // MaterialAssetManager::Revision() read at
+        std::vector<InstanceBlock> slots;              // per material slot; mvp is the view's
+        bool hasTransparentDraws = false;
+    };
+
+    StaticMeshRenderer();
     ~StaticMeshRenderer();
+
+    // The instance's view-independent records (see Instance::prepared). Made again when the instance
+    // or MaterialAssetManager::Revision() changes; cheap to keep, about 200 bytes per material slot.
+    // True when they differ from what out held (a material loaded for another model changes none).
+    bool PrepareInstance(const Instance& instance, PreparedInstance& out) const;
 
     bool Create(ixrhi::IXRHIDevice& rhi,
                 client::asset::IAssetReader& assets,
                 const std::string& modelPath);
+    // Create in two halves, so a model loads off the render thread: LoadCpu on any thread (parses
+    // the model and decodes its textures, touching no device; false: not a static model or failed,
+    // see Status()), then FinishGpu on the render thread (buffers, textures, descriptors, pipelines).
+    // deferUploads: the vertex and index buffers and the textures are made empty and their data
+    // staged instead of uploaded and waited for (a model finished mid-game waited for the frames in
+    // flight); RecordPendingUploads copies it in, and the model draws nothing until it has.
+    bool LoadCpu(client::asset::IAssetReader& assets, const std::string& modelPath);
+    bool FinishGpu(ixrhi::IXRHIDevice& rhi, bool deferUploads = false);
+    bool HasPendingUploads() const { return m_pendingUploads != nullptr; }
+    // Once a frame, outside render passes, before the model is drawn in it: the staged uploads
+    // (FinishGpu's, once), and the material textures decoded since (made and copied in; usable by
+    // the frame's draws). Staging goes once the frame that copied it is done.
+    void RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame);
     bool RecreatePipeline(ixrhi::IXRHIDevice& rhi);
     // Borrowed target pass (offscreen scene pass); null = backend default.
     void SetTargetPass(const ixrhi::IXRHIRenderPass* pass) { m_targetPass = pass; }
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
+    // The sun shadow cascades the lit draws sample. Set before the first draw (the map is bound in
+    // every draw) and each frame (cascades follow the camera).
+    void SetSunShadow(const SunShadowReceive& shadow);
+    // These instances into one sun shadow cascade, depth only (alpha-masked materials keep their
+    // cut-outs). Call inside the cascade's render pass (viewport set by its owner). shadowTexelMeters:
+    // the cascade's texel size; each instance is drawn at the coarsest shadow detail level that stays
+    // within half a texel at its scale (BuildLods; 0: the model's own triangles).
+    void RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
+        const WorldMat4& lightViewProj,
+        const InstanceList& instances,
+        const ixrhi::IXRHIRenderPass* shadowPass,
+        float shadowTexelMeters = 0.0f);
     void RenderInWorld(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
@@ -144,17 +200,29 @@ public:
         const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
         const WorldCamera& camera,
-        const std::vector<Instance>& instances,
+        const InstanceList& instances,
         std::uint32_t targetWidth = 0,
         std::uint32_t targetHeight = 0);
     void RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
         const WorldCamera& camera,
-        const std::vector<Instance>& instances,
+        const InstanceList& instances,
         const LodConfig& lodConfig,
         std::uint64_t configHash,
         std::uint32_t lodLevel,
+        std::uint32_t targetWidth = 0,
+        std::uint32_t targetHeight = 0);
+    // Whether any of the instance's draws has an alpha-blended (Blend) material. The batches above
+    // leave those out: RenderTransparentInWorld draws them, in the frame's back-to-front order.
+    bool HasTransparentDraws(const Instance& instance) const;
+    // The instance's alpha-blended draws, over what is already drawn: depth tested but not written,
+    // back faces before front faces. Call after the opaque scene, the farthest instance first.
+    void RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
+        const ixrhi::IXRHIFrameInfo& frame,
+        double timeSeconds,
+        const WorldCamera& camera,
+        const Instance& instance,
         std::uint32_t targetWidth = 0,
         std::uint32_t targetHeight = 0);
     void RequestLodQualityBuild(const LodConfig& lodConfig, std::uint64_t configHash, std::uint32_t entityId);
@@ -167,7 +235,7 @@ public:
     bool HasVertexBuffer() const { return m_vertexBuffer != nullptr; }
     bool HasIndexBuffer() const { return m_indexBuffer != nullptr; }
     bool HasTexture() const { return m_texture.image != nullptr; }
-    bool HasDescriptors() const { return m_bindGroup != nullptr && m_bindLayout != nullptr; }
+    bool HasDescriptors() const { return !m_bindPages.empty() && m_bindLayout != nullptr; }
     std::size_t VertexCount() const { return m_vertices.size(); }
     std::size_t IndexCount() const { return m_indices.size(); }
     std::size_t TriangleCount() const { return m_indices.size() / 3u; }
@@ -179,6 +247,11 @@ public:
     std::uint32_t LastSubmittedDrawCalls() const { return m_lastSubmittedDrawCalls; }
     std::uint32_t LastSubmittedInstances() const { return m_lastSubmittedInstances; }
     std::uint32_t LastSubmittedIndexCount() const { return m_lastSubmittedIndexCount; }
+    std::uint64_t LastSubmittedTriangles() const { return m_lastSubmittedTriangles; }
+    std::uint32_t LastImpostorTrees() const { return m_lastImpostorTrees; }
+    bool HasTreeImpostor() const;
+    // Call between frames after device.WaitIdle(); parent mesh/scene records stay valid.
+    void ReloadTreeImpostor();
     bool LastUsedFullResFallback() const { return m_lastUsedFullResFallback; }
     std::uint32_t LastMaterialUniformUpdates() const { return m_lastMaterialUniformUpdates; }
     std::uint32_t LastOverrideActiveDraws() const { return m_lastOverrideActiveDraws; }
@@ -189,6 +262,9 @@ public:
     const std::array<float, 3>& BoundsMax() const { return m_boundsMax; }
     const std::string& TextureName() const { return m_texture.name; }
     bool CopyPhysicsMesh(std::vector<std::array<float, 3>>& outVertices, std::vector<std::uint32_t>& outIndices) const;
+    // Bake an existing two-material tree without changing its mesh or GUID (editor/offline utility).
+    static bool BakeTreeImpostorAsset(client::asset::IAssetReader& assets, const std::filesystem::path& modelPath,
+        const tree_tool::TreeImpostorSettings& settings, std::string& error);
 
     static bool DetectSkinnedGltf(client::asset::IAssetReader& assets,
         const std::string& modelPath,
@@ -196,8 +272,19 @@ public:
         std::string* error);
 
 private:
+    struct TreeImpostorState;
+    void LoadTreeImpostorCpu();
+    std::unique_ptr<TreeImpostorState> m_treeImpostor;
+    bool m_isTreeImpostor = false;
+    std::uint32_t m_lastImpostorTrees = 0;
+    bool RenderTreeImpostors(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
+        double timeSeconds, const WorldCamera& camera, const InstanceList& instances,
+        const LodConfig& config, std::uint64_t configHash, std::uint32_t lodLevel,
+        std::uint32_t targetWidth, std::uint32_t targetHeight);
     static constexpr uint32_t kFramesInFlight = 2;
+    // Bind sets per page and frame in flight (see BindPage), and the most pages a renderer makes.
     static constexpr uint32_t kUniformSlots = 64;
+    static constexpr uint32_t kMaxBindPages = 64;
     static constexpr uint32_t kInitialInstanceCapacity = 256;
 
     struct Vertex
@@ -291,7 +378,7 @@ private:
         MaterialTexture normal;
         MaterialTexture orm;
         std::string resolvedMaterial = "gltf_baked";
-        std::string baseColorTextureGuid = "EMPTY";
+        std::optional<Guid> baseColorTextureGuid;  // the material's base colour texture (diagnostics)
         std::string alphaMode = "OPAQUE";
         float alphaCutoff = 0.5f;
         const char* fragmentShaderAlphaPath = "none";
@@ -307,7 +394,7 @@ private:
         std::string normalTexture;
         std::string ormTexture;
         std::string resolvedMaterial = "gltf_baked";
-        std::string baseColorTextureGuid = "EMPTY";
+        std::optional<Guid> baseColorTextureGuid;  // the material's base colour texture (diagnostics)
         std::string alphaMode = "OPAQUE";
         float alphaCutoff = 0.5f;
         const char* fragmentShaderAlphaPath = "none";
@@ -334,8 +421,42 @@ private:
     bool LoadLodCpuCache(std::uint64_t configHash, LodCpuSet& out) const;
     void WriteLodCpuCache(const LodCpuSet& set) const;
     std::filesystem::path LodCachePath(const std::string& modelPath, std::uint64_t configHash) const;
-    bool CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath);
-    bool UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture);
+    void DecodeTextures(const std::string& modelPath);  // into m_decodedTextures (LoadCpu)
+    // Detail levels (LoadCpu): each opaque submesh simplified to within kLodErrors[level] of its
+    // surface, in model units, each level from the one before; a level that takes off less than a
+    // quarter of the one before is that one again. Two sets of them: the sun shadow's, of the
+    // surface welded across its uv and normal seams (a depth pass reads positions only), and the
+    // view's, the seams kept (its texture and lighting stay). For the shadow, an alpha-masked
+    // submesh of many small separate pieces (leaf cards) has the coarsest level too:
+    // kShadowCardKeep of the pieces, each grown about its centre to cover kShadowCardCover of the
+    // area of those left out (the shadow's density then matches the full crown's: the grown pieces
+    // overlap each other less). The view draws an instance at the coarsest level whose error, at its
+    // scale and nearest depth, projects under kViewLodMaxErrorPixels.
+    static constexpr std::size_t kLodLevels = 3;
+    static constexpr std::array<float, kLodLevels> kLodErrors = {0.005f, 0.016f, 0.064f};
+    static constexpr float kShadowCardKeep = 0.25f;
+    static constexpr float kShadowCardCover = 0.7f;
+    static constexpr float kViewLodMaxErrorPixels = 0.5f;
+    void BuildLods();
+    bool UploadDecodedTextures(ixrhi::IXRHIDevice& rhi);
+    // staging: when given, the texture is made empty and its texels go there (a deferred upload).
+    bool UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture,
+                       std::shared_ptr<ixrhi::IXRHIBuffer>* staging = nullptr);
+    // FinishGpu's deferred uploads: the data, and the frame that recorded the copies.
+    struct PendingUploads
+    {
+        std::shared_ptr<ixrhi::IXRHIBuffer> vertexStaging;
+        std::shared_ptr<ixrhi::IXRHIBuffer> indexStaging;
+        std::shared_ptr<ixrhi::IXRHIBuffer> lodIndexStaging;
+        std::shared_ptr<ixrhi::IXRHIBuffer> shadowCardVertexStaging;
+        std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, 3> textureStaging{};  // diffuse, normal, orm
+        std::uint64_t recordedFrame = std::numeric_limits<std::uint64_t>::max();
+    };
+    // Whether the model's data is on the GPU for this frame's draws (copied, or the copies recorded).
+    bool UploadsRecorded() const
+    {
+        return !m_pendingUploads || m_pendingUploads->recordedFrame != std::numeric_limits<std::uint64_t>::max();
+    }
     const Texture* EnsureMaterialTexture(ixrhi::IXRHIDevice& rhi,
         const std::optional<Guid>& guid,
         ixrhi::IXRHIFormat format,
@@ -343,16 +464,59 @@ private:
     MaterialTextureViews ResolveMaterialTextureViews(ixrhi::IXRHIDevice& rhi,
         const Instance& instance,
         std::uint32_t materialSlot);
-    void UpdateMaterialTextureDescriptors(uint32_t frameIndex,
-        uint32_t uniformSlot,
-        const MaterialTextureViews& textures);
+    // Textures/samplers each bind set's descriptors point at (baseColor, normal, orm), so a draw
+    // re-binding the same material skips the descriptor writes. A bind group keeps every resource
+    // ever bound to it alive, so a stored pointer cannot be reused by another texture meanwhile.
+    struct BoundSlotTexture
+    {
+        const ixrhi::IXRHITexture* texture = nullptr;
+        const ixrhi::IXRHISampler* sampler = nullptr;
+    };
+    // Every draw of a frame binds a set of its own: a set must not change once the frame's command
+    // list has bound it. Sets come in pages of kUniformSlots per frame in flight; a frame drawing more
+    // than the pages hold adds one, kept for the frames after.
+    struct BindPage
+    {
+        std::unique_ptr<ixrhi::IXRHIBindGroup> group;  // set = frame index * kUniformSlots + slot
+        std::shared_ptr<ixrhi::IXRHIBuffer> uniforms;  // every set's UniformBlock (kUniformStride apart)
+        std::array<std::array<BoundSlotTexture, 3>, kFramesInFlight * kUniformSlots> textures{};
+        // The instance buffer binding 4 points at: re-pointed when the set is next taken, after a
+        // frame grew the buffer (never while a frame that bound the set may still run).
+        std::array<const ixrhi::IXRHIBuffer*, kFramesInFlight * kUniformSlots> instances{};
+    };
+    struct BindSlot
+    {
+        BindPage* page = nullptr;
+        std::uint32_t set = 0;
+        std::uint32_t id = 0;  // page * sets per page + set (diagnostics)
+    };
+    // Starts this renderer's set and instance cursors over when the frame is a new one.
+    void BeginFrameSlots(const ixrhi::IXRHIFrameInfo& frame);
+    // The frame's next set, its instance binding current; none past kMaxBindPages (logged once).
+    std::optional<BindSlot> NextBindSlot(uint32_t frameIndex);
+    BindPage* AddBindPage(ixrhi::IXRHIDevice& rhi);
+    void UpdateMaterialTextureDescriptors(const BindSlot& slot, const MaterialTextureViews& textures);
     bool CreateBindGroup(ixrhi::IXRHIDevice& rhi);
     bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
+    bool CreateShadowPipelines(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* shadowPass);
+    // The instance's record for one material slot in the view (its prepared one when usable).
+    void FillInstanceBlock(const WorldMat4& viewProjection,
+        const Instance& instance,
+        std::uint32_t materialSlot,
+        InstanceBlock& out) const;
+    bool PreparedUsable(const Instance& instance) const;
+    // FillInstanceBlock for every instance into out[0, instances.size()): those with a usable
+    // prepared record in parallel (large batches), the others (their materials are looked up, which
+    // is not thread-safe) on this thread after.
+    void FillInstanceBlocks(const WorldMat4& viewProjection,
+        const InstanceList& instances,
+        std::uint32_t materialSlot,
+        InstanceBlock* out) const;
+    // Appends instance blocks at this frame's cursor; returns the first record's index.
+    std::optional<std::uint32_t> AppendInstanceBlocks(uint32_t frameIndex, const std::vector<InstanceBlock>& blocks);
     bool EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi, uint32_t frameIndex, std::uint32_t requiredRecords);
-    void UpdateInstanceDescriptorSets(uint32_t frameIndex);
     void DestroyPipeline();
-    void UpdateWorldUniform(uint32_t frameIndex,
-        uint32_t uniformSlot,
+    void UpdateWorldUniform(const BindSlot& slot,
         const WorldCamera& camera,
         const Instance& instance,
         double timeSeconds,
@@ -362,28 +526,85 @@ private:
     const ixrhi::IXRHIRenderPass* m_targetPass = nullptr; // borrowed (frame owner)
     client::asset::IAssetReader* m_assets = nullptr;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_vertexBuffer;
+    std::unique_ptr<PendingUploads> m_pendingUploads;
+    bool m_deferUploads = false;  // FinishGpu's, for CreateBuffers and UploadDecodedTextures
     std::shared_ptr<ixrhi::IXRHIBuffer> m_indexBuffer;
-    std::array<std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kUniformSlots>, kFramesInFlight> m_uniformBuffers{};
+    // The detail levels' indices (BuildLods), and per level and draw its span in them (indexCount 0:
+    // the draw's own indices; none for a model too small or without opaque submeshes), the shadow's
+    // and the view's. The leaf cards' spans in them index their own vertices. None for a model with
+    // nothing to take off.
+    std::vector<std::uint32_t> m_lodIndices;
+    std::array<std::vector<MeshDraw>, kLodLevels> m_shadowLodDraws;
+    std::array<std::vector<MeshDraw>, kLodLevels> m_viewLodDraws;
+    float m_modelRadius = 0.0f;  // the farthest point of the bounds from the model's origin
+    std::vector<Vertex> m_shadowCardVertices;
+    std::vector<MeshDraw> m_shadowCardDraws;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_lodIndexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_shadowCardVertexBuffer;
+    // Grown when a frame appends more records than it holds. The records a frame wrote before stay
+    // in the old buffer, which the sets bound to it keep alive.
     std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_instanceBuffers{};
     std::array<std::uint32_t, kFramesInFlight> m_instanceBufferCapacity{};
-    // CPU mirror of instance records per frame (lets growth preserve already
-    // written records without GPU readback; same bytes as the old map-copy).
-    std::array<std::vector<InstanceBlock>, kFramesInFlight> m_instanceMirror{};
     Texture m_texture;
     Texture m_normalTexture;
     Texture m_ormTexture;
-    std::unordered_map<std::string, Texture> m_materialTextureCache;
-    std::unordered_set<std::string> m_failedMaterialTextureKeys;
+    // Material textures by (role, texture GUID). Looked up for every draw of every pass, so the key
+    // builds no strings.
+    struct MaterialTextureKey
+    {
+        std::uint8_t role = 0;  // see MaterialTextureRoleIndex
+        Guid guid;
+        bool operator==(const MaterialTextureKey& other) const { return role == other.role && guid == other.guid; }
+    };
+    struct MaterialTextureKeyHash
+    {
+        std::size_t operator()(const MaterialTextureKey& key) const noexcept
+        {
+            return std::hash<Guid>{}(key.guid) ^ (static_cast<std::size_t>(key.role) * 0x9e3779b97f4a7c15ull);
+        }
+    };
+    std::unordered_map<MaterialTextureKey, Texture, MaterialTextureKeyHash> m_materialTextureCache;
+    // Material textures on their way: decoded on a loading thread (EnsureMaterialTexture starts it, at
+    // draw time), then made and copied in by RecordPendingUploads; the model's own textures stand in.
+    struct MaterialTextureLoad;
+    std::unordered_map<MaterialTextureKey, std::unique_ptr<MaterialTextureLoad>, MaterialTextureKeyHash>
+        m_materialTextureLoads;
+    // Their staging, kept until the frame that copied it is done.
+    struct RetiredStaging
+    {
+        std::shared_ptr<ixrhi::IXRHIBuffer> buffer;
+        std::uint64_t frame = 0;
+    };
+    std::vector<RetiredStaging> m_materialTextureStaging;
+    // A texture's copy from its staging, with the layout changes around it (outside render passes).
+    static void RecordTextureUpload(ixrhi::IXRHICommandList& cmd, const Texture& texture, const ixrhi::IXRHIBuffer& staging);
+    std::unordered_set<MaterialTextureKey, MaterialTextureKeyHash> m_failedMaterialTextureKeys;
     std::vector<LastMaterialBinding> m_lastMaterialBindings;
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
-    std::unique_ptr<ixrhi::IXRHIBindGroup> m_bindGroup;
+    std::vector<std::unique_ptr<BindPage>> m_bindPages;
+    bool m_loggedBindPagesFull = false;
     // Pipeline variants (same 5 as before; mask reuses the lit fragment shader):
     // opaque, alpha-mask, unlit, unlit alpha-mask, selection outline.
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_maskPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitMaskPipeline;
+    // The alpha-masked draws in two steps (RenderLodBatchInWorld): their depth, alpha-tested by a shader
+    // that does nothing else and writes no colour; then their colour where that depth is theirs, not
+    // written (so the hardware rejects a hidden texel before shading it).
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_maskDepthPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_maskOnDepthPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitMaskOnDepthPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_outlinePipeline;
+    // Alpha-blended (Blend materials): [lit, unlit] x [back faces, front faces].
+    std::array<std::array<std::unique_ptr<ixrhi::IXRHIGraphicsPipeline>, 2>, 2> m_blendPipelines;
+    // Sun shadow pass (depth only), baked against the cascades' pass: opaque, and alpha-masked.
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowMaskPipeline;
+    const ixrhi::IXRHIRenderPass* m_shadowPass = nullptr;
+    bool m_shadowPipelinesFailed = false;
+    SunShadowReceive m_sunShadow;
+    const ixrhi::IXRHITexture* m_boundSunShadowTexture = nullptr;  // what binding 5 holds in every set
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
     std::vector<MeshDraw> m_draws;
@@ -405,12 +626,20 @@ private:
     std::uint32_t m_lodCoalescedDropped = 0;
     std::unordered_map<std::uint64_t, LodCpuSet> m_lodPendingResults;
     std::vector<MaterialDefaults> m_materialDefaults;
+    std::array<RgbaImage, 3> m_decodedTextures;  // diffuse, normal, orm: LoadCpu -> FinishGpu
+    // A glTF's parsed asset, LoadCpu -> FinishGpu: registering its materials (the material manager
+    // and the asset database are not thread-safe) is the render thread's work.
+    struct PendingMaterialImport;
+    std::unique_ptr<PendingMaterialImport> m_pendingMaterialImport;
     std::uint32_t m_materialSlotCount = 1;
     std::string m_alphaModeName = "opaque";
     std::array<float, 3> m_boundsMin = {0.0f, 0.0f, 0.0f};
     std::array<float, 3> m_boundsMax = {0.0f, 0.0f, 0.0f};
     LightingState m_lightingState;
     LoadStatus m_status = LoadStatus::NotLoaded;
+    // The frame the cursors below count in (its frame number: a renderer drawn every other frame
+    // meets the same frame index again without the frame between).
+    std::uint64_t m_worldRenderFrameNumber = std::numeric_limits<std::uint64_t>::max();
     uint32_t m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
     uint32_t m_worldUniformCursor = 0;
     // Per-frame write cursor into the instance storage buffer. The same renderer can be
@@ -421,6 +650,7 @@ private:
     std::uint32_t m_lastSubmittedDrawCalls = 0;
     std::uint32_t m_lastSubmittedInstances = 0;
     std::uint32_t m_lastSubmittedIndexCount = 0;
+    std::uint64_t m_lastSubmittedTriangles = 0;
     bool m_lastUsedFullResFallback = false;
     std::uint32_t m_lastMaterialUniformUpdates = 0;
     std::uint32_t m_lastOverrideActiveDraws = 0;

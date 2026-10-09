@@ -59,12 +59,37 @@ public:
                            ixrhi::IXRHIImageLayout from,
                            ixrhi::IXRHIImageLayout to) override;
     void CopyTexture(const ixrhi::IXRHITexture& src, ixrhi::IXRHITexture& dst) override;
+    void CopyTextureLayerRegion(const ixrhi::IXRHITexture& src,
+                                std::uint32_t srcLayer,
+                                std::uint32_t srcX,
+                                std::uint32_t srcY,
+                                ixrhi::IXRHITexture& dst,
+                                std::uint32_t dstLayer,
+                                std::uint32_t dstX,
+                                std::uint32_t dstY,
+                                std::uint32_t width,
+                                std::uint32_t height) override;
+    void CopyTextureLayer(const ixrhi::IXRHITexture& src,
+                          std::uint32_t srcLayer,
+                          ixrhi::IXRHITexture& dst,
+                          std::uint32_t dstLayer) override;
     void CopyBuffer(const ixrhi::IXRHIBuffer& src,
                     ixrhi::IXRHIBuffer& dst,
                     std::uint64_t byteCount) override;
+    void CopyBufferToTexture(const ixrhi::IXRHIBuffer& src,
+                             std::uint64_t srcOffsetBytes,
+                             std::uint32_t srcRowTexels,
+                             ixrhi::IXRHITexture& dst,
+                             std::uint32_t mipLevel,
+                             std::uint32_t arrayLayer,
+                             std::uint32_t x,
+                             std::uint32_t y,
+                             std::uint32_t width,
+                             std::uint32_t height) override;
     void TransitionBuffer(ixrhi::IXRHIBuffer& buffer,
                           ixrhi::IXRHIBufferState from,
                           ixrhi::IXRHIBufferState to) override;
+    void BufferMemoryBarrier(ixrhi::IXRHIBufferState from, ixrhi::IXRHIBufferState to) override;
 
     VkCommandBuffer Native() const { return m_cmd; }
 

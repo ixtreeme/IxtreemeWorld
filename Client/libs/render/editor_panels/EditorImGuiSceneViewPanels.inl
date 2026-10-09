@@ -1,6 +1,14 @@
 // This file is included from EditorImGui.cpp inside the editor-enabled implementation block.
 // Keep shared anonymous-namespace helpers in EditorImGui.cpp until this panel group is fully decoupled.
 
+// A view panel's image area in framebuffer pixels (what its render target should be).
+static void StorePanelPixels(const ImVec2& avail, std::uint32_t (&pixels)[2])
+{
+    const ImVec2 scale = ImGui::GetIO().DisplayFramebufferScale;
+    pixels[0] = static_cast<std::uint32_t>(std::max(0.0f, ixtreeme::math::Round(avail.x * scale.x)));
+    pixels[1] = static_cast<std::uint32_t>(std::max(0.0f, ixtreeme::math::Round(avail.y * scale.y)));
+}
+
 void EditorImGui::RenderDemoPanels()
 {
     if (!m_editorModeActive)
@@ -47,26 +55,29 @@ void EditorImGui::RenderDockSpace()
         ImGui::DockBuilderAddNode(dockspaceId, dockBuilderFlags);
         ImGui::DockBuilderSetNodeSize(dockspaceId, viewport->WorkSize);
 
+        // Hierarchy on the left, Inspector (and Scene Settings) on the right, the views in the middle,
+        // the project's files and the messages under them. The toolbar and the status bar are fixed
+        // strips outside the dock space.
         ImGuiID mainId = dockspaceId;
         ImGuiID leftId = 0;
         ImGuiID rightId = 0;
         ImGuiID bottomId = 0;
-        ImGuiID topId = 0;
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Up, 0.06f, &topId, &mainId);
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Left, 0.20f, &leftId, &mainId);
-        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Right, 0.25f, &rightId, &mainId);
+        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Left, 0.18f, &leftId, &mainId);
+        ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Right, 0.27f, &rightId, &mainId);
         ImGui::DockBuilderSplitNode(mainId, ImGuiDir_Down, 0.30f, &bottomId, &mainId);
-        ImGui::DockBuilderDockWindow("Editor Toolbar", topId);
-        ImGui::DockBuilderDockWindow(ICON_FA_LIST_TREE " Hierarchy", leftId);
-        ImGui::DockBuilderDockWindow("Tools", leftId);
-        ImGui::DockBuilderDockWindow("Inspector", rightId);
-        ImGui::DockBuilderDockWindow("Scene Settings", rightId);
-        ImGui::DockBuilderDockWindow(ICON_FA_GLOBE " World", rightId);
-        ImGui::DockBuilderDockWindow("Asset Browser", bottomId);
-        ImGui::DockBuilderDockWindow("Scene View", mainId);
-        ImGui::DockBuilderDockWindow(ICON_FA_PERSON_RUNNING " Animator", mainId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Hierarchy, leftId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Inspector, rightId);
+        ImGui::DockBuilderDockWindow(EditorWindow::SceneSettings, rightId);
+        ImGui::DockBuilderDockWindow(EditorWindow::AssetBrowser, bottomId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Scripts, bottomId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Console, bottomId);
+        ImGui::DockBuilderDockWindow(EditorWindow::BuildOutput, bottomId);
+        ImGui::DockBuilderDockWindow(EditorWindow::SceneView, mainId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Game, mainId);
+        ImGui::DockBuilderDockWindow(EditorWindow::Animator, mainId);
         ImGui::DockBuilderFinish(dockspaceId);
-        Tracen("[EDITOR-LAYOUT] Default Unity-style dock layout applied");
+        m_defaultLayoutTabSelectFrames = 3;
+        Tracen("[EDITOR-LAYOUT] Default dock layout applied");
     }
     ImGui::End();
 }
@@ -140,7 +151,7 @@ void EditorImGui::RenderSceneViewDropTarget()
         }
     };
 
-    if (!ImGui::Begin("Scene View", nullptr, flags))
+    if (!ImGui::Begin(EditorWindow::SceneView, nullptr, flags))
     {
         // Scene View is not visible (e.g. the Game tab is in front in the same dock).
         // Invalidate its viewport input rect so mouse input over the now-hidden region
@@ -149,12 +160,15 @@ void EditorImGui::RenderSceneViewDropTarget()
         m_viewportInputDiagnostics.sceneViewRectValid = false;
         m_viewportInputDiagnostics.sceneViewHovered = false;
         m_viewportInputDiagnostics.sceneViewFocused = false;
+        m_sceneViewVisible = false;  // the engine skips drawing the scene view
         ImGui::End();
         return;
     }
+    m_sceneViewVisible = true;
 
     const ImVec2 sceneMin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
+    StorePanelPixels(avail, m_sceneViewPanelPixels);
     const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
     const ImVec2 viewportPos = mainViewport ? mainViewport->Pos : ImVec2(0.0f, 0.0f);
     ImVec2 imageMin = sceneMin;
@@ -201,11 +215,22 @@ void EditorImGui::RenderSceneViewDropTarget()
         ImGui::SetCursorScreenPos(imageMin);
         ImGui::Image(reinterpret_cast<ImTextureID>(sceneViewTextureId), imageSize);
         sceneViewItemDrawn = true;
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        char sceneViewFpsText[96]{};
+        std::snprintf(sceneViewFpsText,
+            sizeof(sceneViewFpsText),
+            "Scene render: %.1f FPS  (%.2f ms)",
+            m_engineStats.sceneViewFps,
+            m_engineStats.sceneViewFrameMs);
+        const ImVec2 fpsTextSize = ImGui::CalcTextSize(sceneViewFpsText);
+        const ImVec2 fpsTextMin(imageMin.x + 8.0f, imageMin.y + 8.0f);
+        const ImVec2 fpsTextMax(fpsTextMin.x + fpsTextSize.x + 12.0f, fpsTextMin.y + fpsTextSize.y + 8.0f);
+        drawList->AddRectFilled(fpsTextMin, fpsTextMax, IM_COL32(10, 12, 18, 190), 4.0f);
+        drawList->AddText(ImVec2(fpsTextMin.x + 6.0f, fpsTextMin.y + 4.0f), IM_COL32(230, 240, 255, 255), sceneViewFpsText);
         if (!m_sceneViewSelectionOutline.empty() &&
             sceneViewWidth > 0 &&
             sceneViewHeight > 0)
         {
-            ImDrawList* drawList = ImGui::GetWindowDrawList();
             auto toScenePoint = [&](float x, float y) {
                 const float u = x / static_cast<float>(sceneViewWidth);
                 const float v = y / static_cast<float>(sceneViewHeight);
@@ -447,17 +472,33 @@ void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& ima
     std::copy(std::begin(m_commands.sceneGizmoScale), std::end(m_commands.sceneGizmoScale), m_sceneGizmoScale);
 }
 
+// Call before Begin(name): docks the window into `anchor`'s dock node when a saved layout has no place
+// for it (saved before the window existed), or holds it as the tiny floating window an undocked view
+// panel auto-sizes to on first use (e.g. a 32x38 "Game").
+static void DockBesideIfUnplaced(const char* name, const char* anchor)
+{
+    const ImGuiWindow* anchorWindow = ImGui::FindWindowByName(anchor);
+    if (anchorWindow == nullptr || anchorWindow->DockId == 0)
+        return;
+    const ImGuiWindow* window = ImGui::FindWindowByName(name);
+    const bool unusable = window != nullptr && window->DockId == 0 &&
+        (window->Size.x < 64.0f || window->Size.y < 64.0f);
+    ImGui::SetNextWindowDockID(anchorWindow->DockId, unusable ? ImGuiCond_Always : ImGuiCond_FirstUseEver);
+}
+
 void EditorImGui::RenderGameViewPanel()
 {
     ImGuiWindowFlags flags =
         ImGuiWindowFlags_NoScrollbar |
         ImGuiWindowFlags_NoScrollWithMouse |
         ImGuiWindowFlags_NoCollapse;
-    if (!ImGui::Begin("Game", nullptr, flags))
+    DockBesideIfUnplaced(EditorWindow::Game, EditorWindow::SceneView);
+    if (!ImGui::Begin(EditorWindow::Game, nullptr, flags))
     {
         // Window collapsed or its dock tab is inactive — not visible, so the engine can
         // skip rendering the Game view this frame.
         m_gameViewVisible = false;
+        m_gameViewRect.valid = false;
         ImGui::End();
         return;
     }
@@ -465,6 +506,7 @@ void EditorImGui::RenderGameViewPanel()
 
     const ImVec2 regionMin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
+    StorePanelPixels(avail, m_gameViewPanelPixels);
     ImVec2 imageMin = regionMin;
     ImVec2 imageSize = avail;
     std::uint32_t gameViewWidth = 0;
@@ -492,10 +534,53 @@ void EditorImGui::RenderGameViewPanel()
             imageMin.y += (avail.y - imageSize.y) * 0.5f;
         }
     }
+    // Where the game image sits in the window: the game's UI (RmlUi) maps mouse input through it.
+    const ImGuiViewport* mainViewport = ImGui::GetMainViewport();
+    const ImVec2 viewportPos = mainViewport ? mainViewport->Pos : ImVec2(0.0f, 0.0f);
+    m_gameViewRect.valid = gameViewTextureId && avail.x > 1.0f && avail.y > 1.0f && gameViewWidth > 0 && gameViewHeight > 0;
+    m_gameViewRect.min[0] = imageMin.x - viewportPos.x;
+    m_gameViewRect.min[1] = imageMin.y - viewportPos.y;
+    m_gameViewRect.size[0] = imageSize.x;
+    m_gameViewRect.size[1] = imageSize.y;
+    m_gameViewRect.extent[0] = gameViewWidth;
+    m_gameViewRect.extent[1] = gameViewHeight;
     if (gameViewTextureId && avail.x > 1.0f && avail.y > 1.0f)
     {
         ImGui::SetCursorScreenPos(imageMin);
         ImGui::Image(reinterpret_cast<ImTextureID>(gameViewTextureId), imageSize);
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        char gpuText[32]{};
+        if (m_engineStats.gpuUsageAvailable)
+            std::snprintf(gpuText, sizeof(gpuText), "%.1f%%", m_engineStats.gpuUsagePercent);
+        else
+            std::snprintf(gpuText, sizeof(gpuText), "n/a");
+        char gameStatsText[256]{};
+        std::snprintf(gameStatsText,
+            sizeof(gameStatsText),
+            "FPS %.1f | CPU %.1f%% | GPU %s | RAM %.1f%% (%.0f MB)",
+            m_engineStats.gameViewFps,
+            m_engineStats.processCpuPercent,
+            gpuText,
+            m_engineStats.ramUsagePercent,
+            m_engineStats.processRamMb);
+        char rendererText[256]{};
+        std::snprintf(rendererText,
+            sizeof(rendererText),
+            "Renderer: %s",
+            m_engineStats.renderer.empty() ? "unknown" : m_engineStats.renderer.c_str());
+        const ImVec2 statsLineSize = ImGui::CalcTextSize(gameStatsText);
+        const ImVec2 rendererLineSize = ImGui::CalcTextSize(rendererText);
+        const float lineHeight = ImGui::GetTextLineHeight();
+        const ImVec2 statsTextMin(imageMin.x + 8.0f, imageMin.y + 8.0f);
+        const float statsWidth = std::max(statsLineSize.x, rendererLineSize.x) + 12.0f;
+        const ImVec2 statsTextMax(statsTextMin.x + statsWidth, statsTextMin.y + lineHeight * 2.0f + 10.0f);
+        drawList->AddRectFilled(statsTextMin, statsTextMax, IM_COL32(10, 12, 18, 190), 4.0f);
+        drawList->AddText(ImVec2(statsTextMin.x + 6.0f, statsTextMin.y + 4.0f),
+            IM_COL32(230, 240, 255, 255),
+            gameStatsText);
+        drawList->AddText(ImVec2(statsTextMin.x + 6.0f, statsTextMin.y + 4.0f + lineHeight),
+            IM_COL32(205, 220, 235, 255),
+            rendererText);
     }
     else if (avail.x > 1.0f && avail.y > 1.0f)
     {
@@ -576,6 +661,7 @@ void EditorImGui::ActivateCurrentProject()
     // Reset the save-to-live poll for the new project: clear the old project's mtimes and force a fresh
     // first-pass seed (so a project switch never spuriously reports changes / auto-builds).
     m_luaMtimes.clear();
+    m_angelMtimes.clear();
     m_cppMtimes.clear();
     m_lastScriptPollSeconds = 0.0;
     LoadProjectPhysicsSettings();
@@ -693,19 +779,19 @@ std::filesystem::path EditorImGui::EngineSdkIncludeDir() const
     return m_engineRoot / "sdk" / "include";  // not found — emit the nominal path (build fails loudly)
 }
 
-void EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& projectRoot)
+bool EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& projectRoot)
 {
     std::error_code ec;
-    // scriptsDir holds the engine-owned CMake project + build tree only. The dev's .cpp SOURCES live
-    // in the asset library scripts folder (srcDir) alongside .lua, so both are first-class, browsable,
-    // drag-attachable assets — and the build never pollutes the asset folder with intermediates.
+    // scriptsDir holds the engine-owned CMake project + build tree only. The dev's .cpp SOURCES are
+    // assets like any other, anywhere under the asset folder (srcDir), so they are browsable and
+    // drag-attachable — and the build never pollutes the asset folder with intermediates.
     const std::filesystem::path scriptsDir = projectRoot / "Scripts";
     const std::filesystem::path srcDir = ProjectScriptSourceDir();
     std::filesystem::create_directories(scriptsDir, ec);
     if (ec)
     {
         m_projectStatus = "Failed to create Scripts/: " + ec.message();
-        return;
+        return false;
     }
     std::filesystem::create_directories(srcDir, ec);
 
@@ -737,6 +823,28 @@ void EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& proj
         }
     }
 
+    // C++ is no longer a project scripting language (AngelScript + Lua are): there is nothing to
+    // scaffold — no CMake project, no seeded Game.cpp — unless the project still carries LEGACY C++
+    // script sources, which keep building. Returns whether the project is buildable at all.
+    bool hasCpp = false;
+    for (std::filesystem::recursive_directory_iterator it(
+             srcDir, std::filesystem::directory_options::skip_permission_denied, ec), end;
+         !ec && it != end && !hasCpp; it.increment(ec))
+    {
+        std::error_code entryEc;
+        hasCpp = it->is_regular_file(entryEc) && it->path().extension() == ".cpp" &&
+            IsNativeScriptSource(srcDir, it->path());
+    }
+    if (!hasCpp)
+    {
+        if (m_assetLibrary)
+        {
+            std::string reconcileError;
+            m_assetLibrary->Refresh(reconcileError);
+        }
+        return false;
+    }
+
     // CMake target name must be a bare identifier — sanitize the (possibly spaced) project name.
     std::string proj = ProjectManager::Instance().CurrentProject().name;
     if (proj.empty())
@@ -759,13 +867,19 @@ void EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& proj
         const std::string scriptsSrc = srcDir.generic_string();
         std::string tmpl =
             "# GENERATED by the IxtreemeWorld editor — DO NOT EDIT. Regenerated on every build.\n"
-            "# Compiles the project's *.cpp game scripts (in the asset scripts folder) into\n"
+            "# Compiles the project's *.cpp game scripts (anywhere in the asset folder) into\n"
             "# <ProjectRoot>/Binaries/@PROJ@.dll (SDK headers only).\n"
             "cmake_minimum_required(VERSION 3.20)\n"
             "project(@PROJ@ CXX)\n\n"
-            "# Recurse so scripts authored in browser subfolders compile too (the asset scripts folder\n"
-            "# holds only game sources — the build tree lives elsewhere, under <ProjectRoot>/Scripts).\n"
-            "file(GLOB_RECURSE GAME_MODULE_SOURCES CONFIGURE_DEPENDS \"@SCRIPTS_SRC@/*.cpp\")\n\n"
+            "# Every .cpp in the asset folder is a game script, in whatever folder it was put (the build\n"
+            "# tree lives elsewhere, under <ProjectRoot>/Scripts). Build folders INSIDE the asset folder\n"
+            "# are skipped — matched on the relative path, as the project itself may sit under a build dir.\n"
+            "file(GLOB_RECURSE GAME_MODULE_RELATIVE CONFIGURE_DEPENDS RELATIVE \"@SCRIPTS_SRC@\" \"@SCRIPTS_SRC@/*.cpp\")\n"
+            "list(FILTER GAME_MODULE_RELATIVE EXCLUDE REGEX \"(^|/)[Bb][Uu][Ii][Ll][Dd]/\")\n"
+            "set(GAME_MODULE_SOURCES \"\")\n"
+            "foreach(GAME_MODULE_SOURCE IN LISTS GAME_MODULE_RELATIVE)\n"
+            "    list(APPEND GAME_MODULE_SOURCES \"@SCRIPTS_SRC@/${GAME_MODULE_SOURCE}\")\n"
+            "endforeach()\n\n"
             "# Runtime-loaded shared library (MODULE — only loaded by the engine, never linked).\n"
             "add_library(@PROJ@ MODULE ${GAME_MODULE_SOURCES})\n\n"
             "set_target_properties(@PROJ@ PROPERTIES\n"
@@ -792,56 +906,16 @@ void EditorImGui::EnsureProjectScriptsScaffold(const std::filesystem::path& proj
         std::ofstream(cmakeFile, std::ios::binary) << tmpl;
     }
 
-    // Seed a starter Game.cpp (in the asset scripts folder) if the project has no C++ source yet. The
-    // class is named after the file (Game) so dragging it onto an entity attaches the right class — and
-    // this is the ONE .cpp that owns the module entry point (IxModuleRegistry.inl).
-    bool hasCpp = false;
-    for (const std::filesystem::directory_entry& e : std::filesystem::directory_iterator(srcDir, ec))
-    {
-        if (e.is_regular_file(ec) && e.path().extension() == ".cpp")
-        {
-            hasCpp = true;
-            break;
-        }
-    }
-    if (!hasCpp)
-    {
-        const char* seed =
-            "#include \"ixtreeme/NativeScript.h\"\n"
-            "#include \"ixtreeme/IxModuleRegistry.inl\"\n\n"
-            "// Your first game script. Spins the entity around Y at `speed` deg/sec. `speed` is editable\n"
-            "// in the inspector and serialized, thanks to IX_REFLECT. Each script is self-contained (the\n"
-            "// registry .inl is inline-merged), so add more via \"New C++ Script\" — no special file.\n"
-            "class Game : public ixscript::NativeScript\n"
-            "{\n"
-            "public:\n"
-            "    float speed = 90.0f;  // deg/sec\n\n"
-            "    void OnUpdate(float dt) override\n"
-            "    {\n"
-            "        float r[3];\n"
-            "        GetRotation(r);  // Euler degrees\n"
-            "        r[1] += speed * dt;\n"
-            "        SetRotation(r);\n"
-            "    }\n\n"
-            "    IX_REFLECT(Game, speed)\n"
-            "};\n"
-            "IXSCRIPT_REGISTER(Game)\n";
-        const std::filesystem::path seedPath = srcDir / "Game.cpp";
-        std::ofstream(seedPath, std::ios::binary) << seed;
-        // Stamp the just-seeded file into the poll map so it isn't seen as a "new .cpp" on the next
-        // poll (which would otherwise fire one redundant auto-build right after the first build).
-        const std::filesystem::file_time_type mt = std::filesystem::last_write_time(seedPath, ec);
-        if (!ec)
-            m_cppMtimes[seedPath.generic_string()] = mt;
-    }
+    // (No Game.cpp seed: C++ scripts are legacy-only; new projects start with AngelScript/Lua.)
 
-    // Register any migrated/seeded .cpp as Script assets now, so they appear in the asset browser
+    // Register any migrated .cpp as Script assets now, so they appear in the asset browser
     // immediately (Refresh's reconcile discovery picks up sources not yet in the manifest).
     if (m_assetLibrary)
     {
         std::string reconcileError;
         m_assetLibrary->Refresh(reconcileError);
     }
+    return true;
 }
 
 bool EditorImGui::LoadProjectStartupScene()
@@ -941,6 +1015,11 @@ void EditorImGui::CreateProjectFromDialog()
 
 void EditorImGui::OpenProjectFromDialog(const std::filesystem::path& manifestPath)
 {
+    if (!CanUseEditorTools())
+    {
+        m_projectStatus = "Stop Play before opening a project";
+        return;
+    }
     std::string error;
     if (!ProjectManager::Instance().OpenProject(manifestPath, error))
     {
@@ -951,4 +1030,3 @@ void EditorImGui::OpenProjectFromDialog(const std::filesystem::path& manifestPat
     ActivateCurrentProject();
     ImGui::CloseCurrentPopup();
 }
-

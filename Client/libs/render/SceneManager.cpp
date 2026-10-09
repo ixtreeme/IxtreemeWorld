@@ -2,6 +2,7 @@
 
 #include "Common.h"
 #include "Debug.h"
+#include "JobSystem.h"
 #include "ProjectManager.h"
 #include "map/MapData.h"
 #include "schema/map_manifest.capnp.h"
@@ -17,9 +18,12 @@
 #include <cmath>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
+#include <unordered_map>
 #include <utility>
 
 #if defined(_WIN32)
@@ -31,6 +35,7 @@ namespace
 {
 using ixtreeme::common::EscapeJson;
 using ixtreeme::common::GenericPath;
+using ixtreeme::common::LegacyTextToUtf8;
 using ixtreeme::common::TimestampUtc;
 
 struct JsonValue
@@ -191,7 +196,10 @@ private:
         {
             const char ch = m_text[m_pos++];
             if (ch == '"')
+            {
+                out = LegacyTextToUtf8(std::move(out));  // a scene saved before the engine wrote UTF-8
                 return true;
+            }
             if (ch != '\\')
             {
                 out.push_back(ch);
@@ -325,6 +333,135 @@ bool WriteBytes(const std::filesystem::path& path, const std::vector<std::uint8_
         return false;
     if (!bytes.empty())
         file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    file.close();
+    return !file.fail();
+}
+
+// Content stamps of the terrain chunk files this process last wrote or read, so a scene save
+// rewrites only the chunks whose bytes changed (rewriting every chunk file blocked each save and
+// autosave for ~150 ms). A stamp only counts while the file on disk still has the size and write
+// time recorded with it: anything else touching the file forces a rewrite.
+struct TerrainFileStamp
+{
+    std::uint64_t contentHash = 0;
+    std::uintmax_t size = 0;
+    std::filesystem::file_time_type writeTime{};
+};
+
+struct OnDiskFile
+{
+    std::uintmax_t size = 0;
+    std::filesystem::file_time_type writeTime{};
+};
+
+std::mutex g_terrainFileStampMutex;
+std::unordered_map<std::string, TerrainFileStamp> g_terrainFileStamps;
+
+std::string TerrainFileStampKey(const std::filesystem::path& path)
+{
+    return path.lexically_normal().generic_string();
+}
+
+std::uint64_t RotateLeft64(std::uint64_t value, int bits)
+{
+    return (value << bits) | (value >> (64 - bits));
+}
+
+std::uint64_t HashBytes64(const std::vector<std::uint8_t>& bytes)
+{
+    constexpr std::uint64_t kPrime1 = 0x9E3779B185EBCA87ull;
+    constexpr std::uint64_t kPrime2 = 0xC2B2AE3D27D4EB4Full;
+    constexpr std::uint64_t kPrime3 = 0x165667B19E3779F9ull;
+    std::uint64_t hash = 0x27D4EB2F165667C5ull ^ (static_cast<std::uint64_t>(bytes.size()) * kPrime1);
+    size_t i = 0;
+    for (; i + 8u <= bytes.size(); i += 8u)
+    {
+        std::uint64_t word = 0;
+        std::memcpy(&word, bytes.data() + i, 8u);
+        hash ^= RotateLeft64(word * kPrime2, 31) * kPrime1;
+        hash = RotateLeft64(hash, 27) * kPrime1 + kPrime3;
+    }
+    for (; i < bytes.size(); ++i)
+    {
+        hash ^= static_cast<std::uint64_t>(bytes[i]) * kPrime3;
+        hash = RotateLeft64(hash, 11) * kPrime1;
+    }
+    hash ^= hash >> 33;
+    hash *= kPrime2;
+    hash ^= hash >> 29;
+    hash *= kPrime3;
+    hash ^= hash >> 32;
+    return hash;
+}
+
+void RecordTerrainFileStamp(const std::filesystem::path& path, std::uint64_t contentHash,
+                            std::uintmax_t size, std::filesystem::file_time_type writeTime)
+{
+    std::scoped_lock lock(g_terrainFileStampMutex);
+    g_terrainFileStamps[TerrainFileStampKey(path)] = TerrainFileStamp{contentHash, size, writeTime};
+}
+
+void ForgetTerrainFileStamp(const std::filesystem::path& path)
+{
+    std::scoped_lock lock(g_terrainFileStampMutex);
+    g_terrainFileStamps.erase(TerrainFileStampKey(path));
+}
+
+// Size and write time of every file in a directory, from one enumeration (cheaper than a stat per file).
+std::unordered_map<std::string, OnDiskFile> ListFilesOnDisk(const std::filesystem::path& directory)
+{
+    std::unordered_map<std::string, OnDiskFile> files;
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(directory, ec), end; !ec && it != end; it.increment(ec))
+    {
+        std::error_code entryEc;
+        if (!it->is_regular_file(entryEc))
+            continue;
+        OnDiskFile file;
+        file.size = it->file_size(entryEc);
+        if (entryEc)
+            continue;
+        file.writeTime = it->last_write_time(entryEc);
+        if (entryEc)
+            continue;
+        files.emplace(it->path().filename().generic_string(), file);
+    }
+    return files;
+}
+
+// Writes bytes unless the file on disk is known to hold exactly them already. onDisk lists the
+// files of path's directory (ListFilesOnDisk). written reports whether the file was rewritten.
+bool WriteBytesIfChanged(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes,
+                         const std::unordered_map<std::string, OnDiskFile>& onDisk, bool& written)
+{
+    written = false;
+    const std::uint64_t contentHash = HashBytes64(bytes);
+    const auto disk = onDisk.find(path.filename().generic_string());
+    if (disk != onDisk.end() && disk->second.size == bytes.size())
+    {
+        std::scoped_lock lock(g_terrainFileStampMutex);
+        const auto stamp = g_terrainFileStamps.find(TerrainFileStampKey(path));
+        if (stamp != g_terrainFileStamps.end() &&
+            stamp->second.contentHash == contentHash &&
+            stamp->second.size == bytes.size() &&
+            stamp->second.writeTime == disk->second.writeTime)
+        {
+            return true;
+        }
+    }
+
+    if (!WriteBytes(path, bytes))
+    {
+        ForgetTerrainFileStamp(path);
+        return false;
+    }
+    written = true;
+    std::error_code ec;
+    const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(path, ec);
+    if (ec)
+        ForgetTerrainFileStamp(path);
+    else
+        RecordTerrainFileStamp(path, contentHash, bytes.size(), writeTime);
     return true;
 }
 
@@ -423,7 +560,19 @@ std::vector<std::uint8_t> BuildMxChunkBytes(const TerrainSceneData& terrain,
 
     Section attributes;
     attributes.type = 3;
-    attributes.bytes.assign(static_cast<size_t>(chunkSize) * chunkSize * sizeof(std::uint16_t), 0);
+    attributes.bytes.reserve(static_cast<size_t>(chunkSize) * chunkSize * sizeof(std::uint16_t));
+    for (std::uint32_t y = 0; y < chunkSize; ++y)
+    {
+        for (std::uint32_t x = 0; x < chunkSize; ++x)
+        {
+            const std::uint32_t gx = chunkX * chunkSize + x;
+            const std::uint32_t gy = chunkY * chunkSize + y;
+            const size_t src = static_cast<size_t>(gy) * terrain.cellsX + gx;
+            const std::uint16_t value = gx < terrain.cellsX && gy < terrain.cellsZ &&
+                src < terrain.attributes.size() ? terrain.attributes[src] : 0;
+            PushU16(attributes.bytes, value);
+        }
+    }
     sections.push_back(std::move(attributes));
     buildSplatSection(4, terrain.splatBBytes);
 
@@ -502,6 +651,12 @@ bool WriteTerrainChunkSet(const std::filesystem::path& scenePath,
                           TerrainSceneData& terrain,
                           const std::array<MapEditorPaletteSlot, 8>& paletteSlots)
 {
+    if (!terrain.attributes.empty() &&
+        terrain.attributes.size() != static_cast<size_t>(terrain.cellsX) * terrain.cellsZ)
+    {
+        TraceError("[TCHUNK] invalid attribute grid dimensions");
+        return false;
+    }
     terrain.chunkSizeCells = std::clamp(terrain.chunkSizeCells == 0 ? 64u : terrain.chunkSizeCells, 32u, 256u);
     const std::uint32_t worldCells = std::max(terrain.cellsX, terrain.cellsZ);
     const std::uint32_t chunkSize = terrain.chunkSizeCells;
@@ -515,16 +670,23 @@ bool WriteTerrainChunkSet(const std::filesystem::path& scenePath,
     if (!WriteBytes(absoluteMapDir / "map.manifest", manifest))
         return false;
 
+    const std::unordered_map<std::string, OnDiskFile> chunksOnDisk = ListFilesOnDisk(absoluteMapDir / "chunks");
     std::uint32_t written = 0;
+    std::uint32_t unchanged = 0;
     for (std::uint32_t cy = 0; cy < chunksY; ++cy)
     {
         for (std::uint32_t cx = 0; cx < chunksX; ++cx)
         {
             const std::filesystem::path chunkPath = absoluteMapDir / "chunks" /
                 ("chunk_" + std::to_string(cx) + "_" + std::to_string(cy) + ".mxchunk");
-            if (!WriteBytes(chunkPath, BuildMxChunkBytes(terrain, cx, cy, worldCells, chunkSize)))
+            bool chunkWritten = false;
+            if (!WriteBytesIfChanged(chunkPath, BuildMxChunkBytes(terrain, cx, cy, worldCells, chunkSize),
+                    chunksOnDisk, chunkWritten))
                 return false;
-            ++written;
+            if (chunkWritten)
+                ++written;
+            else
+                ++unchanged;
         }
     }
 
@@ -532,8 +694,9 @@ bool WriteTerrainChunkSet(const std::filesystem::path& scenePath,
     terrain.heightmapRef.clear();
     terrain.splatRef.clear();
     terrain.maskRef.clear();
-    Tracenf("[TCHUNK] save chunks=%u manifest=%s",
+    Tracenf("[TCHUNK] save chunks=%u unchanged=%u manifest=%s",
         written,
+        unchanged,
         terrain.chunkManifestRef.c_str());
     Tracen("[TMAT] saved per-layer params: layers=8");
     return true;
@@ -553,9 +716,16 @@ bool ReadTerrainChunkSet(const std::filesystem::path& sceneDir,
         std::filesystem::path p(path);
         if (!p.is_absolute())
             p = sceneDir / p;
+        // Write time taken before reading: a change made after it fails the stamp check on save.
+        std::error_code timeEc;
+        const std::filesystem::file_time_type writeTime = std::filesystem::last_write_time(p, timeEc);
         std::vector<std::uint8_t> bytes = ReadBytes(p);
         if (bytes.empty())
             return std::nullopt;
+        if (timeEc)
+            ForgetTerrainFileStamp(p);
+        else
+            RecordTerrainFileStamp(p, HashBytes64(bytes), bytes.size(), writeTime);
         return bytes;
     };
     const std::filesystem::path relativeRoot = std::filesystem::relative(mapRoot, sceneDir);
@@ -580,6 +750,17 @@ bool ReadTerrainChunkSet(const std::filesystem::path& sceneDir,
         {
             const size_t src = static_cast<size_t>(y) * field->width_vertices + x;
             terrain.heightCmGrid.push_back(src < field->heights_cm.size() ? static_cast<float>(field->heights_cm[src]) : 0.0f);
+        }
+    }
+    terrain.attributes.assign(static_cast<size_t>(terrain.cellsX) * terrain.cellsZ, 0);
+    for (std::uint32_t y = 0; y < terrain.cellsZ; ++y)
+    {
+        for (std::uint32_t x = 0; x < terrain.cellsX; ++x)
+        {
+            const size_t src = static_cast<size_t>(y) * field->manifest.world_size_cells + x;
+            const size_t dst = static_cast<size_t>(y) * terrain.cellsX + x;
+            if (src < field->attributes.size())
+                terrain.attributes[dst] = field->attributes[src];
         }
     }
     const size_t splatBytes = static_cast<size_t>(terrain.cellsX) * terrain.cellsZ * 4u;
@@ -640,8 +821,30 @@ bool ReadTerrainChunkSet(const std::filesystem::path& sceneDir,
     return true;
 }
 
+constexpr std::uint64_t kMaxTerrainHeightCount = 100000000ull;
+
+bool TerrainHeightCount(std::uint32_t cellsX, std::uint32_t cellsZ,
+                        float cellSizeMeters, std::uint64_t& count)
+{
+    if (cellsX == 0 || cellsZ == 0 || !std::isfinite(cellSizeMeters) || cellSizeMeters <= 0.0f)
+        return false;
+    const std::uint64_t columns = static_cast<std::uint64_t>(cellsX) + 1ull;
+    const std::uint64_t rows = static_cast<std::uint64_t>(cellsZ) + 1ull;
+    if (columns > kMaxTerrainHeightCount / rows)
+        return false;
+    count = columns * rows;
+    return std::isfinite(static_cast<float>(cellsX) * cellSizeMeters) &&
+        std::isfinite(static_cast<float>(cellsZ) * cellSizeMeters);
+}
+
 bool WriteTerrainHeightmap(const std::filesystem::path& path, const TerrainSceneData& terrain)
 {
+    std::uint64_t expectedCount = 0;
+    if (!TerrainHeightCount(terrain.cellsX, terrain.cellsZ, terrain.cellSizeMeters, expectedCount) ||
+        terrain.heightCmGrid.size() != expectedCount ||
+        !std::all_of(terrain.heightCmGrid.begin(), terrain.heightCmGrid.end(),
+            [](float value) { return std::isfinite(value); }))
+        return false;
     if (!path.parent_path().empty())
         std::filesystem::create_directories(path.parent_path());
     std::ofstream file(path, std::ios::binary);
@@ -659,14 +862,18 @@ bool WriteTerrainHeightmap(const std::filesystem::path& path, const TerrainScene
     if (!terrain.heightCmGrid.empty())
         file.write(reinterpret_cast<const char*>(terrain.heightCmGrid.data()),
             static_cast<std::streamsize>(terrain.heightCmGrid.size() * sizeof(float)));
-    return true;
+    file.close();
+    return static_cast<bool>(file);
 }
 
-bool ReadTerrainHeightmap(const std::filesystem::path& path, TerrainSceneData& terrain)
+bool ReadTerrainHeightmap(const std::filesystem::path& path, TerrainSceneData& terrain,
+                           bool requireMatchingGeometry = false)
 {
-    std::ifstream file(path, std::ios::binary);
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file)
         return false;
+    const std::streamoff fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
     char magic[12]{};
     std::uint32_t version = 0;
     file.read(magic, sizeof(magic));
@@ -681,12 +888,18 @@ bool ReadTerrainHeightmap(const std::filesystem::path& path, TerrainSceneData& t
     file.read(reinterpret_cast<char*>(&cellsZ), sizeof(cellsZ));
     file.read(reinterpret_cast<char*>(&cellSize), sizeof(cellSize));
     file.read(reinterpret_cast<char*>(&count), sizeof(count));
-    if (!file || count > 100000000ull)
+    std::uint64_t expectedCount = 0;
+    if (!file || !TerrainHeightCount(cellsX, cellsZ, cellSize, expectedCount) ||
+        count != expectedCount ||
+        fileSize != static_cast<std::streamoff>(36ull + count * sizeof(float)) ||
+        (requireMatchingGeometry && (cellsX != terrain.cellsX || cellsZ != terrain.cellsZ ||
+            cellSize != terrain.cellSizeMeters)))
         return false;
     std::vector<float> heights(static_cast<size_t>(count));
     if (!heights.empty())
         file.read(reinterpret_cast<char*>(heights.data()), static_cast<std::streamsize>(heights.size() * sizeof(float)));
-    if (!file)
+    if (!file || !std::all_of(heights.begin(), heights.end(),
+        [](float value) { return std::isfinite(value); }))
         return false;
     terrain.cellsX = cellsX;
     terrain.cellsZ = cellsZ;
@@ -886,6 +1099,142 @@ void WritePaletteSlot(std::ostream& out, const MapEditorPaletteSlot& slot, bool 
     out << "      \"uv_offset\": [" << slot.uvOffset[0] << ", " << slot.uvOffset[1] << "],\n";
     out << "      \"uv_rotation_degrees\": " << slot.uvRotationDegrees << "\n";
     out << "    }" << (comma ? "," : "") << "\n";
+}
+
+const char* SkyModeName(SkySettings::Mode mode)
+{
+    switch (mode)
+    {
+    case SkySettings::Mode::Color: return "color";
+    case SkySettings::Mode::Procedural: return "procedural";
+    case SkySettings::Mode::Cubemap: return "cubemap";
+    case SkySettings::Mode::Panorama: return "panorama";
+    }
+    return "procedural";
+}
+
+SkySettings::Mode SkyModeFromName(const std::string& name, SkySettings::Mode fallback)
+{
+    if (name == "color")
+        return SkySettings::Mode::Color;
+    if (name == "procedural")
+        return SkySettings::Mode::Procedural;
+    if (name == "cubemap")
+        return SkySettings::Mode::Cubemap;
+    if (name == "panorama")
+        return SkySettings::Mode::Panorama;
+    return fallback;
+}
+
+// The "sky" object inside "environment".
+void WriteSkySettings(std::ostream& out, const SkySettings& sky)
+{
+    out << "    \"sky\": {\n";
+    out << "      \"mode\": \"" << SkyModeName(sky.mode) << "\",\n";
+    out << "      \"color\": " << FloatArray(sky.color, 3) << ",\n";
+    out << "      \"zenith_color\": " << FloatArray(sky.zenithColor, 3) << ",\n";
+    out << "      \"horizon_color\": " << FloatArray(sky.horizonColor, 3) << ",\n";
+    out << "      \"ground_color\": " << FloatArray(sky.groundColor, 3) << ",\n";
+    out << "      \"sun_size_degrees\": " << sky.sunSizeDegrees << ",\n";
+    out << "      \"sun_glow\": " << sky.sunGlow << ",\n";
+    out << "      \"cube_faces\": [";
+    for (std::size_t face = 0; face < sky.cubeFacePaths.size(); ++face)
+        out << (face > 0 ? ", " : "") << "\"" << EscapeJson(sky.cubeFacePaths[face]) << "\"";
+    out << "],\n";
+    out << "      \"panorama\": \"" << EscapeJson(sky.panoramaPath) << "\",\n";
+    out << "      \"exposure\": " << sky.exposure << ",\n";
+    out << "      \"rotation_degrees\": " << sky.rotationDegrees << ",\n";
+    out << "      \"tint\": " << FloatArray(sky.tint, 3) << ",\n";
+    out << "      \"ambient_from_sky\": " << (sky.ambientFromSky ? "true" : "false") << ",\n";
+    out << "      \"god_rays\": {\n";
+    out << "        \"enabled\": " << (sky.godRays ? "true" : "false") << ",\n";
+    out << "        \"intensity\": " << sky.godRayIntensity << ",\n";
+    out << "        \"length\": " << sky.godRayLength << ",\n";
+    out << "        \"falloff\": " << sky.godRayFalloff << ",\n";
+    out << "        \"quality\": " << sky.godRayQuality << ",\n";
+    out << "        \"technique\": " << sky.godRayTechnique << ",\n";
+    out << "        \"volumetric_intensity\": " << sky.volumetricIntensity << ",\n";
+    out << "        \"volumetric_density\": " << sky.volumetricDensity << ",\n";
+    out << "        \"volumetric_anisotropy\": " << sky.volumetricAnisotropy << ",\n";
+    out << "        \"volumetric_distance\": " << sky.volumetricDistance << ",\n";
+    out << "        \"volumetric_quality\": " << sky.volumetricQuality << "\n";
+    out << "      }\n";
+    out << "    }";
+}
+
+SkySettings ReadSkySettings(const JsonValue& object)
+{
+    SkySettings sky;
+    sky.mode = SkyModeFromName(ReadString(object, "mode"), sky.mode);
+    ReadFloatArray(object, "color", sky.color, 3);
+    ReadFloatArray(object, "zenith_color", sky.zenithColor, 3);
+    ReadFloatArray(object, "horizon_color", sky.horizonColor, 3);
+    ReadFloatArray(object, "ground_color", sky.groundColor, 3);
+    sky.sunSizeDegrees = std::clamp(ReadFloat(object, "sun_size_degrees", sky.sunSizeDegrees), 0.0f, 20.0f);
+    sky.sunGlow = std::clamp(ReadFloat(object, "sun_glow", sky.sunGlow), 0.0f, 4.0f);
+    if (const JsonValue* faces = Find(object, "cube_faces"); faces && faces->type == JsonValue::Type::Array)
+    {
+        for (std::size_t face = 0; face < sky.cubeFacePaths.size() && face < faces->array.size(); ++face)
+            sky.cubeFacePaths[face] = faces->array[face].StringOr({});
+    }
+    sky.panoramaPath = ReadString(object, "panorama");
+    sky.exposure = std::clamp(ReadFloat(object, "exposure", sky.exposure), 0.0f, 64.0f);
+    sky.rotationDegrees = ReadFloat(object, "rotation_degrees", sky.rotationDegrees);
+    ReadFloatArray(object, "tint", sky.tint, 3);
+    sky.ambientFromSky = ReadBool(object, "ambient_from_sky", sky.ambientFromSky);
+    if (const JsonValue* rays = Find(object, "god_rays"); rays && rays->type == JsonValue::Type::Object)
+    {
+        sky.godRays = ReadBool(*rays, "enabled", sky.godRays);
+        sky.godRayIntensity = std::clamp(ReadFloat(*rays, "intensity", sky.godRayIntensity), 0.0f, 4.0f);
+        sky.godRayLength = std::clamp(ReadFloat(*rays, "length", sky.godRayLength), 0.05f, 1.0f);
+        sky.godRayFalloff = std::clamp(ReadFloat(*rays, "falloff", sky.godRayFalloff), 0.8f, 1.0f);
+        sky.godRayQuality = std::clamp(static_cast<std::int32_t>(ReadU32(*rays, "quality", 1u)), 0, 2);
+        sky.godRayTechnique = std::clamp(static_cast<std::int32_t>(ReadU32(*rays, "technique", 0u)), 0, 2);
+        sky.volumetricIntensity = std::clamp(ReadFloat(*rays, "volumetric_intensity", sky.volumetricIntensity), 0.0f, 8.0f);
+        sky.volumetricDensity = std::clamp(ReadFloat(*rays, "volumetric_density", sky.volumetricDensity), 0.0f, 0.2f);
+        sky.volumetricAnisotropy = std::clamp(ReadFloat(*rays, "volumetric_anisotropy", sky.volumetricAnisotropy), 0.0f, 0.95f);
+        sky.volumetricDistance = std::clamp(ReadFloat(*rays, "volumetric_distance", sky.volumetricDistance), 5.0f, 200.0f);
+        sky.volumetricQuality = std::clamp(static_cast<std::int32_t>(ReadU32(*rays, "volumetric_quality", 1u)), 0, 2);
+    }
+    return sky;
+}
+
+const char* ToneMappingName(std::int32_t mode)
+{
+    switch (mode)
+    {
+    case 0: return "none";
+    case 2: return "filmic";
+    default: return "neutral";
+    }
+}
+
+std::int32_t ToneMappingFromName(const std::string& name, std::int32_t fallback)
+{
+    if (name == "none")
+        return 0;
+    if (name == "neutral")
+        return 1;
+    if (name == "filmic")
+        return 2;
+    return fallback;
+}
+
+// The "tone_mapping" object inside "environment" (kept in SkySettings with the scene's other looks).
+void WriteToneMapping(std::ostream& out, const SkySettings& sky)
+{
+    out << "    \"tone_mapping\": {\n";
+    out << "      \"mode\": \"" << ToneMappingName(sky.toneMapping) << "\",\n";
+    out << "      \"exposure_ev\": " << (sky.exposureEv == 0.0f ? 0.0f : sky.exposureEv) << "\n";  // no "-0"
+    out << "    }";
+}
+
+void ReadToneMapping(const JsonValue& object, SkySettings& sky)
+{
+    sky.toneMapping = ToneMappingFromName(ReadString(object, "mode"), sky.toneMapping);
+    sky.exposureEv = std::clamp(ReadFloat(object, "exposure_ev", sky.exposureEv), -8.0f, 8.0f);
+    if (sky.exposureEv == 0.0f)
+        sky.exposureEv = 0.0f;  // a "-0" shows as "-0.0 EV"
 }
 
 MapEditorPaletteSlot ReadPaletteSlot(const JsonValue& object)
@@ -1197,6 +1546,51 @@ void WriteScriptComponent(std::ostream& out, const ixscript::ScriptComponent& s)
     out << "      }";
 }
 
+void WriteParticleSystemComponent(std::ostream& out, const ixparticle::ParticleSystemComponent& p)
+{
+    out << "      \"particle_system\": {\n";
+    out << "        \"texture_asset_id\": \"" << EscapeJson(p.textureAssetId) << "\",\n";
+    out << "        \"effect_asset_id\": \"" << EscapeJson(p.effectAssetId) << "\",\n";
+    out << "        \"enabled\": " << (p.enabled ? "true" : "false") << ",\n";
+    out << "        \"play_on_start\": " << (p.playOnStart ? "true" : "false") << ",\n";
+    out << "        \"loop\": " << (p.loop ? "true" : "false") << ",\n";
+    out << "        \"gpu_simulation\": " << (p.gpuSimulation ? "true" : "false") << ",\n";
+    out << "        \"blend_mode\": \"" << ixparticle::BlendModeName(p.blendMode) << "\",\n";
+    out << "        \"duration\": " << p.duration << ",\n";
+    out << "        \"emission_rate\": " << p.emissionRate << ",\n";
+    out << "        \"burst_count\": " << p.burstCount << ",\n";
+    out << "        \"max_particles\": " << p.maxParticles << ",\n";
+    out << "        \"start_lifetime_min\": " << p.startLifetimeMin << ",\n";
+    out << "        \"start_lifetime_max\": " << p.startLifetimeMax << ",\n";
+    out << "        \"start_speed_min\": " << p.startSpeedMin << ",\n";
+    out << "        \"start_speed_max\": " << p.startSpeedMax << ",\n";
+    out << "        \"start_size_min\": " << p.startSizeMin << ",\n";
+    out << "        \"start_size_max\": " << p.startSizeMax << ",\n";
+    out << "        \"size_over_life\": " << FloatArray(p.sizeOverLife, 4) << ",\n";
+    out << "        \"direction\": " << FloatArray(p.direction, 3) << ",\n";
+    out << "        \"cone_angle\": " << p.coneAngle << ",\n";
+    out << "        \"shape_radius\": " << p.shapeRadius << ",\n";
+    out << "        \"gravity\": " << p.gravity << ",\n";
+    out << "        \"drag\": " << p.drag << ",\n";
+    out << "        \"rotation_speed\": " << p.rotationSpeed << ",\n";
+    out << "        \"soft_particles\": " << (p.softParticles ? "true" : "false") << ",\n";
+    out << "        \"soft_distance\": " << p.softDistance << ",\n";
+    out << "        \"atlas_columns\": " << p.atlasColumns << ",\n";
+    out << "        \"atlas_rows\": " << p.atlasRows << ",\n";
+    out << "        \"shape\": \"" << ixparticle::ShapeName(p.shape) << "\",\n";
+    out << "        \"local_space\": " << (p.localSpace ? "true" : "false") << ",\n";
+    out << "        \"shape_extents\": " << FloatArray(p.shapeExtents, 3) << ",\n";
+    out << "        \"shape_arc\": " << p.shapeArc << ",\n";
+    out << "        \"collide_with_ground\": " << (p.collideWithGround ? "true" : "false") << ",\n";
+    out << "        \"collision_bounce\": " << p.collisionBounce << ",\n";
+    out << "        \"collision_friction\": " << p.collisionFriction << ",\n";
+    out << "        \"ground_plane_y\": " << p.groundPlaneY << ",\n";
+    out << "        \"start_color\": " << FloatArray(p.colorOverLife, 4) << ",\n";
+    out << "        \"end_color\": " << FloatArray(p.colorOverLife + 12, 4) << ",\n";
+    out << "        \"color_over_life\": " << FloatArray(p.colorOverLife, 16) << "\n";
+    out << "      }";
+}
+
 void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma)
 {
     out << "    {\n";
@@ -1211,6 +1605,18 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
     out << "      \"mesh_asset_id\": \"" << EscapeJson(mesh.meshAssetId) << "\",\n";
     out << "      \"mesh_asset_path\": \"" << EscapeJson(mesh.meshAssetPath) << "\",\n";
     out << "      \"skinned\": " << (mesh.skinned ? "true" : "false");
+    // The AnimatorController the character plays (an asset id), in the editor and in the built game.
+    out << ",\n      \"enabled\": " << (mesh.enabled ? "true" : "false");
+    if (!mesh.animatorControllerId.empty())
+        out << ",\n      \"animator_controller_id\": \"" << EscapeJson(mesh.animatorControllerId) << "\"";
+    if (mesh.layerAuthoring.enabled || mesh.layerAuthoring.tags != 0)
+    {
+        out << ",\n";
+        out << "      \"layer_authoring\": {\n";
+        out << "        \"enabled\": " << (mesh.layerAuthoring.enabled ? "true" : "false") << ",\n";
+        out << "        \"tags\": " << mesh.layerAuthoring.tags << "\n";
+        out << "      }";
+    }
     if (!mesh.materialSlots.empty())
     {
         out << ",\n";
@@ -1301,6 +1707,11 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
     {
         out << ",\n";
         WriteScriptComponent(out, mesh.script);
+    }
+    if (mesh.hasParticleSystem)
+    {
+        out << ",\n";
+        WriteParticleSystemComponent(out, mesh.particleSystem);
     }
     out << "\n";
     out << "    }" << (comma ? "," : "") << "\n";
@@ -1614,6 +2025,74 @@ ixscript::ScriptComponent ReadScriptComponent(const JsonValue& entity)
     return s;
 }
 
+ixparticle::ParticleSystemComponent ReadParticleSystemComponent(const JsonValue& entity)
+{
+    ixparticle::ParticleSystemComponent p;
+    if (const JsonValue* object = Find(entity, "particle_system"); object && object->type == JsonValue::Type::Object)
+    {
+        p.textureAssetId = ReadString(*object, "texture_asset_id");
+        p.effectAssetId = ReadString(*object, "effect_asset_id");
+        p.enabled = ReadBool(*object, "enabled", p.enabled);
+        p.playOnStart = ReadBool(*object, "play_on_start", p.playOnStart);
+        p.loop = ReadBool(*object, "loop", p.loop);
+        p.gpuSimulation = ReadBool(*object, "gpu_simulation", p.gpuSimulation);
+        p.blendMode = ixparticle::ParseBlendMode(ReadString(*object, "blend_mode"));
+        p.duration = ReadFloat(*object, "duration", p.duration);
+        p.emissionRate = ReadFloat(*object, "emission_rate", p.emissionRate);
+        p.burstCount = static_cast<int>(ReadU32(*object, "burst_count", static_cast<std::uint32_t>(p.burstCount)));
+        p.maxParticles = static_cast<int>(ReadU32(*object, "max_particles", static_cast<std::uint32_t>(p.maxParticles)));
+        p.startLifetimeMin = ReadFloat(*object, "start_lifetime_min", p.startLifetimeMin);
+        p.startLifetimeMax = ReadFloat(*object, "start_lifetime_max", p.startLifetimeMax);
+        p.startSpeedMin = ReadFloat(*object, "start_speed_min", p.startSpeedMin);
+        p.startSpeedMax = ReadFloat(*object, "start_speed_max", p.startSpeedMax);
+        p.startSizeMin = ReadFloat(*object, "start_size_min", p.startSizeMin);
+        p.startSizeMax = ReadFloat(*object, "start_size_max", p.startSizeMax);
+        // Backward compatibility: pre-curve files stored a linear start/end pair + an end size
+        // scale. Apply those first, then let the curve arrays (when present) override.
+        {
+            float startColor[4] = {p.colorOverLife[0], p.colorOverLife[1], p.colorOverLife[2], p.colorOverLife[3]};
+            float endColor[4] = {p.colorOverLife[12], p.colorOverLife[13], p.colorOverLife[14], p.colorOverLife[15]};
+            ReadFloatArray(*object, "start_color", startColor, 4);
+            ReadFloatArray(*object, "end_color", endColor, 4);
+            for (int c = 0; c < 4; ++c)
+            {
+                p.colorOverLife[c] = startColor[c];
+                p.colorOverLife[12 + c] = endColor[c];
+                p.colorOverLife[4 + c] = startColor[c] + (endColor[c] - startColor[c]) * (1.0f / 3.0f);
+                p.colorOverLife[8 + c] = startColor[c] + (endColor[c] - startColor[c]) * (2.0f / 3.0f);
+            }
+            ReadFloatArray(*object, "color_over_life", p.colorOverLife, 16);
+
+            const float endSizeScale = ReadFloat(*object, "end_size_scale", p.sizeOverLife[3]);
+            p.sizeOverLife[0] = 1.0f;
+            p.sizeOverLife[1] = 1.0f;
+            p.sizeOverLife[2] = 1.0f;
+            p.sizeOverLife[3] = endSizeScale;
+            ReadFloatArray(*object, "size_over_life", p.sizeOverLife, 4);
+        }
+        ReadFloatArray(*object, "direction", p.direction, 3);
+        p.coneAngle = ReadFloat(*object, "cone_angle", p.coneAngle);
+        p.shapeRadius = ReadFloat(*object, "shape_radius", p.shapeRadius);
+        p.gravity = ReadFloat(*object, "gravity", p.gravity);
+        p.drag = ReadFloat(*object, "drag", p.drag);
+        p.rotationSpeed = ReadFloat(*object, "rotation_speed", p.rotationSpeed);
+        p.softParticles = ReadBool(*object, "soft_particles", p.softParticles);
+        p.softDistance = ReadFloat(*object, "soft_distance", p.softDistance);
+        p.atlasColumns = static_cast<int>(ReadU32(*object, "atlas_columns", static_cast<std::uint32_t>(p.atlasColumns)));
+        p.atlasRows = static_cast<int>(ReadU32(*object, "atlas_rows", static_cast<std::uint32_t>(p.atlasRows)));
+        p.shape = ixparticle::ParseShape(ReadString(*object, "shape"));
+        p.localSpace = ReadBool(*object, "local_space", p.localSpace);
+        ReadFloatArray(*object, "shape_extents", p.shapeExtents, 3);
+        p.shapeArc = ReadFloat(*object, "shape_arc", p.shapeArc);
+        p.collideWithGround = ReadBool(*object, "collide_with_ground", p.collideWithGround);
+        p.collisionBounce = ReadFloat(*object, "collision_bounce", p.collisionBounce);
+        p.collisionFriction = ReadFloat(*object, "collision_friction", p.collisionFriction);
+        p.groundPlaneY = ReadFloat(*object, "ground_plane_y", p.groundPlaneY);
+    }
+    ixparticle::Sanitize(p);
+    return p;
+}
+
 MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
 {
     MeshSceneEntity mesh;
@@ -1628,7 +2107,30 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     ReadFloatArray(entity, "scale", mesh.scale, 3);
     mesh.meshAssetId = ReadString(entity, "mesh_asset_id");
     mesh.meshAssetPath = ReadString(entity, "mesh_asset_path");
+    mesh.enabled = ReadBool(entity, "enabled", true);
     mesh.skinned = ReadBool(entity, "skinned", mesh.skinned);
+    mesh.animatorControllerId = ReadString(entity, "animator_controller_id");
+    if (const JsonValue* authoring = Find(entity, "layer_authoring");
+        authoring && authoring->type == JsonValue::Type::Object)
+    {
+        mesh.layerAuthoring.enabled = ReadBool(*authoring, "enabled", false);
+        if (const JsonValue* tags = Find(*authoring, "tags"))
+        {
+            const double value = tags->number;
+            if (tags->type == JsonValue::Type::Number && std::isfinite(value) &&
+                value >= 0.0 && value <= std::numeric_limits<std::uint32_t>::max() &&
+                value == std::floor(value))
+            {
+                mesh.layerAuthoring.tags = static_cast<std::uint32_t>(value);
+            }
+            else
+            {
+                // Retain an invalid mask for the strict authoring validator;
+                // malformed metadata must not silently become a ground floor.
+                mesh.layerAuthoring.tags = std::numeric_limits<std::uint32_t>::max();
+            }
+        }
+    }
     if (const JsonValue* materials = Find(entity, "materials"); materials && materials->type == JsonValue::Type::Array)
     {
         for (const JsonValue& value : materials->array)
@@ -1636,7 +2138,7 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
             if (value.type == JsonValue::Type::String)
                 mesh.materialSlots.push_back(value.string);
         }
-        Tracenf("[MATERIAL-SLOTS] loaded entity=%u slots=%zu", mesh.id, mesh.materialSlots.size());
+        // (Counted per scene by the loader: a line per entity was 10 000 flushed lines for a big scene.)
     }
     if (const JsonValue* materials = Find(entity, "material_overrides"); materials && materials->type == JsonValue::Type::Array)
     {
@@ -1688,6 +2190,11 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
     {
         mesh.hasScript = true;
         mesh.script = ReadScriptComponent(entity);
+    }
+    if (const JsonValue* particleObj = Find(entity, "particle_system"); particleObj && particleObj->type == JsonValue::Type::Object)
+    {
+        mesh.hasParticleSystem = true;
+        mesh.particleSystem = ReadParticleSystemComponent(entity);
     }
     if (mesh.lod.enabled &&
         std::none_of(mesh.editorComponents.begin(), mesh.editorComponents.end(), [](const EditorAttachedComponent& component) {
@@ -1747,9 +2254,11 @@ void SceneManager::SetWindowTitleSuffix(std::string suffix)
 
 void SceneManager::SetCurrentSceneSnapshot(const SceneData& scene)
 {
-    SceneData snapshot = scene;
-    snapshot.name = m_currentScene.name.empty() ? scene.name : m_currentScene.name;
-    m_currentScene = std::move(snapshot);
+    // Called every editor frame: copy-assign so the current buffers are reused (a terrain's grids
+    // are megabytes; a fresh copy each frame cost milliseconds).
+    std::string name = m_currentScene.name.empty() ? scene.name : m_currentScene.name;
+    m_currentScene = scene;
+    m_currentScene.name = std::move(name);
 }
 
 void SceneManager::RestoreSceneSnapshot(const SceneData& scene, const std::string& path, bool dirty)
@@ -1813,8 +2322,22 @@ bool SceneManager::LoadScene(const std::string& path)
     return LoadSceneInternal(ResolveProjectScenePath(path));
 }
 
+void SceneManager::SetSnapshotRefresher(std::function<void()> refresher)
+{
+    m_snapshotRefresher = std::move(refresher);
+}
+
+void SceneManager::RefreshSnapshotForSave()
+{
+    // Not while a scene switch is pending (new/load/close): the editor still holds the previous
+    // scene then, and the current scene data is already the complete one being switched to.
+    if (m_snapshotRefresher && !m_hasPendingScene)
+        m_snapshotRefresher();
+}
+
 bool SceneManager::SaveScene()
 {
+    RefreshSnapshotForSave();
     if (m_currentScenePath.empty())
         return SaveSceneAs({});
     return SaveSceneInternal(m_currentScenePath);
@@ -1822,6 +2345,7 @@ bool SceneManager::SaveScene()
 
 bool SceneManager::SaveSceneAs(const std::string& path)
 {
+    RefreshSnapshotForSave();
     std::string target = path.empty() ? DefaultProjectScenePath(m_currentScene) : path;
     if (target.empty())
         target = SaveSceneDialog();
@@ -1889,9 +2413,15 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         return false;
     }
 
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point readBegin = Clock::now();
     std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    const std::size_t textBytes = text.size();
+    const Clock::time_point parseBegin = Clock::now();
     JsonValue root;
-    if (!JsonParser(std::move(text)).Parse(root) || root.type != JsonValue::Type::Object)
+    const bool parsed = JsonParser(std::move(text)).Parse(root);
+    const Clock::time_point parseEnd = Clock::now();
+    if (!parsed || root.type != JsonValue::Type::Object)
     {
         TraceError("[SCENE] JSON parse error: %s", path.c_str());
         TraceError("[SCENE] load FAILED: parse error path=%s", path.c_str());
@@ -1934,6 +2464,15 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         scene.lighting.ambient.r = ambientColor[0];
         scene.lighting.ambient.g = ambientColor[1];
         scene.lighting.ambient.b = ambientColor[2];
+        // Scenes saved before the sky existed keep their old look: the flat backdrop colour.
+        if (const JsonValue* sky = Find(*env, "sky"); sky && sky->type == JsonValue::Type::Object)
+            scene.sky = ReadSkySettings(*sky);
+        else
+            scene.sky.mode = SkySettings::Mode::Color;
+        // Scenes saved before it get the neutral curve: up to 0.8 they look exactly as they did.
+        if (const JsonValue* toneMapping = Find(*env, "tone_mapping");
+            toneMapping && toneMapping->type == JsonValue::Type::Object)
+            ReadToneMapping(*toneMapping, scene.sky);
     }
     if (const JsonValue* physics = Find(root, "physics"); physics && physics->type == JsonValue::Type::Object)
     {
@@ -1968,6 +2507,15 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         scene.terrain.chunkSizeCells = ReadU32(*terrain, "chunk_size_cells", scene.terrain.chunkSizeCells);
         scene.terrain.chunkManifestRef = ReadString(*terrain, "chunk_manifest_ref");
         scene.terrain.heightmapRef = ReadString(*terrain, "heightmap_ref");
+        if (const JsonValue* exact = Find(*terrain, "exact_heightmap_ref"))
+        {
+            if (exact->type != JsonValue::Type::String || exact->string.empty())
+            {
+                TraceError("[SCENE] invalid exact terrain heightmap reference: %s", path.c_str());
+                return false;
+            }
+            scene.terrain.exactHeightmapRef = exact->string;
+        }
         scene.terrain.splatRef = ReadString(*terrain, "splat_ref");
         scene.terrain.maskRef = ReadString(*terrain, "mask_ref");
         scene.terrain.triplanarEnabled = ReadBool(*terrain, "triplanar_enabled", scene.terrain.triplanarEnabled);
@@ -1994,6 +2542,17 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
             ReadTerrainHeightmap(sceneDir / scene.terrain.heightmapRef, scene.terrain);
         if (!loadedChunkSet && !scene.terrain.splatRef.empty())
             ReadTerrainSplat(sceneDir / scene.terrain.splatRef, scene.terrain);
+        if (!scene.terrain.exactHeightmapRef.empty())
+        {
+            // New saves declare both the exact heights and their legacy chunk set.
+            // Losing a declared chunk set would also silently lose cell attributes.
+            if ((!scene.terrain.chunkManifestRef.empty() && !loadedChunkSet) ||
+                !ReadTerrainHeightmap(sceneDir / scene.terrain.exactHeightmapRef, scene.terrain, true))
+            {
+                TraceError("[SCENE] declared exact terrain data is missing or invalid: %s", path.c_str());
+                return false;
+            }
+        }
         if (!loadedChunkSet && (!scene.terrain.heightmapRef.empty() || !scene.terrain.splatRef.empty()))
         {
             const std::uint32_t chunkSize = std::clamp(scene.terrain.chunkSizeCells == 0 ? 64u : scene.terrain.chunkSizeCells, 32u, 256u);
@@ -2033,8 +2592,28 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         Tracen("[SCENE] no terrain in scene");
     }
 
+    const Clock::time_point entitiesBegin = Clock::now();
     if (const JsonValue* entities = Find(root, "entities"); entities && entities->type == JsonValue::Type::Array)
     {
+        // The mesh entities (most of a big scene) are read in parallel on the shared pool, each into
+        // its own place, and kept in file order; the other kinds below, in order, on this thread.
+        std::vector<const JsonValue*> meshNodes;
+        for (const JsonValue& entity : entities->array)
+        {
+            if (ReadString(entity, "type") == "mesh_entity")
+                meshNodes.push_back(&entity);
+        }
+        const std::size_t firstMesh = scene.meshEntities.size();
+        scene.meshEntities.resize(firstMesh + meshNodes.size());
+        ixjobs::JobSystem::Instance().ParallelFor(static_cast<std::uint32_t>(meshNodes.size()), 256,
+            [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+                for (std::uint32_t i = begin; i < end; ++i)
+                    scene.meshEntities[firstMesh + i] = ReadMeshSceneEntity(*meshNodes[i]);
+            });
+        std::size_t entitiesWithSlots = 0;
+        for (std::size_t i = firstMesh; i < scene.meshEntities.size(); ++i)
+            entitiesWithSlots += scene.meshEntities[i].materialSlots.empty() ? 0u : 1u;
+        Tracenf("[MATERIAL-SLOTS] loaded slots of %zu mesh entities", entitiesWithSlots);
         for (const JsonValue& entity : entities->array)
         {
             const std::string type = ReadString(entity, "type");
@@ -2068,7 +2647,7 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
             }
             else if (type == "mesh_entity")
             {
-                scene.meshEntities.push_back(ReadMeshSceneEntity(entity));
+                // (read above)
             }
             else if (type == "camera")
             {
@@ -2121,6 +2700,12 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     Tracenf("[SCENE] Loaded successfully: %s (%zu entities)",
         path.c_str(),
         scene.waterBodies.size() + scene.pointLights.size() + scene.spotLights.size() + scene.meshEntities.size());
+    const auto ms = [](Clock::time_point from, Clock::time_point to) {
+        return std::chrono::duration<double, std::milli>(to - from).count();
+    };
+    Tracenf("[SCENE] load %.1f ms: read %.1f (%zu KB), parse %.1f, entities and the rest %.1f",
+        ms(readBegin, Clock::now()), ms(readBegin, parseBegin), textBytes / 1024u, ms(parseBegin, parseEnd),
+        ms(entitiesBegin, Clock::now()));
     return true;
 }
 
@@ -2136,11 +2721,52 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
         scene.name = SceneNameFromPath(path);
     if (scene.terrain.exists)
     {
-        if (!WriteTerrainChunkSet(scenePath, scene.terrain, scene.paletteSlots))
+        std::uint64_t expectedHeightCount = 0;
+        if (!TerrainHeightCount(scene.terrain.cellsX, scene.terrain.cellsZ,
+                scene.terrain.cellSizeMeters, expectedHeightCount) ||
+            (!scene.terrain.heightCmGrid.empty() &&
+                scene.terrain.heightCmGrid.size() != expectedHeightCount) ||
+            !std::all_of(scene.terrain.heightCmGrid.begin(), scene.terrain.heightCmGrid.end(),
+                [](float value) { return std::isfinite(value); }))
         {
-            TraceError("[SCENE] terrain chunk save failed: %s", path.c_str());
+            TraceError("[SCENE] invalid terrain height grid: %s", path.c_str());
             return false;
         }
+        std::filesystem::path exactFilename = scenePath.stem();
+        exactFilename += "_terrain_exact.height";
+        std::error_code existsEc;
+        const bool terrainOnDisk = std::filesystem::exists(scenePath.parent_path() / exactFilename, existsEc);
+        if (scene.terrain.heightCmGrid.empty() && terrainOnDisk)
+        {
+            // No heights in the data to save (a snapshot taken without the terrain grids) while this
+            // scene already has its terrain on disk: never overwrite that with a flat terrain — keep
+            // the terrain files as they are and save the rest of the scene.
+            TraceError("[SCENE] terrain heights missing from the save data; the terrain files on disk are kept unchanged: %s",
+                path.c_str());
+            std::filesystem::path manifest = scenePath.stem();
+            manifest += "_terrain_map";
+            scene.terrain.chunkManifestRef = GenericPath(manifest / "map.manifest");
+            scene.terrain.heightmapRef.clear();
+            scene.terrain.splatRef.clear();
+            scene.terrain.maskRef.clear();
+        }
+        else
+        {
+            // A scene saved for the first time with a new flat terrain may omit its all-zero grid.
+            if (scene.terrain.heightCmGrid.empty())
+                scene.terrain.heightCmGrid.assign(static_cast<size_t>(expectedHeightCount), 0.0f);
+            if (!WriteTerrainChunkSet(scenePath, scene.terrain, scene.paletteSlots))
+            {
+                TraceError("[SCENE] terrain chunk save failed: %s", path.c_str());
+                return false;
+            }
+            if (!WriteTerrainHeightmap(scenePath.parent_path() / exactFilename, scene.terrain))
+            {
+                TraceError("[SCENE] exact terrain height save failed: %s", path.c_str());
+                return false;
+            }
+        }
+        scene.terrain.exactHeightmapRef = GenericPath(exactFilename);
         Tracenf("[SCENE] terrain saved: dims=%.2fx%.2f m cellSize=%.2f cells=%ux%u chunkSize=%u manifest=%s triplanar=%s sharpness=%.2f slopeThreshold=%.3f transition=%.3f",
             scene.terrain.widthMeters,
             scene.terrain.depthMeters,
@@ -2188,8 +2814,11 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "    \"directional_light_angle_y\": " << scene.lighting.directional.azimuthDegrees << ",\n";
     const float ambientColor[3] = {scene.lighting.ambient.r, scene.lighting.ambient.g, scene.lighting.ambient.b};
     out << "    \"ambient_color\": " << FloatArray(ambientColor, 3) << ",\n";
-    out << "    \"ambient_intensity\": " << scene.lighting.ambient.intensity << "\n";
-    out << "  },\n";
+    out << "    \"ambient_intensity\": " << scene.lighting.ambient.intensity << ",\n";
+    WriteSkySettings(out, scene.sky);
+    out << ",\n";
+    WriteToneMapping(out, scene.sky);
+    out << "\n  },\n";
     out << "  \"physics\": {\n";
     out << "    \"gravity\": " << FloatArray(scene.physics.gravity, 3) << ",\n";
     out << "    \"fixed_delta_seconds\": " << scene.physics.fixedDeltaSeconds << ",\n";
@@ -2208,6 +2837,7 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
         out << "    \"chunk_size_cells\": " << scene.terrain.chunkSizeCells << ",\n";
         out << "    \"chunk_manifest_ref\": \"" << EscapeJson(scene.terrain.chunkManifestRef) << "\",\n";
         out << "    \"heightmap_ref\": \"" << EscapeJson(scene.terrain.heightmapRef) << "\",\n";
+        out << "    \"exact_heightmap_ref\": \"" << EscapeJson(scene.terrain.exactHeightmapRef) << "\",\n";
         out << "    \"splat_ref\": \"" << EscapeJson(scene.terrain.splatRef) << "\",\n";
         out << "    \"mask_ref\": \"" << EscapeJson(scene.terrain.maskRef) << "\",\n";
         out << "    \"triplanar_enabled\": " << (scene.terrain.triplanarEnabled ? "true" : "false") << ",\n";
@@ -2257,6 +2887,12 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "]\n";
     out << "}\n";
 
+    out.close();
+    if (!out)
+    {
+        TraceError("[SCENE] Failed to finish writing: %s", path.c_str());
+        return false;
+    }
     m_currentScene = scene;
     m_currentScenePath = path;
     m_sceneOpen = true;

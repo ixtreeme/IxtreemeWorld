@@ -73,14 +73,55 @@ public:
     // True when the Game panel was actually visible (active dock tab, not collapsed) last
     // frame. Lets the engine skip the expensive Game-view scene render when it's not shown.
     bool IsGameViewVisible() const { return m_gameViewVisible; }
+    // Whether the Scene View panel was visible last frame (e.g. not behind the Game tab in Play).
+    bool IsSceneViewVisible() const { return !m_editorModeActive || m_sceneViewVisible; }
+    // The editor UI is up and shows the offscreen scene as its Scene View panel image (so a full-window
+    // composite of that scene under the UI would be covered by it).
+    bool ShowsSceneViewAsPanel() const
+    {
+        return m_editorModeActive && m_textureProvider && m_textureProvider->GetSceneViewTexture() != nullptr;
+    }
+    // The image area of the Scene View / Game panel in framebuffer pixels, as laid out last frame
+    // (0 x 0 before the panel was first shown). The views render at this size, not the window's.
+    void GetSceneViewPanelPixels(std::uint32_t& width, std::uint32_t& height) const
+    {
+        width = m_sceneViewPanelPixels[0];
+        height = m_sceneViewPanelPixels[1];
+    }
+    void GetGameViewPanelPixels(std::uint32_t& width, std::uint32_t& height) const
+    {
+        width = m_gameViewPanelPixels[0];
+        height = m_gameViewPanelPixels[1];
+    }
+
+    // Script text prompts (IScriptApi::PromptText) drawn as small modal-less dialogs during Play. The
+    // engine hands the open prompts in each frame and collects the answers after RenderPanels. Secret
+    // prompts are masked, and every input buffer is wiped once answered or no longer listed.
+    struct ScriptPromptView
+    {
+        std::uint32_t id = 0;
+        std::string title;
+        std::string label;
+        bool secret = false;
+    };
+    struct ScriptPromptAnswer
+    {
+        std::uint32_t id = 0;
+        bool submitted = false;  // false = cancelled
+        std::string text;
+    };
+    void SetScriptPrompts(std::vector<ScriptPromptView> prompts);
+    std::vector<ScriptPromptAnswer> TakeScriptPromptAnswers();
 
     // Native C++ game-module DLLs (Unreal-style): load/unload the project's modules, and the in-engine
     // Build pipeline driven from RunGame's frame loop. Called from EngineApplication.
     void LoadProjectGameModules(const std::filesystem::path& projectRoot);
     void UnloadGameModules();
-    // Ensure <ProjectRoot>/Scripts exists with an engine-owned CMakeLists.txt (ALWAYS regenerated, the
-    // dev never edits it) + a starter Game.cpp (only if no *.cpp). Idempotent; called before every Build.
-    void EnsureProjectScriptsScaffold(const std::filesystem::path& projectRoot);
+    // Prepares <ProjectRoot>/Scripts for the LEGACY C++ build: creates the dirs, migrates stray
+    // sources, and (re)generates the engine-owned CMakeLists.txt only when the project actually has
+    // .cpp script sources. C++ is no longer a project language — nothing is seeded. Returns true when
+    // there is something to build.
+    bool EnsureProjectScriptsScaffold(const std::filesystem::path& projectRoot);
     std::filesystem::path EngineSdkIncludeDir() const;  // resolves <root>/sdk/include (searches up)
     void SetBuildRunning() { m_buildState = ScriptBuildState::Running; }
     void SetBuildResult(bool ok, std::string log)
@@ -90,14 +131,30 @@ public:
         m_buildLog = std::move(log);
         m_buildOutputPanelOpen = true;
     }
+    // "Build Game" (packaging the project into a folder that runs without the editor).
+    void SetGameBuildRunning()
+    {
+        m_gameBuildState = ScriptBuildState::Running;
+        m_buildOutputPanelOpen = true;
+    }
+    void SetGameBuildResult(bool ok, std::string log, std::filesystem::path executable)
+    {
+        m_gameBuildState = ScriptBuildState::Done;
+        m_gameBuildSucceeded = ok;
+        m_gameBuildLog = std::move(log);
+        m_gameBuildExecutable = std::move(executable);
+        m_buildOutputPanelOpen = true;
+    }
+    bool IsGameBuildRunning() const { return m_gameBuildState == ScriptBuildState::Running; }
 
-    // Save-to-live iteration: a per-frame (throttled) mtime poll over the project's .lua Script assets
-    // and <ProjectRoot>/Scripts/*.cpp,*.h. EngineApplication drains m_pendingScriptChanges each frame to
-    // hot-reload Lua (in Play) and auto-build native C++ (in Edit).
+    // Save-to-live iteration: a per-frame (throttled) mtime poll over the project's .lua/.as Script
+    // assets and <ProjectRoot>/Scripts/*.cpp,*.h. EngineApplication drains m_pendingScriptChanges each
+    // frame to hot-reload AngelScript/Lua (in Play) and auto-build legacy native C++ (in Edit).
     struct ScriptFileChanges
     {
-        std::vector<std::string> changedLua;  // Script asset ids whose .lua mtime changed
-        bool changedCpp = false;              // any <Project>/Scripts/*.cpp,*.h,*.hpp changed/added/removed
+        std::vector<std::string> changedLua;          // Script asset ids whose .lua mtime changed
+        std::vector<std::string> changedAngelScript;  // Script asset ids whose .as mtime changed
+        bool changedCpp = false;                      // any <Project>/Scripts/*.cpp,*.h,*.hpp changed/added/removed
     };
     ScriptFileChanges PollScriptFileChanges();
     ScriptFileChanges m_pendingScriptChanges;  // set in RenderEditorPanels, drained by EngineApplication
@@ -120,16 +177,24 @@ public:
     bool IsTextInputActive() const;
     bool IsSceneViewInputTarget(const InputEvent& event) const;
     InputEvent MapInputToSceneView(const InputEvent& event) const;
+    // A window mouse event in the Game view's pixels (its render target), for the game's own UI.
+    // False when the Game view is not shown or the pointer is outside its image.
+    bool MapInputToGameView(const InputEvent& event, InputEvent& out) const;
     void SetSceneViewKeyboardFocus(bool focused);
     void SetMapEditorSettings(const MapEditorSettings& settings);
     MapEditorSettings GetMapEditorSettings() const { return m_editorSettings; }
     void SetEditorPlayModeState(const EditorPlayModeState& state);
     void SetLightingState(const LightingState& state);
     LightingState GetLightingState() const { return m_lightingState; }
+    void SetSkySettings(const SkySettings& sky) { m_skySettings = sky; }
+    const SkySettings& GetSkySettings() const { return m_skySettings; }
+    // Shown under the sky settings while the sky cannot draw as set (a missing image, ...).
+    void SetSkyStatus(const std::string& status) { m_skyStatus = status; }
     void SetDynamicLightEditorState(const DynamicLightEditorState& state);
     void SetCameraEditorState(const CameraEditorState& state);
     void SetWaterBodyEditorState(const WaterBodyEditorState& state);
     void SetMeshRendererEditorState(const MeshRendererEditorState& state);
+    void SetLayerAuthoringStatus(std::string status) { m_layerAuthoringStatus = std::move(status); }
     void SetAnimatorGraphEditorState(const AnimatorGraphEditorState& state) { m_animatorGraphState = state; }
     bool IsAnimatorGraphVisible() const { return m_animatorGraphVisible; }
     void SetTerrainEditorState(const TerrainEditorState& state);
@@ -142,11 +207,25 @@ public:
     void SetWaterMaterials(std::vector<std::pair<std::string, WaterMaterialData>> materials);
     void SetWaterMaterialUsageCounts(std::vector<std::pair<std::string, std::uint32_t>> usageCounts);
     std::vector<std::pair<std::string, WaterMaterialData>> GetWaterMaterialsSnapshot() const;
+    // Changes whenever GetWaterMaterialsSnapshot() may return something else: the asset library was
+    // saved, reloaded or replaced, or a water/PBR material has unsaved edits (they are in it).
+    std::uint64_t WaterMaterialsRevision() const;
+    // Changes whenever the asset library may describe something else: refreshed, an entry edited
+    // (a LOD default saved), or another library (a project opened). For caches over its entries.
+    std::uint64_t AssetLibraryRevision() const;
     void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
     void SetEngineRoot(const std::filesystem::path& clientRoot);
     void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
     void InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot, const std::filesystem::path& assetRoot);
     void RefreshAssetLibrary();
+    std::vector<std::filesystem::path> TakeTreeImpostorChanges()
+    {
+        std::vector<std::filesystem::path> paths;
+        paths.swap(m_treeImpostorChanges);
+        return paths;
+    }
+    // The folder the asset browser shows (relative to the asset root): where new assets go.
+    const std::string& CurrentAssetFolder() const { return m_assetSubpath; }
     // Generates retargetable .ixclip assets for a loaded rigged model's existing _anim_<i>.ozz
     // sidecars (joint names come from the model's skeleton). Idempotent; no-op if already present.
     void EnsureModelAnimationClips(const std::filesystem::path& modelPath, const std::vector<std::string>& jointNames);
@@ -155,6 +234,13 @@ public:
     // Absolute filesystem path of an AnimatorController asset's .controller file (empty if none).
     std::string AnimatorControllerFilePath(const std::string& controllerId) const;
     std::string AudioClipFilePath(const std::string& clipId) const;
+    // A Texture asset id -> its file path ("" = not found). Used by the ParticleRenderer's
+    // texture resolver (the renderer decodes + caches the image itself).
+    std::string TextureFilePath(const std::string& textureId) const;
+    // A .particle effect asset id -> its file path ("" = not found).
+    std::string ParticleEffectFilePath(const std::string& effectId) const;
+    // Reads a .particle preset and copies its parameters into `out` (the inspector's picker).
+    bool ApplyParticleEffectPreset(const std::string& effectId, ixparticle::ParticleSystemComponent& out) const;
     // Absolute filesystem path of a Script asset's .lua file (empty if none) — for the Lua backend.
     std::string ScriptSourceFilePath(const std::string& scriptId) const;
     // Id of the first AnimationClip whose display name matches (empty if none) — for auto-filling
@@ -171,23 +257,6 @@ public:
     void Destroy();
 
 private:
-    enum class AssetBrowserFilter
-    {
-        All,
-        Texture,
-        Model,
-        Animation,
-        AnimationClip,
-        AnimatorController,
-        Audio,
-        Script,
-        Material,
-        WaterMaterial,
-        PhysicsMaterial,
-        Scene,
-        Prefab
-    };
-
     enum class ProjectDialogMode
     {
         None,
@@ -237,6 +306,8 @@ private:
     void RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& imageSize);
     void RenderMenuBar();
     bool SaveProjectAndCurrentScene(bool automatic = false);
+    // True (with a status message) while Play is running: Play-mode state is never saved.
+    bool RefuseSaveDuringPlay();
     void RunProjectAutoSave();
     void UpdateAutoSaveWindowTitle(double now);
     void LoadProjectPhysicsSettings();
@@ -251,8 +322,38 @@ private:
     bool CreateDefaultProjectScene();
     void CreateProjectFromDialog();
     void OpenProjectFromDialog(const std::filesystem::path& manifestPath);
-    void RenderEditorToolbar();
+    // Editor shell (EditorImGuiShellPanels.inl): fixed toolbar and status bar, Console, and the
+    // windows opened from the menus.
+    enum class ConsoleSeverity
+    {
+        Info,
+        Warning,
+        Error
+    };
+    struct ConsoleMessage
+    {
+        double time = 0.0;
+        std::string clock;
+        ConsoleSeverity severity = ConsoleSeverity::Info;
+        std::string text;
+    };
+    void RenderMainToolbar();
+    void RenderStatusBar();
+    void RenderConsolePanel();
+    void PushConsoleMessage(ConsoleSeverity severity, std::string text);
+    // Lists every new status text (project, asset, layer, build) in the Console and the status bar.
+    void TrackStatusMessages();
+    void RenderStatisticsWindow();
+    void RenderPhysicsDebuggerWindow();
+    void RenderProjectSettingsWindow();
+    void RenderLayeredWorldWindow();
+    void RenderShortcutsWindow();
+    void RenderAboutPopup();
+    void QueueDebugToggleCommands();
+    void ResetEditorLayout();
     void RenderBuildOutputPanel();
+    void OpenBuildGameDialog();
+    void RenderBuildGamePopup();
     void RenderScriptsPanel();
     void RenderSceneSettingsPanel();
     struct ProjectSceneEntry
@@ -275,11 +376,13 @@ private:
     bool HierarchySubtreePassesSearch(std::uint64_t entity) const;
     const HierarchySceneEntity* FindHierarchyEntity(std::uint64_t entity) const;
     const HierarchySceneEntity* FindHierarchyEntity(HierarchyEntityType type, std::uint32_t objectId) const;
+    // The selected entity, picked in the Hierarchy or in the Scene View (nullptr: none).
+    const HierarchySceneEntity* SelectedHierarchyEntity() const;
     bool HierarchyPassesSearch(const std::string& name) const;
     void QueueHierarchySelection(const HierarchySceneEntity& entity);
     void QueueHierarchyFocus(const HierarchySceneEntity& entity);
     void StartHierarchyRename(const HierarchySceneEntity& entity);
-    void RenderToolsPanel();
+    void RenderHierarchyCreateMenuItems();
     void RenderInspector();
     void RenderSelectedWaterBodyInspector();
     void RenderSelectedTerrainInspector();
@@ -291,21 +394,29 @@ private:
                                       const PrefabInstanceState& instance,
                                       const std::vector<std::string>& overrides);
     void RenderAddComponentMenu();
+    // The Inspector's title row: what is selected, with the engine-id (debug info) toggle.
+    void RenderInspectorTitle(const char* icon, const char* typeName, std::uint32_t objectId);
     bool RenderAttachedEditorComponents(std::vector<EditorAttachedComponent>& components);
-    bool RenderTransformComponent(float* position, float* rotation, float* scale);
-    bool RenderAxisFloat(const char* axis, float& value, float r, float g, float b, float speed, float minValue, float maxValue);
-    void RenderWorldPanel();
-    void RenderPerformancePanel();
+    // meshScale: a model scale multiplier (fine steps down to 0.001) instead of a size in metres.
+    bool RenderTransformComponent(float* position, float* rotation, float* scale, bool meshScale = false);
+    bool RenderAxisFloat(const char* axis, float& value, float r, float g, float b, float speed, float minValue, float maxValue,
+        const char* format = "%.2f");
     void RenderCreateTerrainModal();
+    void OpenCreateTerrainDialog();
     void RenderLightingPanel();
-    void RenderDynamicLightsPanel();
+    void RenderSkyPanel();
+    void RenderGodRaysPanel();
+    void RenderToneMappingPanel();
     void RenderGizmoControls();
-    void RenderWaterSculptToolPanel();
-    void RenderHeightmapToolPanel();
-    void RenderSplatPaintToolPanel();
+    // Terrain and water editing tools, shown in the Inspector of the selected terrain / water body.
+    void RenderWaterSculptTool();
+    void RenderTerrainSculptTool();
+    void RenderTerrainPaintTool();
     void RenderSplatLayerSlot(std::uint32_t slotIndex);
     void RenderWaterMaterialEditor();
     void RenderTreeGeneratorPanel();
+    // Whether the Inspector shows the Tree Generator's settings (instead of the selection).
+    bool InspectorShowsTreeGenerator();
     void RenderWaterMaterialHeader();
     void RenderWaterMaterialColorsSection(WaterMaterialData& material);
     void RenderWaterMaterialWaveSection(WaterMaterialData& material);
@@ -323,37 +434,55 @@ private:
     bool RenderSelectedPrefabAssetInspector();
     void RenderAssetBrowser();
     void RenderAssetBrowserToolbar();
-    void RenderAssetTypeTabs();
-    void RenderAssetFolderPanel();
-    void RenderAssetFolderNode(const std::string& path, const std::vector<std::string>& folders);
     void RenderAssetBrowserFolderTree();
     void RenderAssetBrowserFolderTreeNode(const std::string& subpath);
     void RenderAssetBrowserContent();
     void RenderAssetBrowserBreadcrumb();
     void RenderAssetBrowserFolderTile(const std::string& subpath, float tileSize);
-    void RenderAssetGrid();
+    // "New ..." items of a folder's context menu: everything is created in targetSubpath.
+    void RenderAssetCreateMenuItems(const std::string& targetSubpath);
+    // Drop target accepting assets and folders dragged inside the browser, moved into targetSubpath.
+    void AcceptAssetBrowserDrop(const std::string& targetSubpath);
     void RenderAssetTile(const AssetLibrary::Entry& entry, float tileSize);
-    void RenderAssetTagFilters();
     void DestroyAssetPreviewTextures();
     void DestroyAssetPreviewTexture(AssetPreviewTexture& texture);
     std::optional<std::filesystem::path> AssetPreviewPathFor(const AssetLibrary::Entry& entry) const;
+    std::optional<std::filesystem::path> ResolveAssetPreviewPath(const AssetLibrary::Entry& entry) const;
     AssetPreviewTexture* GetAssetPreviewTexture(const AssetLibrary::Entry& entry);
     bool LoadAssetPreviewTexture(const std::filesystem::path& path, AssetPreviewTexture& outTexture);
-    void CreateAssetFolder();
-    void DeleteAssetFolder();
-    void DeleteAsset(const AssetLibrary::Entry& entry);
     void OpenImportAssetDialog(const std::string& targetSubpath);
     void ImportAssetFromPath(const std::filesystem::path& sourcePath,
                              const std::string& targetSubpath,
                              const char* trigger);
+    // Copies a folder dropped from the OS (with everything in it) into the browser folder; the
+    // library then picks up the assets inside.
+    void ImportFolderFromPath(const std::filesystem::path& sourceFolder, const std::string& targetSubpath);
+    // The asset creators below put the new asset into CreateTargetSubpath(): the folder a context
+    // menu was opened on (m_assetCreateTarget, consumed), else the folder the browser shows.
+    std::string CreateTargetSubpath();
+    void RevealCreatedAsset(const AssetLibrary::Entry& entry);
     void CreatePbrMaterialAsset();
     void CreateLuaScriptAsset();                            // new .lua Script asset (browser/Scripts panel)
-    void CreateNativeScriptAsset();                         // new .cpp Script asset (browser, default name)
-    void CreateNativeScriptFile(const std::string& className);  // new <className>.cpp Script asset
-    // The directory holding native C++ game-script sources (.cpp). They live alongside .lua in the
-    // asset library's scripts folder so both are first-class, browsable assets; the Build pipeline's
-    // CMake project (in <ProjectRoot>/Scripts) compiles them from here.
+    void CreateAngelScriptAsset();                          // new .as Script asset (browser/Scripts panel)
+    // New .particle preset: from the selected entity's Particle System component when it has one,
+    // else the component defaults.
+    void CreateParticleEffectAsset();
+    // Writes `effect` out as a new .particle preset asset and reveals it in the browser.
+    void CreateParticleEffectFromComponent(const ixparticle::ParticleSystemComponent& effect);
+    void CreateNativeScriptAsset();                         // LEGACY: new .cpp Script asset (kept, not offered)
+    void CreateNativeScriptFile(const std::string& className);  // LEGACY: new <className>.cpp Script asset
+    void CreateAnimatorControllerAsset();
+    // Native C++ game-script sources (.cpp) live anywhere under the project's asset folder, like
+    // every other asset; the Build pipeline's CMake project (in <ProjectRoot>/Scripts) compiles all
+    // of them from here.
     std::filesystem::path ProjectScriptSourceDir() const;
+    // True while the project still has LEGACY C++ script sources (.cpp Script assets): the editor only
+    // offers the C++ compile path in that case (AngelScript/Lua need no build).
+    bool ProjectHasNativeScriptSources() const;
+    // Script assets of one extension (".as" / ".lua" / ".cpp"), cached per asset-library revision:
+    // the toolbar, the Scripts panel and the inspector need these lists every frame, and EntriesFor
+    // copies every matching entry.
+    const std::vector<AssetLibrary::Entry>& CachedScriptAssets(const char* extension) const;
     void CreateWaterMaterialAsset();
     bool CreateWaterMaterialAsset(const std::string& displayName, AssetLibrary::Entry& outEntry);
     void CreatePhysicsMaterialAsset();
@@ -363,13 +492,24 @@ private:
     void MarkPbrMaterialChanged(const char* field);
     bool SaveWaterMaterialEditor();
     bool SavePbrMaterialEditor();
+    // The PBR editor on a .material file (the renderer's materials): its draft written into the loaded
+    // material (packMaps: the occlusion, roughness and metallic maps packed again when they changed).
+    bool PbrEditorEditsMaterialFile() const;
+    void ApplyPbrDraftToMaterial(struct MaterialAsset& material, bool packMaps);
+    std::string TextureEntryIdForGuid(const std::optional<Guid>& guid) const;
+    std::optional<Guid> TextureGuidForEntryId(const std::string& entryId) const;
     bool DeleteWaterMaterialEditor();
     void SyncWaterMaterialSnapshot();
-    std::vector<AssetLibrary::Entry> QueryVisibleAssets() const;
-    std::vector<std::string> QueryVisibleFolders() const;
-    std::vector<std::pair<std::string, std::uint32_t>> QueryVisibleTags() const;
-    std::vector<std::string> QueryFilesystemChildFolders(const std::string& subpath) const;
-    std::vector<AssetLibrary::Entry> QueryFilesystemAssetsInFolder(const std::string& subpath) const;
+    // Both return references into the asset browser cache: callers must not hold them across a
+    // cache invalidation (library swap) or across frames; use within the current frame is safe.
+    const std::vector<std::string>& QueryFilesystemChildFolders(const std::string& subpath) const;
+    const std::vector<AssetLibrary::Entry>& QueryFilesystemAssetsInFolder(const std::string& subpath) const;
+    const AssetLibrary::ModelContents& QueryModelContents(const AssetLibrary::Entry& model) const;
+    // Drops the cached asset browser listings when the asset library changed (or they are too old
+    // to trust for edits made outside the editor).
+    void ValidateAssetBrowserCache() const;
+    void InvalidateAssetBrowserCache() const { m_assetBrowserCache = {}; }
+    std::string CachedComparablePath(const std::filesystem::path& path) const;
     std::filesystem::path AssetBrowserRoot() const;
     std::filesystem::path AssetBrowserPath(const std::string& subpath) const;
     std::string AssetBrowserSubpath(const std::filesystem::path& path) const;
@@ -387,10 +527,6 @@ private:
     void DeleteFilesystemSelection();
     bool MoveAssetEntryToFolder(const std::string& assetId, const std::string& targetFolderSubpath);
     bool MoveFolderToFolder(const std::string& sourceSubpath, const std::string& targetFolderSubpath);
-    bool AssetPassesCurrentFilters(const AssetLibrary::Entry& entry) const;
-    bool ActiveAssetCategory(AssetLibrary::Category category) const;
-    AssetLibrary::Category FolderCategory() const;
-    const char* AssetFilterName() const;
     void ApplyTimeOfDayPreset(float hour);
     void MarkSelectedWaterBodyChanged();
     void MarkSelectedLightChanged();
@@ -429,6 +565,8 @@ private:
     bool m_showDemoWindow = false;
     bool m_applyDefaultDockLayout = false;
     bool m_defaultDockLayoutBuilt = false;
+    int m_defaultLayoutTabSelectFrames = 0; // frames left to pick the default layout's front tabs
+    int m_startupViewFocusFrames = 3;       // frames left to focus the Scene View after startup
     bool m_logToolsRendered = false;
     bool m_logInspectorRendered = false;
     bool m_debugDisableShadowPass = false;
@@ -481,6 +619,8 @@ private:
     // pending ImGui window to focus, applied at the start of the next panel render.
     const char* m_pendingViewFocusWindow = nullptr;
     LightingState m_lightingState;
+    SkySettings m_skySettings;
+    std::string m_skyStatus;
     DynamicLightEditorState m_dynamicLightState;
     CameraEditorState m_cameraEditorState;
     WaterBodyEditorState m_waterBodyState;
@@ -490,20 +630,69 @@ private:
     EngineStats m_engineStats;
     std::vector<PhysicsEventEditorState> m_physicsEvents;
     MapEditorCommands m_commands;
+    bool m_showLayerVolumes = false;
+    float m_serverWorldSpawn[2] = {0, 0};
+    std::uint32_t m_serverWorldSpawnVolume = 0;
+    struct ScriptPromptBuffer
+    {
+        ScriptPromptView view;
+        std::array<char, 257> text{};
+        bool focusPending = true;
+    };
+    std::vector<ScriptPromptBuffer> m_scriptPrompts;
+    std::vector<ScriptPromptAnswer> m_scriptPromptAnswers;
+    void RenderScriptPrompts();
+    char m_serverWorldId[65] = "editor-world";
+    std::uint32_t m_layerGroundVolume = 1;
+    float m_layerGroundPoint[2] = {0, 0};
+    std::string m_layerAuthoringStatus;
     // Game-script build state (driven by EngineApplication's worker thread; UI reads it).
     enum class ScriptBuildState { Idle, Running, Done };
     ScriptBuildState m_buildState = ScriptBuildState::Idle;
     bool m_buildSucceeded = false;
     bool m_buildOutputPanelOpen = false;
     std::string m_buildLog;
+    // "Build Game" state (packaging; shown in the Build Output panel) and its dialog.
+    ScriptBuildState m_gameBuildState = ScriptBuildState::Idle;
+    bool m_gameBuildSucceeded = false;
+    std::string m_gameBuildLog;
+    std::filesystem::path m_gameBuildExecutable;
+    bool m_openBuildGamePopup = false;
+    char m_buildGameName[128]{};
+    char m_buildGameOutputDir[512]{};
+    std::string m_buildGameStartupScene;  // project-relative
+    bool m_buildGameCompileScripts = true;
+    bool m_buildGameRunWhenDone = true;
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;
     std::unordered_map<std::string, std::uint32_t> m_waterMaterialUsageCounts;
     WaterMaterialEditorState m_waterMaterialEditor;
     PbrMaterialEditorState m_pbrMaterialEditor;
+    // WaterMaterialsRevision: bumped per unsaved material edit and when the asset library is replaced.
+    mutable std::uint64_t m_waterMaterialsTick = 0;
+    std::uint64_t m_assetLibraryGeneration = 0;  // bumped for each new library (AssetLibraryRevision)
+    std::vector<std::filesystem::path> m_treeImpostorChanges;
+    mutable bool m_waterMaterialsDrafting = false;
     std::unique_ptr<tree_tool::TreeGeneratorPanel> m_treeGeneratorPanel;
+    bool m_inspectorShowsTreeGenerator = false;
     std::filesystem::path m_engineRoot;
     std::unique_ptr<AssetLibrary> m_assetLibrary;
+    // Cached script lists (see CachedScriptAssets), keyed by extension and invalidated by the
+    // library revision.
+    struct CachedScriptList
+    {
+        const AssetLibrary* library = nullptr;
+        std::uint64_t revision = 0;
+        bool valid = false;
+        std::vector<AssetLibrary::Entry> entries;
+    };
+    mutable std::unordered_map<std::string, CachedScriptList> m_scriptAssetCache;
+    // ProjectHasNativeScriptSources, cached per library revision and script folder.
+    mutable const AssetLibrary* m_nativeSourcesLibrary = nullptr;
+    mutable std::uint64_t m_nativeSourcesRevision = 0;
+    mutable std::filesystem::path m_nativeSourcesDir;
+    mutable bool m_nativeSourcesValid = false;
+    mutable bool m_hasNativeSources = false;
     ProjectDialogMode m_projectDialogMode = ProjectDialogMode::None;
     bool m_projectPopupNeedsOpen = false;
     bool m_projectCreateBrowserVisible = false;
@@ -514,6 +703,7 @@ private:
     double m_lastScriptPollSeconds = 0.0;
     bool m_autoBuildOnSave = true;
     std::unordered_map<std::string, std::filesystem::file_time_type> m_luaMtimes;  // key = Script asset id
+    std::unordered_map<std::string, std::filesystem::file_time_type> m_angelMtimes;  // key = Script asset id
     std::unordered_map<std::string, std::filesystem::file_time_type> m_cppMtimes;  // key = abs source path
     int m_lastAutoSaveTitleRemainingSeconds = -1;
     char m_projectParentBuffer[512]{};
@@ -521,16 +711,12 @@ private:
     char m_projectOpenPathBuffer[512]{};
     char m_projectBrowsePathBuffer[512]{};
     char m_projectBrowseFilterBuffer[128]{};
-    bool m_waterSculptToolOpen = false;
-    bool m_heightmapToolOpen = false;
-    bool m_splatPaintToolOpen = false;
     bool m_createTerrainModalOpen = false;
     bool m_replaceTerrainConfirmOpen = false;
     float m_createTerrainWidthMeters = 200.0f;
     float m_createTerrainDepthMeters = 200.0f;
     float m_createTerrainCellSizeMeters = 1.0f;
     int m_createTerrainChunkSizeCells = 64;
-    AssetBrowserFilter m_assetFilter = AssetBrowserFilter::All;
     std::string m_assetSubpath;
     std::string m_selectedAssetId;
     bool m_assetInspectorSelectionActive = false;
@@ -545,7 +731,10 @@ private:
     std::string m_assetNewFolderParent;
     char m_assetRenameBuffer[128]{};
     std::string m_assetRenamePath;
+    std::string m_assetRenameAssetId;  // library asset being renamed (empty: a folder or a scene file)
     bool m_assetRenameIsFolder = false;
+    std::optional<std::string> m_assetCreateTarget;  // see CreateTargetSubpath()
+    std::string m_createMaterialTargetSubpath;       // folder of the pending "Create New Material" popup
     std::string m_assetDeletePath;
     bool m_assetDeleteIsFolder = false;
     bool m_assetOpenNewFolderPopup = false;
@@ -580,6 +769,11 @@ private:
     std::uint64_t m_sceneRootEntity = 0;
     std::string m_sceneRootName = "Untitled";
     std::vector<HierarchySceneEntity> m_hierarchyEntities;
+    // Built with m_hierarchyEntities: each entity's place in it, and each parent's children (in list
+    // order). Rows looked children and entities up by a scan of the list: O(n^2) per frame.
+    std::unordered_map<std::uint64_t, std::size_t> m_hierarchyIndexByEntity;
+    std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> m_hierarchyChildren;
+    const std::vector<std::uint64_t>& HierarchyChildren(std::uint64_t entity) const;
     std::vector<std::string> m_attachedScenePaths;
     std::vector<platform::DynamicLibraryHandle> m_loadedGameModules;  // native C++ game-module DLLs
     std::uint64_t m_selectedHierarchyEntity = 0;
@@ -589,9 +783,43 @@ private:
     bool m_componentRegistryLogged = false;
     bool m_logHierarchyRendered = false;
     std::unordered_map<std::string, AssetPreviewTexture> m_assetPreviewTextures;
+    // The asset browser's folder/asset/scene listings and preview paths come from directory scans and
+    // path canonicalization; redone every frame they cost ~4 ms with a project open. Cached per asset
+    // library revision (the file watcher refreshes the library on outside changes), and re-read every
+    // few seconds as a safety net.
+    struct AssetBrowserCache
+    {
+        const AssetLibrary* library = nullptr;
+        std::uint64_t revision = 0;
+        std::uint64_t materialRevision = 0;
+        double builtAt = -1.0;
+        int validatedFrame = -1;  // the ImGui frame it was last checked in (at most once a frame)
+        std::unordered_map<std::string, std::vector<std::string>> childFolders;
+        std::unordered_map<std::string, std::vector<AssetLibrary::Entry>> folderAssets;
+        std::unordered_map<std::string, AssetLibrary::ModelContents> modelContents;
+        std::optional<std::vector<AssetLibrary::Entry>> sceneAssets;
+        std::unordered_map<std::string, std::optional<std::filesystem::path>> previewPaths;
+        // Scripts panel: native C++ sources (absolute path, path shown relative to the scripts dir).
+        std::optional<std::vector<std::pair<std::filesystem::path, std::string>>> nativeScriptSources;
+        // ComparablePath (absolute + weakly_canonical: filesystem calls) of the Hierarchy's scene paths.
+        std::unordered_map<std::string, std::string> comparablePaths;
+    };
+    mutable AssetBrowserCache m_assetBrowserCache;
+    std::unordered_set<std::string> m_expandedModelAssets;
     bool m_assetBrowserLogged = false;
     std::string m_loggedDragAssetId;
     bool m_gameViewVisible = false;
+    struct GameViewRect
+    {
+        bool valid = false;
+        float min[2] = {0.0f, 0.0f};   // window pixels
+        float size[2] = {0.0f, 0.0f};
+        std::uint32_t extent[2] = {0u, 0u};  // render target pixels
+    };
+    GameViewRect m_gameViewRect;
+    bool m_sceneViewVisible = true;
+    std::uint32_t m_sceneViewPanelPixels[2] = {0u, 0u};
+    std::uint32_t m_gameViewPanelPixels[2] = {0u, 0u};
     bool m_animatorGraphVisible = false;
     bool m_animatorPanelOpen = true;
     float m_animatorPan[2] = {0.0f, 0.0f};
@@ -630,4 +858,31 @@ private:
     bool m_sceneGizmoSnapEnabled = false;
     float m_sceneGizmoSnapValue = 1.0f;
     float m_timeOfDayHours = 12.0f;
+
+    // Editor shell: panels the View menu shows/hides, the Console log and the status bar.
+    bool m_hierarchyPanelOpen = true;
+    bool m_inspectorPanelOpen = true;
+    bool m_sceneSettingsPanelOpen = true;
+    bool m_assetBrowserPanelOpen = true;
+    bool m_scriptsPanelOpen = true;
+    bool m_consolePanelOpen = true;
+    bool m_statisticsWindowOpen = false;
+    bool m_physicsDebuggerOpen = false;
+    bool m_projectSettingsOpen = false;
+    bool m_layeredWorldOpen = false;
+    bool m_shortcutsWindowOpen = false;
+    bool m_openAboutPopup = false;
+    bool m_inspectorShowDebugInfo = false;  // engine ids and asset paths in the Inspector
+    int m_terrainToolTab = 0;               // Inspector > Terrain: 0 Sculpt, 1 Paint, 2 Settings
+    std::vector<ConsoleMessage> m_consoleMessages;
+    std::optional<ConsoleMessage> m_statusBarMessage;
+    bool m_consoleShowInfo = true;
+    bool m_consoleShowWarnings = true;
+    bool m_consoleShowErrors = true;
+    bool m_consoleScrollToBottom = false;
+    std::string m_lastSeenProjectStatus;
+    std::string m_lastSeenAssetStatus;
+    std::string m_lastSeenLayerStatus;
+    ScriptBuildState m_lastSeenBuildState = ScriptBuildState::Idle;
+    ScriptBuildState m_lastSeenGameBuildState = ScriptBuildState::Idle;
 };

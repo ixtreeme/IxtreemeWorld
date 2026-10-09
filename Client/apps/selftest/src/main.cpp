@@ -1043,7 +1043,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             terrainRendererSource.find("BuildR8ArrayMipUpload") != std::string::npos &&
             terrainRendererSource.find("normalRenorm=%s") != std::string::npos &&
             terrainRendererSource.find("sampler=trilinear aniso=%s") != std::string::npos &&
-            terrainRendererSource.find("sampler.mipmapMode = out.mipLevels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR") != std::string::npos,
+            terrainRendererSource.find("trilinear,") != std::string::npos,
         "terrain array texture mip chains", "Terrain array textures must upload full mip chains and use trilinear/aniso sampling");
     ctx.Expect(terrainSource.find("const float layerWeightEpsilon = 1.0 / 255.0") != std::string::npos &&
             terrainSource.find("int u_activeLayerCount") != std::string::npos &&
@@ -1059,7 +1059,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             terrainRendererSource.find("[TERRAIN-SHADER-DIAG] active_layer_count=%u total_layer_count=8") != std::string::npos &&
             terrainRendererSource.find("render_pass_count=1") != std::string::npos &&
             terrainRendererSource.find("const uint32_t baseDrawCallsBefore = terrainStats.drawCalls") != std::string::npos &&
-            terrainRendererSource.find("&m_descriptorSets[frameIndex]") != std::string::npos,
+            terrainRendererSource.find("BindGroup(0, *m_bindGroup, terrainSlot)") != std::string::npos,
         "terrain shader single pass optimization", "Terrain renderer must submit the palette-array terrain in a single material pass with active-layer diagnostics");
     const std::filesystem::path waterBodyIoPath = options.clientRoot / "libs" / "render" / "WaterBodyIO.h";
     std::ifstream waterBodyIo(waterBodyIoPath);
@@ -1079,13 +1079,13 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             terrainRendererSource.find("global water fallback") == std::string::npos,
         "legacy global water renderer removed", "TerrainRenderer still contains legacy global water mesh/config/fallback code");
     ctx.Expect(terrainRendererSource.find("UpdateWaterBodyUniform") != std::string::npos &&
-            terrainRendererSource.find("waterBody.descriptorSets") != std::string::npos,
+            terrainRendererSource.find("uniformBuffersSecondary") != std::string::npos,
         "water object per-body UBO source", "Object water must use per-body uniform buffers/descriptors");
     ctx.Expect(terrainRendererSource.find("FindClosestWaterBody") != std::string::npos &&
             terrainRendererSource.find("reflectionTargetDistance") != std::string::npos &&
             terrainRendererSource.find("reflection_target=id=") != std::string::npos,
         "water object closest reflection target source", "WATER-OBJ-2 closest-body reflection selection is missing");
-    ctx.Expect(terrainRendererSource.find("ComputeMirrorCamera(camera, {m_waterReflection.width, m_waterReflection.height}, reflectionWaterLevelY)") != std::string::npos &&
+    ctx.Expect(terrainRendererSource.find("ComputeMirrorCamera(camera, m_waterReflection.width, m_waterReflection.height, reflectionWaterLevelY)") != std::string::npos &&
             terrainRendererSource.find("m_reflectionClipWaterLevelY = reflectionWaterLevelY") != std::string::npos,
         "water object reflection uses body level", "Reflection pass must mirror and clip at the selected water body's level");
     ctx.Expect(terrainRendererSource.find("BuildWaterUniform(camera, timeSeconds, ResolveWaterConfig(waterBody.body), waterBody.body.waterLevelY, reflectionTarget)") != std::string::npos &&
@@ -1098,14 +1098,14 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
     ctx.Expect(terrainRendererSource.find("WaterMaterialTextureSet") != std::string::npos &&
             terrainRendererSource.find("LoadWaterMaterialTextureSet") != std::string::npos &&
             terrainRendererSource.find("ResolveWaterMaterialTextures(waterBody.body)") != std::string::npos &&
-            terrainRendererSource.find("materialTextures && materialTextures->normalA.view") != std::string::npos,
+            terrainRendererSource.find("materialTextures && materialTextures->normalA.image") != std::string::npos,
         "water object material normal textures", "Water body descriptor sets must bind the assigned material's normal maps");
-    ctx.Expect(terrainRendererSource.find("VK_FORMAT_R8G8B8A8_SRGB") != std::string::npos &&
-            terrainRendererSource.find("textureParams[0] = textures->normalA.view") != std::string::npos &&
-            terrainRendererSource.find("textureParams[2] = textures->diffuse.view") != std::string::npos &&
+    ctx.Expect(terrainRendererSource.find("ixrhi::IXRHIFormat::R8G8B8A8Srgb") != std::string::npos &&
+            terrainRendererSource.find("textureParams[0] = textures->normalA.image") != std::string::npos &&
+            terrainRendererSource.find("textureParams[2] = textures->diffuse.image") != std::string::npos &&
             terrainRendererSource.find("textureScroll[0] = material->scrollSpeedA[0]") != std::string::npos &&
             terrainRendererSource.find("diffusePath") != std::string::npos &&
-            terrainRendererSource.find("dstBinding = 6") != std::string::npos,
+            terrainRendererSource.find("UpdateTexture(slot, 6,") != std::string::npos,
         "water object material texture sampling source", "Water body materials must drive normal/diffuse texture sampling and tiling flags");
     ctx.Expect(terrainRendererSource.find("ComputeWaterBodyDistanceField") != std::string::npos &&
             terrainRendererSource.find("BilinearSampleWaterDistance") != std::string::npos &&
@@ -1129,7 +1129,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             terrainRendererSource.find("m_waterSculptBrushVisible") != std::string::npos &&
             terrainRendererSource.find("m_waterSculptBrushAddMode ? 8.0f : 9.0f") != std::string::npos,
         "water sculpt brush renderer source", "WATER-OBJ-5 needs add/remove brush cursor rendering");
-    ctx.Expect(terrainRendererSource.find("device.WaitIdle();\n    DestroyWaterBodyResources();") != std::string::npos,
+    ctx.Expect(terrainRendererSource.find("rhi.WaitIdle();\n    DestroyWaterBodyResources();") != std::string::npos,
         "water object SetWaterBodies wait-idle", "SetWaterBodies must wait before destroying in-flight GPU resources");
 
     const std::string legacyUiName = "Noe" "sis";
@@ -1890,7 +1890,7 @@ bool RunRenderChecks(const Options& options, TestContext& ctx)
             clientMainSource.find("body.config = state.config") == std::string::npos &&
             clientMainSource.find("SetWaterMaterials(editorImGui.GetWaterMaterialsSnapshot())") != std::string::npos,
         "water body uses material reference", "Client main must not copy material config into WaterBody");
-    ctx.Expect(clientMainSource.find("terrain.SetSelectedWaterBodyHighlight(device, 0u)") != std::string::npos &&
+    ctx.Expect(clientMainSource.find("terrain.SetSelectedWaterBodyHighlight(*rhiDevice, 0u)") != std::string::npos &&
             clientMainSource.find("RenderSelectedWaterBodyHighlight(device, camera)") == std::string::npos &&
             clientMainSource.find("Water \" + std::to_string(body.id)") == std::string::npos &&
             clientMainSource.find("for (const WaterBody& body : editorWaterBodies)\n                    {\n                        if (skinSlot") == std::string::npos,

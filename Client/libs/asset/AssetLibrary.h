@@ -16,7 +16,8 @@ class AssetLibrary
 public:
     using FbxSidecarProcessor = bool (*)(const std::filesystem::path& destination,
                                          const std::filesystem::path& libraryRoot,
-                                         std::string& error);
+                                         std::string& error,
+                                         const std::filesystem::path& source);
 
     enum class Category
     {
@@ -31,7 +32,9 @@ public:
         AnimationClip,
         AnimatorController,
         Audio,
-        Script
+        Script,
+        ParticleEffect,  // .particle: a reusable Particle System parameter preset
+        UiDocument  // game UI (RmlUi): .rml documents and their .rcss style sheets
     };
 
     enum class TextureRole
@@ -56,7 +59,7 @@ public:
         std::string heightTextureId;
         float tilingScaleX = 1.0f;
         float tilingScaleY = 1.0f;
-        float colorTint[3] = {1.0f, 1.0f, 1.0f};
+        float colorTint[4] = {1.0f, 1.0f, 1.0f, 1.0f};  // rgb, and alpha (kept in .material files)
         float normalStrength = 1.0f;
         float aoStrength = 1.0f;
         float roughnessStrength = 1.0f;
@@ -93,6 +96,9 @@ public:
         std::string rootMotionMode = "none";  // none | bake_xz | bake_full
     };
 
+    // An asset can live anywhere under the library root (the project's Assets folder): subpath is
+    // its folder relative to that root and filename its file name. originalPath always mirrors the
+    // resulting absolute path (kept in sync by the library; it is not an import-source path).
     struct Entry
     {
         std::string id;
@@ -101,6 +107,7 @@ public:
         std::string subpath;
         std::string filename;
         std::string originalPath;
+        std::string guid;  // AssetDatabase GUID (from the .meta) when known: finds the file after it moved
         std::string thumbnail;
         std::string importedAt;
         std::vector<std::string> tags;
@@ -130,7 +137,13 @@ public:
     static void SetFbxSidecarProcessor(FbxSidecarProcessor processor);
 
     bool Initialize();
+    // Loads the manifest only: no folder scan, nothing written. For short-lived lookups and the
+    // game runtime; the editor's library keeps the manifest current.
+    bool InitializeReadOnly();
     const std::vector<Entry>& Entries() const { return m_entries; }
+    // Bumped whenever the entries may have changed (manifest written, loaded or refreshed), so a
+    // view can cache what it derives from them.
+    std::uint64_t Revision() const { return m_revision; }
     std::vector<Entry> EntriesFor(Category category, const std::string& filter = {}) const;
     std::vector<Entry> QueryEntries(Category category,
                                     const std::string& subpath,
@@ -138,6 +151,12 @@ public:
                                     const std::vector<std::string>& activeTags,
                                     const std::string& search) const;
     std::optional<Entry> FindById(const std::string& id) const;
+    struct ModelContents
+    {
+        std::vector<Entry> assets; // Materials first, then distinct referenced/extracted textures.
+        std::vector<std::string> missingTextures;
+    };
+    ModelContents QueryModelContents(const Entry& model) const;
     std::vector<std::string> SubpathsFor(Category category) const;
     std::vector<std::string> FolderSubpathsFor(Category category) const;
     std::vector<std::pair<std::string, std::uint32_t>> TagsFor(Category category) const;
@@ -185,12 +204,19 @@ public:
     // Creates a .controller asset seeded with a default Idle/Walk/Run locomotion graph
     // (Speed/IsGrounded/Jump params; clip ids empty — assigned later in the Inspector/graph editor).
     bool CreateAnimatorController(const ImportOptions& options, Entry& outEntry, std::string& error);
+    // Creates a .particle effect preset asset: a reusable Particle System parameter set. The
+    // inspector's preset picker applies it to a component (a copy — no runtime asset dependency).
+    bool CreateParticleEffect(const ImportOptions& options,
+                              const ixparticle::ParticleSystemComponent& effect,
+                              Entry& outEntry,
+                              std::string& error);
     // Creates a new .lua Script asset seeded with an OnStart/OnUpdate/OnDestroy template.
     bool CreateLuaScript(const ImportOptions& options, Entry& outEntry, std::string& error);
-    // Creates a native C++ game script (.cpp) as a first-class Script asset, the same way as a Lua
-    // script: written into the library scripts dir, registered, browsable + drag-attachable. The
-    // class is named after the (sanitized) display name (one class per file, Unity-style); the
-    // Build pipeline compiles it into the project's game-module DLL.
+    // Creates a new .as AngelScript asset seeded with a `class Script` template (the project's
+    // hot-reloadable scripting language, alongside Lua). No build step: compiled by the engine at Play.
+    bool CreateAngelScript(const ImportOptions& options, Entry& outEntry, std::string& error);
+    // Creates a native C++ game script (.cpp) as a first-class Script asset. LEGACY: C++ is no longer
+    // offered as a project scripting language (AngelScript + Lua are); kept for existing projects.
     bool CreateNativeScript(const ImportOptions& options, Entry& outEntry, std::string& error);
     bool Remove(const std::string& id, std::string& error);
     bool UpdateAssetMetadata(const std::string& id,
@@ -201,7 +227,13 @@ public:
                                const LodConfig& config,
                                Entry& outEntry,
                                std::string& error);
+    // Moves the asset file (and its .meta) into another folder, keeping its id.
     bool MoveAssetToSubpath(const std::string& id, const std::string& subpath, Entry& outEntry, std::string& error);
+    // Updates entries after files were moved/renamed/deleted on disk by the caller, so ids (and the
+    // references to them) survive. RelocateFolder rewrites every entry inside oldSubpath; ForgetPath
+    // drops the entries at or under a path without touching any file.
+    bool RelocateFolder(const std::string& oldSubpath, const std::string& newSubpath, std::string& error);
+    bool ForgetPath(const std::filesystem::path& absolutePath, std::string& error);
     bool RenameAsset(const std::string& id,
                      const std::string& newBaseName,
                      bool allowTextureRoleChange,
@@ -233,6 +265,12 @@ public:
                           const std::array<MapEditorPaletteSlot, 8>& slots,
                           std::string& error) const;
 
+    // Category of a file the library picks up on its own wherever it sits under the root (by its
+    // extension); nullopt for anything else, including derived data (.ozz) and scenes.
+    static std::optional<Category> DiscoverableCategory(const std::filesystem::path& path);
+    // True for library-internal folders (generated thumbnails) the asset browser does not show.
+    static bool IsInternalFolder(const std::string& subpath);
+
     static const char* CategoryName(Category category);
     static const char* TextureRoleName(TextureRole role);
     static const char* TextureRoleBadge(TextureRole role);
@@ -246,12 +284,18 @@ public:
     static void EndMaterialDiscoveryFrame(std::uint64_t frameNumber);
 
 private:
-    std::filesystem::path CategoryDirectory(Category category) const;
+    // Pre-v2 manifests stored subpaths relative to these per-type folders; only read to migrate.
+    std::filesystem::path LegacyCategoryDirectory(Category category) const;
+    void SyncLocation(Entry& entry) const;
+    std::optional<Entry> MakeDiscoveredEntry(Category category,
+                                             const std::filesystem::path& path,
+                                             const std::unordered_set<std::string>& takenIds,
+                                             std::vector<std::string>& failedMaterialPaths);
     static std::string CategoryString(Category category);
     static std::optional<Category> ParseCategory(const std::string& value);
     static std::optional<TextureRole> ParseTextureRole(const std::string& value);
 
-    bool LoadManifest();
+    bool LoadManifest(bool reconcile = true);
     bool SaveManifest(std::string& error) const;
     bool ReconcileFilesystem(std::string& error);
     bool PopulateTextureMetadata(Entry& entry, bool generateThumbnail, std::string* error = nullptr) const;
@@ -259,13 +303,18 @@ private:
     bool EnsureDirectories() const;
     bool ValidateFile(Category category, const std::filesystem::path& path, std::string& error) const;
     std::string MakeUniqueId(Category category, const std::filesystem::path& sourcePath) const;
-    std::filesystem::path MakeUniqueDestination(Category category,
-                                                const std::string& subpath,
+    std::string MakeUniqueId(Category category,
+                             const std::filesystem::path& sourcePath,
+                             const std::unordered_set<std::string>& takenIds) const;
+    std::filesystem::path MakeUniqueDestination(const std::string& subpath,
                                                 const std::filesystem::path& sourcePath) const;
 
     std::filesystem::path m_clientRoot;
     std::filesystem::path m_libraryRoot;
     std::vector<Entry> m_entries;
+    mutable std::uint64_t m_revision = 0;  // see Revision(); SaveManifest() is const
+    bool m_lastReconcileOk = true;         // result of the reconcile LoadManifest() ran
+    std::string m_lastReconcileError;
     std::unordered_set<std::string> m_failedMaterialDiscoveryAttempts;
     bool m_loggedMaterialFailureHint = false;
     mutable std::optional<size_t> m_lastSavedManifestHash;

@@ -1,180 +1,128 @@
 // This file is included from EditorImGui.cpp inside the editor-enabled implementation block.
 // Keep shared anonymous-namespace helpers in EditorImGui.cpp until this panel group is fully decoupled.
 
+namespace
+{
+constexpr ImU32 kAssetTileColor = IM_COL32(44, 48, 55, 255);
+constexpr ImU32 kAssetTileHoveredColor = IM_COL32(56, 61, 70, 255);
+constexpr ImU32 kAssetTileBorderColor = IM_COL32(62, 67, 76, 255);
+constexpr ImU32 kFolderIconColor = IM_COL32(226, 182, 84, 255);
+constexpr float kAssetTileSize = 76.0f;
+constexpr float kAssetCellWidth = 124.0f;
+
+// The name under a tile: centred on it, cut with an ellipsis when wider than the cell. Returns
+// whether it is hovered.
+bool AssetTileLabel(const std::string& text, float tileSize, bool selected)
+{
+    const float maxWidth = kAssetCellWidth - 6.0f;
+    const ImVec2 cursor = ImGui::GetCursorScreenPos();
+    const ImVec2 textSize = ImGui::CalcTextSize(text.c_str());
+    const float width = std::min(textSize.x, maxWidth);
+    const ImVec2 pos(cursor.x + (tileSize - width) * 0.5f, cursor.y);
+    ImGui::SetCursorScreenPos(pos);
+    ImGui::Dummy(ImVec2(width, textSize.y));
+    const bool hovered = ImGui::IsItemHovered();
+    if (selected)
+        ImGui::PushStyleColor(ImGuiCol_Text, UI::Theme::AccentHovered);
+    ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(),
+        pos,
+        ImVec2(pos.x + width, pos.y + textSize.y),
+        pos.x + width,
+        text.c_str(),
+        nullptr,
+        &textSize);
+    if (selected)
+        ImGui::PopStyleColor();
+    return hovered;
+}
+}
+
 void EditorImGui::RenderAssetBrowserToolbar()
 {
-    if (UI::IconButton(ICON_FA_ROTATE, "Refresh"))
-        RefreshAssetLibrary();
-}
-
-void EditorImGui::RenderAssetTypeTabs()
-{
-    const auto tab = [this](const char* label, AssetBrowserFilter filter) {
-        const bool active = m_assetFilter == filter;
-        if (active)
-        {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-        }
-        else
-        {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_Tab));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_TabHovered));
-            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_TabActive));
-        }
-
-        if (ImGui::Button(label))
-        {
-            if (m_assetFilter != filter)
-            {
-                m_assetFilter = filter;
-                m_assetSubpath.clear();
-                m_activeAssetTags.clear();
-                m_selectedAssetId.clear();
-                m_assetInspectorSelectionActive = false;
-            }
-        }
-        ImGui::PopStyleColor(3);
-    };
-
-    tab("All", AssetBrowserFilter::All);
-    ImGui::SameLine();
-    tab("Textures", AssetBrowserFilter::Texture);
-    ImGui::SameLine();
-    tab("Models", AssetBrowserFilter::Model);
-    ImGui::SameLine();
-    tab("Anims", AssetBrowserFilter::Animation);
-    ImGui::SameLine();
-    tab("Anim Clips", AssetBrowserFilter::AnimationClip);
-    ImGui::SameLine();
-    tab("Animators", AssetBrowserFilter::AnimatorController);
-    ImGui::SameLine();
-    tab("Audio", AssetBrowserFilter::Audio);
-    ImGui::SameLine();
-    tab("Scripts", AssetBrowserFilter::Script);
-    ImGui::SameLine();
-    tab("Materials", AssetBrowserFilter::Material);
-    ImGui::SameLine();
-    tab("Water Mats", AssetBrowserFilter::WaterMaterial);
-    ImGui::SameLine();
-    tab("Physics Mats", AssetBrowserFilter::PhysicsMaterial);
-    ImGui::SameLine();
-    tab("Scenes", AssetBrowserFilter::Scene);
-    ImGui::SameLine();
-    tab("Prefabs", AssetBrowserFilter::Prefab);
-}
-
-void EditorImGui::RenderAssetFolderNode(const std::string& path, const std::vector<std::string>& folders)
-{
-    const std::string nodeId = path.empty() ? std::string("__asset_root__") : path;
-    ImGui::PushID(nodeId.c_str());
-
-    const bool selected = AssetLibrary::NormalizeSubpath(path) == AssetLibrary::NormalizeSubpath(m_assetSubpath);
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth;
-    if (selected)
-        flags |= ImGuiTreeNodeFlags_Selected;
-
-    bool hasChildren = false;
-    for (const std::string& folder : folders)
-    {
-        if (IsDirectChildFolder(path, folder))
-        {
-            hasChildren = true;
-            break;
-        }
-    }
-    if (!hasChildren)
-        flags |= ImGuiTreeNodeFlags_Leaf;
-
-    const std::string label = FolderDisplayName(path);
-    const bool open = ImGui::TreeNodeEx(label.c_str(), flags);
-    if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
-    {
-        m_assetSubpath = AssetLibrary::NormalizeSubpath(path);
-        m_selectedAssetId.clear();
-        m_assetInspectorSelectionActive = false;
-    }
-
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            AssetLibrary::Entry moved{};
-            std::string error;
-            if (m_assetLibrary && m_assetLibrary->MoveAssetToSubpath(assetId, path, moved, error))
-            {
-                m_assetStatus = "Moved asset to " + FolderDisplayName(path);
-                Tracenf("[EDITOR-IMGUI-3] Drag dropped: asset_id=%s target_type=folder path=%s",
-                    assetId.c_str(),
-                    path.c_str());
-            }
-            else
-            {
-                m_assetStatus = "Move failed: " + error;
-            }
-        }
-        ImGui::EndDragDropTarget();
-    }
-
-    if (open)
-    {
-        for (const std::string& folder : folders)
-        {
-            if (IsDirectChildFolder(path, folder))
-                RenderAssetFolderNode(folder, folders);
-        }
-        ImGui::TreePop();
-    }
-
-    ImGui::PopID();
-}
-
-void EditorImGui::RenderAssetFolderPanel()
-{
-    const bool sceneCategory = m_assetFilter == AssetBrowserFilter::Scene;
-    if (UI::IconButton(ICON_FA_HOUSE, "Home"))
-    {
-        m_assetSubpath.clear();
-        m_selectedAssetId.clear();
-        m_assetInspectorSelectionActive = false;
-    }
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_FOLDER_OPEN, "Up"))
-    {
-        m_assetSubpath = ParentSubpath(m_assetSubpath);
-        m_selectedAssetId.clear();
-        m_assetInspectorSelectionActive = false;
-    }
-
-    if (sceneCategory)
+    const bool hasLibrary = m_assetLibrary != nullptr;
+    if (!hasLibrary)
         ImGui::BeginDisabled();
-    if (UI::IconButton(ICON_FA_FOLDER_PLUS, "Folder"))
-        ImGui::OpenPopup("NewAssetFolder");
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_TRASH, "Delete") && !m_assetSubpath.empty())
-        DeleteAssetFolder();
-    if (sceneCategory)
-        ImGui::EndDisabled();
-
-    if (ImGui::BeginPopup("NewAssetFolder"))
+    if (UI::IconButton(ICON_FA_PLUS, "Create"))
+        ImGui::OpenPopup("AssetBrowserCreatePopup");
+    UI::ItemTooltip("Create a folder, script or material in the folder shown");
+    if (ImGui::BeginPopup("AssetBrowserCreatePopup"))
     {
-        ImGui::InputText("Name", m_newAssetFolderName, sizeof(m_newAssetFolderName));
-        if (ImGui::Button("Create"))
-        {
-            CreateAssetFolder();
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel"))
-            ImGui::CloseCurrentPopup();
+        RenderAssetCreateMenuItems(m_assetSubpath);
         ImGui::EndPopup();
     }
+    ImGui::SameLine();
+    if (UI::IconButton(ICON_FA_FILE_IMPORT, "Import"))
+        OpenImportAssetDialog(m_assetSubpath);
+    UI::ItemTooltip("Copy files into the folder shown (dropping files from the OS works too)");
+    if (!hasLibrary)
+        ImGui::EndDisabled();
 
+    // Right: search and refresh; the breadcrumb takes the room between.
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float refreshWidth = ImGui::GetFrameHeight();
+    const float searchWidth = std::clamp(ImGui::GetContentRegionAvail().x * 0.28f, 140.0f, 280.0f);
+    const float rightStart = ImGui::GetWindowContentRegionMax().x - searchWidth - refreshWidth - style.ItemSpacing.x;
+
+    ImGui::SameLine(0.0f, 16.0f);
+    RenderAssetBrowserBreadcrumb();
+
+    ImGui::SameLine(std::max(ImGui::GetCursorPosX() + 8.0f, rightStart));
+    ImGui::SetNextItemWidth(searchWidth);
+    ImGui::InputTextWithHint("##asset_search", ICON_FA_MAGNIFYING_GLASS "  Search assets", m_assetSearchBuffer, sizeof(m_assetSearchBuffer));
+    UI::ItemTooltip("Find assets by name in the whole project");
+    ImGui::SameLine();
+    if (UI::IconOnlyButton(ICON_FA_ARROWS_ROTATE))
+        RefreshAssetLibrary();
+    UI::ItemTooltip("Re-read the asset folder (changes made outside the editor show up by themselves)");
+}
+
+void EditorImGui::RenderAssetCreateMenuItems(const std::string& targetSubpath)
+{
+    const std::string target = AssetLibrary::NormalizeSubpath(targetSubpath);
+    if (ImGui::MenuItem(ICON_FA_FOLDER_PLUS "  New Folder"))
+    {
+        m_assetNewFolderParent = target;
+        CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(target)));
+        m_assetOpenNewFolderPopup = true;
+    }
     ImGui::Separator();
-    const std::vector<std::string> folders = QueryVisibleFolders();
-    RenderAssetFolderNode("", folders);
+    // Each creator consumes m_assetCreateTarget (see CreateTargetSubpath).
+    const auto createItem = [&](const char* label, void (EditorImGui::*create)()) {
+        if (ImGui::MenuItem(label))
+        {
+            m_assetCreateTarget = target;
+            (this->*create)();
+            m_assetCreateTarget.reset();
+        }
+    };
+    createItem(ICON_FA_FILE_CODE "  New AngelScript", &EditorImGui::CreateAngelScriptAsset);
+    createItem(ICON_FA_FILE_CODE "  New Lua Script", &EditorImGui::CreateLuaScriptAsset);
+    ImGui::Separator();
+    createItem(ICON_FA_PALETTE "  New Material", &EditorImGui::CreatePbrMaterialAsset);
+    createItem(ICON_FA_DROPLET "  New Water Material", static_cast<void (EditorImGui::*)()>(&EditorImGui::CreateWaterMaterialAsset));
+    createItem(ICON_FA_CUBES "  New Physics Material", &EditorImGui::CreatePhysicsMaterialAsset);
+    createItem(ICON_FA_DIAGRAM_PROJECT "  New Animator Controller", &EditorImGui::CreateAnimatorControllerAsset);
+    createItem(ICON_FA_SHAPES "  New Particle Effect", &EditorImGui::CreateParticleEffectAsset);
+    ImGui::Separator();
+    if (ImGui::MenuItem(ICON_FA_FILE_IMPORT "  Import Asset..."))
+        OpenImportAssetDialog(target);
+}
+
+void EditorImGui::AcceptAssetBrowserDrop(const std::string& targetSubpath)
+{
+    if (!ImGui::BeginDragDropTarget())
+        return;
+    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+    {
+        const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+        MoveAssetEntryToFolder(assetId, targetSubpath);
+    }
+    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetFolderPayloadType))
+    {
+        const std::string source(static_cast<const char*>(payload->Data), payload->DataSize);
+        MoveFolderToFolder(source, targetSubpath);
+    }
+    ImGui::EndDragDropTarget();
 }
 
 void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSize)
@@ -186,16 +134,34 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
 
     const ImVec2 previewMin = ImGui::GetCursorScreenPos();
     const ImVec2 previewMax(previewMin.x + tileSize, previewMin.y + tileSize);
+    if (entry.category == AssetLibrary::Category::Model)
+    {
+        const bool expanded = m_expandedModelAssets.contains(entry.id);
+        ImGui::SetCursorScreenPos(ImVec2(previewMin.x - 23.0f, previewMin.y + (tileSize - ImGui::GetFrameHeight()) * 0.5f));
+        if (ImGui::ArrowButton("##model_contents", expanded ? ImGuiDir_Down : ImGuiDir_Right))
+        {
+            if (expanded) m_expandedModelAssets.erase(entry.id);
+            else m_expandedModelAssets.insert(entry.id);
+        }
+        if (ImGui::IsItemHovered())
+        {
+            const auto& contents = QueryModelContents(entry);
+            ImGui::BeginTooltip();
+            ImGui::Text("%zu materials/textures", contents.assets.size());
+            if (!contents.missingTextures.empty())
+                ImGui::TextColored(UI::Theme::Warning, "%zu missing textures", contents.missingTextures.size());
+            ImGui::EndTooltip();
+        }
+        ImGui::SetCursorScreenPos(previewMin);
+    }
     ImGui::InvisibleButton("##asset_tile", ImVec2(tileSize, tileSize));
     const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     const bool doubleClicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     const bool hovered = ImGui::IsItemHovered();
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();
-    const ImU32 baseColor = ImGui::ColorConvertFloat4ToU32(hovered
-        ? ImVec4(categoryColor.x + 0.08f, categoryColor.y + 0.08f, categoryColor.z + 0.08f, 1.0f)
-        : categoryColor);
-    drawList->AddRectFilled(previewMin, previewMax, baseColor, 5.0f);
+    // A dark tile with the type's icon in the type's color (or the preview image when there is one).
+    drawList->AddRectFilled(previewMin, previewMax, hovered ? kAssetTileHoveredColor : kAssetTileColor, 5.0f);
     void* previewTextureId =
         (preview && preview->handle.IsValid() && m_textureProvider)
         ? m_textureProvider->GetPreviewTexture(preview->handle)
@@ -226,16 +192,16 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         const ImVec2 iconSize = ImGui::CalcTextSize(icon);
         drawList->AddText(
             ImVec2(previewMin.x + (tileSize - iconSize.x) * 0.5f, previewMin.y + (tileSize - iconSize.y) * 0.5f),
-            IM_COL32(245, 248, 255, 235),
+            ImGui::ColorConvertFloat4ToU32(categoryColor),
             icon);
         if (UI::GetEditorFonts().bold)
             ImGui::PopFont();
     }
     drawList->AddRect(previewMin, previewMax,
-        selected ? IM_COL32(255, 210, 92, 255) : IM_COL32(55, 60, 70, 255),
+        selected ? ImGui::ColorConvertFloat4ToU32(UI::Theme::AccentHovered) : kAssetTileBorderColor,
         5.0f,
         0,
-        selected ? 3.0f : 1.0f);
+        selected ? 2.5f : 1.0f);
 
     if (clicked)
     {
@@ -274,8 +240,10 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
             m_commands.previewAudioClipId = entry.id;
             m_assetStatus = "Preview: " + entry.displayName;
         }
-        else if (doubleClicked && entry.category == AssetLibrary::Category::Script)
+        else if (doubleClicked && (entry.category == AssetLibrary::Category::Script ||
+                                      entry.category == AssetLibrary::Category::UiDocument))
         {
+            // Scripts and UI documents are text: edit them in the OS's editor for that file type.
             std::string err;
             const std::filesystem::path path = m_assetLibrary->AbsolutePath(entry);
             if (platform::OpenInDefaultApp(path, &err))
@@ -340,24 +308,48 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
                 m_assetStatus = "Preview: " + entry.displayName;
             }
         }
-        else
+        else if (entry.category == AssetLibrary::Category::Model)
         {
             ImGui::Separator();
-            if (entry.category == AssetLibrary::Category::Model && ImGui::MenuItem("Export to FBX..."))
+            if (ImGui::MenuItem("Export to FBX..."))
                 OpenFbxExportDialogForAsset(entry);
-            if (ImGui::MenuItem("New Material"))
-                CreatePbrMaterialAsset();
-            if (ImGui::MenuItem("New Water Material"))
-                CreateWaterMaterialAsset();
-            if (ImGui::MenuItem("New Physics Material"))
-                CreatePhysicsMaterialAsset();
+            const auto modelPath = entry.originalPath.empty() && m_assetLibrary
+                ? m_assetLibrary->AbsolutePath(entry) : std::filesystem::path(entry.originalPath);
+            if (modelPath.extension() == ".glb" && ProjectManager::Instance().HasProject() &&
+                AssetDatabase::Instance().loadDefaultMaterials(modelPath).size() == 2)
+            {
+                if (ImGui::MenuItem("Bake tree impostor"))
+                {
+                    client::asset::FileAssetReader reader(ProjectManager::Instance().ProjectRoot());
+                    std::string error;
+                    if (StaticMeshRenderer::BakeTreeImpostorAsset(reader, modelPath, {}, error))
+                    {
+                        m_assetStatus = "Tree impostor baked (180m): " + entry.displayName;
+                        m_treeImpostorChanges.push_back(modelPath);
+                    }
+                    else m_assetStatus = "Tree impostor failed: " + error;
+                }
+                std::error_code existsError;
+                if (std::filesystem::exists(modelPath.string() + ".impostor.json", existsError) &&
+                    ImGui::MenuItem("Disable tree impostor"))
+                {
+                    std::error_code error;
+                    std::filesystem::remove(modelPath.string() + ".impostor.json", error);
+                    m_assetStatus = error ? "Cannot disable impostor: " + error.message() : "Tree impostor disabled: " + entry.displayName;
+                    if (!error) m_treeImpostorChanges.push_back(modelPath);
+                }
+            }
+        }
+        ImGui::Separator();
+        if (ImGui::BeginMenu("Create Here"))
+        {
+            RenderAssetCreateMenuItems(entry.subpath);
+            ImGui::EndMenu();
         }
         ImGui::EndPopup();
     }
 
-    const std::string shortName = ShortAssetFilename(entry);
-    ImGui::TextUnformatted(shortName.c_str());
-    const bool labelHovered = ImGui::IsItemHovered();
+    const bool labelHovered = AssetTileLabel(entry.filename.empty() ? entry.displayName : entry.filename, tileSize, selected);
     if (hovered || labelHovered)
     {
         ImGui::BeginTooltip();
@@ -366,6 +358,13 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         if (!entry.displayName.empty() && entry.displayName != entry.filename)
             ImGui::TextDisabled("Name: %s", entry.displayName.c_str());
         ImGui::TextDisabled("Type: %s", AssetLibrary::CategoryName(entry.category));
+        if (entry.category == AssetLibrary::Category::Model)
+        {
+            const auto& contents = QueryModelContents(entry);
+            ImGui::TextDisabled("Contents: %zu materials/textures (use the arrow to expand)", contents.assets.size());
+            for (const auto& missing : contents.missingTextures)
+                ImGui::TextColored(UI::Theme::Warning, "Missing texture: %s", missing.c_str());
+        }
         if (!entry.subpath.empty())
             ImGui::TextDisabled("Folder: %s", entry.subpath.c_str());
         if (entry.category == AssetLibrary::Category::Texture)
@@ -384,68 +383,6 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         ImGui::EndTooltip();
     }
     ImGui::PopID();
-}
-
-void EditorImGui::RenderAssetGrid()
-{
-    const std::vector<AssetLibrary::Entry> visibleAssets = QueryVisibleAssets();
-    const std::vector<std::string> folders = QueryVisibleFolders();
-    uint32_t directFolders = 0;
-    for (const std::string& folder : folders)
-    {
-        if (IsDirectChildFolder(m_assetSubpath, folder))
-            ++directFolders;
-    }
-
-    ImGui::Text("%zu assets, %u folders | %s | %s",
-        visibleAssets.size(),
-        directFolders,
-        AssetFilterName(),
-        m_assetSubpath.empty() ? "Home" : m_assetSubpath.c_str());
-    ImGui::Separator();
-
-    const float tileSize = 86.0f;
-    const float cellWidth = 142.0f;
-    const float panelWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x);
-    const float columnStride = cellWidth + ImGui::GetStyle().ItemSpacing.x;
-    const int columns = std::max(1, static_cast<int>((panelWidth + ImGui::GetStyle().ItemSpacing.x) / columnStride));
-    if (ImGui::BeginTable("AssetGridTiles", columns, ImGuiTableFlags_SizingFixedSame | ImGuiTableFlags_NoSavedSettings))
-    {
-        for (int i = 0; i < columns; ++i)
-            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, cellWidth);
-
-        for (const AssetLibrary::Entry& entry : visibleAssets)
-        {
-            ImGui::TableNextColumn();
-            ImGui::BeginGroup();
-            RenderAssetTile(entry, tileSize);
-            ImGui::EndGroup();
-        }
-        ImGui::EndTable();
-    }
-
-    if (visibleAssets.empty())
-        ImGui::TextDisabled("No assets in this view.");
-
-    if (ImGui::BeginPopupContextWindow("AssetGridContext", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
-    {
-        if (ImGui::MenuItem("New Material"))
-            CreatePbrMaterialAsset();
-        if (ImGui::MenuItem("New Water Material"))
-            CreateWaterMaterialAsset();
-        if (ImGui::MenuItem("New Physics Material"))
-            CreatePhysicsMaterialAsset();
-        ImGui::EndPopup();
-    }
-
-    if (!m_assetBrowserLogged)
-    {
-        m_assetBrowserLogged = true;
-        Tracenf("[EDITOR-IMGUI-3] Asset Browser rendered, current_path=%s filter_type=%s visible_assets=%zu",
-            m_assetSubpath.c_str(),
-            AssetFilterName(),
-            visibleAssets.size());
-    }
 }
 
 void EditorImGui::RenderAssetBrowserFolderTreeNode(const std::string& subpath)
@@ -471,29 +408,10 @@ void EditorImGui::RenderAssetBrowserFolderTreeNode(const std::string& subpath)
         ImGui::EndDragDropSource();
     }
 
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveAssetEntryToFolder(assetId, normalized);
-        }
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetFolderPayloadType))
-        {
-            const std::string source(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveFolderToFolder(source, normalized);
-        }
-        ImGui::EndDragDropTarget();
-    }
+    AcceptAssetBrowserDrop(normalized);
 
     if (ImGui::BeginPopupContextItem("FolderTreeContext"))
     {
-        if (ImGui::MenuItem("New Folder"))
-        {
-            m_assetNewFolderParent = normalized;
-            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(normalized)));
-            m_assetOpenNewFolderPopup = true;
-        }
         if (!normalized.empty() && ImGui::MenuItem("Rename"))
             BeginFolderRename(normalized);
         if (!normalized.empty() && ImGui::MenuItem("Delete"))
@@ -502,9 +420,9 @@ void EditorImGui::RenderAssetBrowserFolderTreeNode(const std::string& subpath)
             m_assetDeleteIsFolder = true;
             m_assetOpenDeletePopup = true;
         }
-        ImGui::Separator();
-        if (ImGui::MenuItem("Import Asset..."))
-            OpenImportAssetDialog(normalized);
+        if (!normalized.empty())
+            ImGui::Separator();
+        RenderAssetCreateMenuItems(normalized);
         ImGui::EndPopup();
     }
 
@@ -524,8 +442,20 @@ void EditorImGui::RenderAssetBrowserFolderTree()
 
 void EditorImGui::RenderAssetBrowserBreadcrumb()
 {
-    if (ImGui::SmallButton("Assets"))
+    // Assets > folder > folder: every part but the last one opens that folder.
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f, ImGui::GetStyle().FramePadding.y));
+    const bool atRoot = AssetLibrary::NormalizeSubpath(m_assetSubpath).empty();
+    if (atRoot)
+    {
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted(ICON_FA_FOLDER_OPEN "  Assets");
+    }
+    else if (ImGui::Button(ICON_FA_FOLDER_OPEN "  Assets"))
+    {
         SelectAssetBrowserFolder("");
+    }
+    AcceptAssetBrowserDrop("");
     std::filesystem::path current(m_assetSubpath);
     std::string acc;
     for (const auto& part : current)
@@ -534,14 +464,25 @@ void EditorImGui::RenderAssetBrowserBreadcrumb()
         if (segment.empty() || segment == ".")
             continue;
         acc = acc.empty() ? segment : acc + "/" + segment;
-        ImGui::SameLine();
-        ImGui::TextDisabled(">");
-        ImGui::SameLine();
+        ImGui::SameLine(0.0f, 2.0f);
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextDisabled(ICON_FA_CHEVRON_RIGHT);
+        ImGui::SameLine(0.0f, 2.0f);
+        ImGui::PushID(acc.c_str());
         if (AssetLibrary::NormalizeSubpath(acc) == AssetLibrary::NormalizeSubpath(m_assetSubpath))
+        {
+            ImGui::AlignTextToFramePadding();
             ImGui::TextUnformatted(segment.c_str());
-        else if (ImGui::SmallButton(segment.c_str()))
+        }
+        else if (ImGui::Button(segment.c_str()))
+        {
             SelectAssetBrowserFolder(acc);
+        }
+        AcceptAssetBrowserDrop(acc);
+        ImGui::PopID();
     }
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
 }
 
 void EditorImGui::RenderAssetBrowserFolderTile(const std::string& subpath, float tileSize)
@@ -555,21 +496,21 @@ void EditorImGui::RenderAssetBrowserFolderTile(const std::string& subpath, float
     const bool doubleClicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     const bool hovered = ImGui::IsItemHovered();
     ImDrawList* drawList = ImGui::GetWindowDrawList();
-    drawList->AddRectFilled(previewMin, previewMax, hovered ? IM_COL32(88, 96, 112, 255) : IM_COL32(72, 78, 92, 255), 5.0f);
+    drawList->AddRectFilled(previewMin, previewMax, hovered ? kAssetTileHoveredColor : kAssetTileColor, 5.0f);
     const char* icon = ICON_FA_FOLDER;
     if (UI::GetEditorFonts().bold)
         ImGui::PushFont(UI::GetEditorFonts().bold);
     const ImVec2 iconSize = ImGui::CalcTextSize(icon);
     drawList->AddText(ImVec2(previewMin.x + (tileSize - iconSize.x) * 0.5f, previewMin.y + (tileSize - iconSize.y) * 0.5f),
-        IM_COL32(245, 248, 255, 235),
+        kFolderIconColor,
         icon);
     if (UI::GetEditorFonts().bold)
         ImGui::PopFont();
     drawList->AddRect(previewMin, previewMax,
-        selected ? IM_COL32(255, 210, 92, 255) : IM_COL32(55, 60, 70, 255),
+        selected ? ImGui::ColorConvertFloat4ToU32(UI::Theme::AccentHovered) : kAssetTileBorderColor,
         5.0f,
         0,
-        selected ? 3.0f : 1.0f);
+        selected ? 2.5f : 1.0f);
     if (clicked)
     {
         m_selectedAssetId = "folder:" + subpath;
@@ -583,28 +524,9 @@ void EditorImGui::RenderAssetBrowserFolderTile(const std::string& subpath, float
         ImGui::Text("%s", FolderDisplayName(subpath).c_str());
         ImGui::EndDragDropSource();
     }
-    if (ImGui::BeginDragDropTarget())
-    {
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
-        {
-            const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveAssetEntryToFolder(assetId, subpath);
-        }
-        if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetFolderPayloadType))
-        {
-            const std::string source(static_cast<const char*>(payload->Data), payload->DataSize);
-            MoveFolderToFolder(source, subpath);
-        }
-        ImGui::EndDragDropTarget();
-    }
+    AcceptAssetBrowserDrop(subpath);
     if (ImGui::BeginPopupContextItem("FolderTileContext"))
     {
-        if (ImGui::MenuItem("New Folder"))
-        {
-            m_assetNewFolderParent = subpath;
-            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(subpath)));
-            m_assetOpenNewFolderPopup = true;
-        }
         if (ImGui::MenuItem("Rename"))
             BeginFolderRename(subpath);
         if (ImGui::MenuItem("Delete"))
@@ -614,75 +536,112 @@ void EditorImGui::RenderAssetBrowserFolderTile(const std::string& subpath, float
             m_assetOpenDeletePopup = true;
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Import Asset..."))
-            OpenImportAssetDialog(subpath);
+        RenderAssetCreateMenuItems(subpath);
         ImGui::EndPopup();
     }
-    ImGui::TextUnformatted(FolderDisplayName(subpath).c_str());
+    const bool labelHovered = AssetTileLabel(FolderDisplayName(subpath), tileSize, selected);
+    if (hovered || labelHovered)
+        ImGui::SetTooltip("%s\nDouble-click to open", FolderDisplayName(subpath).c_str());
     ImGui::PopID();
 }
 
 void EditorImGui::RenderAssetBrowserContent()
 {
-    RenderAssetBrowserBreadcrumb();
-    ImGui::Separator();
-    const std::vector<std::string> folders = QueryFilesystemChildFolders(m_assetSubpath);
-    const std::vector<AssetLibrary::Entry> assets = QueryFilesystemAssetsInFolder(m_assetSubpath);
-    ImGui::Text("%zu assets, %zu folders | Assets%s%s",
-        assets.size(),
-        folders.size(),
-        m_assetSubpath.empty() ? "" : "/",
-        m_assetSubpath.c_str());
-    ImGui::Separator();
+    // With a search, every matching asset of the project; otherwise the folder shown.
+    const bool searching = m_assetSearchBuffer[0] != '\0';
+    std::vector<std::string> folders;
+    std::vector<AssetLibrary::Entry> assets;
+    const std::vector<std::string>* folderView = &folders;
+    const std::vector<AssetLibrary::Entry>* assetView = &assets;
+    if (searching)
+    {
+        for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+        {
+            if (ContainsCaseInsensitive(entry.displayName, m_assetSearchBuffer) ||
+                ContainsCaseInsensitive(entry.filename, m_assetSearchBuffer))
+                assets.push_back(entry);
+        }
+        std::sort(assets.begin(), assets.end(), [](const AssetLibrary::Entry& a, const AssetLibrary::Entry& b) {
+            return ToLowerAscii(a.displayName) < ToLowerAscii(b.displayName);
+        });
+        ImGui::TextDisabled("%zu asset%s found for \"%s\"", assets.size(), assets.size() == 1 ? "" : "s", m_assetSearchBuffer);
+        ImGui::SameLine();
+        if (ImGui::SmallButton(ICON_FA_XMARK "  Clear search"))
+            m_assetSearchBuffer[0] = '\0';
+        ImGui::Spacing();
+    }
+    else
+    {
+        folderView = &QueryFilesystemChildFolders(m_assetSubpath);
+        assetView = &QueryFilesystemAssetsInFolder(m_assetSubpath);
+    }
 
-    const float tileSize = 76.0f;
-    const float cellWidth = 128.0f;
     const float panelWidth = std::max(1.0f, ImGui::GetContentRegionAvail().x);
-    const int columns = std::max(1, static_cast<int>(panelWidth / (cellWidth + ImGui::GetStyle().ItemSpacing.x)));
-    if (ImGui::BeginTable("AssetBrowserUnityGrid", columns, ImGuiTableFlags_SizingFixedSame | ImGuiTableFlags_NoSavedSettings))
+    const int columns = std::max(1, static_cast<int>(panelWidth / (kAssetCellWidth + ImGui::GetStyle().ItemSpacing.x)));
+    if (ImGui::BeginTable("AssetBrowserGrid", columns, ImGuiTableFlags_SizingFixedSame | ImGuiTableFlags_NoSavedSettings))
     {
         for (int i = 0; i < columns; ++i)
-            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, cellWidth);
-        for (const std::string& folder : folders)
-        {
+            ImGui::TableSetupColumn(nullptr, ImGuiTableColumnFlags_WidthFixed, kAssetCellWidth);
+        const auto beginCell = []() {
             ImGui::TableNextColumn();
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (kAssetCellWidth - kAssetTileSize) * 0.5f);
             ImGui::BeginGroup();
-            RenderAssetBrowserFolderTile(folder, tileSize);
+        };
+        for (const std::string& folder : *folderView)
+        {
+            beginCell();
+            RenderAssetBrowserFolderTile(folder, kAssetTileSize);
             ImGui::EndGroup();
         }
-        for (const AssetLibrary::Entry& entry : assets)
+        for (const AssetLibrary::Entry& entry : *assetView)
         {
-            ImGui::TableNextColumn();
-            ImGui::BeginGroup();
-            RenderAssetTile(entry, tileSize);
+            beginCell();
+            RenderAssetTile(entry, kAssetTileSize);
             ImGui::EndGroup();
+            if (entry.category == AssetLibrary::Category::Model && m_expandedModelAssets.contains(entry.id))
+            {
+                const auto& contents = QueryModelContents(entry);
+                ImGui::PushID(entry.id.c_str());
+                for (const auto& child : contents.assets)
+                {
+                    beginCell();
+                    const ImVec2 childMin = ImGui::GetCursorScreenPos();
+                    ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(childMin.x - 5.0f, childMin.y - 3.0f),
+                        ImVec2(childMin.x + kAssetTileSize + 5.0f, childMin.y + kAssetTileSize + 24.0f),
+                        IM_COL32(45, 65, 78, 120), 5.0f);
+                    RenderAssetTile(child, kAssetTileSize);
+                    ImGui::EndGroup();
+                }
+                if (contents.assets.empty())
+                {
+                    beginCell();
+                    ImGui::TextDisabled(contents.missingTextures.empty() ? "No materials\nor textures" : "Missing textures\nSee model tooltip");
+                    ImGui::EndGroup();
+                }
+                ImGui::PopID();
+            }
         }
         ImGui::EndTable();
     }
-    if (folders.empty() && assets.empty())
-        ImGui::TextDisabled("Empty folder.");
+    if (folderView->empty() && assetView->empty())
+    {
+        ImGui::Spacing();
+        ImGui::TextDisabled(searching ? "Nothing matches the search."
+                                      : "This folder is empty. Drop files here from the OS, or use Create / Import above.");
+    }
+
+    // The empty area under the tiles takes drops too (into the folder shown) and opens the create menu.
+    const ImVec2 remaining = ImGui::GetContentRegionAvail();
+    if (!searching && remaining.x > 1.0f && remaining.y > 1.0f)
+    {
+        ImGui::InvisibleButton("##asset_content_drop", remaining);
+        AcceptAssetBrowserDrop(m_assetSubpath);
+        ImGui::OpenPopupOnItemClick("AssetBrowserContentContext", ImGuiPopupFlags_MouseButtonRight);
+    }
 
     if (ImGui::BeginPopupContextWindow("AssetBrowserContentContext", ImGuiPopupFlags_MouseButtonRight | ImGuiPopupFlags_NoOpenOverItems))
     {
-        if (ImGui::MenuItem("New Folder"))
-        {
-            m_assetNewFolderParent = m_assetSubpath;
-            CopyToBuffer(m_newAssetFolderName, sizeof(m_newAssetFolderName), UniqueFolderName(AssetBrowserPath(m_assetSubpath)));
-            m_assetOpenNewFolderPopup = true;
-        }
-        if (ImGui::MenuItem("New Lua Script"))
-            CreateLuaScriptAsset();
-        if (ImGui::MenuItem("New C++ Script"))
-            CreateNativeScriptAsset();
-        if (ImGui::MenuItem("New Material"))
-            CreatePbrMaterialAsset();
-        if (ImGui::MenuItem("New Water Material"))
-            CreateWaterMaterialAsset();
-        if (ImGui::MenuItem("New Physics Material"))
-            CreatePhysicsMaterialAsset();
-        ImGui::Separator();
-        if (ImGui::MenuItem("Import Asset..."))
-            OpenImportAssetDialog(m_assetSubpath);
+        RenderAssetCreateMenuItems(m_assetSubpath);
         ImGui::EndPopup();
     }
 }
@@ -756,7 +715,7 @@ void EditorImGui::RenderAssetBrowserOperationPopups()
         ImGui::TextDisabled("Target: %s", target.generic_string().c_str());
         ImGui::TextWrapped("Choose a supported source file, or drag files from Explorer onto the editor window.");
         ImGui::InputText("Source File", m_assetImportPathBuffer, sizeof(m_assetImportPathBuffer));
-        ImGui::TextDisabled("Supported: png jpg jpeg tga bmp dds ktx glb gltf fbx obj material anim ozz wav ogg mp3 flac");
+        ImGui::TextDisabled("Supported: png jpg jpeg tga bmp dds ktx hdr exr glb gltf fbx obj material anim ozz wav ogg mp3 flac");
 
         ImGui::Separator();
         ImGui::InputText("Browse Path", m_assetImportBrowserPathBuffer, sizeof(m_assetImportBrowserPathBuffer));
@@ -884,7 +843,7 @@ void EditorImGui::RenderCreatePbrMaterialPopup()
     {
         AssetLibrary::ImportOptions options{};
         options.displayName = m_createMaterialName[0] != '\0' ? m_createMaterialName : "material";
-        options.subpath = m_assetSubpath;
+        options.subpath = m_createMaterialTargetSubpath;
         options.tags = {"material"};
         AssetLibrary::MaterialData material{};
         material.shadingMode = m_createMaterialShadingMode == 1 ? "unlit" : "lit";
@@ -897,8 +856,7 @@ void EditorImGui::RenderCreatePbrMaterialPopup()
         }
         else
         {
-            m_assetFilter = AssetBrowserFilter::Material;
-            m_selectedAssetId = entry.id;
+            RevealCreatedAsset(entry);
             m_assetStatus = "Material created: " + entry.displayName;
             Tracenf("[MATERIAL] created path=%s shadingMode=%s",
                 m_assetLibrary->AbsolutePath(entry).generic_string().c_str(),
@@ -1025,33 +983,12 @@ void EditorImGui::RenderFbxExportPopup()
     ImGui::EndPopup();
 }
 
-void EditorImGui::RenderAssetTagFilters()
-{
-    const std::vector<std::pair<std::string, std::uint32_t>> tags = QueryVisibleTags();
-    ImGui::TextUnformatted("Tags");
-    ImGui::Separator();
-    for (const auto& tag : tags)
-    {
-        bool active = std::find(m_activeAssetTags.begin(), m_activeAssetTags.end(), tag.first) != m_activeAssetTags.end();
-        const std::string label = tag.first + " (" + std::to_string(tag.second) + ")";
-        if (ImGui::Checkbox(label.c_str(), &active))
-        {
-            if (active)
-                m_activeAssetTags.push_back(tag.first);
-            else
-                m_activeAssetTags.erase(std::remove(m_activeAssetTags.begin(), m_activeAssetTags.end(), tag.first), m_activeAssetTags.end());
-        }
-    }
-    if (!m_activeAssetTags.empty() && ImGui::Button("Clear Filters"))
-        m_activeAssetTags.clear();
-}
-
 void EditorImGui::RenderAssetBrowser()
 {
-    if (!m_editorModeActive)
+    if (!m_editorModeActive || !m_assetBrowserPanelOpen)
         return;
 
-    if (ImGui::Begin("Asset Browser"))
+    if (ImGui::Begin(EditorWindow::AssetBrowser, &m_assetBrowserPanelOpen))
     {
         if (!m_assetLibrary)
         {
@@ -1063,16 +1000,10 @@ void EditorImGui::RenderAssetBrowser()
         RenderAssetBrowserToolbar();
         ImGui::Separator();
 
-        if (!m_assetStatus.empty())
-        {
-            ImGui::TextDisabled("%s", m_assetStatus.c_str());
-            ImGui::Separator();
-        }
-
         const float browserPanelHeight = std::max(140.0f, ImGui::GetContentRegionAvail().y);
         if (ImGui::BeginTable("AssetBrowserLayout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV))
         {
-            ImGui::TableSetupColumn("Folder Tree", ImGuiTableColumnFlags_WidthFixed, 230.0f);
+            ImGui::TableSetupColumn("Folders", ImGuiTableColumnFlags_WidthFixed, 210.0f);
             ImGui::TableSetupColumn("Content", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableNextRow();
 
@@ -1138,30 +1069,16 @@ void EditorImGui::RenderAssetBrowser()
 
 void EditorImGui::RenderScriptsPanel()
 {
-    if (!m_editorModeActive)
+    if (!m_editorModeActive || !m_scriptsPanelOpen)
         return;
-    if (!ImGui::Begin("Scripts"))
+    DockBesideIfUnplaced(EditorWindow::Scripts, EditorWindow::AssetBrowser);
+    if (!ImGui::Begin(EditorWindow::Scripts, &m_scriptsPanelOpen))
     {
         ImGui::End();
         return;
     }
 
     const bool hasProject = ProjectManager::Instance().HasProject();
-
-    // Build the project's native C++ game scripts (same action as the toolbar Build button).
-    const bool canBuild = hasProject && m_playModeState.mode == EditorPlayMode::Edit && !IsBuildRunning();
-    if (!canBuild)
-        ImGui::BeginDisabled();
-    if (ImGui::Button(IsBuildRunning() ? ICON_FA_HAMMER " Building..." : ICON_FA_HAMMER " Build Game Scripts"))
-        m_commands.buildGameScripts = true;
-    if (!canBuild)
-        ImGui::EndDisabled();
-    ImGui::SameLine();
-    ImGui::TextDisabled("compiles <Project>/Scripts -> Binaries + reloads");
-    ImGui::Checkbox("Auto-build on save", &m_autoBuildOnSave);
-    ImGui::SameLine();
-    ImGui::TextDisabled("(.cpp save -> auto Build in Edit; .lua hot-reloads live in Play)");
-    ImGui::Separator();
 
     auto openExternal = [this](const std::filesystem::path& p) {
         std::string err;
@@ -1170,84 +1087,13 @@ void EditorImGui::RenderScriptsPanel()
         else
             m_assetStatus = "Open failed: " + err;
     };
-
-    // --- Native C++ source (<ProjectRoot>/Scripts/*.cpp,*.h) ---
-    ImGui::SeparatorText("C++ source (Scripts/)");
-    if (hasProject && ImGui::Button(ICON_FA_PLUS " New C++ Script"))
-    {
-        CopyToBuffer(m_newCppScriptName, sizeof(m_newCppScriptName), std::string("MyScript"));
-        m_openNewCppScriptPopup = true;
-    }
-    if (m_openNewCppScriptPopup)
-    {
-        ImGui::OpenPopup("NewCppScript");
-        m_openNewCppScriptPopup = false;
-    }
-    if (ImGui::BeginPopupModal("NewCppScript", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-        ImGui::TextUnformatted("Class name (the file is named after it):");
-        ImGui::InputText("##cppname", m_newCppScriptName, sizeof(m_newCppScriptName));
-        if (ImGui::Button("Create") && m_newCppScriptName[0] != '\0')
-        {
-            CreateNativeScriptFile(m_newCppScriptName);
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Cancel"))
-            ImGui::CloseCurrentPopup();
-        ImGui::EndPopup();
-    }
-    if (!hasProject)
-    {
-        ImGui::TextDisabled("No project open.");
-    }
-    else
-    {
-        const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
-        std::error_code ec;
-        bool anySource = false;
-        if (std::filesystem::is_directory(scriptsDir, ec))
-        {
-            for (const std::filesystem::directory_entry& e :
-                 std::filesystem::recursive_directory_iterator(
-                     scriptsDir, std::filesystem::directory_options::skip_permission_denied, ec))
-            {
-                if (!e.is_regular_file(ec))
-                    continue;
-                if (e.path().generic_string().find("/build/") != std::string::npos)
-                    continue;
-                std::string ext = e.path().extension().string();
-                std::transform(ext.begin(), ext.end(), ext.begin(),
-                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                if (ext != ".cpp" && ext != ".h" && ext != ".hpp" && ext != ".cxx" && ext != ".cc")
-                    continue;
-                anySource = true;
-                const std::string rel = std::filesystem::relative(e.path(), scriptsDir, ec).generic_string();
-                ImGui::PushID(rel.c_str());
-                if (ImGui::Selectable((ICON_FA_FILE " " + rel).c_str(), false,
-                        ImGuiSelectableFlags_AllowDoubleClick) &&
-                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                {
-                    openExternal(e.path());
-                }
-                ImGui::PopID();
-            }
-        }
-        if (!anySource)
-            ImGui::TextDisabled("No C++ scripts yet — use \"New C++ Script\" or click Build to scaffold Game.cpp.");
-    }
-
-    // --- Lua script assets ---
-    ImGui::SeparatorText("Lua scripts (.lua assets)");
-    if (m_assetLibrary && ImGui::Button(ICON_FA_PLUS " New Lua Script"))
-        CreateLuaScriptAsset();
-    if (m_assetLibrary)
-    {
-        const std::vector<AssetLibrary::Entry> luaScripts =
-            m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
-        if (luaScripts.empty())
-            ImGui::TextDisabled("No .lua scripts. Drop a .lua into the asset browser.");
-        for (const AssetLibrary::Entry& e : luaScripts)
+    // Cached per asset-library revision: the panel renders every frame and EntriesFor copies the
+    // whole Script category.
+    const auto scriptAssetsWithExtension = [this](const char* extension) -> const std::vector<AssetLibrary::Entry>& {
+        return CachedScriptAssets(extension);
+    };
+    const auto renderScriptList = [&](const std::vector<AssetLibrary::Entry>& scripts, const char* dragLabel) {
+        for (const AssetLibrary::Entry& e : scripts)
         {
             ImGui::PushID(e.id.c_str());
             if (ImGui::Selectable((ICON_FA_FILE " " + e.displayName).c_str(), false,
@@ -1256,34 +1102,83 @@ void EditorImGui::RenderScriptsPanel()
             {
                 openExternal(m_assetLibrary->AbsolutePath(e));
             }
-            // Drag a .lua onto an entity row in the hierarchy to attach it (Unity-style).
+            // Drag onto an entity row in the Hierarchy to attach it (Unity-style).
             if (ImGui::BeginDragDropSource())
             {
                 ImGui::SetDragDropPayload(kAssetPayloadType, e.id.data(), e.id.size());
                 ImGui::Text("%s", e.displayName.c_str());
-                ImGui::TextDisabled("Lua script");
+                ImGui::TextDisabled("%s", dragLabel);
                 ImGui::EndDragDropSource();
             }
             ImGui::PopID();
         }
+    };
+
+    // --- AngelScript (.as assets): a project scripting language (hot-reloaded in Play, like Lua) ---
+    ImGui::SeparatorText("AngelScript (.as assets)");
+    if (m_assetLibrary && ImGui::Button(ICON_FA_PLUS " New AngelScript"))
+        CreateAngelScriptAsset();
+    if (m_assetLibrary)
+    {
+        const std::vector<AssetLibrary::Entry>& scripts = scriptAssetsWithExtension(".as");
+        if (scripts.empty())
+            ImGui::TextDisabled("No .as scripts. Drop an .as into the asset browser or click New AngelScript.");
+        renderScriptList(scripts, "AngelScript script");
+    }
+    if (!hasProject)
+        ImGui::TextDisabled("No project open.");
+
+    // --- Lua script assets ---
+    ImGui::SeparatorText("Lua scripts (.lua assets)");
+    if (m_assetLibrary && ImGui::Button(ICON_FA_PLUS " New Lua Script"))
+        CreateLuaScriptAsset();
+    if (m_assetLibrary)
+    {
+        const std::vector<AssetLibrary::Entry>& luaScripts = scriptAssetsWithExtension(".lua");
+        if (luaScripts.empty())
+            ImGui::TextDisabled("No .lua scripts. Drop a .lua into the asset browser.");
+        renderScriptList(luaScripts, "Lua script");
     }
 
-    // --- Registered native C++ classes (drag onto an entity to attach a Native Script component) ---
-    ImGui::SeparatorText("Registered C++ classes");
+    // --- LEGACY native C++ sources: shown only while the project actually has .cpp Script assets ---
+    if (hasProject && ProjectHasNativeScriptSources())
     {
-        const std::vector<std::string> classes = ixscript::NativeBackend::RegisteredNames();
-        if (classes.empty())
-            ImGui::TextDisabled("No native classes — Build your C++ scripts first.");
-        for (const std::string& cls : classes)
+        ImGui::SeparatorText("Legacy C++ source");
+        ImGui::TextDisabled("C++ is no longer a project scripting language (use AngelScript or Lua).");
+        const bool canBuild = m_playModeState.mode == EditorPlayMode::Edit && !IsBuildRunning();
+        if (!canBuild)
+            ImGui::BeginDisabled();
+        if (ImGui::Button(IsBuildRunning() ? ICON_FA_HAMMER "  Compiling..." : ICON_FA_HAMMER "  Compile Legacy C++ Scripts"))
+            m_commands.buildGameScripts = true;
+        if (!canBuild)
+            ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Checkbox("Compile on save", &m_autoBuildOnSave);
+
+        const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
+        // The .cpp Script assets (anywhere in the asset folder): cached with the browser listings.
+        ValidateAssetBrowserCache();
+        if (!m_assetBrowserCache.nativeScriptSources && m_assetLibrary)
         {
-            ImGui::PushID(cls.c_str());
-            ImGui::Selectable((ICON_FA_FILE " " + cls).c_str());
-            if (ImGui::BeginDragDropSource())
+            auto& sources = m_assetBrowserCache.nativeScriptSources.emplace();
+            for (const AssetLibrary::Entry& e : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
             {
-                ImGui::SetDragDropPayload(kNativeClassPayloadType, cls.data(), cls.size());
-                ImGui::Text("%s", cls.c_str());
-                ImGui::TextDisabled("C++ class");
-                ImGui::EndDragDropSource();
+                const std::filesystem::path p = m_assetLibrary->AbsolutePath(e);
+                if (IsNativeScriptSource(scriptsDir, p))
+                    sources.emplace_back(p, e.subpath.empty() ? e.filename : e.subpath + "/" + e.filename);
+            }
+            std::sort(sources.begin(), sources.end(), [](const auto& a, const auto& b) { return a.second < b.second; });
+        }
+        if (!m_assetBrowserCache.nativeScriptSources)
+            m_assetBrowserCache.nativeScriptSources.emplace();
+        for (const auto& [path, rel] : *m_assetBrowserCache.nativeScriptSources)
+        {
+            ImGui::PushID(rel.c_str());
+            if (ImGui::Selectable((ICON_FA_FILE " " + rel).c_str(), false,
+                    ImGuiSelectableFlags_AllowDoubleClick) &&
+                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+            {
+                openExternal(path);
             }
             ImGui::PopID();
         }

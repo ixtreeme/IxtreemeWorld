@@ -1,8 +1,10 @@
 #include "PhysicsWorld.h"
 
 #include "Debug.h"
+#include "JobSystem.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <mutex>
 #include <thread>
@@ -13,7 +15,8 @@
 #include <Jolt/Jolt.h>
 #include <Jolt/RegisterTypes.h>
 #include <Jolt/Core/Factory.h>
-#include <Jolt/Core/JobSystemThreadPool.h>
+#include <Jolt/Core/FixedSizeFreeList.h>
+#include <Jolt/Core/JobSystemWithBarrier.h>
 #include <Jolt/Core/TempAllocator.h>
 #include <Jolt/Physics/Body/Body.h>
 #include <Jolt/Physics/Body/BodyActivationListener.h>
@@ -647,6 +650,92 @@ private:
 #endif
 }
 
+#if defined(IXENGINE_PHYSICS_WITH_JOLT)
+namespace
+{
+// Jolt's jobs on the engine's shared worker pool (ixjobs), instead of a pool of Jolt's own whose
+// threads would compete with the engine's for the same cores. Jolt keeps the dependencies and the
+// barriers (a barrier's waiter runs its jobs too); a job is queued here once it is ready to run.
+class EngineJoltJobSystem final : public JPH::JobSystemWithBarrier
+{
+public:
+    EngineJoltJobSystem(JPH::uint maxJobs, JPH::uint maxBarriers)
+    {
+        JobSystemWithBarrier::Init(maxBarriers);
+        m_jobs.Init(maxJobs, maxJobs);
+    }
+
+    // A barrier's waiter may have run a job whose queued task still holds it: those tasks release
+    // their jobs into this system, so it outlives them.
+    ~EngineJoltJobSystem() override
+    {
+        ixjobs::JobSystem::Instance().Wait(m_queued);
+    }
+
+    int GetMaxConcurrency() const override
+    {
+        return static_cast<int>(ixjobs::JobSystem::Instance().WorkerCount()) + 1;
+    }
+
+    JPH::JobHandle CreateJob(const char* name,
+        JPH::ColorArg color,
+        const JobFunction& function,
+        JPH::uint32 dependencies = 0) override
+    {
+        JPH::uint32 index;
+        for (;;)
+        {
+            index = m_jobs.ConstructObject(name, color, this, function, dependencies);
+            if (index != AvailableJobs::cInvalidObjectIndex)
+                break;
+            JPH_ASSERT(false, "No jobs available!");
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        Job* job = &m_jobs.Get(index);
+        // The handle keeps a reference: the job may run (and finish) as soon as it is queued.
+        JPH::JobHandle handle(job);
+        if (dependencies == 0)
+            QueueJob(job);
+        return handle;
+    }
+
+    void QueueJob(Job* job) override
+    {
+        ixjobs::JobSystem& pool = ixjobs::JobSystem::Instance();
+        // No workers: the barrier the job is added to runs it on the thread that waits for it.
+        if (!pool.Parallel())
+            return;
+        job->AddRef();
+        pool.Submit(
+            [](void* data, std::uint32_t) {
+                Job* queued = static_cast<Job*>(data);
+                queued->Execute();  // a no-op if a barrier's waiter ran it already
+                queued->Release();
+            },
+            job,
+            0,
+            &m_queued);
+    }
+
+    void QueueJobs(Job** jobs, JPH::uint count) override
+    {
+        for (JPH::uint i = 0; i < count; ++i)
+            QueueJob(jobs[i]);
+    }
+
+    void FreeJob(Job* job) override
+    {
+        m_jobs.DestructObject(job);
+    }
+
+private:
+    using AvailableJobs = JPH::FixedSizeFreeList<Job>;
+    AvailableJobs m_jobs;
+    ixjobs::Counter m_queued;  // this system's tasks still on the pool
+};
+} // namespace
+#endif
+
 struct PhysicsWorld::Impl
 {
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
@@ -654,12 +743,14 @@ struct PhysicsWorld::Impl
     ObjectVsBroadPhaseLayerFilter objectVsBroadPhaseLayerFilter;
     ObjectLayerPairFilter objectLayerPairFilter;
     std::unique_ptr<JPH::TempAllocatorImpl> tempAllocator;
-    std::unique_ptr<JPH::JobSystemThreadPool> jobSystem;
+    std::unique_ptr<EngineJoltJobSystem> jobSystem;
     std::unordered_map<BodyId, PhysicsSurfaceProperties> bodySurfaces;
     std::unique_ptr<EngineContactListener> contactListener;
     JPH::PhysicsSystem system;
     std::unordered_map<BodyId, JPH::BodyID> bodies;
     std::unordered_map<ConstraintId, JPH::Ref<JPH::Constraint>> constraints;
+    struct SuspendedMotion { JPH::Vec3 linear, angular; bool active; };
+    std::unordered_map<BodyId, SuspendedMotion> suspendedMotion;
 #else
     std::unordered_map<BodyId, PhysicsTransform> bodies;
 #endif
@@ -712,10 +803,7 @@ bool PhysicsWorld::Create()
     constexpr std::uint32_t maxContactConstraints = 20480;
     constexpr std::uint32_t tempAllocatorSizeBytes = 128u * 1024u * 1024u;
     m_impl->tempAllocator = std::make_unique<JPH::TempAllocatorImpl>(tempAllocatorSizeBytes);
-    m_impl->jobSystem = std::make_unique<JPH::JobSystemThreadPool>(
-        JPH::cMaxPhysicsJobs,
-        JPH::cMaxPhysicsBarriers,
-        std::max(1u, std::thread::hardware_concurrency() > 1 ? std::thread::hardware_concurrency() - 1 : 1u));
+    m_impl->jobSystem = std::make_unique<EngineJoltJobSystem>(JPH::cMaxPhysicsJobs, JPH::cMaxPhysicsBarriers);
     m_impl->system.Init(maxBodies,
         bodyMutexes,
         maxBodyPairs,
@@ -786,10 +874,11 @@ void PhysicsWorld::Destroy()
         for (const auto& entry : m_impl->constraints)
             m_impl->system.RemoveConstraint(entry.second);
         m_impl->constraints.clear();
+        m_impl->suspendedMotion.clear();
         JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
         for (const auto& entry : m_impl->bodies)
         {
-            bodies.RemoveBody(entry.second);
+            if (bodies.IsAdded(entry.second)) bodies.RemoveBody(entry.second);
             bodies.DestroyBody(entry.second);
         }
     }
@@ -883,8 +972,16 @@ BodyId PhysicsWorld::CreateTerrainCollider(const TerrainColliderDesc& desc)
     const std::uint32_t vertsZ = desc.cellsZ + 1u;
     const std::size_t expectedHeights = static_cast<std::size_t>(vertsX) * static_cast<std::size_t>(vertsZ);
     const bool hasHeightGrid = desc.heightCmGrid.size() >= expectedHeights;
-    const float cellX = desc.widthMeters / static_cast<float>(desc.cellsX);
-    const float cellZ = desc.depthMeters / static_cast<float>(desc.cellsZ);
+    // Authored terrain has an explicit isotropic cell size. Dividing its
+    // rounded float extent back by the cell count can produce a different
+    // float pitch and move the physical triangles away from render vertices.
+    // Keep the historical per-axis interpretation for other legacy callers.
+    const bool authoredCellSize = std::isfinite(desc.cellSizeMeters) && desc.cellSizeMeters > 0.0f &&
+        std::isfinite(desc.widthMeters) && std::isfinite(desc.depthMeters) &&
+        desc.widthMeters == static_cast<float>(desc.cellsX) * desc.cellSizeMeters &&
+        desc.depthMeters == static_cast<float>(desc.cellsZ) * desc.cellSizeMeters;
+    const float cellX = authoredCellSize ? desc.cellSizeMeters : desc.widthMeters / static_cast<float>(desc.cellsX);
+    const float cellZ = authoredCellSize ? desc.cellSizeMeters : desc.depthMeters / static_cast<float>(desc.cellsZ);
 
     const BodyId id = m_impl->nextBodyId++;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
@@ -1048,12 +1145,58 @@ void PhysicsWorld::DestroyBody(BodyId id)
         return;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    bodies.RemoveBody(it->second);
+    for (auto constraint = m_impl->constraints.begin(); constraint != m_impl->constraints.end();) {
+        auto* joint = static_cast<JPH::TwoBodyConstraint*>(constraint->second.GetPtr());
+        if (joint->GetBody1()->GetID() == it->second || joint->GetBody2()->GetID() == it->second) {
+            m_impl->system.RemoveConstraint(constraint->second);
+            constraint = m_impl->constraints.erase(constraint);
+        } else ++constraint;
+    }
+    if (bodies.IsAdded(it->second)) bodies.RemoveBody(it->second);
     bodies.DestroyBody(it->second);
 #endif
     m_impl->bodies.erase(it);
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     m_impl->bodySurfaces.erase(id);
+    m_impl->suspendedMotion.erase(id);
+#endif
+}
+
+void PhysicsWorld::SetBodyEnabled(BodyId id, bool enabled)
+{
+    if (!m_impl || !m_impl->created) return;
+    auto it = m_impl->bodies.find(id);
+    if (it == m_impl->bodies.end()) return;
+#if defined(IXENGINE_PHYSICS_WITH_JOLT)
+    auto& bodies = m_impl->system.GetBodyInterface();
+    if (bodies.IsAdded(it->second) == enabled) return;
+    // Keep body/velocity/constraint objects, but suspend constraints before removing a body.
+    for (auto& [cid, base] : m_impl->constraints) {
+        auto* joint = static_cast<JPH::TwoBodyConstraint*>(base.GetPtr());
+        if (!enabled && (joint->GetBody1()->GetID() == it->second || joint->GetBody2()->GetID() == it->second))
+            joint->SetEnabled(false);
+    }
+    if (enabled) {
+        const auto motion = m_impl->suspendedMotion.find(id);
+        bodies.AddBody(it->second, motion != m_impl->suspendedMotion.end() && motion->second.active
+            ? JPH::EActivation::Activate : JPH::EActivation::DontActivate);
+        if (motion != m_impl->suspendedMotion.end()) {
+            bodies.SetLinearAndAngularVelocity(it->second, motion->second.linear, motion->second.angular);
+            m_impl->suspendedMotion.erase(motion);
+        }
+    } else {
+        // Jolt deactivation zeroes motion, so snapshot it before RemoveBody.
+        if (bodies.GetMotionType(it->second) != JPH::EMotionType::Static)
+            m_impl->suspendedMotion[id] = {bodies.GetLinearVelocity(it->second),
+                bodies.GetAngularVelocity(it->second), bodies.IsActive(it->second)};
+        bodies.RemoveBody(it->second);
+    }
+    for (auto& [cid, base] : m_impl->constraints) {
+        auto* joint = static_cast<JPH::TwoBodyConstraint*>(base.GetPtr());
+        joint->SetEnabled(bodies.IsAdded(joint->GetBody1()->GetID()) && bodies.IsAdded(joint->GetBody2()->GetID()));
+    }
+#else
+    (void)enabled;
 #endif
 }
 
@@ -1070,7 +1213,7 @@ void PhysicsWorld::SetBodyTransform(BodyId id, const PhysicsTransform& transform
         it->second,
         JPH::RVec3(transform.position[0], transform.position[1], transform.position[2]),
         JPH::Quat(transform.rotation[0], transform.rotation[1], transform.rotation[2], transform.rotation[3]),
-        JPH::EActivation::Activate);
+        bodies.IsAdded(it->second) ? JPH::EActivation::Activate : JPH::EActivation::DontActivate);
 #else
     it->second = transform;
 #endif
@@ -1110,12 +1253,32 @@ bool PhysicsWorld::SetLinearVelocity(BodyId id, const float velocity[3])
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
     if (bodies.GetMotionType(it->second) == JPH::EMotionType::Static)
         return false;
-    bodies.SetLinearVelocity(it->second, JPH::Vec3(velocity[0], velocity[1], velocity[2]));
+    if (auto paused = m_impl->suspendedMotion.find(id); paused != m_impl->suspendedMotion.end())
+        paused->second.linear = JPH::Vec3(velocity[0], velocity[1], velocity[2]);
+    else bodies.SetLinearVelocity(it->second, JPH::Vec3(velocity[0], velocity[1], velocity[2]));
 #else
     (void)velocity;
     return false;
 #endif
     return true;
+}
+
+bool PhysicsWorld::SetAngularVelocity(BodyId id, const float velocity[3])
+{
+    if (!m_impl || !m_impl->created || !velocity) return false;
+    auto it=m_impl->bodies.find(id);
+    if(it==m_impl->bodies.end()) return false;
+#if defined(IXENGINE_PHYSICS_WITH_JOLT)
+    auto& bodies=m_impl->system.GetBodyInterface();
+    if(bodies.GetMotionType(it->second)==JPH::EMotionType::Static) return false;
+    const JPH::Vec3 value(velocity[0],velocity[1],velocity[2]);
+    if(auto paused=m_impl->suspendedMotion.find(id); paused!=m_impl->suspendedMotion.end())
+        paused->second.angular=value;
+    else bodies.SetAngularVelocity(it->second,value);
+    return true;
+#else
+    return false;
+#endif
 }
 
 bool PhysicsWorld::GetLinearVelocity(BodyId id, float outVelocity[3]) const
@@ -1131,7 +1294,9 @@ bool PhysicsWorld::GetLinearVelocity(BodyId id, float outVelocity[3]) const
     if (it == m_impl->bodies.end())
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
-    const JPH::Vec3 velocity = m_impl->system.GetBodyInterface().GetLinearVelocity(it->second);
+    const auto paused = m_impl->suspendedMotion.find(id);
+    const JPH::Vec3 velocity = paused != m_impl->suspendedMotion.end() ? paused->second.linear
+        : m_impl->system.GetBodyInterface().GetLinearVelocity(it->second);
     outVelocity[0] = velocity.GetX();
     outVelocity[1] = velocity.GetY();
     outVelocity[2] = velocity.GetZ();
@@ -1155,7 +1320,9 @@ bool PhysicsWorld::GetAngularVelocity(BodyId id, float outVelocity[3]) const
     if (it == m_impl->bodies.end())
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
-    const JPH::Vec3 velocity = m_impl->system.GetBodyInterface().GetAngularVelocity(it->second);
+    const auto paused = m_impl->suspendedMotion.find(id);
+    const JPH::Vec3 velocity = paused != m_impl->suspendedMotion.end() ? paused->second.angular
+        : m_impl->system.GetBodyInterface().GetAngularVelocity(it->second);
     outVelocity[0] = velocity.GetX();
     outVelocity[1] = velocity.GetY();
     outVelocity[2] = velocity.GetZ();
@@ -1190,7 +1357,7 @@ bool PhysicsWorld::MoveKinematic(BodyId id, const PhysicsTransform& targetTransf
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    if (bodies.GetMotionType(it->second) != JPH::EMotionType::Kinematic)
+    if (!bodies.IsAdded(it->second) || bodies.GetMotionType(it->second) != JPH::EMotionType::Kinematic)
         return false;
     const float safeDelta = std::clamp(deltaSeconds, 1.0f / 240.0f, 1.0f / 15.0f);
     bodies.MoveKinematic(
@@ -1219,7 +1386,7 @@ bool PhysicsWorld::AddForce(BodyId id, const float force[3])
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    if (bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
+    if (!bodies.IsAdded(it->second) || bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
         return false;
     bodies.AddForce(it->second, JPH::Vec3(force[0], force[1], force[2]), JPH::EActivation::Activate);
 #else
@@ -1238,7 +1405,7 @@ bool PhysicsWorld::AddImpulse(BodyId id, const float impulse[3])
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    if (bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
+    if (!bodies.IsAdded(it->second) || bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
         return false;
     bodies.AddImpulse(it->second, JPH::Vec3(impulse[0], impulse[1], impulse[2]));
 #else
@@ -1257,7 +1424,7 @@ bool PhysicsWorld::AddAngularImpulse(BodyId id, const float angularImpulse[3])
         return false;
 #if defined(IXENGINE_PHYSICS_WITH_JOLT)
     JPH::BodyInterface& bodies = m_impl->system.GetBodyInterface();
-    if (bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
+    if (!bodies.IsAdded(it->second) || bodies.GetMotionType(it->second) != JPH::EMotionType::Dynamic)
         return false;
     bodies.AddAngularImpulse(it->second, JPH::Vec3(angularImpulse[0], angularImpulse[1], angularImpulse[2]));
 #else

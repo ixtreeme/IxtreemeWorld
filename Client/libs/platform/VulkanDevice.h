@@ -23,35 +23,19 @@ public:
     // framebuffers — those are backend-owned). Public for backend use only.
     bool RecreateSwapchain(uint32_t width, uint32_t height);
 
-    // Phase-3C migration shims, synced by IXVulkanDevice every frame so
-    // still-native renderers (terrain/skinned/RmlUi) keep working unchanged.
-    // GetCommandBuffer returns the backend-active buffer; indices/numbers and
-    // IsFrameActive mirror backend authority; GetRenderPass returns the
-    // backend-owned main pass mirror (legacy must never destroy it).
-    void SetMigrationFrameState(VkCommandBuffer activeCmd,
-                                uint32_t frameIndex,
-                                uint32_t imageIndex,
-                                uint64_t frameNumber,
-                                uint64_t safeFrameNumber,
-                                bool frameActive);
-    void SetMigrationMainPass(VkRenderPass pass) { m_renderPass = pass; }
+    // Phase-3F: frame-migration shims deleted (no generic native renderer
+    // remains). Frame authority is IXVulkanDevice (BeginFrame/EndFrame);
+    // swapchain images/views/queues below stay backend infrastructure.
     VkSwapchainKHR GetSwapchain() const { return m_swapchain; }
     VkQueue GetPresentQueue() const { return m_presentQueue; }
     VkImage GetSwapchainImage(uint32_t index) const;
     VkImageView GetSwapchainImageView(uint32_t index) const;
 
-    bool IsFrameActive() const { return m_frameStarted && !m_skipFrame; }
     VkInstance GetInstance() const { return m_instance; }
     VkPhysicalDevice GetPhysicalDevice() const { return m_physicalDevice; }
     VkDevice GetDevice() const { return m_device; }
     VkQueue GetGraphicsQueue() const { return m_graphicsQueue; }
     uint32_t GetGraphicsQueueFamily() const { return m_queueFamilies.graphics; }
-    VkRenderPass GetRenderPass() const { return m_renderPass; }
-    // Migration shim: the backend-active command buffer while a frame records
-    // (null outside frames). Still-native renderers must only call this
-    // between backend BeginFrame success and EndFrame.
-    VkCommandBuffer GetCommandBuffer() const { return m_migrationActiveCmd; }
-    uint32_t GetFrameIndex() const { return m_currentFrame; }
     VkExtent2D GetSwapchainExtent() const { return m_swapchainExtent; }
     // False when the swapchain fell back to FIFO (vsync) — i.e. FPS is capped to the
     // monitor refresh. True for IMMEDIATE/MAILBOX (uncapped).
@@ -60,8 +44,6 @@ public:
     VkFormat GetDepthStencilFormat() const { return m_depthStencilFormat; }
     VkSurfaceTransformFlagBitsKHR GetSurfaceTransform() const { return m_currentTransform; }
     uint32_t GetSwapchainImageCount() const { return static_cast<uint32_t>(m_swapchainImages.size()); }
-    uint64_t GetFrameNumber() const { return m_frameNumber; }
-    uint64_t GetSafeFrameNumber() const { return m_safeFrameNumber; }
     bool SupportsSamplerAnisotropy() const { return m_samplerAnisotropySupported; }
     float GetMaxSamplerAnisotropy() const { return m_maxSamplerAnisotropy; }
     uint32_t GetWidth() const { return m_width; }
@@ -126,19 +108,8 @@ private:
     std::vector<VkDeviceMemory> m_depthStencilMemory;
     std::vector<VkImageView> m_depthStencilImageViews;
 
-    VkRenderPass m_renderPass = VK_NULL_HANDLE; // backend-owned mirror (3C); legacy never frees
-    // Backend-active command buffer for still-native renderers (synced per frame).
-    VkCommandBuffer m_migrationActiveCmd = VK_NULL_HANDLE;
-
-    uint32_t m_currentFrame = 0; // backend-synced mirror (deleted with shims)
-    uint32_t m_imageIndex = 0; // backend-synced mirror (deleted with shims)
     uint32_t m_width = 0;
     uint32_t m_height = 0;
-    uint64_t m_frameNumber = 0; // backend-synced mirror (deleted with shims)
-    uint64_t m_safeFrameNumber = 0; // backend-synced mirror (deleted with shims)
-    bool m_frameStarted = false; // backend-synced mirror (deleted with shims)
-    bool m_skipFrame = false; // backend-synced mirror (deleted with shims)
-    bool m_swapchainDirty = false; // vestigial: set by deferred create path, unread
     bool m_validationEnabled = false;
     bool m_samplerAnisotropySupported = false;
     float m_maxSamplerAnisotropy = 1.0f;

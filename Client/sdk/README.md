@@ -1,12 +1,16 @@
 # IxtreemeWorld Native C++ Game Module SDK
 
+> **Legacy path.** C++ is no longer a project scripting language: projects use **AngelScript**
+> (`.as`) and **Lua** (`.lua`) assets — both hot-reload in Play and need no build step. This SDK
+> documents the native C++ game-module path, kept for existing projects and engine-internal scripts.
+
 Write your game's gameplay code in native C++ and run it in the **prebuilt** IxtreemeWorld engine — no
 engine source required. You compile your `NativeScript` classes into a **game module DLL** against the
 headers in this SDK; the engine loads it at project open and your classes appear in the Script
 component's **Native** class picker, running in Play exactly like the built-in scripts.
 
-This is the C++ counterpart to Lua scripting (`.lua` assets). Use C++ for performance-critical or large
-systems; use Lua for small, fast-iteration gameplay. Both work without the engine source.
+This is the C++ counterpart to AngelScript/Lua scripting. Use it only for legacy projects; new
+gameplay should be written in AngelScript or Lua, which also work without the engine source.
 
 ## Requirements (read this first)
 
@@ -52,6 +56,64 @@ IXSCRIPT_REGISTER(MyScript)
 - Physics: `Raycast(ox,oy,oz, dx,dy,dz, maxDist) -> RaycastHit{hit, entityId, point[3], normal[3], distance}`
 - Animator: `SetAnimatorFloat(name,v)` / `SetAnimatorBool(name,v)` / `SetAnimatorTrigger(name)` (no-op if no animator)
 - Parameters: `Param("key")` / `ParamFloat("key", default)` — untyped string values set per-entity
+- Network (v4): `NetConnect(host, port)->handle` (non-blocking; 0 = could not start), `NetState(handle)`
+  (0 connecting, 1 connected, 2 closed, 3 failed), `NetSend(handle, bytes, n)`, `NetReceive(handle, buf, cap)->n`,
+  `NetClose(handle)`. A plain TCP **byte stream** — framing and the game protocol belong in your script.
+  Every stream is closed when Play stops.
+- Prompt (v4): `PromptText(title, label, secret)->id` shows a one-line input dialog (`secret` masks it, e.g. a
+  password; 0 = no prompt UI on this host — today only the editor draws them), then poll
+  `PromptResult(id, buf, cap)`: 0 still open, 1 submitted (text copied, the engine forgets it), -1 cancelled.
+- Material (v5): `SetMaterial(slot, material)` on this entity, or `api->SetMaterial(id, slot, material)` on any
+  entity (e.g. one just spawned) — `material` is a material asset GUID (as in a scene's `materials`) or its asset
+  id. Deferred like spawn/destroy, so it applies to an entity spawned earlier in the same frame.
+
+### Example: a whole MMO client as a scene script
+
+The current native module ABI is **7**. Rebuild ABI 6 modules against the shipped headers; the engine
+rejects old modules before committing their factories. ABI 7 adds `RaycastFiltered`, `OverlapSphere`
+and deferred `SetEntityEnabled` while retaining the original `Raycast`.
+
+`QueryFilter` contains `layerMask`, `flags` (bit 0 includes triggers), `ignoreEntityId` and `reserved`
+(zero). Layer bits are Default 0, StaticWorld 1, DynamicObject 2, Player 3, Trigger 4, Projectile 5,
+Foliage 6 and NoCollision 7. A null filter uses all layers and includes triggers. Unknown filter flags,
+nonzero reserved, nonfinite coordinates, nonpositive radius/distance and degenerate rays return no hits.
+
+`OverlapSphere` writes sorted, unique `SphereOverlapHit {entityId, flags}` values into a caller-owned
+buffer; capacity is clamped to 1024, and `truncated` reports omitted results. Entity 0 represents terrain
+or another non-entity body. Duplicate hits merge their trigger flags. A zero-capacity/null-buffer probe
+returns zero and reports whether hits exist. Physics collects matches before truncating, so a query over
+a dense scene still costs work proportional to the matches; avoid issuing broad overlaps per particle.
+
+`SetEntityEnabled(id, enabled)` takes effect after the current frame's script callbacks. It preserves the
+entity's data, physics motion, scripts, animator and particle state. Disabled meshes and their descendants
+do not render, cast shadows, simulate, emit audio or participate in physics queries. Re-enabling resumes
+them, retaining each descendant's local flag. `OnStart` runs once when a newly created script first becomes
+active; toggles do not call lifecycle hooks. Audio resumes only if it was playing before suspension, so
+completed one-shots do not replay. Entity `enabled` defaults to true in older scenes/prefabs and is saved.
+
+Lua bindings use global functions:
+```lua
+local hit, entityId = RaycastFiltered(ox,oy,oz, dx,dy,dz, distance, mask, includeTriggers, ignoreId)
+local hits, truncated = OverlapSphere(x,y,z, radius, mask, includeTriggers, ignoreId, capacity)
+-- hits[i].entityId, hits[i].trigger (Lua arrays start at 1)
+SetEntityEnabled(entityId, false)
+```
+AngelScript uses `RaycastFiltered(..., uint mask, bool triggers, uint ignore, RaycastHit &out hit)`
+and `array<SphereOverlapHit>@ OverlapSphere(..., uint mask, bool triggers, uint ignore, uint capacity,
+bool &out truncated)`; `SphereOverlapHit.flags & 1` is the trigger bit.
+
+Runtime `SpawnPrefab` supports mesh-rooted prefabs containing meshes, point lights and spot lights,
+with remapped parents/joints, animator controllers and component state. Invalid hierarchies are rejected
+before publishing any entities. Position offsets the whole instance relative to its root; stored world
+rotations/scales remain intact. The whole instance is published before child `OnStart` hooks. Like other
+spawns, its preallocated id is a ghost until commit. `DestroyEntity` destroys the specified mesh entity;
+it does not recursively delete a prefab subtree or its lights.
+
+`examples/mmo_client/MmoClient.cpp` is the IxtreemeWorld MMO client protocol written as a script: login
+prompt, login server handshake/login/character select, game server handshake and EnterWorld, transform
+frames (incl. layered volume/layer changes) and movement packets, with a hand-written Cap'n Proto codec —
+the engine itself knows nothing about the protocol. Attach `MmoClient` to the player's entity (parameters:
+`loginHost`, `loginPort`, `character`, `proxyMesh`, `visualLift`) and press Play.
 
 `ScriptKey`: `W A S D Space Shift Ctrl Up Down Left Right MouseLeft MouseRight` — **all wired** (v3).
 > **Spawn is deferred:** `SpawnMesh` returns a usable id immediately, but the entity actually appears
@@ -118,6 +180,7 @@ from the **Class** dropdown, set any parameters, and press **Play**.
 ## v1 limitations
 
 - **No hot reload.** The DLL is loaded at project open; rebuild + reopen the project to pick up changes.
-- **One ABI version.** A module built against a different `IXTREEME_MODULE_API_VERSION` is rejected.
+- **One ABI version.** A module built against a different `IXTREEME_MODULE_API_VERSION` is rejected
+  (v4 added the network/prompt slots, v5 `SetMaterial`: rebuild older modules).
 - **Native only.** This is the C++ path; Lua scripts ship as `.lua` assets (no DLL).
 - **Desktop.** Module DLL loading is the desktop workflow; on Android native code is built into the app.

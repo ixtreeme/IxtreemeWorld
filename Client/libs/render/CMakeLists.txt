@@ -13,6 +13,8 @@ add_library(IXEngineRender STATIC
     MapEditorTypes.h
     WorldLabelRenderer.cpp
     WorldLabelRenderer.h
+    ParticleRenderer.cpp
+    ParticleRenderer.h
     OffscreenSceneRenderer.cpp
     OffscreenSceneRenderer.h
     RmlUiLayer.cpp
@@ -23,6 +25,12 @@ add_library(IXEngineRender STATIC
     RuntimeUiAdapter.h
     SceneManager.cpp
     SceneManager.h
+    SceneLayerAuthoring.cpp
+    SceneLayerAuthoring.h
+    SceneLayerGround.cpp
+    SceneLayerGround.h
+    SceneWorldPackage.cpp
+    SceneWorldPackage.h
     SelectionOutlineRenderer.cpp
     SelectionOutlineRenderer.h
     SpatialIndex.cpp
@@ -37,6 +45,10 @@ add_library(IXEngineRender STATIC
     StaticMeshRenderer.h
     SkinnedMeshRenderer.cpp
     SkinnedMeshRenderer.h
+    SkyRenderer.cpp
+    SkyRenderer.h
+    GodRayRenderer.cpp
+    GodRayRenderer.h
     tools/tree/TreeGeneratorPanel.h
     tools/tree/TreePreviewRenderer.h
     tools/tree/TreeTexturePalette.cpp
@@ -82,10 +94,12 @@ target_link_libraries(IXEngineRender
         IXEnginePlatform
         IXEngineAsset
         IXEngineCommon
+        IXEngineJobs
         IXEngineMath
         IXEnginePhysics
         IXEngineAudio
         IXEngineScript
+        IXEngineParticle
         IXEngineImportExport
         IXEngineMapData
         fastgltf::fastgltf
@@ -99,17 +113,13 @@ target_link_libraries(IXEngineRender
         ${CLIENT_FLECS_TARGET}
 )
 
-# PRIVATE backend access for still-native code in transition (TerrainRenderer
-# refraction seam). Does not propagate: migrated renderers see IXRHI only.
-target_link_libraries(IXEngineRender
-    PRIVATE
-        IXEngineVulkan
-)
-
+# NOTE: no Vulkan backend dependency here. Generic render code sees IXRHI
+# only; Vulkan headers/libs reach this target transitively via
+# IXEnginePlatform (VulkanDevice.h) where still needed. The app links
+# IXEngineVulkan directly for the backend factory/adapter.
 if(WIN32)
     target_link_libraries(IXEngineRender
         PUBLIC
-            Vulkan::Vulkan
             Gdi32
             Advapi32
     )
@@ -124,10 +134,66 @@ if(WIN32)
 elseif(ANDROID)
     target_link_libraries(IXEngineRender
         PUBLIC
-            vulkan
             log
             android
     )
 endif()
 
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
+
+if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(TreeImpostorTest tests/TreeImpostorTest.cpp)
+    target_link_libraries(TreeImpostorTest PRIVATE IXEngineRender)
+    target_compile_features(TreeImpostorTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(TreeImpostorTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME TreeImpostorTest COMMAND TreeImpostorTest)
+    set_tests_properties(TreeImpostorTest PROPERTIES TIMEOUT 90)
+
+    add_executable(FbxImportTest tests/FbxImportTest.cpp)
+    target_link_libraries(FbxImportTest PRIVATE IXEngineRender)
+    target_compile_features(FbxImportTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(FbxImportTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME FbxImportTest COMMAND FbxImportTest)
+    set_tests_properties(FbxImportTest PROPERTIES TIMEOUT 60)
+
+    add_executable(ExrImageTest tests/ExrImageTest.cpp)
+    target_link_libraries(ExrImageTest PRIVATE IXEngineRender)
+    target_compile_features(ExrImageTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(ExrImageTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME ExrImageTest COMMAND ExrImageTest)
+
+    add_executable(SceneLayerGroundTest tests/SceneLayerGroundTest.cpp)
+    target_link_libraries(SceneLayerGroundTest PRIVATE IXEngineRender)
+    target_compile_features(SceneLayerGroundTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(SceneLayerGroundTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME SceneLayerGroundTest COMMAND SceneLayerGroundTest)
+
+    add_executable(SceneLayerAuthoringTest tests/SceneLayerAuthoringTest.cpp)
+    target_link_libraries(SceneLayerAuthoringTest PRIVATE IXEngineRender)
+    target_compile_features(SceneLayerAuthoringTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(SceneLayerAuthoringTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME SceneLayerAuthoringTest COMMAND SceneLayerAuthoringTest)
+    add_executable(SceneWorldPackageTest tests/SceneWorldPackageTest.cpp)
+    target_link_libraries(SceneWorldPackageTest PRIVATE IXEngineRender)
+    target_compile_features(SceneWorldPackageTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(SceneWorldPackageTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME SceneWorldPackageTest COMMAND SceneWorldPackageTest)
+endif()

@@ -48,92 +48,144 @@ void EditorImGui::RenderMenuBar()
 
     SceneManager& scenes = SceneManager::Instance();
     ProjectManager& projects = ProjectManager::Instance();
+    // Scene/project switches would prompt to save (and then restore over) the Play-mode copy.
+    const bool editing = CanUseEditorTools();
     if (ImGui::BeginMenu("File"))
     {
-        if (ImGui::MenuItem("New Project..."))
+        if (ImGui::MenuItem(ICON_FA_FOLDER_PLUS "  New Project...", nullptr, false, editing))
             OpenProjectDialog(ProjectDialogMode::Create);
-        if (ImGui::MenuItem("Open Project..."))
+        if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Project...", nullptr, false, editing))
             OpenProjectDialog(ProjectDialogMode::Open);
-        if (ImGui::MenuItem("Save Project", "Ctrl+S", false, projects.HasProject()))
-            SaveProjectAndCurrentScene();
-        if (ImGui::BeginMenu("Recent Projects", !projects.RecentProjects().empty()))
+        if (ImGui::BeginMenu("      Recent Projects", editing && !projects.RecentProjects().empty()))
         {
             for (const auto& path : projects.RecentProjects())
             {
                 const std::string label = path.parent_path().filename().string();
                 if (ImGui::MenuItem(label.c_str()))
                     OpenProjectFromDialog(path);
+                UI::ItemTooltip(path.parent_path().generic_string().c_str());
             }
             ImGui::EndMenu();
         }
         ImGui::Separator();
-        if (ImGui::MenuItem(ICON_FA_FILE "  New Scene", "Ctrl+N"))
+        if (ImGui::MenuItem(ICON_FA_FILE "  New Scene", "Ctrl+N", false, editing))
             scenes.NewScene();
-        if (ImGui::MenuItem(ICON_FA_FOLDER_OPEN "  Open Scene...", "Ctrl+O"))
+        // The project's scenes are listed right here: switching scene needs no OS file dialog.
+        if (ImGui::BeginMenu(ICON_FA_GLOBE "  Open Scene", editing && projects.HasProject()))
         {
-#if defined(_WIN32)
-            char file[MAX_PATH]{};
-            OPENFILENAMEA ofn{};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.lpstrTitle = "Open Scene";
-            ofn.lpstrFilter = "Scene Files (*.scene)\0*.scene\0All files (*.*)\0*.*\0\0";
-            ofn.lpstrFile = file;
-            ofn.nMaxFile = MAX_PATH;
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameA(&ofn))
-                scenes.LoadScene(file);
-#endif
+            const std::vector<AssetLibrary::Entry> sceneAssets = QuerySceneAssets();
+            if (sceneAssets.empty())
+                ImGui::TextDisabled("The project has no scene yet");
+            const std::string currentScene = CachedComparablePath(scenes.GetCurrentScenePath());
+            for (const AssetLibrary::Entry& scene : sceneAssets)
+            {
+                std::error_code ec;
+                const std::filesystem::path relative = std::filesystem::relative(scene.originalPath, projects.ProjectRoot(), ec);
+                const std::string label = ec ? scene.displayName : relative.generic_string();
+                const bool current = !currentScene.empty() && CachedComparablePath(scene.originalPath) == currentScene;
+                if (ImGui::MenuItem(label.c_str(), nullptr, current))
+                    scenes.LoadScene(scene.originalPath);
+            }
+            ImGui::EndMenu();
         }
-        ImGui::Separator();
-        if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK "  Save Scene As...", "Ctrl+Shift+S"))
-            scenes.SaveSceneAs({});
-        ImGui::Separator();
-        if (ImGui::BeginMenu("Recent Scenes", !scenes.GetRecentScenes().empty()))
+        if (ImGui::BeginMenu("      Recent Scenes", editing && !scenes.GetRecentScenes().empty()))
         {
             for (const std::string& path : scenes.GetRecentScenes())
             {
                 const std::string label = std::filesystem::path(path).filename().string();
                 if (ImGui::MenuItem(label.c_str()))
                     scenes.LoadScene(path);
+                UI::ItemTooltip(path.c_str());
             }
             ImGui::EndMenu();
         }
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_FLOPPY_DISK "  Save", "Ctrl+S", false, projects.HasProject() || scenes.HasOpenScene()))
+            SaveProjectAndCurrentScene();
+        UI::ItemTooltip("Save the project and the open scene");
+        if (ImGui::MenuItem("      Save Scene As...", "Ctrl+Shift+S", false, scenes.HasOpenScene()))
+        {
+            if (!RefuseSaveDuringPlay())
+                scenes.SaveSceneAs({});
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_HAMMER "  Build Game...", nullptr, false,
+                editing && projects.HasProject() && !IsGameBuildRunning() && !IsBuildRunning()))
+            OpenBuildGameDialog();
+        UI::ItemTooltip("Package the project as a game that runs without the editor");
         ImGui::EndMenu();
     }
+
     if (ImGui::BeginMenu("Edit"))
     {
-        ImGui::MenuItem("Undo", "Ctrl+Z", false, false);
-        ImGui::MenuItem("Redo", "Ctrl+Y", false, false);
+        const HierarchySceneEntity* selected = SelectedHierarchyEntity();
+        const bool canEditSelection = editing && selected != nullptr;
+        if (ImGui::MenuItem(ICON_FA_BULLSEYE "  Frame Selection", "F", false, selected != nullptr))
+            QueueHierarchyFocus(*selected);
+        if (ImGui::MenuItem(ICON_FA_PEN "  Rename", nullptr, false, canEditSelection))
+            StartHierarchyRename(*selected);
+        if (ImGui::MenuItem(ICON_FA_COPY "  Duplicate", nullptr, false, canEditSelection))
+        {
+            m_commands.hierarchyDuplicateEntity = true;
+            m_commands.hierarchyEntityType = selected->type;
+            m_commands.hierarchyEntityId = selected->objectId;
+            m_commands.hierarchyEntityHandle = selected->entity;
+        }
+        if (ImGui::MenuItem(ICON_FA_TRASH "  Delete", "Del", false, canEditSelection))
+        {
+            m_commands.hierarchyDeleteEntity = true;
+            m_commands.hierarchyEntityType = selected->type;
+            m_commands.hierarchyEntityId = selected->objectId;
+            m_commands.hierarchyEntityHandle = selected->entity;
+        }
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_GEAR "  Project Settings..."))
+            m_projectSettingsOpen = true;
         ImGui::EndMenu();
     }
+
+    if (ImGui::BeginMenu("Create"))
+    {
+        RenderHierarchyCreateMenuItems();
+        ImGui::EndMenu();
+    }
+
     if (ImGui::BeginMenu("View"))
     {
-        ImGui::MenuItem(ICON_FA_PERSON_RUNNING " Animator", nullptr, &m_animatorPanelOpen);
-        ImGui::MenuItem("Demo Window", nullptr, &m_showDemoWindow);
+        // Opens the panel and brings it to the front (it may be hidden behind another tab); the
+        // tick shows which panels are open, the tab's x closes one.
+        const auto panelItem = [this](const char* label, bool& open, const char* window) {
+            if (ImGui::MenuItem(label, nullptr, open))
+            {
+                open = true;
+                m_pendingViewFocusWindow = window;
+            }
+        };
+        panelItem(ICON_FA_LIST_TREE "  Hierarchy", m_hierarchyPanelOpen, EditorWindow::Hierarchy);
+        panelItem(ICON_FA_CIRCLE_INFO "  Inspector", m_inspectorPanelOpen, EditorWindow::Inspector);
+        panelItem(ICON_FA_SLIDERS "  Scene Settings", m_sceneSettingsPanelOpen, EditorWindow::SceneSettings);
+        panelItem(ICON_FA_FOLDER_OPEN "  Asset Browser", m_assetBrowserPanelOpen, EditorWindow::AssetBrowser);
+        panelItem(ICON_FA_CODE "  Scripts", m_scriptsPanelOpen, EditorWindow::Scripts);
+        panelItem(ICON_FA_TERMINAL "  Console", m_consolePanelOpen, EditorWindow::Console);
+        panelItem(ICON_FA_HAMMER "  Build Output", m_buildOutputPanelOpen, EditorWindow::BuildOutput);
+        panelItem(ICON_FA_PERSON_RUNNING "  Animator", m_animatorPanelOpen, EditorWindow::Animator);
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_CUBES "  Scene View"))
+            m_pendingViewFocusWindow = EditorWindow::SceneView;
+        if (ImGui::MenuItem(ICON_FA_GAMEPAD "  Game View"))
+            m_pendingViewFocusWindow = EditorWindow::Game;
+        ImGui::Separator();
+        panelItem(ICON_FA_GAUGE_HIGH "  Statistics", m_statisticsWindowOpen, EditorWindow::Statistics);
+        ImGui::Separator();
+        if (ImGui::MenuItem(ICON_FA_ARROWS_ROTATE "  Reset Layout"))
+            ResetEditorLayout();
+        UI::ItemTooltip("Put every panel back where it starts");
         ImGui::EndMenu();
     }
-    if (ImGui::BeginMenu("Audio"))
-    {
-        ImGui::TextDisabled("Bus Volumes");
-        bool volChanged = false;
-        ImGui::SetNextItemWidth(160.0f);
-        volChanged |= ImGui::SliderFloat("Master", &m_audioVolume[0], 0.0f, 1.0f, "%.2f");
-        ImGui::SetNextItemWidth(160.0f);
-        volChanged |= ImGui::SliderFloat("Music", &m_audioVolume[1], 0.0f, 1.0f, "%.2f");
-        ImGui::SetNextItemWidth(160.0f);
-        volChanged |= ImGui::SliderFloat("SFX", &m_audioVolume[2], 0.0f, 1.0f, "%.2f");
-        if (volChanged)
-        {
-            m_commands.audioVolumesChanged = true;
-            m_commands.audioVolume[0] = m_audioVolume[0];
-            m_commands.audioVolume[1] = m_audioVolume[1];
-            m_commands.audioVolume[2] = m_audioVolume[2];
-        }
-        ImGui::EndMenu();
-    }
+
     if (ImGui::BeginMenu("Tools"))
     {
-        if (ImGui::MenuItem("Tree Generator..."))
+        if (ImGui::MenuItem(ICON_FA_TREE "  Tree Generator..."))
         {
             if (!m_treeGeneratorPanel)
             {
@@ -145,7 +197,12 @@ void EditorImGui::RenderMenuBar()
             m_treeGeneratorPanel->SetAssetLibrary(m_assetLibrary.get());
             m_treeGeneratorPanel->Show();
         }
-        if (ImGui::BeginMenu("Debug"))
+        if (ImGui::MenuItem(ICON_FA_LAYER_GROUP "  Layered World...", nullptr, m_layeredWorldOpen))
+            m_layeredWorldOpen = true;
+        if (ImGui::MenuItem(ICON_FA_BUG "  Physics Debugger...", nullptr, m_physicsDebuggerOpen))
+            m_physicsDebuggerOpen = true;
+        ImGui::Separator();
+        if (ImGui::BeginMenu(ICON_FA_WRENCH "  Engine Diagnostics"))
         {
             if (ImGui::MenuItem("Capture GPU Frame", "F11"))
                 m_commands.captureGpuFrame = true;
@@ -154,35 +211,27 @@ void EditorImGui::RenderMenuBar()
             if (ImGui::MenuItem("Dump Material Bindings", "F12"))
                 m_commands.dumpMaterialState = true;
             ImGui::Separator();
-            bool debugTogglesChanged = false;
-            debugTogglesChanged = ImGui::MenuItem("Disable Shadow Pass", nullptr, &m_debugDisableShadowPass) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Disable Water Reflection Pass", nullptr, &m_debugDisableWaterReflectionPass) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Disable Asset Library Discovery", nullptr, &m_debugDisableAssetLibraryDiscovery) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Disable Asset Watcher Poll", nullptr, &m_debugDisableAssetWatcherPoll) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Disable Hierarchy Iteration", nullptr, &m_debugDisableHierarchyIteration) || debugTogglesChanged;
+            bool togglesChanged = false;
+            togglesChanged |= ImGui::MenuItem("Disable Shadow Pass", nullptr, &m_debugDisableShadowPass);
+            togglesChanged |= ImGui::MenuItem("Disable Water Reflection Pass", nullptr, &m_debugDisableWaterReflectionPass);
+            togglesChanged |= ImGui::MenuItem("Disable Asset Library Discovery", nullptr, &m_debugDisableAssetLibraryDiscovery);
+            togglesChanged |= ImGui::MenuItem("Disable Asset Watcher Poll", nullptr, &m_debugDisableAssetWatcherPoll);
+            togglesChanged |= ImGui::MenuItem("Disable Hierarchy Iteration", nullptr, &m_debugDisableHierarchyIteration);
+            if (togglesChanged)
+                QueueDebugToggleCommands();
             ImGui::Separator();
-            debugTogglesChanged = ImGui::MenuItem("Show Physics Colliders", nullptr, &m_debugShowPhysicsColliders) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Show Physics Contacts", nullptr, &m_debugShowPhysicsContacts) || debugTogglesChanged;
-            debugTogglesChanged = ImGui::MenuItem("Show Physics Body Centers", nullptr, &m_debugShowPhysicsBodyCenters) || debugTogglesChanged;
-            if (debugTogglesChanged)
-            {
-                m_commands.debugPerfTogglesChanged = true;
-                m_commands.disableShadowPass = m_debugDisableShadowPass;
-                m_commands.disableWaterReflectionPass = m_debugDisableWaterReflectionPass;
-                m_commands.disableAssetLibraryDiscovery = m_debugDisableAssetLibraryDiscovery;
-                m_commands.disableAssetWatcherPoll = m_debugDisableAssetWatcherPoll;
-                m_commands.disableHierarchyIteration = m_debugDisableHierarchyIteration;
-                m_commands.showPhysicsColliders = m_debugShowPhysicsColliders;
-                m_commands.showPhysicsContacts = m_debugShowPhysicsContacts;
-                m_commands.showPhysicsBodyCenters = m_debugShowPhysicsBodyCenters;
-            }
+            ImGui::MenuItem("ImGui Demo Window", nullptr, &m_showDemoWindow);
             ImGui::EndMenu();
         }
         ImGui::EndMenu();
     }
+
     if (ImGui::BeginMenu("Help"))
     {
-        ImGui::MenuItem("About IxtreemeEngine", nullptr, false, false);
+        if (ImGui::MenuItem(ICON_FA_KEYBOARD "  Keyboard Shortcuts"))
+            m_shortcutsWindowOpen = true;
+        if (ImGui::MenuItem(ICON_FA_CIRCLE_INFO "  About IxtreemeEngine"))
+            m_openAboutPopup = true;
         ImGui::EndMenu();
     }
 
@@ -231,6 +280,14 @@ void EditorImGui::StoreProjectPhysicsSettings()
 
 bool EditorImGui::SaveProjectAndCurrentScene(bool automatic)
 {
+    if (!CanUseEditorTools())
+    {
+        // Play runs on a throwaway copy of the scene (restored on Stop): never write it out. The
+        // autosave timer is left as is, so the autosave happens right after Play stops.
+        if (!automatic)
+            RefuseSaveDuringPlay();
+        return false;
+    }
     ProjectManager& projects = ProjectManager::Instance();
     if (!projects.HasProject())
     {
@@ -278,9 +335,23 @@ bool EditorImGui::SaveProjectAndCurrentScene(bool automatic)
     return true;
 }
 
+bool EditorImGui::RefuseSaveDuringPlay()
+{
+    if (CanUseEditorTools())
+        return false;
+    m_projectStatus = "Stop Play before saving: Play-mode changes are never saved";
+    Tracen("[PROJECT] save refused during Play");
+    return true;
+}
+
 void EditorImGui::RunProjectAutoSave()
 {
     const double now = ImGui::GetTime();
+    if (!CanUseEditorTools())
+    {
+        UpdateAutoSaveWindowTitle(now);
+        return; // deferred until Play stops (see SaveProjectAndCurrentScene)
+    }
     if (!ProjectManager::Instance().HasProject())
     {
         m_lastAutoSaveSeconds = now;
@@ -321,57 +392,66 @@ EditorImGui::ScriptFileChanges EditorImGui::PollScriptFileChanges()
 
     std::error_code ec;
 
-    // (a) .lua Script assets — report each changed asset id (hot-reloaded live). Native .cpp Script
-    // assets are ALSO in this category now, but they're compiled (handled by the .cpp poll below), not
-    // hot-reloaded — so skip them here or we'd fire a bogus Lua reload on a C++ edit.
+    // (a) .lua + .as Script assets — report each changed asset id (hot-reloaded live). Legacy .cpp
+    // Script assets are ALSO in this category, but they're compiled (handled by the .cpp poll below),
+    // not hot-reloaded — so skip them here or we'd fire a bogus script reload on a C++ edit.
     for (const AssetLibrary::Entry& e : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
     {
-        if (e.filename.size() < 4 ||
-            e.filename.compare(e.filename.size() - 4, 4, ".lua") != 0)
+        const bool isLua = e.filename.size() >= 4 &&
+            e.filename.compare(e.filename.size() - 4, 4, ".lua") == 0;
+        const bool isAngelScript = e.filename.size() >= 3 &&
+            e.filename.compare(e.filename.size() - 3, 3, ".as") == 0;
+        if (!isLua && !isAngelScript)
             continue;
         const std::filesystem::path p = m_assetLibrary->AbsolutePath(e);
         const std::filesystem::file_time_type mt = std::filesystem::last_write_time(p, ec);
         if (ec)
             continue;  // mid-write/locked — catch it next tick
-        const auto it = m_luaMtimes.find(e.id);
-        if (it == m_luaMtimes.end())
-            m_luaMtimes[e.id] = mt;
+        auto& mtimes = isLua ? m_luaMtimes : m_angelMtimes;
+        const auto it = mtimes.find(e.id);
+        if (it == mtimes.end())
+            mtimes[e.id] = mt;
         else if (it->second != mt)
         {
             it->second = mt;
             if (!firstPass)
-                changes.changedLua.push_back(e.id);
+                (isLua ? changes.changedLua : changes.changedAngelScript).push_back(e.id);
         }
     }
 
-    // (b) native C++ sources (the asset scripts folder, *.cpp,*.h,*.hpp) — a single "something changed"
-    // flag that triggers an auto-build. Headers aren't assets, and brand-new .cpp may not be registered
-    // yet, so scan the directory directly rather than rely on the manifest.
+    // (b) native C++ sources — every .cpp Script asset (wherever it sits in the asset folder) plus the
+    // headers beside them: a single "something changed" flag that triggers an auto-build. A brand-new
+    // .cpp counts once the library registered it (the file watcher refreshes the library), so the
+    // whole asset folder is never walked here.
     const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
     std::unordered_map<std::string, std::filesystem::file_time_type> seen;
-    if (std::filesystem::is_directory(scriptsDir, ec))
+    std::set<std::filesystem::path> sourceDirs;
+    const auto stampSource = [&](const std::filesystem::path& path) {
+        const std::filesystem::file_time_type mt = std::filesystem::last_write_time(path, ec);
+        if (ec)
+            return;
+        const std::string full = path.generic_string();
+        seen[full] = mt;
+        const auto it = m_cppMtimes.find(full);
+        if (it != m_cppMtimes.end() && it->second != mt && !firstPass)
+            changes.changedCpp = true;
+    };
+    for (const AssetLibrary::Entry& e : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
     {
-        for (const std::filesystem::directory_entry& de : std::filesystem::recursive_directory_iterator(
-                 scriptsDir, std::filesystem::directory_options::skip_permission_denied, ec))
+        const std::filesystem::path p = m_assetLibrary->AbsolutePath(e);
+        if (!IsNativeScriptSource(scriptsDir, p))
+            continue;
+        stampSource(p);
+        sourceDirs.insert(p.parent_path());
+    }
+    for (const std::filesystem::path& dir : sourceDirs)
+    {
+        for (const std::filesystem::directory_entry& de : std::filesystem::directory_iterator(
+                 dir, std::filesystem::directory_options::skip_permission_denied, ec))
         {
-            if (!de.is_regular_file(ec))
-                continue;
-            // Skip any CMake build tree that might sit under the scripts dir (its churn isn't a source edit).
-            const std::string full = de.path().generic_string();
-            if (full.find("/build/") != std::string::npos)
-                continue;
-            std::string ext = de.path().extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(),
-                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (ext != ".cpp" && ext != ".h" && ext != ".hpp" && ext != ".cxx" && ext != ".cc")
-                continue;
-            const std::filesystem::file_time_type mt = std::filesystem::last_write_time(de.path(), ec);
-            if (ec)
-                continue;
-            seen[full] = mt;
-            const auto it = m_cppMtimes.find(full);
-            if (it != m_cppMtimes.end() && it->second != mt && !firstPass)
-                changes.changedCpp = true;
+            std::error_code entryEc;
+            if (de.is_regular_file(entryEc) && de.path().extension() != ".cpp" && IsNativeScriptSource(scriptsDir, de.path()))
+                stampSource(de.path());
         }
     }
     if (!firstPass && seen.size() != m_cppMtimes.size())
@@ -419,7 +499,10 @@ void EditorImGui::HandleEditorHotkeys()
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false))
     {
         if (io.KeyShift)
-            SceneManager::Instance().SaveSceneAs({});
+        {
+            if (!RefuseSaveDuringPlay())
+                SceneManager::Instance().SaveSceneAs({});
+        }
         else
             SaveProjectAndCurrentScene();
         return;
@@ -463,7 +546,9 @@ void EditorImGui::HandleEditorHotkeys()
 
     if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F, false))
     {
-        if (m_waterBodyState.selected)
+        if (const HierarchySceneEntity* selected = SelectedHierarchyEntity())
+            QueueHierarchyFocus(*selected);
+        else if (m_waterBodyState.selected)
         {
             if (const HierarchySceneEntity* entity = FindHierarchyEntity(HierarchyEntityType::WaterBody, m_waterBodyState.id))
                 QueueHierarchyFocus(*entity);
@@ -527,133 +612,55 @@ void EditorImGui::HandleEditorHotkeys()
         }
     }
 
-    if (io.KeyCtrl)
+    // W / E / R pick the Move / Rotate / Scale tool, unless the right mouse button is flying the
+    // camera (W is "forward" then).
+    if (CanUseEditorTools() && !io.KeyCtrl && !io.KeyShift && !io.KeyAlt && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
     {
-        SceneManager& scenes = SceneManager::Instance();
-        if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_N, false))
-            scenes.NewScene();
-        if (!io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_O, false))
+        const MapEditorGizmoOperation previous = m_gizmoOperation;
+        if (ImGui::IsKeyPressed(ImGuiKey_W, false))
+            m_gizmoOperation = MapEditorGizmoOperation::Translate;
+        else if (ImGui::IsKeyPressed(ImGuiKey_E, false))
+            m_gizmoOperation = MapEditorGizmoOperation::Rotate;
+        else if (ImGui::IsKeyPressed(ImGuiKey_R, false))
+            m_gizmoOperation = MapEditorGizmoOperation::Scale;
+        if (m_gizmoOperation != previous)
         {
-#if defined(_WIN32)
-            char file[MAX_PATH]{};
-            OPENFILENAMEA ofn{};
-            ofn.lStructSize = sizeof(ofn);
-            ofn.lpstrTitle = "Open Scene";
-            ofn.lpstrFilter = "Scene Files (*.scene)\0*.scene\0All files (*.*)\0*.*\0\0";
-            ofn.lpstrFile = file;
-            ofn.nMaxFile = MAX_PATH;
-            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-            if (GetOpenFileNameA(&ofn))
-                scenes.LoadScene(file);
-#endif
+            m_commands.gizmoSettingsChanged = true;
+            m_commands.gizmoOperation = m_gizmoOperation;
+            m_commands.gizmoSnapEnabled = m_gizmoSnapEnabled;
+            m_commands.gizmoSnapValue = m_gizmoSnapValue;
         }
     }
+
+    if (io.KeyCtrl && !io.KeyShift && CanUseEditorTools() && ImGui::IsKeyPressed(ImGuiKey_N, false))
+        SceneManager::Instance().NewScene();
 }
 
-void EditorImGui::RenderEditorToolbar()
+// A cmake/game build log can be megabytes; rendering it whole builds millions of vertices every
+// frame. Only the tail matters while watching a build, so cap what is drawn.
+static void RenderBuildLogTail(const std::string& log)
 {
-    if (!m_editorModeActive)
-        return;
-
-    const ImGuiViewport* viewport = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(ImVec2(viewport->WorkPos.x + 12.0f, viewport->WorkPos.y + 12.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(760.0f, 58.0f), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Editor Toolbar", nullptr,
-        ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar))
+    constexpr std::size_t kMaxCharacters = 8 * 1024;
+    if (log.empty())
     {
-        const bool isEdit = m_playModeState.mode == EditorPlayMode::Edit;
-        const bool isPlay = m_playModeState.mode == EditorPlayMode::Play;
-        const bool isPaused = m_playModeState.mode == EditorPlayMode::PlayPaused;
-
-        if (isEdit)
-        {
-            const bool canPlay = SceneManager::Instance().HasOpenScene();
-            if (!canPlay)
-                ImGui::BeginDisabled();
-            if (UI::IconButton(ICON_FA_PLAY, "Play", ImVec2(96.0f, 32.0f)))
-                m_commands.enterPlayMode = true;
-            if (!canPlay)
-            {
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip("Open a scene to Play");
-            }
-        }
-        else
-        {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.20f, 0.20f, 1.0f));
-            if (UI::IconButton(ICON_FA_STOP, "Stop", ImVec2(96.0f, 32.0f)))
-                m_commands.exitPlayMode = true;
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            if (isPlay)
-            {
-                if (UI::IconButton(ICON_FA_PAUSE, "Pause", ImVec2(104.0f, 32.0f)))
-                    m_commands.pausePlayMode = true;
-            }
-            else if (isPaused)
-            {
-                if (UI::IconButton(ICON_FA_PLAY, "Resume", ImVec2(112.0f, 32.0f)))
-                    m_commands.resumePlayMode = true;
-            }
-        }
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(16.0f, 0.0f));
-        ImGui::SameLine();
-
-        const char* modeText = isEdit ? "EDIT MODE" : isPlay ? "PLAY MODE" : "PAUSED";
-        const ImVec4 modeColor = isEdit
-            ? ImVec4(0.72f, 0.72f, 0.72f, 1.0f)
-            : isPlay ? ImVec4(0.35f, 0.90f, 0.35f, 1.0f) : ImVec4(0.95f, 0.74f, 0.30f, 1.0f);
-        ImGui::TextColored(modeColor, "%s", modeText);
-        if (!isEdit)
-        {
-            ImGui::SameLine();
-            ImGui::TextDisabled("(%.1fs, frame %d)", m_playModeState.elapsedSeconds, m_playModeState.frameCount);
-        }
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(16.0f, 0.0f));
-        ImGui::SameLine();
-        {
-            // Build the project's native C++ game scripts (<ProjectRoot>/Scripts) into the module DLL.
-            const bool canBuild = isEdit && ProjectManager::Instance().HasProject() && !IsBuildRunning();
-            if (!canBuild)
-                ImGui::BeginDisabled();
-            const char* buildLabel = IsBuildRunning() ? "Building..." : "Build";
-            if (UI::IconButton(ICON_FA_HAMMER, buildLabel, ImVec2(120.0f, 32.0f)))
-                m_commands.buildGameScripts = true;
-            if (!canBuild)
-            {
-                ImGui::EndDisabled();
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-                    ImGui::SetTooltip(IsBuildRunning() ? "Build in progress..."
-                        : !isEdit ? "Stop Play to build" : "Open a project to build C++ scripts");
-            }
-        }
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(24.0f, 0.0f));
-        ImGui::SameLine();
-        RenderGizmoControls();
-
-        ImGui::SameLine();
-        ImGui::Dummy(ImVec2(18.0f, 0.0f));
-        ImGui::SameLine();
-        ImGui::TextDisabled("FPS %.0f | %.2f ms | CPU %.0f%%",
-            m_engineStats.fps,
-            m_engineStats.averageFrameMs > 0.0 ? m_engineStats.averageFrameMs : m_engineStats.frameMs,
-            m_engineStats.processCpuPercent);
+        ImGui::TextDisabled("(no output)");
+        return;
     }
-    ImGui::End();
+    if (log.size() > kMaxCharacters)
+    {
+        ImGui::TextDisabled("... (%zu earlier characters not shown)", log.size() - kMaxCharacters);
+        ImGui::TextUnformatted(log.c_str() + (log.size() - kMaxCharacters), log.c_str() + log.size());
+        return;
+    }
+    ImGui::TextUnformatted(log.c_str());
 }
 
 void EditorImGui::RenderBuildOutputPanel()
 {
     if (!m_buildOutputPanelOpen)
         return;
-    if (ImGui::Begin("Build Output", &m_buildOutputPanelOpen))
+    DockBesideIfUnplaced(EditorWindow::BuildOutput, EditorWindow::AssetBrowser);
+    if (ImGui::Begin(EditorWindow::BuildOutput, &m_buildOutputPanelOpen))
     {
         if (m_buildState == ScriptBuildState::Running)
             ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Building game scripts...");
@@ -661,80 +668,223 @@ void EditorImGui::RenderBuildOutputPanel()
             ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.35f, 1.0f), "Build succeeded — module reloaded.");
         else if (m_buildState == ScriptBuildState::Done)
             ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "Build FAILED — see the log below.");
+
+        // "Build Game" status, with the finished game one click away.
+        if (m_gameBuildState == ScriptBuildState::Running)
+        {
+            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f),
+                "Building the game... (the first time this also compiles the runtime player: several minutes)");
+        }
+        else if (m_gameBuildState == ScriptBuildState::Done && m_gameBuildSucceeded)
+        {
+            ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.35f, 1.0f), "Game built: %s",
+                m_gameBuildExecutable.generic_string().c_str());
+            ImGui::SameLine();
+            std::string openError;
+            if (ImGui::SmallButton("Run Game") && !platform::OpenInDefaultApp(m_gameBuildExecutable, &openError))
+                m_projectStatus = "Run failed: " + openError;
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Open Folder") &&
+                !platform::OpenInDefaultApp(m_gameBuildExecutable.parent_path(), &openError))
+                m_projectStatus = "Open folder failed: " + openError;
+        }
+        else if (m_gameBuildState == ScriptBuildState::Done)
+        {
+            ImGui::TextColored(ImVec4(0.95f, 0.35f, 0.35f, 1.0f), "Game build FAILED — see the log below.");
+        }
         ImGui::Separator();
         ImGui::BeginChild("##buildlog", ImVec2(0, 0), ImGuiChildFlags_Borders,
             ImGuiWindowFlags_HorizontalScrollbar);
-        ImGui::TextUnformatted(m_buildLog.empty() ? "(no output)" : m_buildLog.c_str());
+        if (m_gameBuildState == ScriptBuildState::Done)
+        {
+            RenderBuildLogTail(m_gameBuildLog);
+            if (!m_buildLog.empty())
+                ImGui::Separator();
+        }
+        if (m_gameBuildState != ScriptBuildState::Done || !m_buildLog.empty())
+            RenderBuildLogTail(m_buildLog);
         ImGui::EndChild();
     }
     ImGui::End();
 }
 
+void EditorImGui::OpenBuildGameDialog()
+{
+    ProjectManager& projects = ProjectManager::Instance();
+    if (!projects.HasProject())
+        return;
+    const std::string name = projects.CurrentProject().name.empty() ? "Game" : projects.CurrentProject().name;
+    CopyToBuffer(m_buildGameName, sizeof(m_buildGameName), name);
+    // Default output: <Project>/Build/<Name> (a "build" folder: the asset database and the package
+    // copy both skip it, so the game never ends up inside itself).
+    std::string folderName;
+    for (char c : name)
+        folderName.push_back(std::isalnum(static_cast<unsigned char>(c)) || c == '-' ? c : '_');
+    const std::string defaultOutput = (projects.ProjectRoot() / "Build" / folderName).string();
+    if (m_buildGameOutputDir[0] == '\0' ||
+        std::string(m_buildGameOutputDir).rfind(projects.ProjectRoot().string(), 0) != 0)
+        CopyToBuffer(m_buildGameOutputDir, sizeof(m_buildGameOutputDir), defaultOutput);
+
+    // Start in the project's startup scene, else the open scene.
+    m_buildGameStartupScene = projects.CurrentProject().startupScene;
+    if (m_buildGameStartupScene.empty())
+    {
+        const std::string current = SceneManager::Instance().GetCurrentScenePath();
+        std::error_code ec;
+        const std::filesystem::path relative = std::filesystem::relative(current, projects.ProjectRoot(), ec);
+        if (!current.empty() && !ec)
+            m_buildGameStartupScene = relative.generic_string();
+    }
+    // Compile the C++ game scripts first when the project has any.
+    m_buildGameCompileScripts = false;
+    if (m_assetLibrary)
+    {
+        for (const AssetLibrary::Entry& entry : m_assetLibrary->EntriesFor(AssetLibrary::Category::Script))
+            m_buildGameCompileScripts = m_buildGameCompileScripts || ToLowerAscii(entry.filename).ends_with(".cpp");
+    }
+    m_openBuildGamePopup = true;
+}
+
+void EditorImGui::RenderBuildGamePopup()
+{
+    if (m_openBuildGamePopup)
+    {
+        ImGui::OpenPopup("Build Game");
+        m_openBuildGamePopup = false;
+    }
+    if (!ImGui::BeginPopupModal("Build Game", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+        return;
+
+    ProjectManager& projects = ProjectManager::Instance();
+    ImGui::TextUnformatted("Package this project as a game that runs without the editor.");
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(360.0f);
+    ImGui::InputText("Game name", m_buildGameName, sizeof(m_buildGameName));
+    ImGui::SetNextItemWidth(560.0f);
+    ImGui::InputText("Output folder", m_buildGameOutputDir, sizeof(m_buildGameOutputDir));
+
+    ImGui::SetNextItemWidth(360.0f);
+    const std::string preview = m_buildGameStartupScene.empty() ? std::string("(choose a scene)") : m_buildGameStartupScene;
+    if (ImGui::BeginCombo("Startup scene", preview.c_str()))
+    {
+        for (const AssetLibrary::Entry& scene : QuerySceneAssets())
+        {
+            std::error_code ec;
+            const std::filesystem::path relative = std::filesystem::relative(scene.originalPath, projects.ProjectRoot(), ec);
+            const std::string label = relative.generic_string();
+            if (ec || label.empty() || label.rfind("..", 0) == 0)
+                continue;  // the game can only start in a scene that is part of the project
+            if (ImGui::Selectable(label.c_str(), label == m_buildGameStartupScene))
+                m_buildGameStartupScene = label;
+        }
+        ImGui::EndCombo();
+    }
+    if (ProjectHasNativeScriptSources())
+        ImGui::Checkbox("Compile the legacy C++ game scripts first", &m_buildGameCompileScripts);
+    else
+        m_buildGameCompileScripts = false;  // AngelScript/Lua need no build step
+    ImGui::Checkbox("Run the game when it is built", &m_buildGameRunWhenDone);
+    ImGui::TextDisabled("The folder gets <Game name>.exe, the engine runtime files and the project (Game/).");
+    ImGui::TextDisabled("The project and the open scene are saved first. The first build also compiles the");
+    ImGui::TextDisabled("editor-less runtime player, which takes several minutes.");
+
+    const bool canBuild = m_buildGameName[0] != '\0' && m_buildGameOutputDir[0] != '\0' &&
+        !m_buildGameStartupScene.empty() && CanUseEditorTools() && !IsGameBuildRunning() && !IsBuildRunning();
+    ImGui::Separator();
+    if (!canBuild)
+        ImGui::BeginDisabled();
+    if (ImGui::Button("Build", ImVec2(120.0f, 0.0f)))
+    {
+        // The package is made from what is on disk: save first.
+        if (SaveProjectAndCurrentScene(false))
+        {
+            m_commands.buildGame = true;
+            m_commands.buildGameName = m_buildGameName;
+            m_commands.buildGameOutputDir = m_buildGameOutputDir;
+            m_commands.buildGameStartupScene = m_buildGameStartupScene;
+            m_commands.buildGameCompileScripts = m_buildGameCompileScripts;
+            m_commands.buildGameRunWhenDone = m_buildGameRunWhenDone;
+            m_gameBuildState = ScriptBuildState::Running;  // until EngineApplication reports back
+            m_buildOutputPanelOpen = true;
+            ImGui::CloseCurrentPopup();
+        }
+    }
+    if (!canBuild)
+        ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel", ImVec2(120.0f, 0.0f)) || ImGui::IsKeyPressed(ImGuiKey_Escape))
+        ImGui::CloseCurrentPopup();
+    if (!m_projectStatus.empty())
+        ImGui::TextDisabled("%s", m_projectStatus.c_str());
+    ImGui::EndPopup();
+}
+
 void EditorImGui::RenderSceneSettingsPanel()
 {
-    if (ImGui::Begin("Scene Settings"))
+    if (!m_sceneSettingsPanelOpen)
+        return;
+    DockBesideIfUnplaced(EditorWindow::SceneSettings, EditorWindow::Inspector);
+    if (ImGui::Begin(EditorWindow::SceneSettings, &m_sceneSettingsPanelOpen))
     {
         SceneManager& scenes = SceneManager::Instance();
         if (!scenes.HasOpenScene())
         {
-            ImGui::TextUnformatted("No scene open");
-            ImGui::TextWrapped("Create or open a scene before editing scene metadata.");
+            ImGui::TextDisabled("No scene is open");
+            ImGui::TextWrapped("Create or open a scene from the File menu.");
         }
         else
         {
             const SceneData& scene = scenes.GetCurrentScene();
-
-            char nameBuffer[128]{};
-            std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", scene.name.c_str());
-            if (ImGui::InputText("Scene Name", nameBuffer, sizeof(nameBuffer)))
-                scenes.SetSceneName(nameBuffer);
-
-            ImGui::Separator();
-            ImGui::TextUnformatted("Editor Camera");
-            ImGui::Text("Eye: %.1f, %.1f, %.1f",
-                scene.editorCamera.eye[0],
-                scene.editorCamera.eye[1],
-                scene.editorCamera.eye[2]);
-            const CameraEntity* mainCamera = nullptr;
-            for (const CameraEntity& cam : scene.cameras)
+            if (ImGui::CollapsingHeader(ICON_FA_GLOBE "  Scene", ImGuiTreeNodeFlags_DefaultOpen))
             {
-                if (cam.id == scene.mainCameraId)
+                char nameBuffer[128]{};
+                std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", scene.name.c_str());
+                if (UI::Prop::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+                    scenes.SetSceneName(nameBuffer);
+                const CameraEntity* mainCamera = nullptr;
+                for (const CameraEntity& cam : scene.cameras)
                 {
-                    mainCamera = &cam;
-                    break;
+                    if (cam.id == scene.mainCameraId)
+                    {
+                        mainCamera = &cam;
+                        break;
+                    }
                 }
+                if (mainCamera)
+                    UI::Prop::Text("Main camera", "%s  (FOV %.0f)", mainCamera->name.c_str(), mainCamera->fovDegrees);
+                else
+                    UI::Prop::Text("Main camera", "none: the Game view and the built game need one");
             }
-            if (mainCamera)
-                ImGui::Text("Main Camera FOV: %.1f  Near/Far: %.2f / %.1f",
-                    mainCamera->fovDegrees,
-                    mainCamera->nearPlane,
-                    mainCamera->farPlane);
-            else
-                ImGui::TextDisabled("No main camera");
 
-            ImGui::Separator();
-            ImGui::TextUnformatted("Environment");
-            ImGui::Text("Sun: %.1f / %.1f  Intensity: %.2f",
-                scene.lighting.directional.elevationDegrees,
-                scene.lighting.directional.azimuthDegrees,
-                scene.lighting.directional.intensity);
-            ImGui::Text("Ambient: %.2f", scene.lighting.ambient.intensity);
+            if (ImGui::CollapsingHeader(ICON_FA_SUN "  Environment", ImGuiTreeNodeFlags_DefaultOpen))
+                RenderLightingPanel();
 
-            ImGui::Separator();
-            ImGui::TextUnformatted("Physics");
-            PhysicsSceneSettings physicsSettings = scene.physics;
-            bool physicsSettingsChanged = false;
-            physicsSettingsChanged |= ImGui::DragFloat3("Gravity", physicsSettings.gravity, 0.05f, -1000.0f, 1000.0f, "%.2f");
-            physicsSettingsChanged |= ImGui::DragFloat("Fixed Timestep", &physicsSettings.fixedDeltaSeconds, 0.001f, 0.001f, 0.1f, "%.4f s");
-            int maxSubsteps = static_cast<int>(physicsSettings.maxSubsteps);
-            if (ImGui::SliderInt("Max Substeps", &maxSubsteps, 1, 16))
+            if (ImGui::CollapsingHeader(ICON_FA_CLOUD_SUN "  Sky", ImGuiTreeNodeFlags_DefaultOpen))
+                RenderSkyPanel();
+
+            if (ImGui::CollapsingHeader(ICON_FA_SUN "  God rays", ImGuiTreeNodeFlags_DefaultOpen))
+                RenderGodRaysPanel();
+
+            if (ImGui::CollapsingHeader(ICON_FA_CAMERA "  Tone mapping", ImGuiTreeNodeFlags_DefaultOpen))
+                RenderToneMappingPanel();
+
+            if (ImGui::CollapsingHeader(ICON_FA_CUBES "  Physics", ImGuiTreeNodeFlags_DefaultOpen))
             {
-                physicsSettings.maxSubsteps = static_cast<std::uint32_t>(std::clamp(maxSubsteps, 1, 16));
-                physicsSettingsChanged = true;
+                PhysicsSceneSettings physicsSettings = scene.physics;
+                bool physicsSettingsChanged = false;
+                physicsSettingsChanged |= UI::Prop::DragFloat3("Gravity", physicsSettings.gravity, 0.05f, -1000.0f, 1000.0f, "%.2f");
+                UI::ItemTooltip("Earth gravity is 0, -9.81, 0 (m/s^2)");
+                physicsSettingsChanged |= UI::Prop::DragFloat("Fixed timestep", &physicsSettings.fixedDeltaSeconds, 0.001f, 0.001f, 0.1f, "%.4f s");
+                int maxSubsteps = static_cast<int>(physicsSettings.maxSubsteps);
+                if (UI::Prop::SliderInt("Max substeps", &maxSubsteps, 1, 16))
+                {
+                    physicsSettings.maxSubsteps = static_cast<std::uint32_t>(std::clamp(maxSubsteps, 1, 16));
+                    physicsSettingsChanged = true;
+                }
+                if (physicsSettingsChanged)
+                    scenes.SetPhysicsSettings(physicsSettings);
+                ImGui::TextDisabled("Which layers collide: Edit > Project Settings.");
             }
-            if (physicsSettingsChanged)
-                scenes.SetPhysicsSettings(physicsSettings);
-            ImGui::TextDisabled("Default Earth gravity: 0.00, -9.81, 0.00");
         }
     }
     ImGui::End();
@@ -747,11 +897,17 @@ bool EditorImGui::HierarchyPassesSearch(const std::string& name) const
 
 const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(std::uint64_t entity) const
 {
-    auto it = std::find_if(m_hierarchyEntities.begin(), m_hierarchyEntities.end(),
-        [entity](const HierarchySceneEntity& candidate) {
-            return candidate.entity == entity;
-        });
-    return it == m_hierarchyEntities.end() ? nullptr : &*it;
+    const auto it = m_hierarchyIndexByEntity.find(entity);
+    return it == m_hierarchyIndexByEntity.end() || it->second >= m_hierarchyEntities.size()
+        ? nullptr
+        : &m_hierarchyEntities[it->second];
+}
+
+const std::vector<std::uint64_t>& EditorImGui::HierarchyChildren(std::uint64_t entity) const
+{
+    static const std::vector<std::uint64_t> kNone;
+    const auto it = m_hierarchyChildren.find(entity);
+    return it == m_hierarchyChildren.end() ? kNone : it->second;
 }
 
 const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(HierarchyEntityType type, std::uint32_t objectId) const
@@ -763,6 +919,16 @@ const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(HierarchyEntityType
     return it == m_hierarchyEntities.end() ? nullptr : &*it;
 }
 
+const HierarchySceneEntity* EditorImGui::SelectedHierarchyEntity() const
+{
+    for (const HierarchySceneEntity& entity : m_hierarchyEntities)
+    {
+        if (entity.selected)
+            return &entity;
+    }
+    return FindHierarchyEntity(m_selectedHierarchyEntity);
+}
+
 bool EditorImGui::HierarchySubtreePassesSearch(std::uint64_t entity) const
 {
     const HierarchySceneEntity* node = FindHierarchyEntity(entity);
@@ -770,9 +936,9 @@ bool EditorImGui::HierarchySubtreePassesSearch(std::uint64_t entity) const
         return false;
     if (HierarchyPassesSearch(node->name))
         return true;
-    for (const HierarchySceneEntity& child : m_hierarchyEntities)
+    for (std::uint64_t child : HierarchyChildren(entity))
     {
-        if (child.parent == entity && HierarchySubtreePassesSearch(child.entity))
+        if (HierarchySubtreePassesSearch(child))
             return true;
     }
     return false;

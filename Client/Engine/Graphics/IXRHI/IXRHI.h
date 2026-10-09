@@ -15,9 +15,9 @@
 // - Public types keep the IXRHI prefix; backend types use IXVulkan (never RHI*,
 //   IRHI*, VulkanRHI).
 // - No void* native-device casts and no GetNativeVk*() on these interfaces.
-//   Backend-private native resolution for in-transition native consumers lives
-//   in the Vulkan module (IXVulkanBridge.h: NativeViewOf/NativeSamplerOf/
-//   NativePassOf for still-native downstream users). Every native access is
+//   Backend-private native resolution for the editor adapter's UI texture
+//   registration lives in the Vulkan module (IXVulkanBridge.h:
+//   NativeViewOf/NativeSamplerOf/NativePassOf). Every native access is
 //   inventoried in docs/architecture/phase2-migration-status.md.
 //
 // OWNERSHIP MODEL (binding, see IXRHIDevice.h for the full contract):

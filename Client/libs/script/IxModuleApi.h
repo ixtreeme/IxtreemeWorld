@@ -14,7 +14,11 @@
 // vtable, the FieldBinder vtable, or the entry-point signature. The engine rejects a module whose
 // returned version differs. v2 added NativeScript::DeclareFields (a new vtable slot) + FieldBinder.
 // v3 added IScriptApi spawn/destroy/raycast + animator-param vtable slots (rebuild v2 modules).
-#define IXTREEME_MODULE_API_VERSION 3u
+// v4 added IScriptApi generic TCP transport (NetConnect..NetClose) + text prompt slots (rebuild v3).
+// v5 added IScriptApi::SetMaterial (rebuild v4).
+// v6 added IScriptApi character state/abilities + game UI (RmlUi) slots and action keys (rebuild v5).
+// v7 appends filtered queries and deferred entity activation (rebuild v6 modules).
+#define IXTREEME_MODULE_API_VERSION 7u
 
 // The exact exported symbol name the engine resolves in each module DLL.
 #define IXTREEME_MODULE_ENTRY_SYMBOL "IxtreemeGameModule_v1"

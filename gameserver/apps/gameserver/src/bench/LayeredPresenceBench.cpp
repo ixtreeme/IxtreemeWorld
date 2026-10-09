@@ -1,0 +1,1484 @@
+#include "LayeredPresenceBench.h"
+
+#include <algorithm>
+#include <array>
+#include <mutex>
+#include <unordered_map>
+#include <cstdarg>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <thread>
+#include <vector>
+
+#include <boost/asio/executor_work_guard.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/read.hpp>
+
+#include "db/CharacterRepository.h"
+#include "map/LayerClearance.h"
+#include "map/LayeredWorldGeometry.h"
+#include "map/ServerTerrain.h"
+#include "map/WorldPackage.h"
+#include "map/WorldPackageWriter.h"
+#include "network/Session.h"
+#include "protocol/Protocol.h"
+#include "protocol/Serialization.h"
+
+#include "../world/WorldRuntime.h"
+#include "../world/components/ComponentRegistration.h"
+#include "../world/components/AiComponents.h"
+#include "../world/debug/WorldValidator.h"
+#include "../world/partition/RegionDefinition.h"
+#include "../world/spatial/SpatialValidator.h"
+#include "../world/spawn/MobPrototypeRegistry.h"
+#include "../world/spawn/SpawnSystem.h"
+#include "../world/systems/MovementSystem.h"
+#include "../world/terrain/TerrainService.h"
+#include "../world/zone/Zone.h"
+#include "../world/zone/ZoneManager.h"
+#include "../world/zone/ZoneOwnership.h"
+#include "../world/components/LayerComponents.h"
+#include "../world/migration/EntityTransfer.h"
+#include "../world/package/WorldPackageLoader.h"
+#include "../world/partition/PartitionConfig.h"
+#include "../world/replication/ProtocolEncoder.h"
+#include "../world/spatial/SpatialGrid.h"
+#include "BenchSnapshot.h"
+
+namespace gs::bench {
+namespace {
+
+namespace fs = std::filesystem;
+namespace asio = boost::asio;
+namespace map = mx::map;
+using Clock = std::chrono::steady_clock;
+using namespace std::chrono_literals;
+
+struct Checks {
+    int passes = 0, failures = 0;
+
+    void Report(const std::string& name, bool pass, const std::string& detail = {})
+    {
+        std::printf("LAYEREDPRESENCE %s: %s%s%s\n", name.c_str(), pass ? "PASS" : "FAIL",
+                    detail.empty() ? "" : " -- ", detail.c_str());
+        (pass ? passes : failures) += 1;
+    }
+};
+
+std::string Fmt(const char* format, ...)
+{
+    char buffer[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(buffer, sizeof(buffer), format, args);
+    va_end(args);
+    return buffer;
+}
+
+struct ScratchDirectory {
+    fs::path parent = fs::weakly_canonical(fs::temp_directory_path());
+    fs::path root;
+
+    ScratchDirectory()
+    {
+        const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            const auto candidate = parent / ("ixw_layeredpresence_" + std::to_string(suffix) + "_" +
+                                             std::to_string(attempt));
+            std::error_code ec;
+            if (fs::create_directory(candidate, ec)) {
+                root = candidate;
+                return;
+            }
+        }
+        throw std::runtime_error("cannot allocate a unique layered presence scratch directory");
+    }
+
+    ~ScratchDirectory()
+    {
+        if (root.is_absolute() && root.parent_path() == parent &&
+            root.filename().string().starts_with("ixw_layeredpresence_")) {
+            std::error_code ec;
+            fs::remove_all(root, ec);
+        }
+    }
+};
+
+struct IoRunner {
+    asio::io_context io;
+    asio::executor_work_guard<asio::io_context::executor_type> work{asio::make_work_guard(io)};
+    std::thread thread{[this] { io.run(); }};
+    ~IoRunner()
+    {
+        work.reset();
+        io.stop();
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+};
+
+std::shared_ptr<gs::network::Session> DetachedSession(asio::io_context& io, gs::common::SessionId id)
+{
+    asio::ip::tcp::socket socket(io);
+    return std::make_shared<gs::network::Session>(std::move(socket), id);
+}
+
+gs::db::Character MakeCharacter(std::uint64_t index)
+{
+    gs::db::Character character;
+    character.id = gs::db::CharacterId{95000 + index};
+    character.account_id = gs::db::AccountId{96000 + index};
+    character.name = "Layered" + std::to_string(index);
+    character.level = 1;
+    character.class_id = 1;
+    character.created_at = std::chrono::system_clock::now();
+    character.last_played_at = character.created_at;
+    return character;
+}
+
+bool WaitFor(std::chrono::milliseconds timeout, const std::function<bool()>& condition)
+{
+    const auto deadline = Clock::now() + timeout;
+    while (Clock::now() < deadline) {
+        if (condition()) {
+            return true;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    return condition();
+}
+
+std::string AuditNow(gs::game::WorldRuntime& sim)
+{
+    sim.RequestValidation();
+    std::string result;
+    for (int i = 0; i < 400; ++i) {
+        if (sim.TryTakeValidationResult(result)) {
+            return result;
+        }
+        std::this_thread::sleep_for(25ms);
+    }
+    return "TIMEOUT";
+}
+
+// Closed box in canonical metres (Z up), outward winding.
+map::LayerCollisionMesh Box(std::uint32_t id, float x0, float y0, float z0, float x1, float y1, float z1)
+{
+    map::LayerCollisionMesh mesh;
+    mesh.source_id = id;
+    mesh.name = "box_" + std::to_string(id);
+    mesh.tags = map::VolumeTagGround;
+    mesh.supports_ground_movement = true;
+    mesh.vertices = {{x0, y0, z0}, {x1, y0, z0}, {x0, y1, z0}, {x1, y1, z0},
+                     {x0, y0, z1}, {x1, y0, z1}, {x0, y1, z1}, {x1, y1, z1}};
+    mesh.indices = {4, 5, 7, 4, 7, 6, 0, 2, 3, 0, 3, 1, 0, 1, 5, 0, 5, 4,
+                    2, 6, 7, 2, 7, 3, 0, 4, 6, 0, 6, 2, 1, 3, 7, 1, 7, 5};
+    return mesh;
+}
+
+constexpr float kWorldSize = 512.0f;
+
+// Floor (top 1 m) across the x = 256 zone cut, a non-walkable wall on it, a
+// stair of four 0.75 m treads onto a 2 m landing at its east edge, and a
+// separate bridge deck (top 6 m) stacked above part of the floor.
+bool CookFixture(map::LayeredWorld& world, std::string& error)
+{
+    std::vector<map::LayerCollisionMesh> walkable{Box(1, 200, 236, 0, 300, 276, 1)};
+    for (std::uint32_t k = 0; k < 4; ++k) {
+        const float x0 = 300 + 0.75f * static_cast<float>(k);
+        walkable.push_back(Box(2 + k, x0, 250, 0, x0 + 0.75f, 254, 1.25f + 0.25f * static_cast<float>(k)));
+    }
+    walkable.push_back(Box(6, 303, 248, 0, 310, 256, 2));
+    walkable.push_back(Box(7, 240, 240, 5, 270, 270, 6));
+    const auto wall = Box(9, 230, 240, 1, 230.5f, 260, 4);
+
+    std::vector<map::LayerSourceSurface> surfaces;
+    map::LayerGeometryReport geometry;
+    if (!map::ExtractLayerSourceSurfaces(walkable, {}, surfaces, geometry)) {
+        error = geometry.errors.empty() ? "extract" : geometry.errors.front();
+        return false;
+    }
+    map::LayerGenerationOptions options;
+    options.world_bounds = map::Rect{0, 0, kWorldSize, kWorldSize};
+    options.require_exact_footprints = true;
+    map::LayerGenerationReport generation;
+    if (!map::GenerateLayeredWorld(surfaces, options, world, generation)) {
+        error = generation.errors.empty() ? "generate" : generation.errors.front();
+        return false;
+    }
+    std::vector<map::LayerObstructionMesh> obstructions;
+    for (const auto& mesh : walkable) obstructions.push_back({mesh.source_id, mesh.vertices, mesh.indices});
+    obstructions.push_back({wall.source_id, wall.vertices, wall.indices});
+    map::LayerClearanceReport report;
+    if (!map::CookLayerClearance(world, options.world_bounds, obstructions, nullptr, map::LayerClearanceProfile{},
+                                 report)) {
+        error = report.errors.empty() ? "cook" : report.errors.front();
+        return false;
+    }
+    return true;
+}
+
+const map::LayerVolume* WalkableAt(const map::LayeredWorld& world, double x, double y, double min_z, double max_z)
+{
+    for (const auto& volume : world.volumes) {
+        if (volume.ground_support && x >= volume.bounds.min_x && x < volume.bounds.max_x &&
+            y >= volume.bounds.min_y && y < volume.bounds.max_y && volume.min_z >= min_z && volume.min_z < max_z) {
+            return &volume;
+        }
+    }
+    return nullptr;
+}
+
+// ---- unit checks (no runtime) ---------------------------------------------
+
+void UnitChecks(Checks& checks)
+{
+    using gs::game::GridSlot;
+    using gs::game::LayerPresence;
+    using gs::game::Position;
+    flecs::world world;
+    gs::game::RegisterWorldComponents(world);
+    gs::game::SpatialGrid grid;
+    auto ground = world.entity();
+    auto upper = world.entity().set<LayerPresence>({7, 2});
+    const Position below{10.5f, 20.5f, 1.0f};
+    const Position above{10.5f, 20.5f, 6.0f};
+    grid.Insert(1, below, ground, 0);
+    grid.Insert(2, above, upper, 7);
+    const auto entries = grid.SnapshotEntries();
+    bool distinct = entries.size() == 2;
+    for (const auto& [net, key] : entries) {
+        distinct = distinct && key.volume_id == (net == 1 ? 0u : 7u) && key.cell_x == 0 && key.cell_y == 0;
+    }
+    checks.Report("grid-stacked-entries-have-distinct-layered-buckets",
+                  distinct && !(entries[0].second == entries[1].second));
+    std::size_t seen = 0;
+    grid.ForEachInRadius(below, 120.0f, [&](const gs::game::GridEntry&) { ++seen; });
+    checks.Report("grid-radius-scan-reads-every-volume-of-the-column", seen == 2);
+    checks.Report("grid-contains-in-is-volume-exact", grid.ContainsIn(2, above, 7) && !grid.ContainsIn(2, above, 0) &&
+                                                         grid.ContainsIn(1, below, 0) && grid.Contains(2, above));
+    // A portal crossing in place: same cell, other volume.
+    upper.set<LayerPresence>({8, 3});
+    const bool changed = grid.Move(upper, 2, gs::game::SpatialCellKey(0, 0), above, 8);
+    const auto* slot = upper.try_get<GridSlot>();
+    checks.Report("grid-volume-change-moves-the-bucket", changed && grid.ContainsIn(2, above, 8) &&
+                                                             !grid.ContainsIn(2, above, 7) && slot &&
+                                                             slot->volume_id == 8 && grid.Size() == 2);
+    grid.Remove(2, above);
+    grid.Remove(1, below);
+    checks.Report("grid-remove-finds-entries-of-any-volume", grid.Size() == 0 && grid.Empty());
+
+    // Transfer DTO round trip keeps presence (and terrain entities stay plain).
+    auto layered = world.entity()
+                       .set<Position>({300.0f, 252.0f, 1.25f})
+                       .set<gs::game::Heading>({})
+                       .set<gs::game::Velocity>({})
+                       .set<gs::game::MoveIntent>({})
+                       .set<gs::game::MoveSpeed>({})
+                       .set<gs::game::Hp>({})
+                       .set<gs::game::CombatStats>({})
+                       .set<gs::game::AttackCooldown>({})
+                       .set<gs::game::NetId>({4242})
+                       .set<gs::game::SessionRef>({1})
+                       .set<LayerPresence>({3, 3});
+    const auto transfer = gs::game::BuildTransfer(layered, true);
+    flecs::world other;
+    gs::game::RegisterWorldComponents(other);
+    const auto applied = gs::game::ApplyTransfer(other, transfer);
+    const auto* moved = applied.try_get<LayerPresence>();
+    checks.Report("transfer-carries-layered-presence", transfer.IsLayered() && moved && moved->volume_id == 3 &&
+                                                         moved->layer_id == 3 &&
+                                                         applied.get<Position>().z == 1.25f);
+    layered.remove<LayerPresence>();
+    const auto plain = gs::game::ApplyTransfer(other, gs::game::BuildTransfer(layered, true));
+    checks.Report("terrain-transfer-stays-without-presence", !plain.has<LayerPresence>());
+
+    // Additive protocol fields.
+    gs::game::BorderEntitySnapshot snapshot;
+    snapshot.net_id = 77;
+    snapshot.volume_id = 12;
+    snapshot.layer_id = 5;
+    const auto spawn = gs::protocol::ParsePacket(gs::game::MakeSpawn(snapshot));
+    const auto accept =
+        gs::protocol::ParsePacket(gs::game::MakeEnterWorldAccept(9, {1.0f, 2.0f, 3.0f}, 44, 12, 5));
+    const auto legacy = gs::protocol::ParsePacket(gs::game::MakeEnterWorldAccept(9, {1.0f, 2.0f, 3.0f}, 44));
+    checks.Report("spawn-packet-carries-volume-and-layer",
+                  spawn && spawn->packet.isEntitySpawn() && spawn->packet.getEntitySpawn().getVolumeId() == 12 &&
+                      spawn->packet.getEntitySpawn().getLayerId() == 5);
+    checks.Report("enter-accept-carries-volume-legacy-defaults-zero",
+                  accept && accept->packet.isEnterWorldAccept() &&
+                      accept->packet.getEnterWorldAccept().getSpawnVolumeId() == 12 &&
+                      accept->packet.getEnterWorldAccept().getSpawnLayerId() == 5 && legacy &&
+                      legacy->packet.getEnterWorldAccept().getSpawnVolumeId() == 0);
+}
+
+// ---- deterministic zone-level checks (production systems, no scheduler) ----
+
+struct ZoneFixture {
+    asio::io_context io; // sessions' sockets must outlive the zone
+    gs::game::ZoneManager zones;
+    gs::game::TerrainService terrain = gs::game::TerrainService::Flat({0, 0, kWorldSize, kWorldSize});
+    map::WorldLogic logic;
+    gs::game::MobPrototypeRegistry types;
+
+    bool Build()
+    {
+        gs::game::PartitionLayout layout;
+        layout.regions_x = layout.regions_y = 1;
+        gs::game::InitialPartition initial;
+        std::string error;
+        if (!gs::game::BuildInitialPartition({0, 0, kWorldSize, kWorldSize}, layout, 240, initial, error)) {
+            return false;
+        }
+        zones.BuildInitialPartition(initial);
+        return zones.ZoneCount() == 1;
+    }
+};
+
+void DeterministicChecks(Checks& checks)
+{
+    using namespace gs::game;
+    map::LayeredWorld layered;
+    std::string error;
+    if (!CookFixture(layered, error)) {
+        checks.Report("deterministic-fixture-cooked", false, error);
+        return;
+    }
+    const auto* floor = WalkableAt(layered, 240, 256, -1, 2);
+    const auto* landing = WalkableAt(layered, 305, 252, 1.5, 3);
+    const auto* bridge = WalkableAt(layered, 250, 250, 4, 7);
+    ZoneFixture fixture;
+    if (!floor || !landing || !bridge || !fixture.Build()) {
+        checks.Report("deterministic-fixture-zone", false);
+        return;
+    }
+    auto& zone = fixture.zones.GetZone(0);
+    const map::LayerActorProfile actor{layered.clearance_profile->actor_radius_m,
+                                       layered.clearance_profile->actor_height_m};
+    ZoneTickContext ctx{fixture.terrain, fixture.logic, fixture.types, fixture.zones};
+    ctx.layered = &layered;
+    ctx.layer_actor = actor;
+
+    auto spawn = [&](std::uint32_t net, float x, float y, const map::LayerVolume& volume) {
+        ZoneWriteGuard guard(zone, "layered fixture spawn");
+        const auto z = static_cast<float>(volume.ground_support->Height(x, y));
+        SpawnSystem::SpawnPlayer(zone, DetachedSession(fixture.io, net), MakeCharacter(net), Position{x, y, z}, net,
+                                 LayerPresence{volume.id, volume.layer_id});
+        return zone.FindEntity(net);
+    };
+    auto steer = [&](flecs::entity entity, float heading, MoveState state) {
+        ZoneWriteGuard guard(zone, "layered fixture input");
+        entity.set<MoveIntent>({heading, state, 0});
+    };
+    auto tick = [&](int ticks, float dt = 0.05f) {
+        for (int i = 0; i < ticks; ++i) {
+            ZoneWriteGuard guard(zone, "layered fixture tick");
+            MovementSystem::Step(zone, dt, ctx);
+        }
+    };
+    constexpr float kEast = 1.5707963f;
+    auto& diag = zone.Diagnostics();
+
+    // Stairs: the volume sequence is exactly floor -> 4 treads -> landing,
+    // one proven portal at a time, z always the current support plane.
+    const auto climber = spawn(501, 296.0f, 252.0f, *floor);
+    steer(climber, kEast, MoveState::Running);
+    std::vector<std::uint32_t> sequence{floor->id};
+    bool z_on_plane = true;
+    for (int i = 0; i < 60; ++i) {
+        tick(1);
+        const auto presence = climber.get<LayerPresence>();
+        const auto position = climber.get<Position>();
+        if (presence.volume_id != sequence.back()) sequence.push_back(presence.volume_id);
+        const auto* volume = WalkableAt(layered, position.x, position.y, -1, 10);
+        z_on_plane = z_on_plane && volume != nullptr &&
+                     position.z == static_cast<float>(volume->ground_support->Height(position.x, position.y));
+    }
+    std::string order;
+    for (const auto id : sequence) order += std::to_string(id) + " ";
+    checks.Report("deterministic-stair-volume-sequence-one-portal-at-a-time",
+                  sequence.size() == 6 && sequence.front() == floor->id && sequence.back() == landing->id &&
+                      diag.layered_portal_crossings_total.load() == 5 && z_on_plane,
+                  "volumes " + order);
+    const auto stopped = climber.get<Position>();
+    // 3D-5D: the landing's east side is an open ledge (2 m drop): the actor
+    // stops inside it at the eroded ledge band (centre <= 310 - radius, cell
+    // quantised), refused as Blocked before ever reaching the footprint edge.
+    checks.Report("deterministic-landing-edge-refuses-leaving-the-volume-system",
+                  stopped.x <= 310.0f - 0.35f && stopped.x > 309.0f &&
+                      climber.get<LayerPresence>().volume_id == landing->id &&
+                      diag.layered_moves_blocked_total.load() > 0,
+                  Fmt("x=%.4f blocked=%llu transition=%llu", stopped.x,
+                      static_cast<unsigned long long>(diag.layered_moves_blocked_total.load()),
+                      static_cast<unsigned long long>(diag.layered_moves_transition_total.load())));
+
+    // Wall: the exact last accepted piece is the last clear cell.
+    const auto walker = spawn(502, 226.0f, 250.0f, *floor);
+    steer(walker, kEast, MoveState::Running);
+    const auto blocked_before = diag.layered_moves_blocked_total.load();
+    tick(30);
+    const auto at_wall = walker.get<Position>();
+    checks.Report("deterministic-wall-blocks-before-actor-radius",
+                  at_wall.x <= 230.0f - 0.35f && at_wall.x > 229.0f &&
+                      diag.layered_moves_blocked_total.load() > blocked_before,
+                  Fmt("x=%.4f", at_wall.x));
+
+    // A low-LOD-sized long step (1.5 m) is split into <= 0.5 m pieces, so it
+    // may still cross treads one portal at a time.
+    const auto stepper = spawn(503, 299.0f, 251.0f, *floor);
+    {
+        ZoneWriteGuard guard(zone, "layered fixture speed");
+        stepper.set<MoveSpeed>({1.5f, 1.5f});
+        stepper.set<MoveIntent>({kEast, MoveState::Walking, 0});
+    }
+    const auto crossings_before = diag.layered_portal_crossings_total.load();
+    tick(1, 1.0f);
+    const auto long_step = stepper.get<Position>();
+    checks.Report("deterministic-long-step-is-sub-stepped-across-portals",
+                  long_step.x == 300.5f && diag.layered_portal_crossings_total.load() == crossings_before + 1 &&
+                      stepper.get<LayerPresence>().volume_id != floor->id && long_step.z == 1.25f,
+                  Fmt("x=%.4f z=%.4f", long_step.x, long_step.z));
+
+    // Without layered metadata in the tick context a layered entity cannot
+    // move at all (never falls back to terrain movement).
+    const auto frozen = spawn(504, 250.0f, 260.0f, *floor);
+    steer(frozen, 0.0f, MoveState::Running);
+    ctx.layered = nullptr;
+    const auto invalid_before = diag.layered_moves_invalid_total.load();
+    tick(3);
+    ctx.layered = &layered;
+    checks.Report("deterministic-no-layered-metadata-freezes-layered-entity",
+                  frozen.get<Position>().y == 260.0f && frozen.get<Position>().z == 1.0f &&
+                      diag.layered_moves_invalid_total.load() > invalid_before);
+    steer(frozen, 0.0f, MoveState::Idle);
+
+    // Audit + spatial index: positive, then one corruption at a time.
+    std::string audit_error;
+    checks.Report("audit-accepts-valid-layered-residents",
+                  ValidateLayeredPresence(fixture.zones, &layered, actor, audit_error) &&
+                      ValidateSpatialIndex(zone, zone.Grid(), audit_error),
+                  audit_error);
+    const auto victim = spawn(505, 250.0f, 250.0f, *bridge);
+    auto corrupt = [&](const char* name, const std::function<void()>& damage, const std::function<void()>& repair,
+                       bool spatial) {
+        {
+            ZoneWriteGuard guard(zone, "layered fixture corruption");
+            damage();
+        }
+        std::string message;
+        const bool caught = spatial ? !ValidateSpatialIndex(zone, zone.Grid(), message)
+                                    : !ValidateLayeredPresence(fixture.zones, &layered, actor, message);
+        {
+            ZoneWriteGuard guard(zone, "layered fixture repair");
+            repair();
+        }
+        checks.Report(name, caught, message);
+    };
+    const Position good = victim.get<Position>();
+    auto place = [&](const Position& p) {
+        const auto current = victim.get<Position>();
+        const auto old_cell = SpatialCellKey(SpatialCellCoord(current.x), SpatialCellCoord(current.y));
+        victim.set<Position>(p);
+        zone.Grid().Move(victim, 505, old_cell, p, SpatialVolumeOf(victim));
+    };
+    corrupt("negative-audit-catches-off-plane-z", [&] { place({good.x, good.y, good.z + 0.01f}); },
+            [&] { place(good); }, false);
+    corrupt("negative-audit-catches-unknown-volume", [&] { victim.set<LayerPresence>({999, bridge->layer_id}); },
+            [&] { victim.set<LayerPresence>({bridge->id, bridge->layer_id}); }, false);
+    corrupt("negative-audit-catches-wrong-layer", [&] { victim.set<LayerPresence>({bridge->id, bridge->layer_id + 1}); },
+            [&] { victim.set<LayerPresence>({bridge->id, bridge->layer_id}); }, false);
+    const auto* wall_floor = floor;
+    corrupt("negative-audit-catches-resident-inside-blocked-cell",
+            [&] {
+                victim.set<LayerPresence>({wall_floor->id, wall_floor->layer_id});
+                place({229.9f, 250.0f, 1.0f});
+            },
+            [&] {
+                victim.set<LayerPresence>({bridge->id, bridge->layer_id});
+                place(good);
+            },
+            false);
+    {
+        std::string message;
+        checks.Report("negative-audit-null-world-refuses-layered-residents",
+                      !ValidateLayeredPresence(fixture.zones, nullptr, actor, message), message);
+    }
+    corrupt("negative-spatial-index-catches-stale-volume-bucket",
+            [&] { victim.set<LayerPresence>({floor->id, floor->layer_id}); },
+            [&] { victim.set<LayerPresence>({bridge->id, bridge->layer_id}); }, true);
+    checks.Report("audit-accepts-after-repairs",
+                  ValidateLayeredPresence(fixture.zones, &layered, actor, audit_error) &&
+                      ValidateSpatialIndex(zone, zone.Grid(), audit_error),
+                  audit_error);
+}
+
+// ---- running runtime ------------------------------------------------------
+
+struct PlayerView {
+    bool found = false;
+    gs::game::ZoneId zone = 0;
+    std::uint32_t net_id = 0;
+    gs::game::Position position;
+    bool layered = false;
+    gs::game::LayerPresence presence;
+};
+
+PlayerView ReadPlayer(gs::game::WorldRuntime& sim, gs::common::SessionId session)
+{
+    return ReadWorld(sim, [session](const WorldSnapshot& snap) {
+        PlayerView out;
+        const auto it = snap.owners.find(session);
+        if (it == snap.owners.end() || it->second.zone_index >= snap.zones.ZoneCount()) {
+            return out;
+        }
+        const auto& zone = snap.zones.GetZone(it->second.zone_index);
+        const auto entity = zone.FindEntity(it->second.net_id);
+        if (!entity.is_valid() || !entity.has<gs::game::Position>()) {
+            return out;
+        }
+        out.found = true;
+        out.zone = zone.Id();
+        out.net_id = it->second.net_id;
+        out.position = entity.get<gs::game::Position>();
+        if (const auto* presence = entity.try_get<gs::game::LayerPresence>()) {
+            out.layered = true;
+            out.presence = *presence;
+        }
+        return out;
+    });
+}
+
+std::string Describe(const PlayerView& p)
+{
+    return Fmt("zone=%u net=%u pos=(%.3f, %.3f, %.3f) volume=%u layer=%u", p.zone, p.net_id, p.position.x,
+               p.position.y, p.position.z, p.presence.volume_id, p.presence.layer_id);
+}
+
+void RuntimeChecks(Checks& checks)
+{
+    ScratchDirectory scratch;
+    map::LayeredWorld layered;
+    std::string error;
+    const bool cooked = CookFixture(layered, error);
+    const auto proven = std::count_if(layered.portals.begin(), layered.portals.end(),
+                                      [](const auto& portal) { return portal.proof.has_value(); });
+    checks.Report("cook-floor-wall-stairs-landing-bridge", cooked && proven == 5, error);
+    if (!cooked) return;
+    const auto* floor = WalkableAt(layered, 240, 256, -1, 2);
+    const auto* landing = WalkableAt(layered, 305, 252, 1.5, 3);
+    const auto* bridge = WalkableAt(layered, 250, 250, 4, 7);
+    if (!floor || !landing || !bridge) {
+        checks.Report("fixture-volumes-found", false);
+        return;
+    }
+    const std::uint32_t floor_id = floor->id, landing_id = landing->id, bridge_id = bridge->id;
+
+    map::PackageWriteSpec spec;
+    spec.world_id = "layeredpresence_fixture";
+    spec.world_name = "3D-5A layered presence fixture";
+    spec.size_cells_x = static_cast<std::uint32_t>(kWorldSize);
+    spec.size_cells_y = static_cast<std::uint32_t>(kWorldSize);
+    spec.origin_x = 0;
+    spec.origin_y = 0;
+    spec.cell_size_m = 1;
+    spec.chunk_size_cells = 128;
+    spec.height_raw = [](std::uint32_t, std::uint32_t) { return 0; };
+    spec.attributes = [](std::uint32_t, std::uint32_t) { return std::uint16_t{0}; };
+    spec.logic.spawns.push_back(map::SpawnRegion{1, 0, map::Rect{96, 96, 104, 104}});
+    spec.layered_world = layered;
+    const auto root = scratch.root / "package";
+    const auto written = map::WritePackage(root, spec);
+    checks.Report("strict-writer-accepts-layered-fixture", written.ok, written.error);
+    if (!written.ok) return;
+    gs::game::WorldLoadRequest request;
+    request.package_root = root;
+    request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+    request.depth = map::ValidationDepth::Full;
+    request.warp_policy = map::WarpPolicy::Strict;
+    map::PackageReport report;
+    auto loaded = gs::game::LoadWorldPackage(request, report);
+    checks.Report("strict-full-load", loaded && report.Ok());
+    if (!loaded) return;
+
+    IoRunner runner;
+    gs::game::PartitionLayout layout;
+    layout.regions_x = 2;
+    layout.regions_y = 1;
+    gs::game::WorldRuntime sim(runner.io, {}, std::move(*loaded), layout);
+    gs::game::PartitionConfig partition;
+    partition.scoring.adaptive_enabled = false;
+    sim.ConfigurePartition(partition);
+
+    struct Player {
+        gs::common::SessionId session;
+        gs::game::DebugSpawnOverride spawn;
+        float heading; // 0 = north (+Y), pi/2 = east (+X)
+        bool moves;
+    };
+    constexpr float kEast = 1.5707963f;
+    const Player players[] = {
+        {95101, {240.0f, 256.0f, floor_id}, kEast, true},   // A: crosses the x=256 zone cut on the floor
+        {95102, {296.0f, 252.0f, floor_id}, kEast, true},   // B: up the stairs onto the landing
+        {95103, {226.0f, 250.0f, floor_id}, kEast, true},   // C: runs into the wall at x=230
+        {95104, {250.0f, 250.0f, bridge_id}, 0.0f, false},  // D: bridge deck, stacked above E
+        {95105, {250.0f, 250.0f, floor_id}, 0.0f, false},   // E: floor under the bridge
+        {95106, {100.0f, 100.0f, 0}, 0.0f, true},           // F: legacy terrain player
+        {95107, {230.25f, 250.0f, floor_id}, 0.0f, false},  // G: inside the wall -> refused
+        {95108, {240.0f, 256.0f, 999}, 0.0f, false},        // H: unknown volume -> refused
+    };
+    std::uint64_t index = 0;
+    for (const auto& p : players) {
+        sim.PostSpawn(DetachedSession(runner.io, p.session), MakeCharacter(index++), p.spawn);
+    }
+    sim.Start();
+    const bool entered = WaitFor(10000ms, [&] {
+        return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); }) == std::size(players);
+    });
+    checks.Report("all-players-entered", entered);
+
+    // Admission (before any movement).
+    const auto d0 = ReadPlayer(sim, 95104);
+    const auto e0 = ReadPlayer(sim, 95105);
+    const auto a0 = ReadPlayer(sim, 95101);
+    checks.Report("layered-admission-explicit-volume-and-support-z",
+                  a0.found && a0.layered && a0.presence.volume_id == floor_id && a0.position.z == 1.0f,
+                  Describe(a0));
+    checks.Report("stacked-admission-same-xy-different-floors",
+                  d0.found && e0.found && d0.layered && e0.layered && d0.presence.volume_id == bridge_id &&
+                      e0.presence.volume_id == floor_id && d0.position.z == 6.0f && e0.position.z == 1.0f &&
+                      d0.position.x == e0.position.x && d0.position.y == e0.position.y,
+                  Describe(d0) + " / " + Describe(e0));
+    for (const auto session : {gs::common::SessionId{95107}, gs::common::SessionId{95108}}) {
+        const auto refused = ReadPlayer(sim, session);
+        checks.Report(session == 95107 ? "layered-admission-in-wall-refused-to-terrain-spawn"
+                                       : "layered-admission-unknown-volume-refused-to-terrain-spawn",
+                      refused.found && !refused.layered && refused.position.x == 100.0f &&
+                          refused.position.y == 100.0f && refused.position.z == 0.0f,
+                      Describe(refused));
+    }
+    const auto stacked_keys = ReadWorld(sim, [&](const WorldSnapshot& snap) {
+        std::vector<mx::map::LayeredSpatialCellKey> keys;
+        for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+            for (const auto& [net, key] : snap.zones.GetZone(i).Grid().SnapshotEntries()) {
+                if (net == d0.net_id || net == e0.net_id) keys.push_back(key);
+            }
+        }
+        return keys;
+    });
+    checks.Report("stacked-players-indexed-in-distinct-volume-buckets",
+                  stacked_keys.size() == 2 && !(stacked_keys[0] == stacked_keys[1]) &&
+                      stacked_keys[0].cell_x == stacked_keys[1].cell_x &&
+                      stacked_keys[0].cell_y == stacked_keys[1].cell_y);
+
+    std::uint32_t seq = 0;
+    const auto run_until = Clock::now() + 4000ms;
+    while (Clock::now() < run_until) {
+        for (const auto& p : players) {
+            if (p.moves) sim.PostMoveInput(p.session, ++seq, p.heading, gs::game::MoveState::Running);
+        }
+        std::this_thread::sleep_for(50ms);
+    }
+    for (const auto& p : players) {
+        if (p.moves) sim.PostMoveInput(p.session, ++seq, p.heading, gs::game::MoveState::Idle);
+    }
+    std::this_thread::sleep_for(400ms);
+
+    const auto a = ReadPlayer(sim, 95101);
+    const auto b = ReadPlayer(sim, 95102);
+    const auto c = ReadPlayer(sim, 95103);
+    const auto f = ReadPlayer(sim, 95106);
+    const auto zone_of = [&](float x) {
+        return ReadWorld(sim, [x](const WorldSnapshot& snap) -> gs::game::ZoneId {
+            for (const auto* leaf : snap.zones.GetActiveLeaves()) {
+                if (leaf->bounds.ContainsHalfOpen(x, 256.0f)) return leaf->zone_id;
+            }
+            return 0;
+        });
+    };
+    checks.Report("layered-player-migrates-across-zone-cut-keeping-presence-and-z",
+                  a.found && a.layered && a.presence.volume_id == floor_id && a.position.x > 256.5f &&
+                      a.zone == zone_of(a.position.x) && a.zone != a0.zone && a.position.z == 1.0f,
+                  Describe(a0) + " -> " + Describe(a));
+    checks.Report("layered-player-climbs-stairs-onto-landing-via-portals",
+                  b.found && b.layered && b.presence.volume_id == landing_id && b.position.z == 2.0f &&
+                      b.position.x > 303.0f && b.position.x < 310.0f,
+                  Describe(b));
+    checks.Report("layered-player-stops-before-unopted-wall",
+                  c.found && c.layered && c.presence.volume_id == floor_id && c.position.x > 227.0f &&
+                      c.position.x <= 230.0f - 0.35f && c.position.z == 1.0f,
+                  Describe(c));
+    checks.Report("terrain-player-moves-on-terrain-without-presence",
+                  f.found && !f.layered && f.position.y > 110.0f && f.position.z == 0.0f, Describe(f));
+
+    struct Counters {
+        std::uint64_t ok = 0, blocked = 0, transition = 0, invalid = 0, portals = 0;
+    };
+    const auto counters = ReadWorld(sim, [](const WorldSnapshot& snap) {
+        Counters out;
+        for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+            const auto& diag = snap.zones.GetZone(i).Diagnostics();
+            out.ok += diag.layered_moves_ok_total.load();
+            out.blocked += diag.layered_moves_blocked_total.load();
+            out.transition += diag.layered_moves_transition_total.load();
+            out.invalid += diag.layered_moves_invalid_total.load();
+            out.portals += diag.layered_portal_crossings_total.load();
+        }
+        return out;
+    });
+    checks.Report("portal-crossings-counted-no-invalid-layered-state",
+                  counters.portals == 5 && counters.invalid == 0 && counters.ok > 0 && counters.blocked > 0,
+                  Fmt("ok=%llu blocked=%llu transition=%llu invalid=%llu portals=%llu",
+                      static_cast<unsigned long long>(counters.ok),
+                      static_cast<unsigned long long>(counters.blocked),
+                      static_cast<unsigned long long>(counters.transition),
+                      static_cast<unsigned long long>(counters.invalid),
+                      static_cast<unsigned long long>(counters.portals)));
+
+    // Ghost of the migrated player in its former zone carries the volume.
+    struct GhostView {
+        bool found = false;
+        std::uint32_t snapshot_volume = 0;
+        std::uint32_t entity_volume = 0;
+    };
+    const auto ghost = ReadWorld(sim, [&](const WorldSnapshot& snap) {
+        GhostView out;
+        for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+            const auto& zone = snap.zones.GetZone(i);
+            if (zone.Id() != a0.zone) continue;
+            if (const auto* record = zone.FindGhost(a.net_id)) {
+                out.found = true;
+                out.snapshot_volume = record->snapshot.volume_id;
+                out.entity_volume = gs::game::SpatialVolumeOf(record->entity);
+            }
+        }
+        return out;
+    });
+    checks.Report("neighbour-ghost-carries-layered-presence",
+                  ghost.found && ghost.snapshot_volume == floor_id && ghost.entity_volume == floor_id,
+                  Fmt("found=%d snapshot=%u entity=%u", ghost.found, ghost.snapshot_volume, ghost.entity_volume));
+
+    // AOI -> visibility across stacked floors (horizontal interest radius).
+    const auto mutual = ReadWorld(sim, [&](const WorldSnapshot& snap) {
+        bool d_sees_e = false, e_sees_d = false;
+        for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+            const auto& zone = snap.zones.GetZone(i);
+            if (const auto* binding = zone.FindPlayer(d0.net_id)) d_sees_e = binding->IsVisible(e0.net_id);
+            if (const auto* binding = zone.FindPlayer(e0.net_id)) e_sees_d = binding->IsVisible(d0.net_id);
+        }
+        return d_sees_e && e_sees_d;
+    });
+    checks.Report("stacked-players-see-each-other", mutual);
+
+    const auto audit = AuditNow(sim);
+    checks.Report("world-audit-including-layered-presence", audit == "OK", audit);
+    sim.Stop();
+}
+
+// ---- 3D-5C1: layered transform frames over real loopback sessions -----------
+
+std::uint32_t ReadU32(const std::uint8_t* p)
+{
+    return static_cast<std::uint32_t>(p[0]) | static_cast<std::uint32_t>(p[1]) << 8 |
+           static_cast<std::uint32_t>(p[2]) << 16 | static_cast<std::uint32_t>(p[3]) << 24;
+}
+
+// What one client learned from its wire stream, decoded independently of
+// the server encoder (strict: every frame must be consumed exactly).
+struct WireLog {
+    std::mutex mutex;
+    std::uint64_t v2_frames = 0, v3_frames = 0, other_frames = 0, parse_errors = 0, layer_fields = 0;
+    std::uint32_t self_volume = 0;
+    std::vector<std::uint32_t> self_volumes; // distinct, in order
+    std::unordered_map<std::uint32_t, std::uint32_t> volume_of;         // net -> last known volume
+    std::unordered_map<std::uint32_t, std::uint32_t> volume_changes_of; // net -> layer fields received
+    std::vector<std::pair<char, std::uint32_t>> events;                  // ('S' spawn | 'D' despawn, net) in order
+};
+
+void ParseTransformFrame(const std::vector<std::uint8_t>& p, WireLog& log)
+{
+    const std::uint8_t opcode = p[1];
+    const bool v3 = opcode == 0x12;
+    if (opcode == 0x11) ++log.v2_frames;
+    else if (v3) ++log.v3_frames;
+    else {
+        ++log.other_frames;
+        return;
+    }
+    const std::size_t header = 1 + 1 + 4 + 2;
+    if (p.size() < header + 19 + (v3 ? 8 : 0)) {
+        ++log.parse_errors;
+        return;
+    }
+    const std::uint32_t count = static_cast<std::uint32_t>(p[6]) | static_cast<std::uint32_t>(p[7]) << 8;
+    std::size_t at = header + 19;
+    if (v3) {
+        const std::uint32_t self = ReadU32(p.data() + at);
+        at += 8;
+        log.self_volume = self;
+        if (log.self_volumes.empty() || log.self_volumes.back() != self) log.self_volumes.push_back(self);
+    }
+    const std::uint8_t allowed = v3 ? 0x0F : 0x07;
+    for (std::uint32_t r = 1; r < count; ++r) {
+        if (at + 5 > p.size()) {
+            ++log.parse_errors;
+            return;
+        }
+        const std::uint32_t net = ReadU32(p.data() + at);
+        const std::uint8_t mask = p[at + 4];
+        at += 5;
+        if ((mask & ~allowed) != 0) {
+            ++log.parse_errors;
+            return;
+        }
+        at += ((mask & 0x01) ? 12 : 0) + ((mask & 0x02) ? 2 : 0) + ((mask & 0x04) ? 1 : 0);
+        if (mask & 0x08) {
+            if (at + 8 > p.size()) {
+                ++log.parse_errors;
+                return;
+            }
+            log.volume_of[net] = ReadU32(p.data() + at);
+            ++log.volume_changes_of[net];
+            ++log.layer_fields;
+            at += 8;
+        }
+    }
+    if (at != p.size()) ++log.parse_errors;
+}
+
+void ReadWire(asio::ip::tcp::socket& socket, WireLog& log)
+{
+    try {
+        std::vector<std::uint8_t> payload;
+        for (;;) {
+            std::array<std::uint8_t, 4> header{};
+            asio::read(socket, asio::buffer(header));
+            const std::uint32_t length = static_cast<std::uint32_t>(header[0]) << 24 |
+                                         static_cast<std::uint32_t>(header[1]) << 16 |
+                                         static_cast<std::uint32_t>(header[2]) << 8 | header[3];
+            payload.resize(length);
+            if (length > 0) asio::read(socket, asio::buffer(payload));
+            if (payload.empty()) continue;
+            std::lock_guard lock(log.mutex);
+            if (payload[0] == gs::protocol::kCodecCapnp) {
+                if (const auto parsed = gs::protocol::ParsePacket(payload); parsed && parsed->packet.isEntitySpawn()) {
+                    const auto spawn = parsed->packet.getEntitySpawn();
+                    log.volume_of[spawn.getNetId()] = spawn.getVolumeId();
+                    log.events.emplace_back('S', spawn.getNetId());
+                } else if (parsed && parsed->packet.isEntityDespawn()) {
+                    log.events.emplace_back('D', parsed->packet.getEntityDespawn().getNetId());
+                } else if (parsed && parsed->packet.isEnterWorldAccept()) {
+                    log.self_volume = parsed->packet.getEnterWorldAccept().getSpawnVolumeId();
+                    log.self_volumes.push_back(log.self_volume);
+                }
+                continue;
+            }
+            if (payload.size() >= 2) ParseTransformFrame(payload, log);
+        }
+    } catch (const std::exception&) {
+        // EOF / reset on teardown ends the reader.
+    }
+}
+
+struct WireClient {
+    asio::io_context io;
+    asio::ip::tcp::socket socket{io};
+    WireLog log;
+    std::thread reader;
+    ~WireClient()
+    {
+        boost::system::error_code ec;
+        socket.close(ec);
+        if (reader.joinable()) reader.join();
+    }
+};
+
+std::shared_ptr<gs::network::Session> Connect(asio::io_context& server_io, asio::ip::tcp::acceptor& acceptor,
+                                              WireClient& client, gs::common::SessionId id)
+{
+    client.socket.connect(asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    asio::ip::tcp::socket server_socket(server_io);
+    acceptor.accept(server_socket);
+    client.reader = std::thread([&client] { ReadWire(client.socket, client.log); });
+    return std::make_shared<gs::network::Session>(std::move(server_socket), id);
+}
+
+void LayeredFrameChecks(Checks& checks)
+{
+    ScratchDirectory scratch;
+    map::LayeredWorld layered;
+    std::string error;
+    if (!CookFixture(layered, error)) {
+        checks.Report("frame-fixture-cooked", false, error);
+        return;
+    }
+    const auto* floor = WalkableAt(layered, 240, 256, -1, 2);
+    const auto* landing = WalkableAt(layered, 305, 252, 1.5, 3);
+    if (!floor || !landing) return;
+    const std::uint32_t floor_id = floor->id, landing_id = landing->id;
+    map::PackageWriteSpec spec;
+    spec.world_id = "layeredframes_fixture";
+    spec.world_name = "3D-5C1 layered frames fixture";
+    spec.size_cells_x = spec.size_cells_y = static_cast<std::uint32_t>(kWorldSize);
+    spec.cell_size_m = 1;
+    spec.chunk_size_cells = 128;
+    spec.height_raw = [](std::uint32_t, std::uint32_t) { return 0; };
+    spec.attributes = [](std::uint32_t, std::uint32_t) { return std::uint16_t{0}; };
+    spec.logic.spawns.push_back(map::SpawnRegion{1, 0, map::Rect{99.5f, 99.5f, 100.5f, 100.5f}});
+    spec.layered_world = layered;
+    const auto root = scratch.root / "frames_package";
+    const auto written = map::WritePackage(root, spec);
+    gs::game::WorldLoadRequest request;
+    request.package_root = root;
+    request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+    request.depth = map::ValidationDepth::Full;
+    request.warp_policy = map::WarpPolicy::Strict;
+    map::PackageReport report;
+    auto loaded = written.ok ? gs::game::LoadWorldPackage(request, report) : std::nullopt;
+    if (!loaded) {
+        checks.Report("frame-package-loads", false, written.error);
+        return;
+    }
+
+    IoRunner runner;
+    asio::ip::tcp::acceptor acceptor(runner.io, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    WireClient climber, observer, legacy;
+    auto climber_session = Connect(runner.io, acceptor, climber, 95401);
+    auto observer_session = Connect(runner.io, acceptor, observer, 95402);
+    auto legacy_session = Connect(runner.io, acceptor, legacy, 95403);
+    climber_session->SetProtocolVersion(gs::protocol::kLayeredFramesProtocolVersion);
+    observer_session->SetProtocolVersion(gs::protocol::kLayeredFramesProtocolVersion);
+    // legacy_session keeps protocol 1.
+
+    {
+        gs::game::PartitionLayout layout;
+        layout.regions_x = 2;
+        layout.regions_y = 1;
+        gs::game::WorldRuntime sim(runner.io, {}, std::move(*loaded), layout);
+        gs::game::PartitionConfig partition;
+        partition.scoring.adaptive_enabled = false;
+        sim.ConfigurePartition(partition);
+        sim.PostSpawn(climber_session, MakeCharacter(81), gs::game::DebugSpawnOverride{296.0f, 252.0f, floor_id});
+        sim.PostSpawn(observer_session, MakeCharacter(82), gs::game::DebugSpawnOverride{308.0f, 254.0f, landing_id});
+        sim.PostSpawn(legacy_session, MakeCharacter(83), gs::game::DebugSpawnOverride{290.0f, 256.0f, floor_id});
+        sim.Start();
+        const bool entered = WaitFor(10000ms, [&] {
+            return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); }) == 3;
+        });
+        std::this_thread::sleep_for(500ms);
+        const auto climber_net = ReadPlayer(sim, 95401).net_id;
+        std::uint32_t seq = 0;
+        const auto run_until = Clock::now() + 2500ms;
+        while (Clock::now() < run_until) {
+            sim.PostMoveInput(95401, ++seq, 1.5707963f, gs::game::MoveState::Running);
+            std::this_thread::sleep_for(50ms);
+        }
+        sim.PostMoveInput(95401, ++seq, 1.5707963f, gs::game::MoveState::Idle);
+        std::this_thread::sleep_for(1500ms); // > one resync period
+        const auto end = ReadPlayer(sim, 95401);
+        sim.RequestReplicationValidation();
+        std::string repl;
+        bool repl_done = false;
+        for (int i = 0; i < 400 && !repl_done; ++i) {
+            repl_done = sim.TryTakeReplicationValidationResult(repl);
+            if (!repl_done) std::this_thread::sleep_for(25ms);
+        }
+        sim.Stop();
+
+        std::lock_guard c_lock(climber.log.mutex);
+        std::lock_guard o_lock(observer.log.mutex);
+        std::lock_guard l_lock(legacy.log.mutex);
+        std::string path;
+        for (const auto v : climber.log.self_volumes) path += std::to_string(v) + " ";
+        checks.Report("frames-climber-reaches-landing", entered && end.layered && end.presence.volume_id == landing_id,
+                      Describe(end));
+        checks.Report("layered-session-gets-only-v3-frames-self-volume-follows-portals",
+                      climber.log.v3_frames > 0 && climber.log.v2_frames == 0 && climber.log.parse_errors == 0 &&
+                          climber.log.self_volumes.size() == 6 && climber.log.self_volumes.front() == floor_id &&
+                          climber.log.self_volume == landing_id,
+                      "self volumes " + path);
+        const auto seen = observer.log.volume_of.find(climber_net);
+        checks.Report("layered-observer-learns-every-volume-change",
+                      observer.log.v3_frames > 0 && observer.log.parse_errors == 0 && seen != observer.log.volume_of.end() &&
+                          seen->second == landing_id && observer.log.volume_changes_of[climber_net] >= 1,
+                      Fmt("known=%u changes=%u layer_fields=%llu", seen != observer.log.volume_of.end() ? seen->second : 0u,
+                          observer.log.volume_changes_of[climber_net],
+                          static_cast<unsigned long long>(observer.log.layer_fields)));
+        checks.Report("protocol-1-session-gets-unchanged-v2-frames",
+                      legacy.log.v2_frames > 0 && legacy.log.v3_frames == 0 && legacy.log.parse_errors == 0 &&
+                          legacy.log.layer_fields == 0,
+                      Fmt("v2=%llu v3=%llu", static_cast<unsigned long long>(legacy.log.v2_frames),
+                          static_cast<unsigned long long>(legacy.log.v3_frames)));
+        checks.Report("replication-shadow-audit-with-layered-recipients", repl_done && repl == "OK", repl);
+    }
+}
+
+// ---- 3D-5D: a layered player that migrated and then disconnects stays gone ----
+//
+// Live acceptance (two editors) showed an observer receiving a despawn of a
+// disconnected player followed by a spawn of the same net id at a minutes-old
+// position. This drives the same shape on the real runtime: the mover crosses
+// the zone border on the layered floor and back, then disconnects
+// (PostDespawn); the observer must see the despawn and never a later spawn.
+void LayeredDespawnChecks(Checks& checks)
+{
+    ScratchDirectory scratch;
+    map::LayeredWorld layered;
+    std::string error;
+    if (!CookFixture(layered, error)) {
+        checks.Report("despawn-fixture-cooked", false, error);
+        return;
+    }
+    const auto* floor = WalkableAt(layered, 240, 256, -1, 2);
+    if (!floor) return;
+    const std::uint32_t floor_id = floor->id;
+    map::PackageWriteSpec spec;
+    spec.world_id = "layereddespawn_fixture";
+    spec.world_name = "3D-5D layered despawn fixture";
+    spec.size_cells_x = spec.size_cells_y = static_cast<std::uint32_t>(kWorldSize);
+    spec.cell_size_m = 1;
+    spec.chunk_size_cells = 128;
+    spec.height_raw = [](std::uint32_t, std::uint32_t) { return 0; };
+    spec.attributes = [](std::uint32_t, std::uint32_t) { return std::uint16_t{0}; };
+    spec.logic.spawns.push_back(map::SpawnRegion{1, 0, map::Rect{99.5f, 99.5f, 100.5f, 100.5f}});
+    spec.layered_world = layered;
+    const auto root = scratch.root / "despawn_package";
+    const auto written = map::WritePackage(root, spec);
+    gs::game::WorldLoadRequest request;
+    request.package_root = root;
+    request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+    request.depth = map::ValidationDepth::Full;
+    request.warp_policy = map::WarpPolicy::Strict;
+    map::PackageReport report;
+    auto loaded = written.ok ? gs::game::LoadWorldPackage(request, report) : std::nullopt;
+    if (!loaded) {
+        checks.Report("despawn-package-loads", false, written.error);
+        return;
+    }
+
+    IoRunner runner;
+    asio::ip::tcp::acceptor acceptor(runner.io, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+    WireClient mover, observer;
+    auto mover_session = Connect(runner.io, acceptor, mover, 95501);
+    auto observer_session = Connect(runner.io, acceptor, observer, 95502);
+    mover_session->SetProtocolVersion(gs::protocol::kLayeredFramesProtocolVersion);
+    observer_session->SetProtocolVersion(gs::protocol::kLayeredFramesProtocolVersion);
+
+    gs::game::PartitionLayout layout;
+    layout.regions_x = 2;
+    layout.regions_y = 1;
+    gs::game::WorldRuntime sim(runner.io, {}, std::move(*loaded), layout);
+    gs::game::PartitionConfig partition;
+    partition.scoring.adaptive_enabled = false;
+    sim.ConfigurePartition(partition);
+    // Both start east of the x = 256 border on the shared floor.
+    sim.PostSpawn(mover_session, MakeCharacter(91), gs::game::DebugSpawnOverride{262.0f, 245.0f, floor_id});
+    sim.PostSpawn(observer_session, MakeCharacter(92), gs::game::DebugSpawnOverride{280.0f, 266.0f, floor_id});
+    sim.Start();
+    const bool entered = WaitFor(10000ms, [&] {
+        return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); }) == 2;
+    });
+    std::this_thread::sleep_for(500ms);
+    const auto mover_net = ReadPlayer(sim, 95501).net_id;
+    std::uint32_t seq = 0;
+    const auto run = [&](float heading, std::chrono::milliseconds duration) {
+        const auto until = Clock::now() + duration;
+        while (Clock::now() < until) {
+            sim.PostMoveInput(95501, ++seq, heading, gs::game::MoveState::Running);
+            std::this_thread::sleep_for(50ms);
+        }
+    };
+    run(4.712389f, 2500ms);  // west across x = 256 (migrates out)
+    run(1.5707963f, 3500ms); // east, back across the border (migrates back)
+    run(0.0f, 700ms);        // north a little
+    sim.PostMoveInput(95501, ++seq, 0.0f, gs::game::MoveState::Idle);
+    std::this_thread::sleep_for(1500ms);
+    const auto before = ReadPlayer(sim, 95501);
+    sim.PostDespawn(95501); // the disconnect path (GameConnectionHandler::OnDisconnect)
+    std::this_thread::sleep_for(2500ms);
+    const auto owners_after = ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); });
+    sim.Stop();
+
+    std::lock_guard o_lock(observer.log.mutex);
+    std::string sequence;
+    for (const auto& [kind, net] : observer.log.events) {
+        if (net == mover_net) sequence += kind;
+    }
+    // The last despawn is the disconnect; nothing may follow it.
+    const std::size_t last_despawn = sequence.rfind('D');
+    const std::size_t respawns_after =
+        last_despawn == std::string::npos ? 0 : sequence.size() - last_despawn - 1;
+    checks.Report("despawned-layered-player-is-not-respawned-to-observers",
+                  entered && before.layered && last_despawn != std::string::npos && respawns_after == 0 &&
+                      owners_after == 1,
+                  Fmt("mover net=%u events=%s respawns_after_despawn=%zu owners_after=%zu end=(%.1f,%.1f)", mover_net,
+                      sequence.c_str(), respawns_after, owners_after, before.position.x, before.position.y));
+    // Migrating out of the observer's zone and back is seamless: one spawn,
+    // then only the disconnect's despawn (no despawn + spawn churn).
+    checks.Report("layered-migration-out-and-back-without-churn-for-source-zone-observer", sequence == "SD",
+                  "events=" + sequence);
+}
+
+// ---- 3D-5B2: proven terrain <-> volume transitions --------------------------
+
+// A platform 0.2 m above flat terrain with a wall along its north edge,
+// cooked WITH the terrain so its level sides become proven terrain edges.
+bool CookPlatform(map::LayeredWorld& world, std::string& error)
+{
+    std::vector<map::LayerCollisionMesh> walkable{Box(21, 100, 100, -1, 110, 110, 0.2f)};
+    const auto wall = Box(29, 100, 109.7f, 0.2f, 110, 110, 2.2f);
+    std::vector<map::LayerSourceSurface> surfaces;
+    map::LayerGeometryReport geometry;
+    if (!map::ExtractLayerSourceSurfaces(walkable, {}, surfaces, geometry)) {
+        error = geometry.errors.empty() ? "extract" : geometry.errors.front();
+        return false;
+    }
+    map::LayerGenerationOptions options;
+    options.world_bounds = map::Rect{0, 0, kWorldSize, kWorldSize};
+    options.require_exact_footprints = true;
+    map::LayerGenerationReport generation;
+    if (!map::GenerateLayeredWorld(surfaces, options, world, generation)) {
+        error = generation.errors.empty() ? "generate" : generation.errors.front();
+        return false;
+    }
+    map::LayerTerrainObstruction terrain;
+    terrain.cell_size = 8;
+    terrain.cells_x = terrain.cells_y = static_cast<std::uint32_t>(kWorldSize / 8);
+    terrain.heights.assign(static_cast<std::size_t>(terrain.cells_x + 1) * (terrain.cells_y + 1), 0.0f);
+    std::vector<map::LayerObstructionMesh> obstructions{{walkable[0].source_id, walkable[0].vertices, walkable[0].indices},
+                                                       {wall.source_id, wall.vertices, wall.indices}};
+    map::LayerClearanceReport report;
+    if (!map::CookLayerClearance(world, options.world_bounds, obstructions, &terrain, map::LayerClearanceProfile{},
+                                 report)) {
+        error = report.errors.empty() ? "cook" : report.errors.front();
+        return false;
+    }
+    return true;
+}
+
+void TerrainEdgeDeterministicChecks(Checks& checks)
+{
+    using namespace gs::game;
+    map::LayeredWorld layered;
+    std::string error;
+    const bool cooked = CookPlatform(layered, error);
+    checks.Report("terrain-edge-platform-cooked-open-sides-only", cooked && layered.terrain_edges.size() == 3, error);
+    const auto* platform = cooked ? WalkableAt(layered, 105, 105, -1, 1) : nullptr;
+    ZoneFixture fixture;
+    if (!platform || !fixture.Build()) return;
+    auto& zone = fixture.zones.GetZone(0);
+    ZoneTickContext ctx{fixture.terrain, fixture.logic, fixture.types, fixture.zones};
+    ctx.layered = &layered;
+    ctx.layer_actor = {layered.clearance_profile->actor_radius_m, layered.clearance_profile->actor_height_m};
+    auto& diag = zone.Diagnostics();
+    auto spawn_terrain = [&](std::uint32_t net, float x, float y) {
+        ZoneWriteGuard guard(zone, "terrain edge spawn");
+        SpawnSystem::SpawnPlayer(zone, DetachedSession(fixture.io, net), MakeCharacter(net), Position{x, y, 0.0f}, net);
+        return zone.FindEntity(net);
+    };
+    auto steer = [&](flecs::entity entity, float heading) {
+        ZoneWriteGuard guard(zone, "terrain edge input");
+        entity.set<MoveIntent>({heading, MoveState::Running, 0});
+    };
+    auto tick = [&](int ticks) {
+        for (int i = 0; i < ticks; ++i) {
+            ZoneWriteGuard guard(zone, "terrain edge tick");
+            MovementSystem::Step(zone, 0.05f, ctx);
+        }
+    };
+    constexpr float kEast = 1.5707963f, kSouth = 3.14159265f;
+
+    // Walk east across the platform: enter over the west edge, leave over
+    // the east edge, z following terrain -> plane -> terrain.
+    const auto walker = spawn_terrain(601, 95.0f, 105.0f);
+    steer(walker, kEast);
+    bool entered = false, on_plane = true;
+    for (int i = 0; i < 80; ++i) {
+        tick(1);
+        if (const auto* presence = walker.try_get<LayerPresence>()) {
+            entered = true;
+            on_plane = on_plane && presence->volume_id == platform->id && walker.get<Position>().z == 0.2f;
+        }
+    }
+    const auto after = walker.get<Position>();
+    checks.Report("terrain-player-enters-and-leaves-platform-over-proven-edges",
+                  entered && on_plane && !walker.has<LayerPresence>() && after.x > 112.0f && after.z == 0.0f &&
+                      diag.layered_terrain_entries_total.load() == 1 && diag.layered_terrain_exits_total.load() == 1,
+                  Fmt("x=%.3f z=%.3f entries=%llu exits=%llu", after.x, after.z,
+                      static_cast<unsigned long long>(diag.layered_terrain_entries_total.load()),
+                      static_cast<unsigned long long>(diag.layered_terrain_exits_total.load())));
+
+    // From the north the wall stands on the edge: no proven entry there.
+    const auto north = spawn_terrain(602, 105.0f, 113.0f);
+    steer(north, kSouth);
+    tick(20);
+    checks.Report("terrain-entry-through-walled-edge-refused",
+                  !north.has<LayerPresence>() && diag.layered_terrain_entries_total.load() == 1,
+                  Fmt("y=%.3f", north.get<Position>().y));
+
+    // A layered player walking north into the wall never reaches the edge.
+    {
+        ZoneWriteGuard guard(zone, "terrain edge layered spawn");
+        SpawnSystem::SpawnPlayer(zone, DetachedSession(fixture.io, 603), MakeCharacter(603),
+                                 Position{105.0f, 105.0f, 0.2f}, 603, LayerPresence{platform->id, platform->layer_id});
+    }
+    const auto inside = zone.FindEntity(603);
+    steer(inside, 0.0f);
+    tick(30);
+    checks.Report("layered-player-cannot-exit-through-wall",
+                  inside.has<LayerPresence>() && inside.get<Position>().y < 109.7f - 0.3f &&
+                      diag.layered_terrain_exits_total.load() == 1,
+                  Fmt("y=%.3f", inside.get<Position>().y));
+
+    std::string audit;
+    checks.Report("terrain-edge-audit", ValidateLayeredPresence(fixture.zones, &layered, ctx.layer_actor, audit) &&
+                                            ValidateSpatialIndex(zone, zone.Grid(), audit),
+                  audit);
+
+    // Same platform without terrain edges: a terrain player never enters.
+    map::LayeredWorld no_edges = layered;
+    no_edges.terrain_edges.clear();
+    ctx.layered = &no_edges;
+    const auto legacy = spawn_terrain(604, 95.0f, 102.0f);
+    steer(legacy, kEast);
+    tick(40);
+    checks.Report("without-terrain-edges-terrain-player-stays-terrain",
+                  !legacy.has<LayerPresence>() && legacy.get<Position>().z == 0.0f &&
+                      diag.layered_terrain_entries_total.load() == 1);
+}
+
+void TerrainEdgeRuntimeChecks(Checks& checks)
+{
+    ScratchDirectory scratch;
+    map::LayeredWorld layered;
+    std::string error;
+    if (!CookPlatform(layered, error)) {
+        checks.Report("runtime-platform-cooked", false, error);
+        return;
+    }
+    map::PackageWriteSpec spec;
+    spec.world_id = "terrainedge_fixture";
+    spec.world_name = "3D-5B2 terrain edge fixture";
+    spec.size_cells_x = spec.size_cells_y = static_cast<std::uint32_t>(kWorldSize);
+    spec.cell_size_m = 1;
+    spec.chunk_size_cells = 128;
+    spec.height_raw = [](std::uint32_t, std::uint32_t) { return 0; };
+    spec.attributes = [](std::uint32_t, std::uint32_t) { return std::uint16_t{0}; };
+    spec.logic.spawns.push_back(map::SpawnRegion{1, 0, map::Rect{94.5f, 104.5f, 95.5f, 105.5f}});
+    spec.layered_world = layered;
+    const auto root = scratch.root / "terrain_edge_package";
+    const auto written = map::WritePackage(root, spec);
+    gs::game::WorldLoadRequest request;
+    request.package_root = root;
+    request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+    request.depth = map::ValidationDepth::Full;
+    request.warp_policy = map::WarpPolicy::Strict;
+    map::PackageReport report;
+    auto loaded = written.ok ? gs::game::LoadWorldPackage(request, report) : std::nullopt;
+    checks.Report("terrain-edge-package-loads-mx3d-v5",
+                  loaded && report.Ok() && loaded->layered_world && loaded->layered_world->terrain_edges.size() == 3,
+                  report.FirstError() ? report.FirstError()->Format() : written.error);
+    if (!loaded) return;
+
+    IoRunner runner;
+    gs::game::PartitionLayout layout;
+    layout.regions_x = 2;
+    layout.regions_y = 1;
+    gs::game::WorldRuntime sim(runner.io, {}, std::move(*loaded), layout);
+    gs::game::PartitionConfig partition;
+    partition.scoring.adaptive_enabled = false;
+    sim.ConfigurePartition(partition);
+    sim.PostSpawn(DetachedSession(runner.io, 95301), MakeCharacter(70), std::nullopt);
+    sim.Start();
+    const bool entered = WaitFor(10000ms, [&] {
+        return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); }) == 1;
+    });
+    const auto start = ReadPlayer(sim, 95301);
+    std::uint32_t seq = 0;
+    bool seen_on_platform = false;
+    const auto run_until = Clock::now() + 4000ms;
+    while (Clock::now() < run_until) {
+        sim.PostMoveInput(95301, ++seq, 1.5707963f, gs::game::MoveState::Running);
+        std::this_thread::sleep_for(50ms);
+        const auto now = ReadPlayer(sim, 95301);
+        seen_on_platform = seen_on_platform || (now.layered && now.position.z == 0.2f);
+    }
+    sim.PostMoveInput(95301, ++seq, 1.5707963f, gs::game::MoveState::Idle);
+    std::this_thread::sleep_for(300ms);
+    const auto end = ReadPlayer(sim, 95301);
+    struct Crossings {
+        std::uint64_t entries = 0, exits = 0;
+    };
+    const auto crossings = ReadWorld(sim, [](const WorldSnapshot& snap) {
+        Crossings out;
+        for (std::size_t i = 0; i < snap.zones.ZoneCount(); ++i) {
+            out.entries += snap.zones.GetZone(i).Diagnostics().layered_terrain_entries_total.load();
+            out.exits += snap.zones.GetZone(i).Diagnostics().layered_terrain_exits_total.load();
+        }
+        return out;
+    });
+    checks.Report("runtime-terrain-player-crosses-platform-and-returns-to-terrain",
+                  entered && start.found && !start.layered && seen_on_platform && end.found && !end.layered &&
+                      end.position.x > 112.0f && end.position.z == 0.0f && crossings.entries == 1 &&
+                      crossings.exits == 1,
+                  Describe(start) + " -> " + Describe(end) +
+                      Fmt(" entries=%llu exits=%llu", static_cast<unsigned long long>(crossings.entries),
+                          static_cast<unsigned long long>(crossings.exits)));
+    const auto audit = AuditNow(sim);
+    checks.Report("runtime-terrain-edge-audit", audit == "OK", audit);
+    sim.Stop();
+}
+
+// ---- 3D-5B: production player spawn region bound to a layered volume -------
+
+std::uint32_t WorldLogicVersion(const fs::path& package)
+{
+    std::ifstream stream(package / "worldlogic.dat", std::ios::binary);
+    unsigned char header[8] = {};
+    stream.read(reinterpret_cast<char*>(header), sizeof(header));
+    return stream ? static_cast<std::uint32_t>(header[4]) | header[5] << 8 | header[6] << 16 |
+                                        static_cast<std::uint32_t>(header[7]) << 24
+                                  : 0;
+}
+
+void LayeredSpawnChecks(Checks& checks)
+{
+    ScratchDirectory scratch;
+    map::LayeredWorld layered;
+    std::string error;
+    if (!CookFixture(layered, error)) {
+        checks.Report("spawn-fixture-cooked", false, error);
+        return;
+    }
+    const auto* floor = WalkableAt(layered, 240, 256, -1, 2);
+    const auto* bridge = WalkableAt(layered, 250, 250, 4, 7);
+    if (!floor || !bridge) {
+        checks.Report("spawn-fixture-volumes", false);
+        return;
+    }
+    auto make_spec = [&](map::SpawnRegion spawn, bool with_layers) {
+        map::PackageWriteSpec spec;
+        spec.world_id = "layeredspawn_fixture";
+        spec.world_name = "3D-5B layered spawn fixture";
+        spec.size_cells_x = spec.size_cells_y = static_cast<std::uint32_t>(kWorldSize);
+        spec.cell_size_m = 1;
+        spec.chunk_size_cells = 128;
+        spec.height_raw = [](std::uint32_t, std::uint32_t) { return 0; };
+        // The terrain under the bridge deck is blocked: only a layered spawn
+        // can be valid there.
+        spec.attributes = [](std::uint32_t x, std::uint32_t y) {
+            const bool blocked = x >= 245 && x < 255 && y >= 245 && y < 255;
+            return static_cast<std::uint16_t>(blocked ? map::CellSample::kBlocked : 0);
+        };
+        spec.logic.spawns.push_back(spawn);
+        if (with_layers) spec.layered_world = layered;
+        return spec;
+    };
+    auto load = [&](const fs::path& root, map::PackageReport& report) {
+        gs::game::WorldLoadRequest request;
+        request.package_root = root;
+        request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+        request.depth = map::ValidationDepth::Full;
+        request.warp_policy = map::WarpPolicy::Strict;
+        return gs::game::LoadWorldPackage(request, report);
+    };
+    const map::Rect deck{249.5f, 249.5f, 250.5f, 250.5f};
+
+    // Rejections first (each its own package).
+    struct Bad {
+        const char* name;
+        map::SpawnRegion spawn;
+        map::PackageErrorCode code;
+    };
+    const Bad bad[] = {
+        {"unknown-spawn-volume-refused-at-load", {1, 0, deck, 999}, map::PackageErrorCode::WorldLogicSpawnVolumeInvalid},
+        {"spawn-centre-in-wall-refused-at-load", {1, 0, map::Rect{229.75f, 249.5f, 230.75f, 250.5f}, floor->id},
+         map::PackageErrorCode::WorldLogicSpawnVolumeInvalid},
+        {"spawn-centre-outside-its-volume-refused-at-load", {1, 0, map::Rect{99.5f, 99.5f, 100.5f, 100.5f}, bridge->id},
+         map::PackageErrorCode::WorldLogicSpawnVolumeInvalid},
+        {"terrain-spawn-on-blocked-cell-still-refused", {1, 0, deck, 0}, map::PackageErrorCode::WorldLogicSpawnBlocked},
+    };
+    int index = 0;
+    for (const auto& b : bad) {
+        const auto root = scratch.root / ("bad" + std::to_string(index++));
+        const auto written = map::WritePackage(root, make_spec(b.spawn, true));
+        map::PackageReport report;
+        const auto loaded = written.ok ? load(root, report) : std::nullopt;
+        const auto* first = report.FirstError();
+        checks.Report(b.name, written.ok && !loaded && first && first->code == b.code,
+                      first ? first->Format() : written.error);
+    }
+    const auto no_sidecar = map::WritePackage(scratch.root / "no_sidecar", make_spec({1, 0, deck, bridge->id}, false));
+    checks.Report("layered-spawn-without-sidecar-refused-by-writer", !no_sidecar.ok, no_sidecar.error);
+    const auto terrain_root = scratch.root / "terrain_spawn";
+    const auto terrain_written = map::WritePackage(terrain_root, make_spec({1, 0, map::Rect{99.5f, 99.5f, 100.5f, 100.5f}, 0}, true));
+    checks.Report("terrain-spawn-writes-worldlogic-v1",
+                  terrain_written.ok && WorldLogicVersion(terrain_root) == map::kWorldLogicFileVersion);
+
+    const auto root = scratch.root / "layered_spawn";
+    const auto written = map::WritePackage(root, make_spec({1, 0, deck, bridge->id}, true));
+    map::PackageReport report;
+    auto loaded = written.ok ? load(root, report) : std::nullopt;
+    checks.Report("layered-spawn-package-loads-strictly",
+                  loaded && report.Ok() && WorldLogicVersion(root) == map::kWorldLogicLayeredFileVersion &&
+                      loaded->logic.spawns.size() == 1 && loaded->logic.spawns[0].volume_id == bridge->id,
+                  report.FirstError() ? report.FirstError()->Format() : written.error);
+    if (!loaded) return;
+
+    IoRunner runner;
+    gs::game::PartitionLayout layout;
+    layout.regions_x = 2;
+    layout.regions_y = 1;
+    gs::game::WorldRuntime sim(runner.io, {}, std::move(*loaded), layout);
+    gs::game::PartitionConfig partition;
+    partition.scoring.adaptive_enabled = false;
+    sim.ConfigurePartition(partition);
+    // No debug override: the production player spawn rule.
+    sim.PostSpawn(DetachedSession(runner.io, 95201), MakeCharacter(50), std::nullopt);
+    sim.Start();
+    const bool entered = WaitFor(10000ms, [&] {
+        return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.owners.size(); }) == 1;
+    });
+    const auto player = ReadPlayer(sim, 95201);
+    checks.Report("production-spawn-region-admits-onto-its-volume",
+                  entered && player.found && player.layered && player.presence.volume_id == bridge->id &&
+                      player.position.x == 250.0f && player.position.y == 250.0f && player.position.z == 6.0f,
+                  Describe(player));
+    const auto audit = AuditNow(sim);
+    checks.Report("production-layered-spawn-audit", audit == "OK", audit);
+    sim.Stop();
+}
+
+} // namespace
+
+int RunLayeredPresenceScenario()
+{
+    Checks checks;
+    try {
+        UnitChecks(checks);
+        DeterministicChecks(checks);
+        RuntimeChecks(checks);
+        LayeredSpawnChecks(checks);
+        TerrainEdgeDeterministicChecks(checks);
+        TerrainEdgeRuntimeChecks(checks);
+        LayeredFrameChecks(checks);
+        LayeredDespawnChecks(checks);
+    } catch (const std::exception& error) {
+        checks.Report("unexpected-exception", false, error.what());
+    }
+    std::printf("LAYEREDPRESENCE summary passes=%d failures=%d scope=server-layered-presence\n", checks.passes,
+                checks.failures);
+    return checks.failures;
+}
+
+} // namespace gs::bench

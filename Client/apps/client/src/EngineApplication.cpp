@@ -12,8 +12,12 @@
 #include "Common.h"
 #include "FbxAssetSidecars.h"
 #include "WorldLabelRenderer.h"
+#include "ParticleRenderer.h"
+#include "ParticleSimulator.h"
 #include "AssetWatcher.h"
+#include "JobSystem.h"
 #include "LODSystem.h"
+#include "MaterialAssetManager.h"
 #include "MeshSystem.h"
 #include "NativeWindow.h"
 #include "AnimationRuntime.h"
@@ -21,14 +25,21 @@
 #include "AudioEngine.h"
 #include "ScriptSystem.h"
 #include "ScriptApiImpl.h"
+#include "EntityActivation.h"
 #include "BuildService.h"  // ixeditor::build::GameScriptBuildService — cmake Build worker (Editor/Build boundary)
-#include "IXVulkanConversions.h" // FromVkFormat — swapchain format queries for offscreen targets
-#include "IXVulkanDevice.h" // ixvulkan::IXVulkanDevice — IXRHI backend owning the frame lifecycle
+#include "GamePackager.h"  // ixeditor::build::GamePackageService — "Build Game" packager (Editor/Build boundary)
+#include "platform/open_external.h"
+#include "IXVulkanDevice.h" // ixvulkan::CreateDevice factory seam + editor adapter (backend bootstrap)
 #include "IXVulkanEditorAdapter.h" // backend-specific editor integration (isolated)
 #include "EditorImGui.h"
 #include "physics/PhysicsWorld.h"
 #if defined(_WIN32)
 #include "NativeWindow_Win32.h"
+#include <pdh.h>
+#include <pdhmsg.h>
+#include <psapi.h>
+#pragma comment(lib, "pdh.lib")
+#pragma comment(lib, "psapi.lib")
 #endif
 #if defined(__ANDROID__)
 #include "NativeWindow_Android.h"
@@ -40,8 +51,13 @@
 #include "RuntimeSession.h"
 #include "RuntimeUiAdapter.h"
 #include "SceneManager.h"
+#include "SceneLayerAuthoring.h"
+#include "SceneLayerGround.h"
+#include "SceneWorldPackage.h"
 #include "SelectionSystem.h"
 #include "SelectionOutlineRenderer.h"
+#include "SkyRenderer.h"
+#include "GodRayRenderer.h"
 #include "SpatialIndex.h"
 #include "StaticMeshRenderer.h"
 #include "TerrainEditorSystem.h"
@@ -72,6 +88,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <atomic>
@@ -94,6 +111,123 @@ namespace
 namespace xm = ixtreeme::math;
 namespace prefab = ixtreeme::prefab;
 namespace phys = ixtreeme::physics;
+
+// Lightweight process/system telemetry for the in-panel Game View overlay. The
+// counters are sampled at most once per second so the diagnostics do not become
+// part of the frame-time measurement they report.
+struct RuntimePerformanceMonitor
+{
+    double gpuUsagePercent = -1.0;
+    bool gpuUsageAvailable = false;
+    double ramUsagePercent = 0.0;
+    double processRamMb = 0.0;
+    double lastSampleSeconds = -1.0;
+
+#if defined(_WIN32)
+    HQUERY gpuQuery = nullptr;
+    HCOUNTER gpuUtilizationCounter = nullptr;
+    bool gpuQueryInitialized = false;
+
+    ~RuntimePerformanceMonitor()
+    {
+        if (gpuQuery != nullptr)
+            PdhCloseQuery(gpuQuery);
+    }
+
+    void InitializeGpuQuery()
+    {
+        if (gpuQueryInitialized)
+            return;
+        gpuQueryInitialized = true;
+        if (PdhOpenQueryW(nullptr, 0, &gpuQuery) != ERROR_SUCCESS)
+        {
+            gpuQuery = nullptr;
+            return;
+        }
+        if (PdhAddEnglishCounterW(gpuQuery,
+                L"\\GPU Engine(*)\\Utilization Percentage",
+                0,
+                &gpuUtilizationCounter) != ERROR_SUCCESS)
+        {
+            PdhCloseQuery(gpuQuery);
+            gpuQuery = nullptr;
+            gpuUtilizationCounter = nullptr;
+        }
+    }
+
+    void SampleGpu()
+    {
+        InitializeGpuQuery();
+        gpuUsageAvailable = false;
+        gpuUsagePercent = -1.0;
+        if (gpuQuery == nullptr || gpuUtilizationCounter == nullptr ||
+            PdhCollectQueryData(gpuQuery) != ERROR_SUCCESS)
+            return;
+
+        DWORD bufferBytes = 0;
+        DWORD itemCount = 0;
+        PDH_STATUS status = PdhGetFormattedCounterArrayW(
+            gpuUtilizationCounter, PDH_FMT_DOUBLE, &bufferBytes, &itemCount, nullptr);
+        if (status != PDH_MORE_DATA || bufferBytes == 0 || itemCount == 0)
+            return;
+
+        std::vector<unsigned char> buffer(bufferBytes);
+        auto* items = reinterpret_cast<PDH_FMT_COUNTERVALUE_ITEM_W*>(buffer.data());
+        status = PdhGetFormattedCounterArrayW(
+            gpuUtilizationCounter, PDH_FMT_DOUBLE, &bufferBytes, &itemCount, items);
+        if (status != ERROR_SUCCESS)
+            return;
+
+        const std::wstring processNeedle = L"pid_" + std::to_wstring(GetCurrentProcessId()) + L"_";
+        double total = 0.0;
+        bool matched = false;
+        for (DWORD index = 0; index < itemCount; ++index)
+        {
+            const auto& item = items[index];
+            if (item.szName == nullptr ||
+                std::wstring(item.szName).find(processNeedle) == std::wstring::npos)
+                continue;
+            matched = true;
+            if (item.FmtValue.CStatus == ERROR_SUCCESS)
+                total += std::max(0.0, item.FmtValue.doubleValue);
+        }
+        if (matched)
+        {
+            gpuUsagePercent = std::clamp(total, 0.0, 100.0);
+            gpuUsageAvailable = true;
+        }
+    }
+#endif
+
+    void Sample(double nowSeconds)
+    {
+        if (lastSampleSeconds >= 0.0 && nowSeconds - lastSampleSeconds < 1.0)
+            return;
+        lastSampleSeconds = nowSeconds;
+#if defined(_WIN32)
+        MEMORYSTATUSEX memory{};
+        memory.dwLength = sizeof(memory);
+        if (GlobalMemoryStatusEx(&memory) != FALSE)
+            ramUsagePercent = static_cast<double>(memory.dwMemoryLoad);
+
+        PROCESS_MEMORY_COUNTERS_EX processMemory{};
+        if (GetProcessMemoryInfo(GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&processMemory),
+                sizeof(processMemory)) != FALSE)
+            processRamMb = static_cast<double>(processMemory.WorkingSetSize) / (1024.0 * 1024.0);
+
+        SampleGpu();
+#else
+        gpuUsageAvailable = false;
+        gpuUsagePercent = -1.0;
+#endif
+    }
+};
+
+bool IsSrgbColorFormat(ixrhi::IXRHIFormat format)
+{
+    return format == ixrhi::IXRHIFormat::R8G8B8A8Srgb || format == ixrhi::IXRHIFormat::B8G8R8A8Srgb;
+}
 
 // Builds a render camera from a scene CameraEntity, matching the editor free-fly
 // convention (rotation[0]=pitch, rotation[1]=yaw). Used to drive the Game view.
@@ -128,6 +262,9 @@ struct CharacterRuntimeState
     RuntimeMoveState moveState = RuntimeMoveState::Idle; // drives walk/run animation
     float planarSpeed = 0.0f;        // continuous horizontal speed (m/s) — drives the Animator "Speed" param
     bool jumpedThisFrame = false;    // a jump was initiated this frame — drives the "Jump" trigger
+    // What the game allows right now (scripts: SetCharacterAbilities, e.g. no running without stamina).
+    bool canRun = true;
+    bool canJump = true;
 };
 
 // Advances one player character (kinematic capsule) for this frame: camera-relative WASD
@@ -181,12 +318,13 @@ void UpdateCharacterController(
         moveX = 0.0f;
         moveZ = 0.0f;
     }
-    const float speed = (inputActive && input.shift) ? cc.runSpeed : cc.walkSpeed;
+    const bool running = inputActive && input.shift && state.canRun;
+    const float speed = running ? cc.runSpeed : cc.walkSpeed;
 
     // Animation state from movement intent: Run when sprinting + moving, Walk when moving,
     // else Idle. Drives the skinned mesh's walk/run/idle clip.
     if (moveLen > 0.0001f)
-        state.moveState = (inputActive && input.shift) ? RuntimeMoveState::Running : RuntimeMoveState::Walking;
+        state.moveState = running ? RuntimeMoveState::Running : RuntimeMoveState::Walking;
     else
         state.moveState = RuntimeMoveState::Idle;
     state.planarSpeed = (moveLen > 0.0001f) ? speed : 0.0f;
@@ -194,7 +332,7 @@ void UpdateCharacterController(
 
     // --- gravity / jump (vertical velocity) ---
     const float gY = worldGravity[1] * cc.gravityScale; // negative downward
-    const bool jumpPressed = inputActive && input.space;
+    const bool jumpPressed = inputActive && input.space && state.canJump;
     if (state.grounded && jumpPressed)
     {
         state.velocity.y = std::sqrt(std::max(0.0f, -2.0f * gY * cc.jumpHeight));
@@ -375,7 +513,56 @@ struct FrameCpuProfile
     double editorUiRenderMs = 0.0;
     double submitPresentMs = 0.0;
     double totalCpuFrameMs = 0.0;
+    // The phases IX_PERF_LOG reports (both builds).
+    double frameWaitMs = 0.0;    // BeginFrame: the frame slot's fence, the swapchain image
+    double simulationMs = 0.0;   // Play: characters, physics, scripts, audio, particles, all of it
+    double physicsMs = 0.0;      //   of which characters and the physics step
+    double scriptsMs = 0.0;      //   of which scripts (OnUpdate, collisions, deferred ops)
+    double particlesMs = 0.0;    // CPU particle emitters (Play and Edit)
+    double animationMs = 0.0;    // skinning pre-pass: animators, clip sampling, palettes, dispatches
+    double renderRecordsMs = 0.0;  // of which: the mesh render records checked (and rebuilt)
+    double shadowPassMs = 0.0;   // sun shadow casters gathered and recorded
+    double particleInstancesMs = 0.0;  // the frame's CPU particle instances built and uploaded
+    std::uint32_t skinnedInstances = 0;  // character instances skinned this frame (all views)
 };
+
+// IX_PERF_LOG=<seconds>: one [PERF] line per interval with the averaged frame phases, the render
+// loop's and the presented frame rates, the scene's load and (with IX_GPU_PROFILE=1) the GPU passes.
+// For measuring a scene the way it runs, the shipped game included; off unless the variable is set.
+struct PerfLogState
+{
+    double intervalSeconds = 0.0;  // 0 = off
+    std::chrono::steady_clock::time_point windowStart{};
+    std::uint64_t presentedAtWindowStart = 0;
+    std::uint32_t frames = 0;
+    FrameCpuProfile sum{};
+    double maxFrameMs = 0.0;
+    std::uint64_t skinnedSum = 0;
+    std::uint64_t frameCounter = 0;
+    std::uint32_t gpuSamples = 0;
+    double gpuFrame = 0.0, gpuShadow = 0.0, gpuReflection = 0.0, gpuTerrain = 0.0, gpuScene = 0.0,
+           gpuPost = 0.0, gpuUi = 0.0;
+    std::array<double, 4> gpuCascades{};  // each sun shadow cascade's draw (0 when kept)
+};
+
+double PerfLogIntervalFromEnvironment()
+{
+    std::string text;
+#if defined(_WIN32)
+    char* value = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&value, &length, "IX_PERF_LOG") == 0 && value != nullptr)
+    {
+        text = value;
+        std::free(value);
+    }
+#else
+    if (const char* value = std::getenv("IX_PERF_LOG"))
+        text = value;
+#endif
+    const double seconds = text.empty() ? 0.0 : std::atof(text.c_str());
+    return seconds > 0.0 ? std::clamp(seconds, 0.25, 60.0) : 0.0;
+}
 
 struct PhysicsDebugContact
 {
@@ -527,6 +714,7 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     std::copy(std::begin(it->rotation), std::end(it->rotation), std::begin(state.rotation));
     std::copy(std::begin(it->scale), std::end(it->scale), std::begin(state.scale));
     state.skinned = it->skinned;
+    state.layerAuthoring = it->layerAuthoring;
     state.materialSlots = it->materialSlots;
     state.materialOverrides = it->materialOverrides;
     state.editorComponents = it->editorComponents;
@@ -547,6 +735,8 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     state.audioListener = it->audioListener;
     state.hasScript = it->hasScript;
     state.script = it->script;
+    state.hasParticleSystem = it->hasParticleSystem;
+    state.particleSystem = it->particleSystem;
     state.debugAnimationClipId = it->debugAnimationClipId;
     state.animatorControllerId = it->animatorControllerId;
     state.materialSlotCount = std::max<std::uint32_t>(
@@ -568,6 +758,7 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     std::copy(std::begin(state.rotation), std::end(state.rotation), std::begin(mesh.rotation));
     std::copy(std::begin(state.scale), std::end(state.scale), std::begin(mesh.scale));
     mesh.skinned = state.skinned;
+    mesh.layerAuthoring = state.layerAuthoring;
     mesh.materialSlots = state.materialSlots;
     mesh.materialOverrides = state.materialOverrides;
     mesh.editorComponents = state.editorComponents;
@@ -588,6 +779,8 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     mesh.audioListener = state.audioListener;
     mesh.hasScript = state.hasScript;
     mesh.script = state.script;
+    mesh.hasParticleSystem = state.hasParticleSystem;
+    mesh.particleSystem = state.particleSystem;
     mesh.debugAnimationClipId = state.debugAnimationClipId;
     mesh.animatorControllerId = state.animatorControllerId;
 }
@@ -602,6 +795,13 @@ std::filesystem::path ResolveModelAssetPathForMeta(const std::string& meshAssetP
     if (path.is_absolute())
         return path;
     ProjectManager& projects = ProjectManager::Instance();
+    // This runs per skinned entity every frame (material-slot sync); weakly_canonical walks path
+    // components with status calls, so cache the resolution per (project root, raw path).
+    static std::unordered_map<std::string, std::filesystem::path> cachedPaths;
+    const std::string cacheKey = projects.ProjectRoot().generic_string() + "|" + meshAssetPath;
+    const auto cached = cachedPaths.find(cacheKey);
+    if (cached != cachedPaths.end())
+        return cached->second;
     if (projects.HasProject())
     {
         const std::string generic = path.generic_string();
@@ -616,7 +816,9 @@ std::filesystem::path ResolveModelAssetPathForMeta(const std::string& meshAssetP
     }
     std::error_code ec;
     const std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
-    return ec ? std::filesystem::absolute(path) : canonical;
+    const std::filesystem::path resolved = ec ? std::filesystem::absolute(path) : canonical;
+    cachedPaths.emplace(cacheKey, resolved);
+    return resolved;
 }
 
 std::uint32_t ResolveModelSubmeshCount(const std::string& meshAssetPath)
@@ -672,9 +874,12 @@ std::vector<std::string> LoadDefaultMaterialSlotGuids(const std::string& meshAss
 
         if (ProjectManager::Instance().HasProject())
         {
-            const std::filesystem::path materialFolder =
-                ProjectManager::Instance().AssetRootPath() / "materials" / modelPath.stem();
+            // The model's materials folder: next to it (<model>_materials), or where older imports
+            // put it (Assets/materials/<model>).
+            std::filesystem::path materialFolder = modelPath.parent_path() / (modelPath.stem().string() + "_materials");
             std::error_code ec;
+            if (!std::filesystem::exists(materialFolder, ec))
+                materialFolder = ProjectManager::Instance().AssetRootPath() / "materials" / modelPath.stem();
             std::vector<std::filesystem::path> materialFiles;
             if (std::filesystem::exists(materialFolder, ec))
             {
@@ -1601,6 +1806,25 @@ std::vector<SelectionOutlineRenderer::Line> BuildPhysicsDebugLines(const std::ve
 
 void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& source)
 {
+    target.generateLayers = target.generateLayers || source.generateLayers;
+    target.exportLayers = target.exportLayers || source.exportLayers;
+    if (source.exportServerWorld)
+    {
+        target.exportServerWorld = true;
+        target.serverWorldId = source.serverWorldId;
+        target.serverWorldSpawnX = source.serverWorldSpawnX;
+        target.serverWorldSpawnZ = source.serverWorldSpawnZ;
+        target.serverWorldSpawnVolume = source.serverWorldSpawnVolume;
+    }
+    target.showLayerVolumes = source.showLayerVolumes;
+    if (source.placeLayerGround || source.moveLayerGround)
+    {
+        target.placeLayerGround = source.placeLayerGround;
+        target.moveLayerGround = source.moveLayerGround;
+        target.layerGroundVolume = source.layerGroundVolume;
+        target.layerGroundX = source.layerGroundX;
+        target.layerGroundZ = source.layerGroundZ;
+    }
     target.save = target.save || source.save;
     target.reload = target.reload || source.reload;
     target.undo = target.undo || source.undo;
@@ -1691,6 +1915,15 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     target.pausePlayMode = target.pausePlayMode || source.pausePlayMode;
     target.resumePlayMode = target.resumePlayMode || source.resumePlayMode;
     target.buildGameScripts = target.buildGameScripts || source.buildGameScripts;
+    if (source.buildGame)
+    {
+        target.buildGame = true;
+        target.buildGameName = source.buildGameName;
+        target.buildGameOutputDir = source.buildGameOutputDir;
+        target.buildGameStartupScene = source.buildGameStartupScene;
+        target.buildGameCompileScripts = source.buildGameCompileScripts;
+        target.buildGameRunWhenDone = source.buildGameRunWhenDone;
+    }
     target.addWaterBody = target.addWaterBody || source.addWaterBody;
     if (source.createTerrain)
     {
@@ -2264,7 +2497,7 @@ int RunGame(NativeWindow& window,
 #endif
     );
     std::unique_ptr<RuntimeSession> runtimeSession = CreateRuntimeSession();
-    if (!runtimeSession->Create(device, assets, swapchainSize.width, swapchainSize.height))
+    if (!runtimeSession->Create(assets, swapchainSize.width, swapchainSize.height))
     {
         ShowFatal("Failed to create runtime session. See debug output/stderr.");
         device.Destroy();
@@ -2298,6 +2531,10 @@ int RunGame(NativeWindow& window,
 
     // Chunk-1 scripting proof: confirm the Lua VM compiles + runs (logs "[SCRIPT] lua ok").
     ixscript::ScriptSystem::RunLuaString("local x = 2 + 2; assert(x == 4)");
+    // Same proof for the AngelScript VM (logs "[SCRIPT] angelscript ok").
+    // (The runner calls `void main()`; a wrong sum divides by zero, a script exception = failure.)
+    ixscript::ScriptSystem::RunAngelScriptString(
+        "void main() { int x = 2 + 2; if (x != 4) { int zero = 0; x = 1 / zero; } }");
 
 #if defined(IXTREEME_WITH_EDITOR)
 #if defined(_WIN32)
@@ -2338,7 +2575,7 @@ int RunGame(NativeWindow& window,
     Tracen("[MAIN] SkinnedMeshRenderer cache initialized; models load on demand per path");
 
     TerrainRenderer terrain;
-    bool terrainOk = terrain.Create(device, assets);
+    bool terrainOk = terrain.Create(*rhiDevice, assets);
     terrain.SetRhiDevice(rhiDevice.get());
     auto syncTerrainAssetRoots = [&]() {
         std::vector<std::filesystem::path> roots;
@@ -2359,7 +2596,7 @@ int RunGame(NativeWindow& window,
         editorImGui.SetPaletteSlots(runtimeSession->GetPaletteSlots());
         editorImGui.SetWaterMaterials(editorImGui.GetWaterMaterialsSnapshot());
 #endif
-        if (!terrain.ApplyPaletteSlots(device, runtimeSession->GetPaletteSlots()))
+        if (!terrain.ApplyPaletteSlots(*rhiDevice, runtimeSession->GetPaletteSlots()))
             Tracenf("[MAIN] world palette could not be applied; keeping initial terrain palette");
     }
 
@@ -2371,12 +2608,40 @@ int RunGame(NativeWindow& window,
         worldLabels.Destroy();
     }
 
+    // Particle emitters (CPU-simulated, instanced billboards). Drawn with the transparent queue.
+    ParticleRenderer particleRenderer;
+    bool particleRendererOk = particleRenderer.Create(*rhiDevice, assets);
+    if (!particleRendererOk)
+    {
+        Tracenf("[MAIN] ParticleRenderer failed to initialize - particle emitters will not render");
+        particleRenderer.Destroy();
+    }
+
     SelectionOutlineRenderer selectionOutlines;
     bool selectionOutlinesOk = selectionOutlines.Create(*rhiDevice, assets);
     if (!selectionOutlinesOk)
     {
         Tracenf("[MAIN] SelectionOutlineRenderer failed to initialize - selection outlines will not be available");
         selectionOutlines.Destroy();
+    }
+
+    // The scene sky (Scene Settings > Sky): drawn behind everything in the Scene view, the Game view
+    // and the water reflection. sceneSky is what it draws; the editor Sky panel edits its own copy.
+    SkyRenderer skyRenderer;
+    bool skyOk = skyRenderer.Create(*rhiDevice, assets);
+    if (!skyOk)
+    {
+        Tracenf("[MAIN] SkyRenderer failed to initialize - scenes show a flat backdrop");
+        skyRenderer.Destroy();
+    }
+    SkySettings sceneSky;
+    // God rays (Scene Settings > God rays): light shafts from the Sun, over the Scene and Game views.
+    GodRayRenderer godRays;
+    bool godRaysOk = godRays.Create(*rhiDevice, assets);
+    if (!godRaysOk)
+    {
+        Tracenf("[MAIN] GodRayRenderer failed to initialize - no god rays");
+        godRays.Destroy();
     }
 
     OffscreenSceneRenderer offscreenScene;
@@ -2386,8 +2651,8 @@ int RunGame(NativeWindow& window,
     ixrhi::IXRHIFormat offscreenColorFormat = ixrhi::IXRHIFormat::Undefined;
     ixrhi::IXRHIFormat offscreenDepthFormat = ixrhi::IXRHIFormat::Undefined;
     auto refreshOffscreenFormats = [&]() {
-        offscreenColorFormat = ixvulkan::FromVkFormat(device.GetSwapchainFormat());
-        offscreenDepthFormat = ixvulkan::FromVkFormat(device.GetDepthStencilFormat());
+        offscreenColorFormat = rhiDevice->GetMainSwapchain().ColorFormat();
+        offscreenDepthFormat = rhiDevice->GetMainSwapchain().DepthFormat();
     };
     refreshOffscreenFormats();
     bool offscreenSceneOk = offscreenScene.Create(*rhiDevice,
@@ -2409,15 +2674,25 @@ int RunGame(NativeWindow& window,
                 offscreenScene.GetSampler(),
                 offscreenScene.Width(),
                 offscreenScene.Height());
-            terrain.RecreatePipeline(device);
+            terrain.RecreatePipeline(*rhiDevice);
         }
         if (selectionOutlinesOk)
         {
-            selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
+            selectionOutlines.SetTargetPass(offscreenScene.GetDisplayPass());
             selectionOutlines.RecreatePipeline(*rhiDevice);
         }
+        if (skyOk)
+        {
+            skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
+            skyRenderer.RecreatePipeline(*rhiDevice);
+        }
+        if (particleRendererOk)
+        {
+            particleRenderer.SetTargetPass(offscreenScene.GetTargetPass());
+            particleRenderer.RecreatePipeline(*rhiDevice);
+        }
 #if defined(IXTREEME_WITH_EDITOR)
-        editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
+        editorAdapter->SetSceneViewTexture(offscreenScene.GetDisplayTexture(),
             offscreenScene.GetSampler(),
             offscreenScene.Width(),
             offscreenScene.Height());
@@ -2426,7 +2701,10 @@ int RunGame(NativeWindow& window,
 
     // Second offscreen target for the Game view (rendered from the scene's main camera).
     // Uses a render-pass-compatible target, so the renderers' existing pipelines work as-is.
+    // The game itself has no Game view: it shows offscreenScene, so it skips these screen-sized
+    // floating-point targets.
     OffscreenSceneRenderer gameView;
+#if defined(IXTREEME_WITH_EDITOR)
     bool gameViewOk = gameView.Create(*rhiDevice,
         assets,
         renderSize.width,
@@ -2434,18 +2712,54 @@ int RunGame(NativeWindow& window,
         offscreenColorFormat,
         offscreenDepthFormat,
         "GameView");
-#if defined(IXTREEME_WITH_EDITOR)
     if (gameViewOk)
-        editorAdapter->SetGameViewTexture(gameView.GetColorTexture(),
+        editorAdapter->SetGameViewTexture(gameView.GetDisplayTexture(),
             gameView.GetSampler(),
             gameView.Width(),
             gameView.Height());
+    // The game's own UI (RmlUi documents opened by scripts) is drawn into the Game view, so the
+    // editor shows it where the built game does; the standalone game draws it over its window.
+    if (gameViewOk)
+    {
+        rmlUi.SetTargetPass(gameView.GetDisplayPass());
+        rmlUi.RecreatePipeline(*rhiDevice);
+        rmlUi.Resize(gameView.Width(), gameView.Height());
+    }
+    rmlUi.SetSrgbTarget(IsSrgbColorFormat(gameViewOk ? gameView.DisplayFormat() : rhiDevice->GetMainSwapchain().ColorFormat()));
+#else
+    bool gameViewOk = false;
+    rmlUi.SetSrgbTarget(IsSrgbColorFormat(rhiDevice->GetMainSwapchain().ColorFormat()));
 #endif
+    // A model's CPU half (the renderer's LoadCpu: reading and parsing it, decoding its textures) on a
+    // loading thread; this thread finishes it (FinishGpu) once that is done. Freeing one waits for its
+    // loading thread, so a load never outlives its renderer.
+    struct ModelLoadJob
+    {
+        ixjobs::Counter done;
+        StaticMeshRenderer* staticRenderer = nullptr;
+        SkinnedMeshRenderer* skinnedRenderer = nullptr;
+        client::asset::IAssetReader* assets = nullptr;
+        std::string modelPath;
+        bool cpuLoaded = false;
+        double cpuMs = 0.0;
+        std::chrono::steady_clock::time_point asked;
+        ~ModelLoadJob() { ixjobs::JobSystem::Instance().Wait(done, /*runBackground=*/true); }
+    };
+    const ixjobs::TaskFunction runModelLoad = [](void* data, std::uint32_t) {
+        ModelLoadJob& job = *static_cast<ModelLoadJob*>(data);
+        const auto begin = std::chrono::steady_clock::now();
+        job.cpuLoaded = job.staticRenderer ? job.staticRenderer->LoadCpu(*job.assets, job.modelPath)
+                                           : job.skinnedRenderer->LoadCpu(*job.assets, job.modelPath);
+        job.cpuMs = MillisecondsBetween(begin, std::chrono::steady_clock::now());
+    };
+    std::uint32_t modelLoadsInFlight = 0;
+    std::uint64_t modelLoadsStarted = 0;
     struct StaticMeshCacheEntry
     {
         enum class State
         {
             Unknown,
+            Loading,  // the renderer is its loading thread's until load is done
             LoadedStatic,
             UnsupportedSkinned,
             Failed
@@ -2453,29 +2767,38 @@ int RunGame(NativeWindow& window,
 
         std::unique_ptr<StaticMeshRenderer> renderer;
         State state = State::Unknown;
+        std::unique_ptr<ModelLoadJob> load;  // while Loading (after renderer: freed, and waited for, first)
     };
     std::unordered_map<std::string, StaticMeshCacheEntry> staticMeshCache;
+    // Moves on whenever a static model is finished (loaded or not): the render records that waited for
+    // one are built again. The entities whose spatial sync found their model loading are synced again
+    // at the next frame's start (pumpModelLoads).
+    std::uint64_t staticModelRevision = 0;
+    std::vector<std::string> finishedStaticModelPaths;
+    std::unordered_map<std::string, std::unordered_set<std::uint32_t>> pendingSpatialSyncs;
 
     // Per-model skinned (rigged character) renderer cache. Keyed by the same resolved
     // runtime path as staticMeshCache, so multiple DISTINCT rigged models render at once.
-    // Each entry owns its own SkinnedMeshRenderer (pipelines, buffers, and its own 32-slot
-    // skin pool), so per-frame skin slots are allocated PER renderer (no global namespace).
+    // Each entry owns its own SkinnedMeshRenderer (pipelines, buffers, and its own skin-slot
+    // pool), so per-frame skin slots are allocated PER renderer (no global namespace).
     struct SkinnedMeshCacheEntry
     {
-        enum class State { Unknown, Loaded, Failed };
+        enum class State { Unknown, Loading, Loaded, Failed };
         std::unique_ptr<SkinnedMeshRenderer> renderer;
         State state = State::Unknown;
-        // Per-frame skin-slot cursors: Scene view consumes bottom-up, Game view top-down,
-        // out of THIS renderer's MaxSkinSlots() pool. Reset lazily once per device frame so a
-        // model drawn in both views in one command buffer never clobbers its own poses.
-        std::uint32_t sceneSlotCursor = 0;
-        std::uint32_t gameSlotCursor = SkinnedMeshRenderer::MaxSkinSlots();
+        std::unique_ptr<ModelLoadJob> load;  // while Loading (after renderer: freed, and waited for, first)
+        // Per-frame skin-slot cursor over THIS renderer's pool (up to MaxSkinSlots(); the renderer
+        // makes slots as they are first used). Reset lazily once per device frame; the Scene and Game
+        // views take slots from it alike, so a model drawn in both views in one command buffer never
+        // clobbers its own poses.
+        std::uint32_t slotCursor = 0;
         std::uint64_t cursorsResetFrame = std::numeric_limits<std::uint64_t>::max();
     };
     std::unordered_map<std::string, SkinnedMeshCacheEntry> skinnedMeshCache;
-    // Most recent finalized lighting; used to seed an entry created mid-frame so its first
-    // frame is lit (matches the per-frame SetLightingState push to all entries).
-    LightingState skinnedCacheLighting{};
+    // The frame's finalized scene lighting, the one the terrain is lit by. Every mesh renderer gets
+    // it (static ones per draw, skinned ones per frame and when created mid-frame), so meshes and
+    // terrain share one sun, the sun the shadow cascades are drawn from.
+    LightingState frameLighting{};
     // Networked-entity and lobby skinned rendering have no per-entity model path; they are
     // dormant today (nothing ever loaded a model for them). Gate them behind this constant —
     // empty => getSkinnedMeshRenderer returns nullptr => those blocks stay no-ops exactly as
@@ -2491,62 +2814,148 @@ int RunGame(NativeWindow& window,
         WorldVec3 position{};
         float yaw = 0.0f;
         std::array<float, 4> tint{1.0f, 1.0f, 1.0f, 1.0f};
+        std::array<float, 3> scale{1.0f, 1.0f, 1.0f};  // the entity Transform scale
     };
 
-    auto getSkinnedMeshRenderer = [&](const std::string& modelPath) -> SkinnedMeshRenderer* {
-        if (modelPath.empty())
-            return nullptr;
-        auto& entry = skinnedMeshCache[modelPath];
-        if (entry.state == SkinnedMeshCacheEntry::State::Loaded)
-            return entry.renderer.get();
-        if (entry.state == SkinnedMeshCacheEntry::State::Failed)
-            return nullptr;
-        entry.renderer = std::make_unique<SkinnedMeshRenderer>();
-        if (!entry.renderer->Create(*rhiDevice, assets, modelPath))
+    // Rigged models load the way static ones do (see requestStaticMeshRenderer): request starts the
+    // load and gives the renderer once it is finished, get waits for it.
+    auto finishSkinnedMeshLoad = [&](const std::string& modelPath, SkinnedMeshCacheEntry& entry) {
+        const auto finishBegin = std::chrono::steady_clock::now();
+        bool loaded = entry.load->cpuLoaded;
+        if (loaded)
+        {
+            // Its pipelines are made for the pass that is current now.
+            if (offscreenSceneOk)
+                entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
+            loaded = entry.renderer->FinishGpu(*rhiDevice);
+        }
+        const auto finished = std::chrono::steady_clock::now();
+        const double cpuMs = entry.load->cpuMs;
+        const double finishMs = MillisecondsBetween(finishBegin, finished);
+        const double askedMs = MillisecondsBetween(entry.load->asked, finished);
+        entry.load.reset();
+        --modelLoadsInFlight;
+        if (!loaded)
         {
             entry.renderer.reset();
             entry.state = SkinnedMeshCacheEntry::State::Failed;
             TraceError("[MESH-ENTITY] Failed to load skinned model: %s", modelPath.c_str());
-            return nullptr;
+            return;
         }
-        // SkinnedMeshRenderer::Create() internally Destroy()s first (clearing any render pass),
-        // so wire the offscreen pass + rebuild the pipeline AFTER Create, not before.
-        if (offscreenSceneOk)
-        {
-                entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
-            entry.renderer->RecreatePipeline(*rhiDevice);
-        }
-        entry.renderer->SetLightingState(skinnedCacheLighting);
+        entry.renderer->SetLightingState(frameLighting);
+        // The sun shadow map is bound in every draw (cascades refreshed each frame after the shadow pass).
+        if (terrainOk)
+            entry.renderer->SetSunShadow(terrain.SunShadowForMeshes(0));
         entry.state = SkinnedMeshCacheEntry::State::Loaded;
-        Tracenf("[MESH-ENTITY] SkinnedMeshRenderer loaded: %s", modelPath.c_str());
+        Tracenf("[MESH-ENTITY] SkinnedMeshRenderer loaded: %s (%.1f ms: loading %.1f, finishing %.1f; %.1f ms after asked)",
+            modelPath.c_str(), cpuMs + finishMs, cpuMs, finishMs, askedMs);
 #if defined(IXTREEME_WITH_EDITOR)
         // Auto-generate retargetable .ixclip assets from this model's existing _anim_<i>.ozz
         // sidecars so they appear under the asset browser's "Anim Clips" tab (idempotent).
         editorImGui.EnsureModelAnimationClips(modelPath, entry.renderer->JointNames());
 #endif
-        return entry.renderer.get();
+    };
+    auto requestSkinnedMeshRenderer = [&](const std::string& modelPath) -> SkinnedMeshRenderer* {
+        if (modelPath.empty())
+            return nullptr;
+        auto& entry = skinnedMeshCache[modelPath];
+        if (entry.state == SkinnedMeshCacheEntry::State::Unknown)
+        {
+            entry.renderer = std::make_unique<SkinnedMeshRenderer>();
+            entry.load = std::make_unique<ModelLoadJob>();
+            entry.load->skinnedRenderer = entry.renderer.get();
+            entry.load->assets = &assets;
+            entry.load->modelPath = modelPath;
+            entry.load->asked = std::chrono::steady_clock::now();
+            entry.state = SkinnedMeshCacheEntry::State::Loading;
+            ++modelLoadsInFlight;
+            ++modelLoadsStarted;
+            ixjobs::JobSystem::Instance().SubmitBackground(runModelLoad, entry.load.get(), 0, &entry.load->done);
+        }
+        if (entry.state == SkinnedMeshCacheEntry::State::Loading && entry.load->done.Done())
+            finishSkinnedMeshLoad(modelPath, entry);
+        return entry.state == SkinnedMeshCacheEntry::State::Loaded ? entry.renderer.get() : nullptr;
+    };
+    auto getSkinnedMeshRenderer = [&](const std::string& modelPath) -> SkinnedMeshRenderer* {
+        if (SkinnedMeshRenderer* renderer = requestSkinnedMeshRenderer(modelPath))
+            return renderer;
+        const auto it = modelPath.empty() ? skinnedMeshCache.end() : skinnedMeshCache.find(modelPath);
+        if (it == skinnedMeshCache.end() || it->second.state != SkinnedMeshCacheEntry::State::Loading)
+            return nullptr;
+        ixjobs::JobSystem::Instance().Wait(it->second.load->done, /*runBackground=*/true);
+        finishSkinnedMeshLoad(modelPath, it->second);
+        return it->second.state == SkinnedMeshCacheEntry::State::Loaded ? it->second.renderer.get() : nullptr;
+    };
+    // resolveMeshRuntimePath hits the filesystem (exists()) up to four times per mesh per frame; the
+    // resolution only changes when the file set does, so cache it and clear the cache on an asset
+    // library refresh (the watcher fires when files appear/disappear).
+    std::unordered_map<std::string, std::string> resolvedMeshPathCache;
+    // LOD defaults are looked up per LOD-enabled mesh (up to twice) every frame; FindById is a
+    // linear scan with a full entry copy, so cache the result per asset id (cleared on a refresh).
+    std::unordered_map<std::string, std::optional<LodConfig>> lodDefaultCache;
+    // Both caches describe one asset library and project: dropped (once a frame, at its start) when
+    // the library changes (a refresh, a saved LOD default, another library) or another project opens.
+    std::uint64_t meshCachesLibraryRevision = 0;
+    std::filesystem::path meshCachesProjectRoot;
+    // Moves on whenever the caches are dropped: what was resolved through them may resolve otherwise.
+    std::uint64_t meshCachesGeneration = 1;
+    auto validateMeshCaches = [&]() {
+        const std::uint64_t libraryRevision = editorImGui.AssetLibraryRevision();
+        const std::filesystem::path projectRoot = ProjectManager::Instance().HasProject()
+            ? ProjectManager::Instance().ProjectRoot()
+            : std::filesystem::path{};
+        if (libraryRevision == meshCachesLibraryRevision && projectRoot == meshCachesProjectRoot)
+            return;
+        resolvedMeshPathCache.clear();
+        lodDefaultCache.clear();
+        meshCachesLibraryRevision = libraryRevision;
+        meshCachesProjectRoot = projectRoot;
+        ++meshCachesGeneration;
+    };
+    auto findModelLodDefault = [&](const std::string& assetId) -> std::optional<LodConfig> {
+        if (assetId.empty())
+            return std::nullopt;
+        const auto it = lodDefaultCache.find(assetId);
+        if (it != lodDefaultCache.end())
+            return it->second;
+        std::optional<LodConfig> result = editorImGui.FindModelLodDefault(assetId);
+        lodDefaultCache.emplace(assetId, result);
+        return result;
     };
     auto resolveMeshRuntimePath = [&](const MeshSceneEntity& mesh) {
         if (mesh.meshAssetPath.empty())
             return std::string{};
         if (mesh.meshAssetPath.rfind("builtin://primitive/", 0) == 0)
             return mesh.meshAssetPath;
+        const auto cached = resolvedMeshPathCache.find(mesh.meshAssetPath);
+        if (cached != resolvedMeshPathCache.end())
+            return cached->second;
+        std::string resolved = mesh.meshAssetPath;
         const std::filesystem::path stored(mesh.meshAssetPath);
         if (stored.is_absolute())
-            return stored.string();
-        if (ProjectManager::Instance().HasProject())
         {
-            const std::filesystem::path projectPath = ProjectManager::Instance().ProjectRoot() / stored;
-            if (std::filesystem::exists(projectPath))
-                return projectPath.string();
+            resolved = stored.string();
         }
-        if (auto root = assets.RootPath())
+        else
         {
-            const std::filesystem::path enginePath = *root / stored;
-            if (std::filesystem::exists(enginePath))
-                return stored.generic_string();
+            if (ProjectManager::Instance().HasProject())
+            {
+                const std::filesystem::path projectPath = ProjectManager::Instance().ProjectRoot() / stored;
+                if (std::filesystem::exists(projectPath))
+                    resolved = projectPath.string();
+            }
+            if (resolved == mesh.meshAssetPath)
+            {
+                if (auto root = assets.RootPath())
+                {
+                    const std::filesystem::path enginePath = *root / stored;
+                    if (std::filesystem::exists(enginePath))
+                        resolved = stored.generic_string();
+                }
+            }
         }
-        return mesh.meshAssetPath;
+        resolvedMeshPathCache.emplace(mesh.meshAssetPath, resolved);
+        return resolved;
     };
     auto modelHasSkeletalSidecar = [&](const std::string& modelPath) {
         std::filesystem::path path(modelPath);
@@ -2574,56 +2983,303 @@ int RunGame(NativeWindow& window,
         const std::filesystem::path skeleton = path.parent_path() / (path.stem().string() + "_skeleton.ozz");
         return std::filesystem::exists(skeleton);
     };
-    auto getStaticMeshRenderer = [&](const std::string& modelPath) -> StaticMeshRenderer* {
-        if (modelPath.empty())
-            return nullptr;
-        auto& entry = staticMeshCache[modelPath];
-        if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
-            return entry.renderer.get();
-        if (entry.state == StaticMeshCacheEntry::State::UnsupportedSkinned ||
-            entry.state == StaticMeshCacheEntry::State::Failed)
-            return nullptr;
-
-        if (modelHasSkeletalSidecar(modelPath))
+    // A loaded model's renderer on this thread (buffers, textures, pipelines), once its loading thread
+    // is done with it; or what it turned out to be (rigged, or not loadable).
+    auto finishStaticMeshLoad = [&](const std::string& modelPath, StaticMeshCacheEntry& entry) {
+        const auto finishBegin = std::chrono::steady_clock::now();
+        bool loaded = entry.load->cpuLoaded;
+        if (loaded)
         {
-            entry.state = StaticMeshCacheEntry::State::UnsupportedSkinned;
-            Tracenf("[MESH-ENTITY] Skinned FBX detected and skipped for mesh entity static path: %s", modelPath.c_str());
-            return nullptr;
+            // Its pipelines are made for the pass that is current now; its data is uploaded by the
+            // next frame (no wait for the frames in flight).
+            if (offscreenSceneOk)
+                entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
+            loaded = entry.renderer->FinishGpu(*rhiDevice, /*deferUploads=*/true);
         }
-
-        bool isSkinned = false;
-        std::string inspectError;
-        std::string ext = std::filesystem::path(modelPath).extension().string();
-        std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
-            return static_cast<char>(std::tolower(c));
-        });
-        const bool builtinPrimitive = modelPath.rfind("builtin://primitive/", 0) == 0;
-        if (!builtinPrimitive && ext != ".fbx" && !StaticMeshRenderer::DetectSkinnedGltf(assets, modelPath, isSkinned, &inspectError))
+        const auto finished = std::chrono::steady_clock::now();
+        const double cpuMs = entry.load->cpuMs;
+        const double finishMs = MillisecondsBetween(finishBegin, finished);
+        const double askedMs = MillisecondsBetween(entry.load->asked, finished);
+        entry.load.reset();
+        --modelLoadsInFlight;
+        ++staticModelRevision;
+        finishedStaticModelPaths.push_back(modelPath);
+        if (loaded)
         {
-            entry.state = StaticMeshCacheEntry::State::Failed;
-            TraceError("[MESH-ENTITY] Static mesh inspect failed: %s (%s)", modelPath.c_str(), inspectError.c_str());
-            return nullptr;
+            // The sun shadow map is bound in every draw (cascades refreshed each frame after the shadow pass).
+            if (terrainOk)
+                entry.renderer->SetSunShadow(terrain.SunShadowForMeshes(0));
+            entry.state = StaticMeshCacheEntry::State::LoadedStatic;
+            Tracenf("[MESH-ENTITY] StaticMeshRenderer loaded: %s (%.1f ms: loading %.1f, finishing %.1f; %.1f ms after asked)",
+                modelPath.c_str(), cpuMs + finishMs, cpuMs, finishMs, askedMs);
+            return;
         }
-        if (isSkinned)
+        const bool skinned = entry.renderer->Status() == StaticMeshRenderer::LoadStatus::UnsupportedSkinned;
+        entry.renderer.reset();
+        if (skinned)
         {
             entry.state = StaticMeshCacheEntry::State::UnsupportedSkinned;
             Tracenf("[MESH-ENTITY] Skinned glTF detected and skipped for mesh entity static path: %s", modelPath.c_str());
-            return nullptr;
         }
-
-        entry.renderer = std::make_unique<StaticMeshRenderer>();
-        if (offscreenSceneOk)
-            entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
-        if (!entry.renderer->Create(*rhiDevice, assets, modelPath))
+        else
         {
-            entry.renderer.reset();
             entry.state = StaticMeshCacheEntry::State::Failed;
             TraceError("[MESH-ENTITY] Static mesh load failed: %s", modelPath.c_str());
-            return nullptr;
         }
-        entry.state = StaticMeshCacheEntry::State::LoadedStatic;
-        Tracenf("[MESH-ENTITY] StaticMeshRenderer loaded: %s", modelPath.c_str());
-        return entry.renderer.get();
+    };
+    // The model's renderer if it is loaded; otherwise its load is started (once) on a loading thread
+    // and nothing is given until it is finished: the frame goes on without the model. For the
+    // per-frame paths (the render records, the spatial index); getStaticMeshRenderer waits instead.
+    auto requestStaticMeshRenderer = [&](const std::string& modelPath) -> StaticMeshRenderer* {
+        if (modelPath.empty())
+            return nullptr;
+        auto& entry = staticMeshCache[modelPath];
+        if (entry.state == StaticMeshCacheEntry::State::Unknown)
+        {
+            if (modelHasSkeletalSidecar(modelPath))
+            {
+                entry.state = StaticMeshCacheEntry::State::UnsupportedSkinned;
+                Tracenf("[MESH-ENTITY] Skinned FBX detected and skipped for mesh entity static path: %s", modelPath.c_str());
+                return nullptr;
+            }
+            entry.renderer = std::make_unique<StaticMeshRenderer>();
+            entry.load = std::make_unique<ModelLoadJob>();
+            entry.load->staticRenderer = entry.renderer.get();
+            entry.load->assets = &assets;
+            entry.load->modelPath = modelPath;
+            entry.load->asked = std::chrono::steady_clock::now();
+            entry.state = StaticMeshCacheEntry::State::Loading;
+            ++modelLoadsInFlight;
+            ++modelLoadsStarted;
+            ixjobs::JobSystem::Instance().SubmitBackground(runModelLoad, entry.load.get(), 0, &entry.load->done);
+        }
+        if (entry.state == StaticMeshCacheEntry::State::Loading && entry.load->done.Done())
+            finishStaticMeshLoad(modelPath, entry);
+        return entry.state == StaticMeshCacheEntry::State::LoadedStatic ? entry.renderer.get() : nullptr;
+    };
+    auto staticMeshModelLoading = [&](const std::string& modelPath) {
+        const auto it = staticMeshCache.find(modelPath);
+        return it != staticMeshCache.end() && it->second.state == StaticMeshCacheEntry::State::Loading;
+    };
+    // The model's renderer, waiting for its load (this thread loads too) when it is not finished yet:
+    // for what needs the model now (physics shapes, picking, the gizmo, exports).
+    auto getStaticMeshRenderer = [&](const std::string& modelPath) -> StaticMeshRenderer* {
+        if (StaticMeshRenderer* renderer = requestStaticMeshRenderer(modelPath))
+            return renderer;
+        const auto it = modelPath.empty() ? staticMeshCache.end() : staticMeshCache.find(modelPath);
+        if (it == staticMeshCache.end() || it->second.state != StaticMeshCacheEntry::State::Loading)
+            return nullptr;
+        ixjobs::JobSystem::Instance().Wait(it->second.load->done, /*runBackground=*/true);
+        finishStaticMeshLoad(modelPath, it->second);
+        return it->second.state == StaticMeshCacheEntry::State::LoadedStatic ? it->second.renderer.get() : nullptr;
+    };
+    // Waits for every model being loaded (this thread loads too) and finishes them.
+    auto finishAllModelLoads = [&]() {
+        if (modelLoadsInFlight == 0)
+            return;
+        ixjobs::JobSystem& jobs = ixjobs::JobSystem::Instance();
+        for (auto& [path, entry] : staticMeshCache)
+        {
+            if (entry.state != StaticMeshCacheEntry::State::Loading)
+                continue;
+            jobs.Wait(entry.load->done, /*runBackground=*/true);
+            finishStaticMeshLoad(path, entry);
+        }
+        for (auto& [path, entry] : skinnedMeshCache)
+        {
+            if (entry.state != SkinnedMeshCacheEntry::State::Loading)
+                continue;
+            jobs.Wait(entry.load->done, /*runBackground=*/true);
+            finishSkinnedMeshLoad(path, entry);
+        }
+    };
+    // Render extraction: what a mesh entity's draws need, kept between frames. It is built again only
+    // when the entity's model, transform or materials, the model path resolution or the material
+    // assets change; the passes read it instead of resolving the model, building the world bounds and
+    // the per-instance records and copying the material lists for every entity, pass and frame.
+    // (Renderers are never dropped from staticMeshCache, so the pointer stays valid.)
+    struct StaticMeshRenderRecord
+    {
+        bool inUse = false;
+        std::uint32_t entityId = 0;
+        std::uint64_t validatedFrame = std::numeric_limits<std::uint64_t>::max();
+        // What it was built from, with the instance's transform and materials.
+        std::uint64_t meshCachesGeneration = 0;
+        std::string meshAssetPath;
+        bool skinned = false;
+        std::string runtimePath;      // the model's resolved path
+        bool modelIsSkinned = false;  // the static path found the model rigged
+        bool awaitingModel = false;   // its model was loading: built again once a model is finished
+        // In the cascades' static shadow cache (a settled caster, see the sun shadow pass); next to the
+        // fields the per-frame loops read (one cache line less per record).
+        bool inStaticShadow = false;
+        std::uint64_t modelRevision = 0;  // staticModelRevision when it was built
+        StaticMeshRenderer* renderer = nullptr;  // null: no static draws
+        StaticMeshRenderer::Instance instance;   // its prepared points at prepared below
+        StaticMeshRenderer::PreparedInstance prepared;
+        SpatialIndex::Aabb worldBounds{};
+        std::array<WorldVec3, 8> corners{};
+        std::uint64_t changedFrame = 0;  // renderRecordFrame it was last built or its materials read in
+        // The bounds it was drawn into the static shadow cache with (where its shadow is taken out).
+        TerrainRenderer::StaticCasterBounds staticShadowBounds{};
+    };
+    // An entity finds its record by the slot it holds (MeshSceneEntity::renderRecordSlot). A deque: a
+    // record stays where it is while others are added, so pointers to records (and to their instances)
+    // hold for the frame. The slots of entities that are gone are freed between frames and reused.
+    std::deque<StaticMeshRenderRecord> staticMeshRenderRecords;
+    std::vector<std::uint32_t> freeStaticMeshRenderRecords;
+    std::uint64_t renderRecordFrame = 0;
+    // The sun shadow pass's static mesh casters by renderer, refilled every frame (their storage is
+    // kept): those settled (unchanged for kShadowSettleFrames) go into the cascades' static cache, the
+    // others (physics bodies, things scripts move) are drawn over it with the characters.
+    struct ShadowCasterBatch
+    {
+        StaticMeshRenderer* renderer = nullptr;
+        std::vector<const StaticMeshRenderRecord*> casters;
+    };
+    std::vector<ShadowCasterBatch> settledShadowCasterBatches;
+    std::vector<ShadowCasterBatch> movingShadowCasterBatches;
+    constexpr std::uint64_t kShadowSettleFrames = 30;
+    // The static shadow cache's casters: a revision moved on whenever one joins or leaves, how many
+    // are in it, and the frame's change (those that joined; the bounds of those that left, also
+    // gathered between frames when a gone entity's record is dropped). The cascades' cache layers take
+    // just that change instead of being drawn again whole.
+    std::uint64_t staticShadowRevision = 1;
+    std::uint32_t staticShadowCount = 0;
+    std::vector<const StaticMeshRenderRecord*> staticShadowJoined;
+    std::vector<TerrainRenderer::StaticCasterBounds> staticShadowLeft;
+    // The settled casters' clip-space extents per cascade (for the regions a change draws again), in
+    // the settled batches' order, and the frame each was worked out in.
+    struct CasterClipRect
+    {
+        float minX = 0.0f;
+        float minY = 0.0f;
+        float maxX = 0.0f;
+        float maxY = 0.0f;
+    };
+    std::array<std::vector<CasterClipRect>, SunShadowReceive::kCascades> settledCasterClipRects;
+    std::vector<const StaticMeshRenderRecord*> settledCasterList;
+    std::uint64_t settledCasterListFrame = std::numeric_limits<std::uint64_t>::max();
+    std::array<std::uint64_t, SunShadowReceive::kCascades> settledCasterClipRectsFrame{};
+    auto leaveStaticShadow = [&](StaticMeshRenderRecord& record) {
+        if (!record.inStaticShadow)
+            return;
+        record.inStaticShadow = false;
+        --staticShadowCount;
+        staticShadowLeft.push_back(record.staticShadowBounds);
+    };
+    // The entity's record, given a slot of its own first if it has none (or holds another's).
+    auto staticMeshRenderRecordSlot = [&](const MeshSceneEntity& mesh) -> StaticMeshRenderRecord& {
+        std::uint32_t slot = mesh.renderRecordSlot;
+        if (slot >= staticMeshRenderRecords.size() || !staticMeshRenderRecords[slot].inUse ||
+            staticMeshRenderRecords[slot].entityId != mesh.id)
+        {
+            if (!freeStaticMeshRenderRecords.empty())
+            {
+                slot = freeStaticMeshRenderRecords.back();
+                freeStaticMeshRenderRecords.pop_back();
+                staticMeshRenderRecords[slot] = {};
+            }
+            else
+            {
+                slot = static_cast<std::uint32_t>(staticMeshRenderRecords.size());
+                staticMeshRenderRecords.emplace_back();
+            }
+            staticMeshRenderRecords[slot].inUse = true;
+            staticMeshRenderRecords[slot].entityId = mesh.id;
+            mesh.renderRecordSlot = slot;
+        }
+        return staticMeshRenderRecords[slot];
+    };
+    // Whether the record still shows the entity. The transform every frame; the model path and the
+    // materials (string compares, ~10 000 entities) every 4th frame per entity, staggered, or at once
+    // when asked to (an edit shows up to 3 frames late otherwise). Reads only: safe in parallel.
+    auto staticMeshRenderRecordMatches = [&](const StaticMeshRenderRecord& record, const MeshSceneEntity& mesh,
+                                             bool recheck) {
+        const bool checkAssets = recheck || record.validatedFrame == std::numeric_limits<std::uint64_t>::max() ||
+            ((mesh.id + renderRecordFrame) & 3u) == 0u;
+        const StaticMeshRenderer::Instance& instance = record.instance;
+        return record.meshCachesGeneration == meshCachesGeneration &&
+            (!record.awaitingModel || record.modelRevision == staticModelRevision) &&
+            record.skinned == mesh.skinned &&
+            instance.entityId == mesh.id &&
+            instance.position.x == mesh.position[0] && instance.position.y == mesh.position[1] &&
+            instance.position.z == mesh.position[2] &&
+            std::equal(std::begin(mesh.rotation), std::end(mesh.rotation), std::begin(instance.rotation)) &&
+            std::equal(std::begin(mesh.scale), std::end(mesh.scale), std::begin(instance.scale)) &&
+            (!checkAssets ||
+                (record.meshAssetPath == mesh.meshAssetPath &&
+                    instance.materialSlots == mesh.materialSlots &&
+                    instance.materialOverrides == mesh.materialOverrides));
+    };
+    // recheck: compare everything now (the entity was just changed by the caller).
+    auto staticMeshRenderRecord = [&](const MeshSceneEntity& mesh, bool recheck = false) -> StaticMeshRenderRecord& {
+        StaticMeshRenderRecord& record = staticMeshRenderRecordSlot(mesh);
+        if (record.validatedFrame == renderRecordFrame && !recheck)
+            return record;
+        const bool unchanged = staticMeshRenderRecordMatches(record, mesh, recheck);
+        record.validatedFrame = renderRecordFrame;
+        StaticMeshRenderer::Instance& instance = record.instance;
+        if (unchanged)
+        {
+            // The material assets changed: its records are made again, and the record counts as
+            // changed (its shadow drawn again, ...) only if they did. A material loaded for another
+            // model changes none: every caster in the scene redrew its shadow for 30 frames.
+            if (record.renderer && record.prepared.materialRevision != MaterialAssetManager::Instance().Revision() &&
+                record.renderer->PrepareInstance(instance, record.prepared))
+                record.changedFrame = renderRecordFrame;
+            return record;
+        }
+        record.changedFrame = renderRecordFrame;
+        record.meshCachesGeneration = meshCachesGeneration;
+        record.meshAssetPath = mesh.meshAssetPath;
+        record.skinned = mesh.skinned;
+        instance = {};
+        instance.entityId = mesh.id;
+        instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            instance.rotation[axis] = mesh.rotation[axis];
+            instance.scale[axis] = mesh.scale[axis];
+        }
+        instance.materialSlots = mesh.materialSlots;
+        instance.materialOverrides = mesh.materialOverrides;
+        record.runtimePath = resolveMeshRuntimePath(mesh);
+        record.renderer = nullptr;
+        record.modelIsSkinned = false;
+        record.awaitingModel = false;
+        if (!mesh.skinned)
+        {
+            // Not waited for: until its model is loaded the entity has no draws.
+            StaticMeshRenderer* renderer = requestStaticMeshRenderer(record.runtimePath);
+            if (renderer && renderer->IsLoaded())
+            {
+                record.renderer = renderer;
+            }
+            else
+            {
+                const auto cached = staticMeshCache.find(record.runtimePath);
+                record.modelIsSkinned = cached != staticMeshCache.end() &&
+                    cached->second.state == StaticMeshCacheEntry::State::UnsupportedSkinned;
+                record.awaitingModel = cached != staticMeshCache.end() &&
+                    cached->second.state == StaticMeshCacheEntry::State::Loading;
+            }
+        }
+        record.modelRevision = staticModelRevision;
+        if (record.renderer)
+        {
+            record.worldBounds = StaticMeshWorldAabb(mesh, *record.renderer);
+            record.corners = SpatialAabbCorners(record.worldBounds);
+            record.renderer->PrepareInstance(instance, record.prepared);
+            instance.prepared = &record.prepared;
+        }
+        return record;
+    };
+    // A view panel's pixel size as the render size, or nothing (the panel was not laid out yet).
+    auto panelRenderExtent = [](std::uint32_t width, std::uint32_t height) -> std::optional<VkExtent2D> {
+        if (width < 16u || height < 16u)
+            return std::nullopt;
+        return VkExtent2D{std::min(width, 7680u), std::min(height, 4320u)};
     };
     auto effectiveRenderExtent = [&]() {
         if (!renderResolutionUseNative &&
@@ -2632,17 +3288,49 @@ int RunGame(NativeWindow& window,
         {
             return requestedRenderResolution;
         }
+#if defined(IXTREEME_WITH_EDITOR)
+        // "View size" in the editor: the Scene View panel's own size. Rendering the whole window's
+        // size and shrinking it into the panel shaded ~3x the pixels that are shown.
+        if (runtimeSession->IsMapEditorOpen())
+        {
+            std::uint32_t panelWidth = 0;
+            std::uint32_t panelHeight = 0;
+            editorImGui.GetSceneViewPanelPixels(panelWidth, panelHeight);
+            if (const std::optional<VkExtent2D> panel = panelRenderExtent(panelWidth, panelHeight))
+                return *panel;
+        }
+#endif
         return device.GetSwapchainExtent();
+    };
+    // The Play state machine drives the simulation in BOTH builds: the editor toggles it Edit<->Play,
+    // the standalone runtime forces it to Play at boot. So the struct is declared unconditionally; only
+    // the editor's "open the map editor at boot" side-effects stay editor-gated.
+    EditorPlayRuntime editorPlay;
+    // The Game view's size: its panel's (with "View size"), else the Scene View's render size.
+    auto gameViewRenderExtent = [&]() {
+#if defined(IXTREEME_WITH_EDITOR)
+        if (renderResolutionUseNative && runtimeSession->IsMapEditorOpen())
+        {
+            std::uint32_t panelWidth = 0;
+            std::uint32_t panelHeight = 0;
+            editorImGui.GetGameViewPanelPixels(panelWidth, panelHeight);
+            if (const std::optional<VkExtent2D> panel = panelRenderExtent(panelWidth, panelHeight))
+                return *panel;
+        }
+#endif
+        return renderSize;
     };
     auto bindOffscreenSceneTargets = [&]() {
         if (!offscreenSceneOk)
             return;
         renderSize.width = offscreenScene.Width();
         renderSize.height = offscreenScene.Height();
+        // (Models still loading are left alone here and below: they take the pass that is current
+        // when they are finished, and the frame's lighting and shadows.)
         for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
         {
             (void)skinnedPath;
-            if (skinnedEntry.renderer)
+            if (skinnedEntry.state == SkinnedMeshCacheEntry::State::Loaded)
             {
                 skinnedEntry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                 skinnedEntry.renderer->RecreatePipeline(*rhiDevice);
@@ -2651,7 +3339,7 @@ int RunGame(NativeWindow& window,
         for (auto& [path, entry] : staticMeshCache)
         {
             (void)path;
-            if (entry.renderer)
+            if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
             {
                 entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                 entry.renderer->RecreatePipeline(*rhiDevice);
@@ -2665,27 +3353,33 @@ int RunGame(NativeWindow& window,
                 offscreenScene.GetSampler(),
                 offscreenScene.Width(),
                 offscreenScene.Height());
-            terrain.RecreatePipeline(device);
+            terrain.RecreatePipeline(*rhiDevice);
         }
         if (selectionOutlinesOk)
         {
-            selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
+            selectionOutlines.SetTargetPass(offscreenScene.GetDisplayPass());
             selectionOutlines.RecreatePipeline(*rhiDevice);
         }
+        if (skyOk)
+        {
+            skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
+            skyRenderer.RecreatePipeline(*rhiDevice);
+        }
 #if defined(IXTREEME_WITH_EDITOR)
-        editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
+        editorAdapter->SetSceneViewTexture(offscreenScene.GetDisplayTexture(),
             offscreenScene.GetSampler(),
             offscreenScene.Width(),
             offscreenScene.Height());
         if (gameViewOk)
         {
+            const VkExtent2D gameExtent = gameViewRenderExtent();
             gameViewOk = gameView.Recreate(*rhiDevice,
-                renderSize.width,
-                renderSize.height,
+                gameExtent.width,
+                gameExtent.height,
                 offscreenColorFormat,
                 offscreenDepthFormat);
             if (gameViewOk)
-                editorAdapter->SetGameViewTexture(gameView.GetColorTexture(),
+                editorAdapter->SetGameViewTexture(gameView.GetDisplayTexture(),
                     gameView.GetSampler(),
                     gameView.Width(),
                     gameView.Height());
@@ -2727,10 +3421,6 @@ int RunGame(NativeWindow& window,
 
     MovementInputState movement;
     FlyCameraController cameraController;
-    // The Play state machine drives the simulation in BOTH builds: the editor toggles it Edit<->Play,
-    // the standalone runtime forces it to Play at boot. So the struct is declared unconditionally; only
-    // the editor's "open the map editor at boot" side-effects stay editor-gated.
-    EditorPlayRuntime editorPlay;
 #if defined(IXTREEME_WITH_EDITOR)
     runtimeSession->SetMapEditorOpen(true);
     if (terrainOk)
@@ -2786,17 +3476,26 @@ int RunGame(NativeWindow& window,
     std::unordered_map<std::uint32_t, ixanim::AnimatorRuntime> entityAnimators;
     std::unordered_map<std::uint32_t, ixanim::AnimatorController> entityControllers;
     std::unordered_map<std::uint32_t, ixaudio::AudioSourceRuntime> entityAudioSources;  // per-entity, Play-only
+    // CPU particle simulators: one per emitting entity, created on Play-enter, stepped each Play
+    // frame, cleared on Play-exit. Particles render through the transparent queue.
+    std::unordered_map<std::uint32_t, ixparticle::ParticleSimulator> entityParticles;
     // Scripting: the facade (wired once below), the subsystem (created on Play-enter), and one live
     // ScriptInstance per scripted entity. All Play-only; torn down on Play-exit.
     ScriptApiImpl scriptApi;
     std::unique_ptr<ixscript::ScriptSystem> scriptSystem;
     std::unordered_map<std::uint32_t, std::unique_ptr<ixscript::ScriptInstance>> entityScripts;
+    std::unordered_set<std::uint32_t> startedEntityScripts;
     // In-engine game-script Build: cmake runs on a worker thread (10-30s) so the UI stays responsive;
     // the reload + log update happen on the main thread when the worker signals done. Owned by the
     // Editor/Build service boundary (ixeditor::build::GameScriptBuildService); the frame loop only
     // triggers RequestBuild() and drains TryTakeResult(). std::jthread-equivalent lifetime: the
     // service joins its worker on Shutdown()/dtor, so no live thread can outlive RunGame locals.
     ixeditor::build::GameScriptBuildService gameScriptBuild;
+    // "Build Game": packages the project with the editor-less runtime player on a worker thread. When the
+    // C++ scripts are compiled first, the request waits for that build (gamePackageAfterScripts).
+    ixeditor::build::GamePackageService gamePackage;
+    std::optional<ixeditor::build::GamePackageRequest> gamePackageAfterScripts;
+    bool gamePackageRunWhenDone = false;
     std::unordered_map<std::uint32_t, std::string> entityBoundControllerId;
     double animPrevFrameSeconds = 0.0;
     float editorPlayerLookDx = 0.0f;
@@ -2868,6 +3567,7 @@ int RunGame(NativeWindow& window,
     // Shared sim helpers (the mesh-entity set + its id->index lookup are unguarded state, and these are
     // used by the standalone runtime's per-frame sim, e.g. the deferred spawn/destroy drain).
     auto rebuildMeshEntityLookup = [&]() {
+        ResolveEntityActivation(editorMeshEntities, editorPointLights, editorSpotLights, &editorCameras);
         editorMeshEntityLookup.clear();
         for (std::size_t i = 0; i < editorMeshEntities.size(); ++i)
             editorMeshEntityLookup[editorMeshEntities[i].id] = i;
@@ -2879,15 +3579,70 @@ int RunGame(NativeWindow& window,
         MeshSceneEntity& mesh = editorMeshEntities[lookupIt->second];
         return mesh.id == id ? &mesh : nullptr;
     };
+    // Every mesh entity's record checked for the frame, up front: the checks in parallel (each marks
+    // only its own record checked), then the changed records rebuilt here in entity order (building
+    // one resolves paths and loads models: this thread's work). IX_PARALLEL_CULL=0 checks serially.
+    std::vector<std::vector<std::uint32_t>> changedRenderRecordChunks;
+    auto validateStaticMeshRenderRecords = [&]() {
+        const std::uint32_t count = static_cast<std::uint32_t>(editorMeshEntities.size());
+        constexpr std::uint32_t kGrain = 512;
+        ixjobs::JobSystem& jobs = ixjobs::JobSystem::Instance();
+        static const bool parallel = ixjobs::FeatureEnabled("IX_PARALLEL_CULL");
+        const std::uint32_t chunks = ixjobs::JobSystem::ChunkCount(count, kGrain);
+        if (changedRenderRecordChunks.size() < chunks)
+            changedRenderRecordChunks.resize(chunks);
+        for (std::vector<std::uint32_t>& changed : changedRenderRecordChunks)
+            changed.clear();
+        const std::uint64_t materialRevision = MaterialAssetManager::Instance().Revision();
+        const auto check = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t chunk) {
+            for (std::uint32_t i = begin; i < end; ++i)
+            {
+                const MeshSceneEntity& mesh = editorMeshEntities[i];
+                // No record of its own yet: one is given (a write) on this thread below.
+                const std::uint32_t slot = mesh.renderRecordSlot;
+                if (slot >= staticMeshRenderRecords.size() || !staticMeshRenderRecords[slot].inUse ||
+                    staticMeshRenderRecords[slot].entityId != mesh.id)
+                {
+                    changedRenderRecordChunks[chunk].push_back(i);
+                    continue;
+                }
+                StaticMeshRenderRecord& record = staticMeshRenderRecords[slot];
+                if (record.validatedFrame == renderRecordFrame)
+                    continue;
+                if (staticMeshRenderRecordMatches(record, mesh, false) &&
+                    (!record.renderer || record.prepared.materialRevision == materialRevision))
+                    record.validatedFrame = renderRecordFrame;
+                else
+                    changedRenderRecordChunks[chunk].push_back(i);
+            }
+        };
+        if (parallel)
+            jobs.ParallelFor(count, kGrain, check);
+        else
+            for (std::uint32_t chunk = 0; chunk < chunks; ++chunk)
+                check(chunk * kGrain, std::min(count, (chunk + 1u) * kGrain), chunk);
+        for (std::uint32_t chunk = 0; chunk < chunks; ++chunk)
+        {
+            for (std::uint32_t index : changedRenderRecordChunks[chunk])
+                staticMeshRenderRecord(editorMeshEntities[index]);
+        }
+    };
     // Shared sim/render/physics helpers (mesh spatial sync, script-spawn, physics world build/step) —
     // the standalone runtime's per-frame sim calls these; everything they touch is unguarded state.
     auto syncStaticMeshSpatialEntity = [&](const MeshSceneEntity& mesh) {
+        if (!mesh.effectiveEnabled) {
+            if (staticMeshSpatialIndexed.erase(mesh.id)) staticMeshSpatialIndex.Remove(mesh.id);
+            return false;
+        }
         const std::string runtimePath = resolveMeshRuntimePath(mesh);
-        StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath);
+        StaticMeshRenderer* renderer = requestStaticMeshRenderer(runtimePath);
         if (!renderer || !renderer->IsLoaded())
         {
             if (staticMeshSpatialIndexed.erase(mesh.id) > 0)
                 staticMeshSpatialIndex.Remove(mesh.id);
+            // Its model is loading: synced again once it is finished (pumpModelLoads).
+            if (staticMeshModelLoading(runtimePath))
+                pendingSpatialSyncs[runtimePath].insert(mesh.id);
             return false;
         }
 
@@ -2903,6 +3658,38 @@ int RunGame(NativeWindow& window,
         }
         return true;
     };
+    // At a frame's start: the model loads that are done are finished, and the entities that waited for
+    // those models go into the spatial index (drawn from this frame on).
+    auto pumpModelLoads = [&]() {
+        if (modelLoadsInFlight > 0)
+        {
+            for (auto& [path, entry] : staticMeshCache)
+            {
+                if (entry.state == StaticMeshCacheEntry::State::Loading && entry.load->done.Done())
+                    finishStaticMeshLoad(path, entry);
+            }
+            for (auto& [path, entry] : skinnedMeshCache)
+            {
+                if (entry.state == SkinnedMeshCacheEntry::State::Loading && entry.load->done.Done())
+                    finishSkinnedMeshLoad(path, entry);
+            }
+        }
+        if (finishedStaticModelPaths.empty())
+            return;
+        std::vector<std::string> finished;
+        finished.swap(finishedStaticModelPaths);
+        for (const std::string& path : finished)
+        {
+            auto waiting = pendingSpatialSyncs.extract(path);
+            if (waiting.empty())
+                continue;
+            for (std::uint32_t id : waiting.mapped())
+            {
+                if (const MeshSceneEntity* mesh = findMeshEntityById(id))
+                    syncStaticMeshSpatialEntity(*mesh);
+            }
+        }
+    };
     // Wire the script facade's stable members once. Per-frame scalars (dt/movement/mouse) are refreshed
     // before each Play frame's OnUpdate loop. The callbacks capture RunGame-local state by reference.
     scriptApi.meshes = &editorMeshEntities;
@@ -2912,8 +3699,9 @@ int RunGame(NativeWindow& window,
     scriptApi.resolveAudioClip = [&](const std::string& clipAssetId) {
         return editorImGui.AudioClipFilePath(clipAssetId);
     };
-    // Lua backend: resolve a .lua asset id -> file path, then slurp its UTF-8 source. Cross-platform
-    // ifstream idiom (same as the scene/prefab text loads); libs/script never sees the filesystem.
+    // Lua/AngelScript backends: resolve a script asset id -> file path, then slurp its UTF-8 source.
+    // Cross-platform ifstream idiom (same as the scene/prefab text loads); libs/script never sees the
+    // filesystem.
     scriptApi.resolveScriptSource = [&](const std::string& scriptAssetId) -> std::string {
         const std::string path = editorImGui.ScriptSourceFilePath(scriptAssetId);
         if (path.empty())
@@ -2923,6 +3711,11 @@ int RunGame(NativeWindow& window,
             return {};
         return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     };
+    // Particle emitters: resolve their texture asset id -> file path (the renderer decodes + caches
+    // the image itself, and falls back to a soft white sprite when this yields "").
+    particleRenderer.SetTextureResolver([&](const std::string& textureAssetId) {
+        return editorImGui.TextureFilePath(textureAssetId);
+    });
     // Rich API: the shared entity-id allocator (for deferred spawn), the animator-param setter, and a
     // synchronous physics raycast that reverse-maps the hit body back to an entity id.
     scriptApi.nextEntityId = &nextEditorMeshEntityId;
@@ -2951,6 +3744,183 @@ int RunGame(NativeWindow& window,
             if (bodyId == hit.bodyId) { outId = entId; break; }
         return true;
     };
+    auto physicsQueryFilter = [&](const ixscript::QueryFilter& filter) {
+        phys::PhysicsQueryFilter out;
+        out.layerMask = filter.layerMask;
+        out.hitTriggers = (filter.flags & 1u) != 0;
+        if (const auto it = editorPhysicsBodies.find(filter.ignoreEntityId); it != editorPhysicsBodies.end())
+            out.ignoreBody = it->second;
+        return out;
+    };
+    auto physicsEntityId = [&](phys::BodyId body) -> std::uint32_t {
+        const auto it = editorPhysicsBodyBindings.find(body);
+        return it == editorPhysicsBodyBindings.end() ? 0u : it->second.entityId;
+    };
+    scriptApi.raycastFiltered = [&](const float* origin, const float* direction, float distance,
+        const ixscript::QueryFilter& filter) {
+        ixscript::RaycastHit out;
+        if (!editorPhysicsWorldActive) return out;
+        phys::PhysicsRaycastHit hit;
+        if (editorPhysicsWorld.Raycast(origin, direction, distance, physicsQueryFilter(filter), hit)) {
+            out.hit = true; out.entityId = physicsEntityId(hit.bodyId); out.distance = hit.distance;
+            std::copy_n(hit.position, 3, out.point); std::copy_n(hit.normal, 3, out.normal);
+        }
+        return out;
+    };
+    scriptApi.overlapSphere = [&](const float* center, float radius, const ixscript::QueryFilter& filter) {
+        std::vector<ixscript::SphereOverlapHit> out;
+        if (!editorPhysicsWorldActive) return out;
+        // Collect before truncating: output order must not depend on Jolt broad-phase traversal.
+        for (const auto& hit : editorPhysicsWorld.OverlapSphere(center, radius, physicsQueryFilter(filter),
+            std::numeric_limits<std::size_t>::max()))
+            out.push_back({physicsEntityId(hit.bodyId), hit.trigger ? 1u : 0u});
+        return out;
+    };
+    // Game UI: scripts open RmlUi documents from the project's asset folder (a HUD, menus, ...).
+    scriptApi.gameUi = &rmlUi;
+    scriptApi.resolveUiDocument = [](const std::string& documentPath) -> std::string {
+        std::filesystem::path path(documentPath);
+        if (path.is_relative() && ProjectManager::Instance().HasProject())
+            path = ProjectManager::Instance().AssetRootPath() / path;
+        std::error_code ec;
+        return std::filesystem::is_regular_file(path, ec) ? path.generic_string() : std::string{};
+    };
+    // Player characters: what the controller did last step, and what it may do (run, jump).
+    scriptApi.getCharacterState = [&](std::uint32_t id, ixscript::CharacterState& out) -> bool {
+        const auto it = editorCharacterStates.find(id);
+        if (it == editorCharacterStates.end() || !it->second.initialized)
+            return false;
+        const CharacterRuntimeState& state = it->second;
+        out.grounded = state.grounded;
+        out.moving = state.moveState != RuntimeMoveState::Idle;
+        out.running = state.moveState == RuntimeMoveState::Running;
+        out.jumped = state.jumpedThisFrame;
+        out.planarSpeed = state.planarSpeed;
+        return true;
+    };
+    scriptApi.setCharacterAbilities = [&](std::uint32_t id, bool canRun, bool canJump) {
+        const bool isCharacter = std::any_of(editorMeshEntities.begin(), editorMeshEntities.end(),
+            [id](const MeshSceneEntity& mesh) { return mesh.id == id && mesh.hasCharacterController; });
+        if (!isCharacter)
+            return;
+        CharacterRuntimeState& state = editorCharacterStates[id];
+        state.canRun = canRun;
+        state.canJump = canJump;
+    };
+    // Particle System actions (scripts): act on the entity's Particle System component. A silent
+    // simulator is created for an emitter that has not started yet (playOnStart=false).
+    scriptApi.particlePlay = [&](std::uint32_t id) {
+        auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+        if (meshIt == editorMeshEntities.end() || !meshIt->hasParticleSystem)
+            return;
+        if (meshIt->particleSystem.gpuSimulation)
+        {
+            particleRenderer.GpuEmitterPlay(id);
+            return;
+        }
+        const auto simIt = entityParticles.find(id);
+        if (simIt == entityParticles.end())
+            entityParticles[id].Reset(meshIt->particleSystem, id);
+        else
+            simIt->second.Play();  // resume without clearing the live particles
+    };
+    scriptApi.particleStop = [&](std::uint32_t id) {
+        auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+        if (meshIt == editorMeshEntities.end() || !meshIt->hasParticleSystem)
+            return;
+        if (meshIt->particleSystem.gpuSimulation)
+        {
+            particleRenderer.GpuEmitterStop(id);
+            return;
+        }
+        const auto simIt = entityParticles.find(id);
+        if (simIt == entityParticles.end())
+            entityParticles[id].Reset(meshIt->particleSystem, id, /*startEmitting=*/false);
+        else
+            simIt->second.Stop();
+    };
+    scriptApi.particleRestart = [&](std::uint32_t id) {
+        auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+        if (meshIt == editorMeshEntities.end() || !meshIt->hasParticleSystem)
+            return;
+        if (meshIt->particleSystem.gpuSimulation)
+        {
+            particleRenderer.GpuEmitterRestart(id);
+            return;
+        }
+        entityParticles[id].Reset(meshIt->particleSystem, id);
+    };
+    scriptApi.particleEmit = [&](std::uint32_t id, std::uint32_t count) {
+        auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+            [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
+        if (meshIt == editorMeshEntities.end() || !meshIt->hasParticleSystem)
+            return;
+        if (meshIt->particleSystem.gpuSimulation)
+        {
+            particleRenderer.GpuEmitterEmit(id, count);
+            return;
+        }
+        auto simIt = entityParticles.find(id);
+        if (simIt == entityParticles.end())
+        {
+            simIt = entityParticles.emplace(id, ixparticle::ParticleSimulator{}).first;
+            simIt->second.Reset(meshIt->particleSystem, id, /*startEmitting=*/false);
+        }
+        simIt->second.QueueBurst(count);
+    };
+    auto resolvePrefabAssetPath = [&](const std::string& assetId)
+        -> std::optional<std::pair<AssetLibrary::Entry, std::filesystem::path>> {
+        if (assetId.empty())
+            return std::nullopt;
+        if (ProjectManager::Instance().HasProject())
+        {
+            AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
+                ProjectManager::Instance().AssetRootPath());
+            if (projectAssets.InitializeReadOnly())
+            {
+                auto entry = projectAssets.FindById(assetId);
+                if (entry && entry->category == AssetLibrary::Category::Prefab)
+                    return std::make_pair(*entry, projectAssets.AbsolutePath(*entry));
+            }
+        }
+        if (auto root = assets.RootPath())
+        {
+            AssetLibrary engineAssets(*root);
+            if (engineAssets.InitializeReadOnly())
+            {
+                auto entry = engineAssets.FindById(assetId);
+                if (entry && entry->category == AssetLibrary::Category::Prefab)
+                    return std::make_pair(*entry, engineAssets.AbsolutePath(*entry));
+            }
+        }
+        return std::nullopt;
+    };
+    auto loadPrefabDocument = [&](const std::string& assetId)
+        -> std::optional<std::pair<prefab::PrefabDocument, std::filesystem::path>> {
+        const auto resolved = resolvePrefabAssetPath(assetId);
+        if (!resolved)
+        {
+            TraceError("[PREFAB] load failed: asset not found id=%s", assetId.c_str());
+            return std::nullopt;
+        }
+        std::ifstream file(resolved->second, std::ios::binary);
+        if (!file)
+        {
+            TraceError("[PREFAB] load failed: unreadable path=%s", resolved->second.string().c_str());
+            return std::nullopt;
+        }
+        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        prefab::PrefabDocument prefabData = prefab::ParseDocument(text, resolved->first.displayName);
+        if (prefabData.entities.empty())
+        {
+            TraceError("[PREFAB] load failed: unsupported file=%s", resolved->second.string().c_str());
+            return std::nullopt;
+        }
+        return std::make_pair(std::move(prefabData), resolved->second);
+    };
     // Creates a mesh entity for a deferred script spawn, reusing the pre-allocated id (self-contained
     // asset resolution + skinned detection, mirroring the editor's createMeshEntityAt).
     auto spawnMeshEntityForScript = [&](const std::string& assetId, const float pos[3],
@@ -2962,7 +3932,7 @@ int RunGame(NativeWindow& window,
             {
                 AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
                     ProjectManager::Instance().AssetRootPath());
-                if (projectAssets.Initialize())
+                if (projectAssets.InitializeReadOnly())
                     if (auto e = projectAssets.FindById(assetId);
                         e && e->category == AssetLibrary::Category::Model)
                     {
@@ -2974,7 +3944,7 @@ int RunGame(NativeWindow& window,
                 if (auto root = assets.RootPath())
                 {
                     AssetLibrary engineAssets(*root);
-                    if (engineAssets.Initialize())
+                    if (engineAssets.InitializeReadOnly())
                         if (auto e = engineAssets.FindById(assetId);
                             e && e->category == AssetLibrary::Category::Model)
                         {
@@ -2999,12 +3969,22 @@ int RunGame(NativeWindow& window,
         std::transform(ext.begin(), ext.end(), ext.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         if (ext == ".fbx")
+        {
             mesh.skinned = std::filesystem::exists(path.parent_path() / (path.stem().string() + "_skeleton.ozz"));
+        }
         else if (ext == ".glb" || ext == ".gltf")
         {
-            bool isSkinned = false;
-            std::string detectError;
-            mesh.skinned = StaticMeshRenderer::DetectSkinnedGltf(assets, path.string(), isSkinned, &detectError) && isSkinned;
+            // Not parsed here (a big model takes tens of ms, the frame waits): rigged if the model caches
+            // already know it so; a model new to them starts as a static one, its load (on a loading
+            // thread) finds it rigged, and the render pre-pass then makes the entity a skinned one.
+            const std::string runtimePath = resolveMeshRuntimePath(mesh);
+            const auto skinnedIt = skinnedMeshCache.find(runtimePath);
+            const auto staticIt = staticMeshCache.find(runtimePath);
+            mesh.skinned = (skinnedIt != skinnedMeshCache.end() &&
+                               skinnedIt->second.state != SkinnedMeshCacheEntry::State::Failed &&
+                               skinnedIt->second.state != SkinnedMeshCacheEntry::State::Unknown) ||
+                (staticIt != staticMeshCache.end() &&
+                    staticIt->second.state == StaticMeshCacheEntry::State::UnsupportedSkinned);
         }
         mesh.materialSlots = LoadDefaultMaterialSlotGuids(mesh.meshAssetPath, ResolveModelSubmeshCount(mesh.meshAssetPath));
         editorMeshEntities.push_back(mesh);
@@ -3014,6 +3994,10 @@ int RunGame(NativeWindow& window,
     auto fitMeshColliderToBounds = [&](MeshSceneEntity& mesh) {
         if (!mesh.hasCollider)
             return false;
+        if (!mesh.effectiveEnabled) {
+            if (staticMeshSpatialIndexed.erase(mesh.id)) staticMeshSpatialIndex.Remove(mesh.id);
+            return false;
+        }
         const std::string runtimePath = resolveMeshRuntimePath(mesh);
         StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath);
         if (!renderer || !renderer->IsLoaded())
@@ -3069,10 +4053,170 @@ int RunGame(NativeWindow& window,
         if (physicsIt != editorPhysicsBodies.end())
         {
             editorPhysicsWorld.DestroyBody(physicsIt->second);
+            editorPhysicsBodyBindings.erase(physicsIt->second);
             editorPhysicsBodies.erase(physicsIt);
         }
         if (staticMeshSpatialIndexed.erase(id) > 0)
             staticMeshSpatialIndex.Remove(id);
+    };
+    struct PhysicsBodyCounts
+    {
+        std::uint32_t created = 0;
+        std::uint32_t dynamic = 0;
+        std::uint32_t statics = 0;
+        std::uint32_t kinematic = 0;
+        std::uint32_t gravity = 0;
+    };
+    // The entity's physics body (from its collider, rigidbody or character controller), made in the
+    // world and bound to the entity; 0 when it has none (or it could not be made). Its joints are made
+    // by rebuildEditorPhysicsWorld.
+    auto createPhysicsBodyForEntity = [&](const MeshSceneEntity& mesh, PhysicsBodyCounts& counts) -> phys::BodyId {
+        const bool isCharacter = mesh.hasCharacterController && mesh.characterController.enabled;
+        if ((!mesh.hasCollider || !mesh.collider.enabled) && !isCharacter)
+            return phys::BodyId{0};
+        phys::PhysicsBodyDesc desc{};
+        const bool rigidbodyEnabled = mesh.hasRigidbody && mesh.rigidbody.enabled;
+        desc.bodyType = rigidbodyEnabled ? mesh.rigidbody.bodyType : phys::BodyType::Static;
+        desc.rigidbody = rigidbodyEnabled ? mesh.rigidbody : phys::RigidbodyComponent{};
+        if (!rigidbodyEnabled)
+            desc.rigidbody.useGravity = false;
+        desc.collider = mesh.collider;
+        desc.transform = PhysicsTransformFromMesh(mesh);
+        desc.scale[0] = mesh.scale[0];
+        desc.scale[1] = mesh.scale[1];
+        desc.scale[2] = mesh.scale[2];
+        if (isCharacter)
+        {
+            // Player character: kinematic capsule on the Player layer, driven by the
+            // CharacterController. Movement is resolved in UpdateCharacterController; the
+            // kinematic sync moves this body to match the mesh each physics step.
+            phys::CharacterControllerComponent cc = mesh.characterController;
+            phys::Sanitize(cc);
+            desc.bodyType = phys::BodyType::Kinematic;
+            desc.rigidbody = phys::RigidbodyComponent{};
+            desc.rigidbody.enabled = true;
+            desc.rigidbody.bodyType = phys::BodyType::Kinematic;
+            desc.rigidbody.useGravity = false;
+            if (!mesh.hasCollider || mesh.collider.shape != phys::ColliderShape::Capsule)
+            {
+                desc.collider = phys::ColliderComponent{};
+                desc.collider.shape = phys::ColliderShape::Capsule;
+                desc.collider.radius = cc.capsuleRadius;
+                desc.collider.height = cc.capsuleHeight;
+                desc.collider.center[1] = cc.capsuleHeight * 0.5f; // seat capsule on feet
+            }
+            desc.collider.layer = phys::PhysicsLayer::Player;
+        }
+        if (desc.collider.shape == phys::ColliderShape::Mesh ||
+            desc.collider.shape == phys::ColliderShape::ConvexHull)
+        {
+            StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+            if (renderer && renderer->CopyPhysicsMesh(desc.meshVertices, desc.meshIndices))
+            {
+                Tracenf("[PHYSICS] %s collider geometry entity=%u name=%s verts=%zu tris=%zu",
+                    phys::ToString(desc.collider.shape),
+                    mesh.id,
+                    mesh.name.c_str(),
+                    desc.meshVertices.size(),
+                    desc.meshIndices.size() / 3u);
+            }
+            else
+            {
+                Tracenf("[PHYSICS] %s collider geometry missing entity=%u name=%s fallback=box",
+                    phys::ToString(desc.collider.shape),
+                    mesh.id,
+                    mesh.name.c_str());
+            }
+        }
+        if (rigidbodyEnabled &&
+            desc.rigidbody.useGravity &&
+            desc.bodyType == phys::BodyType::Static)
+        {
+            desc.bodyType = phys::BodyType::Dynamic;
+            Tracenf("[PHYSICS] body auto-promoted entity=%u name=%s reason=static-rigidbody-with-gravity",
+                mesh.id,
+                mesh.name.c_str());
+        }
+        bool physicsMaterialApplied = false;
+        if (!desc.collider.materialAssetId.empty())
+        {
+            if (auto physicsMaterial = editorImGui.FindPhysicsMaterial(desc.collider.materialAssetId))
+            {
+                desc.collider.friction = physicsMaterial->friction;
+                desc.collider.restitution = physicsMaterial->restitution;
+                desc.collider.frictionCombine = physicsMaterial->frictionCombine;
+                desc.collider.restitutionCombine = physicsMaterial->restitutionCombine;
+                desc.rigidbody.linearDamping = physicsMaterial->linearDamping;
+                desc.rigidbody.angularDamping = physicsMaterial->angularDamping;
+                if (rigidbodyEnabled && desc.bodyType == phys::BodyType::Dynamic)
+                    desc.rigidbody.mass = std::max(0.001f, desc.rigidbody.mass * physicsMaterial->density);
+                physicsMaterialApplied = true;
+            }
+            else
+            {
+                Tracenf("[PHYSICS-MAT] missing entity=%u material=%s",
+                    mesh.id,
+                    desc.collider.materialAssetId.c_str());
+            }
+        }
+        const phys::BodyId bodyId = editorPhysicsWorld.CreateBody(desc);
+        if (bodyId == 0)
+            return phys::BodyId{0};
+        editorPhysicsBodies[mesh.id] = bodyId;
+        editorPhysicsBodyBindings[bodyId] = PhysicsBodyEntityBinding{mesh.id, mesh.name, false};
+        ++counts.created;
+        if (desc.bodyType == phys::BodyType::Dynamic)
+        {
+            ++counts.dynamic;
+            if (desc.rigidbody.useGravity)
+                ++counts.gravity;
+        }
+        else if (desc.bodyType == phys::BodyType::Kinematic)
+        {
+            ++counts.kinematic;
+        }
+        else
+        {
+            ++counts.statics;
+        }
+        Tracenf("[PHYSICS] body entity=%u name=%s type=%s gravity=%u sleep=%u ccd=%u collider=%s layer=%s material=%s mass=%.3f friction=%.2f bounce=%.2f combine=(%s,%s) scale=(%.3f,%.3f,%.3f)",
+            mesh.id,
+            mesh.name.c_str(),
+            phys::ToString(desc.bodyType),
+            desc.rigidbody.useGravity ? 1u : 0u,
+            desc.rigidbody.allowSleeping ? 1u : 0u,
+            desc.rigidbody.continuousCollision ? 1u : 0u,
+            phys::ToString(desc.collider.shape),
+            phys::ToString(desc.collider.layer),
+            physicsMaterialApplied ? desc.collider.materialAssetId.c_str() : "none",
+            desc.rigidbody.mass,
+            desc.collider.friction,
+            desc.collider.restitution,
+            phys::ToString(desc.collider.frictionCombine),
+            phys::ToString(desc.collider.restitutionCombine),
+            desc.scale[0],
+            desc.scale[1],
+            desc.scale[2]);
+        return bodyId;
+    };
+    // The entities that take part in a joint, at either end. A joint holds its bodies, so such an
+    // entity's body is not added or removed alone: the world is built again instead.
+    auto physicsJointEntities = [&]() {
+        std::unordered_set<std::uint32_t> entities;
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+        {
+            if (mesh.hasFixedJoint && mesh.fixedJoint.enabled && mesh.fixedJoint.connectedEntityId != 0)
+            {
+                entities.insert(mesh.id);
+                entities.insert(mesh.fixedJoint.connectedEntityId);
+            }
+            if (mesh.hasHingeJoint && mesh.hingeJoint.enabled && mesh.hingeJoint.connectedEntityId != 0)
+            {
+                entities.insert(mesh.id);
+                entities.insert(mesh.hingeJoint.connectedEntityId);
+            }
+        }
+        return entities;
     };
     auto clearEditorPhysicsWorld = [&]() {
         editorPhysicsBodies.clear();
@@ -3095,11 +4239,7 @@ int RunGame(NativeWindow& window,
             Tracen("[PHYSICS] world create failed");
             return false;
         }
-        std::uint32_t createdBodies = 0;
-        std::uint32_t dynamicBodies = 0;
-        std::uint32_t staticBodies = 0;
-        std::uint32_t kinematicBodies = 0;
-        std::uint32_t gravityBodies = 0;
+        PhysicsBodyCounts counts;
         std::uint32_t fixedJoints = 0;
         std::uint32_t hingeJoints = 0;
         auto makeJointPairKey = [](std::uint32_t a, std::uint32_t b) -> std::uint64_t {
@@ -3125,139 +4265,12 @@ int RunGame(NativeWindow& window,
                     0u,
                     terrainData.name.empty() ? std::string("Terrain") : terrainData.name,
                     true};
-                ++createdBodies;
-                ++staticBodies;
+                ++counts.created;
+                ++counts.statics;
             }
         }
         for (const MeshSceneEntity& mesh : editorMeshEntities)
-        {
-            const bool isCharacter = mesh.hasCharacterController && mesh.characterController.enabled;
-            if ((!mesh.hasCollider || !mesh.collider.enabled) && !isCharacter)
-                continue;
-            phys::PhysicsBodyDesc desc{};
-            const bool rigidbodyEnabled = mesh.hasRigidbody && mesh.rigidbody.enabled;
-            desc.bodyType = rigidbodyEnabled ? mesh.rigidbody.bodyType : phys::BodyType::Static;
-            desc.rigidbody = rigidbodyEnabled ? mesh.rigidbody : phys::RigidbodyComponent{};
-            if (!rigidbodyEnabled)
-                desc.rigidbody.useGravity = false;
-            desc.collider = mesh.collider;
-            desc.transform = PhysicsTransformFromMesh(mesh);
-            desc.scale[0] = mesh.scale[0];
-            desc.scale[1] = mesh.scale[1];
-            desc.scale[2] = mesh.scale[2];
-            if (isCharacter)
-            {
-                // Player character: kinematic capsule on the Player layer, driven by the
-                // CharacterController. Movement is resolved in UpdateCharacterController; the
-                // kinematic sync moves this body to match the mesh each physics step.
-                phys::CharacterControllerComponent cc = mesh.characterController;
-                phys::Sanitize(cc);
-                desc.bodyType = phys::BodyType::Kinematic;
-                desc.rigidbody = phys::RigidbodyComponent{};
-                desc.rigidbody.enabled = true;
-                desc.rigidbody.bodyType = phys::BodyType::Kinematic;
-                desc.rigidbody.useGravity = false;
-                if (!mesh.hasCollider || mesh.collider.shape != phys::ColliderShape::Capsule)
-                {
-                    desc.collider = phys::ColliderComponent{};
-                    desc.collider.shape = phys::ColliderShape::Capsule;
-                    desc.collider.radius = cc.capsuleRadius;
-                    desc.collider.height = cc.capsuleHeight;
-                    desc.collider.center[1] = cc.capsuleHeight * 0.5f; // seat capsule on feet
-                }
-                desc.collider.layer = phys::PhysicsLayer::Player;
-            }
-            if (desc.collider.shape == phys::ColliderShape::Mesh ||
-                desc.collider.shape == phys::ColliderShape::ConvexHull)
-            {
-                StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
-                if (renderer && renderer->CopyPhysicsMesh(desc.meshVertices, desc.meshIndices))
-                {
-                    Tracenf("[PHYSICS] %s collider geometry entity=%u name=%s verts=%zu tris=%zu",
-                        phys::ToString(desc.collider.shape),
-                        mesh.id,
-                        mesh.name.c_str(),
-                        desc.meshVertices.size(),
-                        desc.meshIndices.size() / 3u);
-                }
-                else
-                {
-                    Tracenf("[PHYSICS] %s collider geometry missing entity=%u name=%s fallback=box",
-                        phys::ToString(desc.collider.shape),
-                        mesh.id,
-                        mesh.name.c_str());
-                }
-            }
-            if (rigidbodyEnabled &&
-                desc.rigidbody.useGravity &&
-                desc.bodyType == phys::BodyType::Static)
-            {
-                desc.bodyType = phys::BodyType::Dynamic;
-                Tracenf("[PHYSICS] body auto-promoted entity=%u name=%s reason=static-rigidbody-with-gravity",
-                    mesh.id,
-                    mesh.name.c_str());
-            }
-            bool physicsMaterialApplied = false;
-            if (!desc.collider.materialAssetId.empty())
-            {
-                if (auto physicsMaterial = editorImGui.FindPhysicsMaterial(desc.collider.materialAssetId))
-                {
-                    desc.collider.friction = physicsMaterial->friction;
-                    desc.collider.restitution = physicsMaterial->restitution;
-                    desc.collider.frictionCombine = physicsMaterial->frictionCombine;
-                    desc.collider.restitutionCombine = physicsMaterial->restitutionCombine;
-                    desc.rigidbody.linearDamping = physicsMaterial->linearDamping;
-                    desc.rigidbody.angularDamping = physicsMaterial->angularDamping;
-                    if (rigidbodyEnabled && desc.bodyType == phys::BodyType::Dynamic)
-                        desc.rigidbody.mass = std::max(0.001f, desc.rigidbody.mass * physicsMaterial->density);
-                    physicsMaterialApplied = true;
-                }
-                else
-                {
-                    Tracenf("[PHYSICS-MAT] missing entity=%u material=%s",
-                        mesh.id,
-                        desc.collider.materialAssetId.c_str());
-                }
-            }
-            const phys::BodyId bodyId = editorPhysicsWorld.CreateBody(desc);
-            if (bodyId == 0)
-                continue;
-            editorPhysicsBodies[mesh.id] = bodyId;
-            editorPhysicsBodyBindings[bodyId] = PhysicsBodyEntityBinding{mesh.id, mesh.name, false};
-            ++createdBodies;
-            if (desc.bodyType == phys::BodyType::Dynamic)
-            {
-                ++dynamicBodies;
-                if (desc.rigidbody.useGravity)
-                    ++gravityBodies;
-            }
-            else if (desc.bodyType == phys::BodyType::Kinematic)
-            {
-                ++kinematicBodies;
-            }
-            else
-            {
-                ++staticBodies;
-            }
-            Tracenf("[PHYSICS] body entity=%u name=%s type=%s gravity=%u sleep=%u ccd=%u collider=%s layer=%s material=%s mass=%.3f friction=%.2f bounce=%.2f combine=(%s,%s) scale=(%.3f,%.3f,%.3f)",
-                mesh.id,
-                mesh.name.c_str(),
-                phys::ToString(desc.bodyType),
-                desc.rigidbody.useGravity ? 1u : 0u,
-                desc.rigidbody.allowSleeping ? 1u : 0u,
-                desc.rigidbody.continuousCollision ? 1u : 0u,
-                phys::ToString(desc.collider.shape),
-                phys::ToString(desc.collider.layer),
-                physicsMaterialApplied ? desc.collider.materialAssetId.c_str() : "none",
-                desc.rigidbody.mass,
-                desc.collider.friction,
-                desc.collider.restitution,
-                phys::ToString(desc.collider.frictionCombine),
-                phys::ToString(desc.collider.restitutionCombine),
-                desc.scale[0],
-                desc.scale[1],
-                desc.scale[2]);
-        }
+            createPhysicsBodyForEntity(mesh, counts);
         for (const MeshSceneEntity& mesh : editorMeshEntities)
         {
             if (!mesh.hasFixedJoint || !mesh.fixedJoint.enabled || mesh.fixedJoint.connectedEntityId == 0)
@@ -3344,14 +4357,17 @@ int RunGame(NativeWindow& window,
                 mesh.hingeJoint.axis[1],
                 mesh.hingeJoint.axis[2]);
         }
+        for (const auto& mesh : editorMeshEntities)
+            if (const auto body = editorPhysicsBodies.find(mesh.id); body != editorPhysicsBodies.end())
+                editorPhysicsWorld.SetBodyEnabled(body->second, mesh.effectiveEnabled);
         editorPhysicsWorldActive = true;
         editorPhysicsStepLogFrames = 0;
         Tracenf("[PHYSICS] play world rebuilt bodies=%u dynamic=%u static=%u kinematic=%u gravityBodies=%u worldGravity=(%.2f,%.2f,%.2f) fixedDt=%.4f maxSubsteps=%u fixedJoints=%u hingeJoints=%u meshEntities=%zu",
-            createdBodies,
-            dynamicBodies,
-            staticBodies,
-            kinematicBodies,
-            gravityBodies,
+            counts.created,
+            counts.dynamic,
+            counts.statics,
+            counts.kinematic,
+            counts.gravity,
             physicsSettings.gravity[0],
             physicsSettings.gravity[1],
             physicsSettings.gravity[2],
@@ -3380,7 +4396,7 @@ int RunGame(NativeWindow& window,
             for (const auto& [meshId, bodyId] : editorPhysicsBodies)
             {
                 MeshSceneEntity* mesh = findMeshEntityById(meshId);
-                if (!mesh)
+                if (!mesh || !mesh->effectiveEnabled)
                     continue;
                 const bool isCharacter = mesh->hasCharacterController && mesh->characterController.enabled;
                 const bool isKinematicRigidbody = mesh->hasRigidbody && mesh->rigidbody.enabled &&
@@ -3580,13 +4596,40 @@ int RunGame(NativeWindow& window,
             b.min.x, b.min.y, b.min.z,
             b.max.x, b.max.y, b.max.z);
     };
+    // A scene's models all start loading here, at once, on the loading threads; the entities whose
+    // model is loaded go into the index now, the others once it is (finishSceneModelLoads waits for
+    // them before the scene's first frame: no model shows up late).
+    std::chrono::steady_clock::time_point sceneModelLoadsBegin{};
+    std::uint32_t sceneModelLoadsStarted = 0;
     auto rebuildStaticMeshSpatialIndex = [&]() {
         staticMeshSpatialIndex.Clear();
         staticMeshSpatialIndexed.clear();
+        pendingSpatialSyncs.clear();
         rebuildMeshEntityLookup();
+        sceneModelLoadsBegin = std::chrono::steady_clock::now();
+        const std::uint64_t loadsBefore = modelLoadsStarted;
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+        {
+            if (mesh.skinned)
+                requestSkinnedMeshRenderer(resolveMeshRuntimePath(mesh));
+        }
         for (const MeshSceneEntity& mesh : editorMeshEntities)
             syncStaticMeshSpatialEntity(mesh);
+        sceneModelLoadsStarted = static_cast<std::uint32_t>(modelLoadsStarted - loadsBefore);
         logStaticMeshSpatialBuild();
+    };
+    auto finishSceneModelLoads = [&]() {
+        const auto waitBegin = std::chrono::steady_clock::now();
+        finishAllModelLoads();
+        pumpModelLoads();
+        if (sceneModelLoadsStarted > 0)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            Tracenf("[SCENE] models: %u started with the spatial index, all ready %.1f ms after that (%.1f ms of it waited for here)",
+                sceneModelLoadsStarted, MillisecondsBetween(sceneModelLoadsBegin, now), MillisecondsBetween(waitBegin, now));
+            logStaticMeshSpatialBuild();
+        }
+        sceneModelLoadsStarted = 0;
     };
     auto logStaticMeshSpatialMutations = [&]() {
         const SpatialIndex::MutationStats mutations = staticMeshSpatialIndex.ConsumeMutationStats();
@@ -3594,7 +4637,9 @@ int RunGame(NativeWindow& window,
             return;
         if (QuietLogsForLodDiag() && mutations.inserts == 0 && mutations.removes == 0 && mutations.updates == 1)
             return;
-        Tracenf("[SPATIAL] mutate insert=%u remove=%u update=%u (this load/edit)",
+        // Diagnostic only: a per-frame Tracenf would write+flush the log file every frame while
+        // several entities are synced (moving, Play). TraceDiagf is compiled out by default.
+        TraceDiagf("[SPATIAL] mutate insert=%u remove=%u update=%u (this load/edit)",
             mutations.inserts,
             mutations.removes,
             mutations.updates);
@@ -3603,11 +4648,12 @@ int RunGame(NativeWindow& window,
         &editorImGui,
         runtimeSession.get(),
         &terrain,
-        &device,
+        rhiDevice.get(),
         &editorWaterBodies,
         &editorPointLights,
         &editorSpotLights,
         &editorMeshEntities,
+        &sceneSky,
         &editorWaterBodiesDirty,
         terrainOk,
         &nextEditorWaterBodyId,
@@ -3637,11 +4683,40 @@ int RunGame(NativeWindow& window,
             snap.yaw = state.yaw;
             snap.pitch = state.pitch;
             cameraController.RestoreSnapshot(snap);
-        }});
+        },
+        finishSceneModelLoads});
 #if defined(IXTREEME_WITH_EDITOR)
+    // Refilled every editor frame for SceneManager, without the terrain grids (megabytes); a save
+    // completes it through the refresher below. Kept across frames to reuse its buffers.
+    SceneData frameSceneSnapshot;
+    SceneManager::Instance().SetSnapshotRefresher([&]() {
+        // Exactly the per-frame snapshot's condition: whenever that one ran (it leaves the terrain
+        // grids out), a save must get the full one. It used to skip itself out of the world too (map
+        // editor closed with F4 / F2) while the per-frame snapshot kept running — the save then
+        // wrote the grid-less terrain as a flat one.
+        if (!terrainOk)
+            return;  // the per-frame snapshot does not run either: the scene data is the loaded one
+        sceneRuntime.BuildSceneSnapshot(frameSceneSnapshot);
+        SceneManager::Instance().SetCurrentSceneSnapshot(frameSceneSnapshot);
+    });
+    struct SnapshotRefresherReset
+    {
+        ~SnapshotRefresherReset() { SceneManager::Instance().SetSnapshotRefresher({}); }
+    } snapshotRefresherReset;
+    // Incremental hierarchy mirror: the rebuild runs every frame, so the per-entity flecs calls
+    // (name, parent, note tag) only happen for entities whose value actually changed. The maps are
+    // keyed by the flecs entity handle and pruned when an entity is deleted.
+    std::unordered_map<std::uint64_t, std::string> editorHierarchyNames;
+    std::unordered_map<std::uint64_t, std::uint64_t> editorHierarchyParents;
+    std::unordered_map<std::uint64_t, bool> editorHierarchyNoteTags;
+    std::string editorHierarchyRootName;
     auto buildHierarchyEntities = [&]() {
         std::vector<HierarchySceneEntity> entities;
         std::vector<std::uint64_t> liveKeys;
+        // Flecs names are unique per scope: names are applied only after the stale entities are
+        // deleted, so an object destroyed and a same-named one spawned in the same frame (a script
+        // replacing a proxy) cannot collide with the not yet deleted predecessor (flecs aborts).
+        std::vector<std::pair<ecs_entity_t, std::string>> pendingNames;
         selectedEditorObject.flecsEntity = 0;
 
         const SceneData& scene = SceneManager::Instance().GetCurrentScene();
@@ -3649,61 +4724,80 @@ int RunGame(NativeWindow& window,
         std::string sceneName = scenePath.stem().empty() ? scene.name : scenePath.stem().string();
         if (sceneName.empty())
             sceneName = "Untitled";
-        ecs_set_name(editorHierarchyWorld.get(), editorSceneRootEntity, sceneName.c_str());
+        if (editorHierarchyRootName != sceneName)
+        {
+            ecs_set_name(editorHierarchyWorld.get(), editorSceneRootEntity, sceneName.c_str());
+            editorHierarchyRootName = sceneName;
+        }
         auto syncEditorComponentTags = [&](ecs_entity_t entity, const std::vector<EditorAttachedComponent>& components) {
             const bool hasNote = std::any_of(components.begin(), components.end(),
                 [](const EditorAttachedComponent& component) { return component.type == "editor.note"; });
+            bool& last = editorHierarchyNoteTags[static_cast<std::uint64_t>(entity)];
+            if (last == hasNote)
+                return;  // unchanged (and a new entity without the tag needs no call: the id is absent)
             if (hasNote)
                 ecs_add_id(editorHierarchyWorld.get(), entity, editorNoteComponentEntity);
             else
                 ecs_remove_id(editorHierarchyWorld.get(), entity, editorNoteComponentEntity);
+            last = hasNote;
         };
         std::unordered_map<std::uint64_t, SceneParentRef> pendingParents;
+        // Per-object lookups built once: the helper lambdas below are called per object, so a linear
+        // scan inside them made the whole rebuild O(N^2).
+        std::unordered_map<std::uint32_t, const MeshSceneEntity*> meshById;
+        meshById.reserve(editorMeshEntities.size());
+        for (const MeshSceneEntity& mesh : editorMeshEntities)
+            meshById.emplace(mesh.id, &mesh);
+        std::unordered_map<std::uint32_t, const PointLight*> pointLightById;
+        pointLightById.reserve(editorPointLights.size());
+        for (const PointLight& light : editorPointLights)
+            pointLightById.emplace(light.id, &light);
+        std::unordered_map<std::uint32_t, const SpotLight*> spotLightById;
+        spotLightById.reserve(editorSpotLights.size());
+        for (const SpotLight& light : editorSpotLights)
+            spotLightById.emplace(light.id, &light);
         auto prefabAssetIdForHierarchyObject = [&](HierarchyEntityType type, std::uint32_t objectId) -> std::string {
             if (type == HierarchyEntityType::MeshEntity)
             {
-                auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
-                    [&](const MeshSceneEntity& mesh) { return mesh.id == objectId; });
-                if (it == editorMeshEntities.end())
+                const auto it = meshById.find(objectId);
+                if (it == meshById.end())
                     return {};
-                return !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                return !it->second->prefabInstance.assetId.empty() ? it->second->prefabInstance.assetId
+                                                                   : it->second->prefabAssetId;
             }
             if (type == HierarchyEntityType::PointLight)
             {
-                auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
-                    [&](const PointLight& light) { return light.id == objectId; });
-                if (it == editorPointLights.end())
+                const auto it = pointLightById.find(objectId);
+                if (it == pointLightById.end())
                     return {};
-                return !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                return !it->second->prefabInstance.assetId.empty() ? it->second->prefabInstance.assetId
+                                                                   : it->second->prefabAssetId;
             }
             if (type == HierarchyEntityType::SpotLight)
             {
-                auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
-                    [&](const SpotLight& light) { return light.id == objectId; });
-                if (it == editorSpotLights.end())
+                const auto it = spotLightById.find(objectId);
+                if (it == spotLightById.end())
                     return {};
-                return !it->prefabInstance.assetId.empty() ? it->prefabInstance.assetId : it->prefabAssetId;
+                return !it->second->prefabInstance.assetId.empty() ? it->second->prefabInstance.assetId
+                                                                   : it->second->prefabAssetId;
             }
             return {};
         };
         auto hierarchyParentRefForObject = [&](HierarchyEntityType type, std::uint32_t objectId) -> SceneParentRef {
             if (type == HierarchyEntityType::MeshEntity)
             {
-                auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
-                    [&](const MeshSceneEntity& mesh) { return mesh.id == objectId; });
-                return it == editorMeshEntities.end() ? SceneParentRef{} : it->parent;
+                const auto it = meshById.find(objectId);
+                return it == meshById.end() ? SceneParentRef{} : it->second->parent;
             }
             if (type == HierarchyEntityType::PointLight)
             {
-                auto it = std::find_if(editorPointLights.begin(), editorPointLights.end(),
-                    [&](const PointLight& light) { return light.id == objectId; });
-                return it == editorPointLights.end() ? SceneParentRef{} : it->parent;
+                const auto it = pointLightById.find(objectId);
+                return it == pointLightById.end() ? SceneParentRef{} : it->second->parent;
             }
             if (type == HierarchyEntityType::SpotLight)
             {
-                auto it = std::find_if(editorSpotLights.begin(), editorSpotLights.end(),
-                    [&](const SpotLight& light) { return light.id == objectId; });
-                return it == editorSpotLights.end() ? SceneParentRef{} : it->parent;
+                const auto it = spotLightById.find(objectId);
+                return it == spotLightById.end() ? SceneParentRef{} : it->second->parent;
             }
             return {};
         };
@@ -3761,7 +4855,7 @@ int RunGame(NativeWindow& window,
                 entity = it->second;
             }
 
-            ecs_set_name(editorHierarchyWorld.get(), entity, displayName.c_str());
+            pendingNames.emplace_back(entity, displayName);
             pendingParents[key] = parent;
 
             const bool selected =
@@ -3786,7 +4880,7 @@ int RunGame(NativeWindow& window,
             ensureEntity(HierarchyEntityType::WaterBody, body.id, EditorDisplayName(body), body.editorHidden);
         if (terrainOk && terrain.HasTerrain())
         {
-            const TerrainSceneData terrainData = terrain.GetTerrainSceneData();
+            const TerrainSceneData terrainData = terrain.GetTerrainSceneInfo();
             ensureEntity(HierarchyEntityType::Terrain, 1u, EditorDisplayName(terrainData), terrainData.editorHidden);
         }
         for (const MeshSceneEntity& mesh : editorMeshEntities)
@@ -3837,16 +4931,46 @@ int RunGame(NativeWindow& window,
                 cameraEntity.parent);
         }
 
+        std::unordered_set<std::uint64_t> liveKeySet(liveKeys.begin(), liveKeys.end());
+        // ChildOf deletes descendants with their parent. Scripts delete only the
+        // requested object, so detach surviving mirrors before removing stale parents.
+        std::unordered_set<ecs_entity_t> staleHandles;
+        for (const auto& [key, handle] : editorHierarchyEntities)
+            if (!liveKeySet.contains(key)) staleHandles.insert(handle);
+        for (const auto& [key, handle] : editorHierarchyEntities)
+        {
+            const auto parent = editorHierarchyParents.find(handle);
+            if (liveKeySet.contains(key) && parent != editorHierarchyParents.end() &&
+                staleHandles.contains(parent->second))
+            {
+                ecs_add_pair(editorHierarchyWorld.get(), handle, EcsChildOf, editorSceneRootEntity);
+                parent->second = editorSceneRootEntity;
+            }
+        }
         for (auto it = editorHierarchyEntities.begin(); it != editorHierarchyEntities.end();)
         {
-            if (std::find(liveKeys.begin(), liveKeys.end(), it->first) == liveKeys.end())
+            if (!liveKeySet.contains(it->first))
             {
-                ecs_delete(editorHierarchyWorld.get(), it->second);
+                // A stale ancestor may already have deleted this stale mirror.
+                if (ecs_is_alive(editorHierarchyWorld.get(), it->second))
+                    ecs_delete(editorHierarchyWorld.get(), it->second);
+                editorHierarchyNames.erase(it->second);
+                editorHierarchyParents.erase(it->second);
+                editorHierarchyNoteTags.erase(it->second);
                 it = editorHierarchyEntities.erase(it);
             }
             else
             {
                 ++it;
+            }
+        }
+        for (const auto& [namedEntity, name] : pendingNames)
+        {
+            std::string& last = editorHierarchyNames[namedEntity];
+            if (last != name)
+            {
+                ecs_set_name(editorHierarchyWorld.get(), namedEntity, name.c_str());
+                last = name;
             }
         }
 
@@ -3865,7 +4989,12 @@ int RunGame(NativeWindow& window,
                     parentHandle = static_cast<std::uint64_t>(parentIt->second);
             }
             entity.parent = parentHandle;
-            ecs_add_pair(editorHierarchyWorld.get(), static_cast<ecs_entity_t>(entity.entity), EcsChildOf, static_cast<ecs_entity_t>(parentHandle));
+            std::uint64_t& lastParent = editorHierarchyParents[entity.entity];
+            if (lastParent != parentHandle)
+            {
+                ecs_add_pair(editorHierarchyWorld.get(), static_cast<ecs_entity_t>(entity.entity), EcsChildOf, static_cast<ecs_entity_t>(parentHandle));
+                lastParent = parentHandle;
+            }
         }
 
         for (const MeshSceneEntity& mesh : editorMeshEntities)
@@ -3901,6 +5030,7 @@ int RunGame(NativeWindow& window,
 
     window.SetInputCallback([&runtimeSession,
                              &runtimeUi,
+                             &rmlUi,
                              &editorImGui,
                              &movement,
                              &cameraController,
@@ -3947,7 +5077,8 @@ int RunGame(NativeWindow& window,
 #endif
                              &renderSize](const InputEvent& event)
     {
-#if defined(IXTREEME_WITH_EDITOR)
+        // Gameplay input state, shared by the editor's Play mode and the standalone game: right-drag
+        // mouse-look for the player character, held mouse buttons and arrow keys for scripts.
         if (event.type == InputEvent::MouseMove ||
             event.type == InputEvent::MouseDown ||
             event.type == InputEvent::MouseUp ||
@@ -3965,6 +5096,20 @@ int RunGame(NativeWindow& window,
             editorHasMousePosition = true;
             editorLastMouseX = event.x;
             editorLastMouseY = event.y;
+
+            // The game's own UI (RmlUi documents opened by scripts) sees the pointer first while Play
+            // runs; a click on one of its buttons is not also a click into the world. In the editor it
+            // lives in the Game view, so the pointer is mapped into that image.
+            if (editorPlay.state.mode == EditorPlayMode::Play && rmlUi.HasVisibleGameDocuments())
+            {
+                InputEvent uiEvent = event;
+                bool overGameImage = true;
+#if defined(IXTREEME_WITH_EDITOR)
+                overGameImage = editorImGui.MapInputToGameView(event, uiEvent);
+#endif
+                if (overGameImage && rmlUi.OnInput(uiEvent) && event.type != InputEvent::MouseMove)
+                    return;
+            }
         }
 
         if (event.type == InputEvent::MouseDown && event.button == MouseButton_Left)
@@ -3986,10 +5131,20 @@ int RunGame(NativeWindow& window,
             case Key_Down: editorScriptInput.down = down; break;
             case Key_Left: editorScriptInput.left = down; break;
             case Key_Right: editorScriptInput.right = down; break;
+            case Key_Q: editorScriptInput.q = down; break;
+            case Key_E: editorScriptInput.e = down; break;
+            case Key_R: editorScriptInput.r = down; break;
+            case Key_F: editorScriptInput.f = down; break;
+            case Key_1: editorScriptInput.num[0] = down; break;
+            case Key_2: editorScriptInput.num[1] = down; break;
+            case Key_3: editorScriptInput.num[2] = down; break;
+            case Key_4: editorScriptInput.num[3] = down; break;
+            case Key_5: editorScriptInput.num[4] = down; break;
             default: break;
             }
         }
 
+#if defined(IXTREEME_WITH_EDITOR)
         if (event.type == InputEvent::KeyDown && event.key == Key_Shift)
             editorShiftDown = true;
         else if (event.type == InputEvent::KeyUp && event.key == Key_Shift)
@@ -4069,10 +5224,16 @@ int RunGame(NativeWindow& window,
             return;
         }
 #endif
+#if defined(IXTREEME_WITH_EDITOR)
         const bool editorFlyCameraKey =
             runtimeSession->IsMapEditorOpen() &&
             cameraController.IsFreeCameraEnabled() &&
             isEditorFlyCameraKey(event);
+#else
+        // The game has no editor viewport: its keys always reach gameplay movement.
+        (void)isEditorFlyCameraKey;
+        const bool editorFlyCameraKey = false;
+#endif
         if (editorFlyCameraKey)
         {
             const auto viewportDiag = editorImGui.GetViewportInputDiagnostics();
@@ -4096,8 +5257,13 @@ int RunGame(NativeWindow& window,
 #if defined(IXTREEME_WITH_EDITOR)
         playerInputActive = editorPlay.state.mode == EditorPlayMode::Play && !cameraController.IsFreeCameraEnabled();
 #endif
+        // ...except while a text field (e.g. a script prompt) owns the keyboard: typed keys must not
+        // also drive the player.
+        const bool keyboardEvent = event.type == InputEvent::KeyDown || event.type == InputEvent::KeyUp ||
+            event.type == InputEvent::Char;
+        const bool textInputOwnsKeyboard = keyboardEvent && editorImGui.IsTextInputActive();
         if (editorImGui.WantsInputCapture(event) && !sceneViewInputTarget && !editorFlyCameraKey &&
-            !playerInputActive)
+            (!playerInputActive || textInputOwnsKeyboard))
         {
             movement.Clear();
             return;
@@ -4258,12 +5424,14 @@ int RunGame(NativeWindow& window,
                 const bool terrainToolActiveForDiag =
                     editorSettings.toolMode == MapEditorToolMode::Heightmap ||
                     editorSettings.toolMode == MapEditorToolMode::SplatPaint;
+                // Button events only: with a terrain tool active every mouse move logged ~8 lines (each
+                // flushed to the log file) while painting/sculpting.
+                const bool sculptDiagButtonEvent =
+                    event.type == InputEvent::MouseDown || event.type == InputEvent::MouseUp;
                 const bool shouldLogSculptDiag =
                     QuietLogsForLodDiag()
-                        ? terrainToolActiveForDiag
-                        : (terrainToolActiveForDiag ||
-                            event.type == InputEvent::MouseDown ||
-                            event.type == InputEvent::MouseUp);
+                        ? (terrainToolActiveForDiag && sculptDiagButtonEvent)
+                        : sculptDiagButtonEvent;
                 const auto viewportDiag = editorImGui.GetViewportInputDiagnostics();
                 auto logSculptGateState = [&](const char* stage, bool brushReached, const char* reason) {
                     if (!shouldLogSculptDiag)
@@ -4732,23 +5900,502 @@ int RunGame(NativeWindow& window,
     // Frame stats + debug toggles: cheap POD, shared so the runtime's render/stats path compiles. The
     // editor-only perf-overlay accumulators ride along harmlessly (they just go unused in the runtime).
     EngineStats engineStats{};
+    RuntimePerformanceMonitor performanceMonitor;
+    engineStats.renderer = "Vulkan";
+    if (!rhiDevice->GetCapabilities().deviceName.empty())
+        engineStats.renderer += " / " + rhiDevice->GetCapabilities().deviceName;
     double statsAccumSeconds = 0.0;
     double statsFrameMsAccum = 0.0;
     double statsMinFrameMs = std::numeric_limits<double>::max();
     double statsMaxFrameMs = 0.0;
     std::uint32_t statsFrameCount = 0;
+    double sceneViewStatsAccumSeconds = 0.0;
+    std::uint32_t sceneViewStatsFrameCount = 0;
+    double sceneViewFps = 0.0;
+    double gameViewStatsAccumSeconds = 0.0;
+    std::uint32_t gameViewStatsFrameCount = 0;
+    double gameViewFps = 0.0;
     std::clock_t statsPreviousCpuClock = std::clock();
     double statsPreviousCpuSampleSeconds = 0.0;
     const unsigned int statsHardwareThreads = std::max(1u, std::thread::hardware_concurrency());
     double lastPerfLogSeconds = -1000.0;
     bool debugDisableAssetLibraryDiscovery = false;
     bool debugDisableAssetWatcherPoll = false;
+    // Watcher-reported asset changes refresh the asset library once the file system has been quiet
+    // for a moment (bounded by a maximum delay), so copying many files in costs one full refresh
+    // instead of one per frame while the copy runs.
+    constexpr auto kAssetRefreshQuietTime = std::chrono::milliseconds(250);
+    constexpr auto kAssetRefreshMaxDelay = std::chrono::milliseconds(1000);
+    bool assetRefreshPending = false;
+    std::chrono::steady_clock::time_point assetRefreshFirstChange{};
+    std::chrono::steady_clock::time_point assetRefreshLastChange{};
     bool debugDisableHierarchyIteration = false;
     bool debugShowPhysicsColliders = false;
+    bool showLayerVolumes = false;
+    SceneLayerAuthoringResult layerAuthoringPreview;
+    // Probe ids belong to one immutable bake. The adapter is destroyed before
+    // its owned world; edited scenes require a new explicit placement.
+    std::unique_ptr<SceneLayerAuthoringResult> layerGroundWorld;
+    std::unique_ptr<SceneLayerGround> layerGroundProbe;
     bool debugShowPhysicsContacts = false;
     bool debugShowPhysicsBodyCenters = false;
     bool dumpFrameProfileRequested = false;
+    bool loggedParticleSoftDepth = false;
+    {
+        const ixjobs::JobSystem& jobs = ixjobs::JobSystem::Instance();
+        Tracenf("[JOBS] shared worker pool: %u workers%s (IX_JOBS, IX_JOBS_WORKERS)", jobs.WorkerCount(),
+            jobs.Parallel() ? "" : ", serial");
+    }
+    PerfLogState perfLog;
+    perfLog.intervalSeconds = PerfLogIntervalFromEnvironment();
+    if (perfLog.intervalSeconds > 0.0)
+        Tracenf("[PERF] frame phase log every %.2f s (IX_PERF_LOG)%s", perfLog.intervalSeconds,
+            " - set IX_GPU_PROFILE=1 for GPU pass times");
+    // Without a project or an open scene the Scene View shows only the default sky: what
+    // its image depends on, as last drawn. It is drawn again only when this changes.
+    struct EmptySceneViewKey
+    {
+        float viewProjection[16]{};
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::int32_t toneMapMode = 0;
+        float exposure = 0.0f;
+        const void* display = nullptr;  // the image the panel shows: a new one is drawn into at once
+        bool operator==(const EmptySceneViewKey& other) const
+        {
+            return std::memcmp(viewProjection, other.viewProjection, sizeof(viewProjection)) == 0 &&
+                width == other.width && height == other.height && toneMapMode == other.toneMapMode &&
+                exposure == other.exposure && display == other.display;
+        }
+    };
+    std::optional<EmptySceneViewKey> emptySceneViewDrawn;
+    std::uint64_t editorSnapshotTick = 0;  // editor-frame counter for the throttled scene snapshot
     Tracen("[VISIBILITY-RESPECT] shadow_pass=yes water_reflection_pass=yes main_pass=yes");
+    // Starting the game simulation of the loaded scene, shared by the editor's Play button and the
+    // standalone game: who drives the camera, the physics world (with the player character bodies),
+    // the audio sources and the script instances (OnStart). The editor wraps it with its own
+    // snapshot/selection handling.
+    auto startPlaySession = [&]() {
+        // With a player character present, Play hands WASD/Space to the character (the editor
+        // free-fly would otherwise capture those keys). Without one, keep free-fly so you can fly
+        // around the running simulation.
+        const bool hasPlayerCharacter = std::any_of(
+            editorMeshEntities.begin(), editorMeshEntities.end(),
+            [](const MeshSceneEntity& m) { return m.hasCharacterController && m.characterController.enabled; });
+        cameraController.SetFreeCameraEnabled(!hasPlayerCharacter);
+        runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
+        rebuildEditorPhysicsWorld();
+        editorCharacterStates.clear();
+        // Audio: create (+ playOnStart-start) each entity's AudioSource for this Play session.
+        entityAudioSources.clear();
+        if (audioEngine.IsInitialized())
+        {
+            for (const MeshSceneEntity& audioMesh : editorMeshEntities)
+            {
+                if (!audioMesh.hasAudioSource || !audioMesh.audioSource.enabled ||
+                    audioMesh.audioSource.clipAssetId.empty())
+                    continue;
+                const std::string clipPath = editorImGui.AudioClipFilePath(audioMesh.audioSource.clipAssetId);
+                if (clipPath.empty())
+                    continue;
+                ixaudio::AudioSourceRuntime rt;
+                if (audioEngine.CreateSource(rt, audioMesh.audioSource, clipPath))
+                {
+                    audioEngine.SetSourcePaused(rt, !audioMesh.effectiveEnabled);
+                    if (audioMesh.audioSource.playOnStart)
+                        audioEngine.StartSource(rt);
+                    entityAudioSources[audioMesh.id] = std::move(rt);
+                }
+            }
+        }
+        // Scripting: spin up the subsystem and create one live instance per scripted entity,
+        // firing OnStart now. A throwing hook must not abort Play, so isolate every call.
+        entityScripts.clear();
+        startedEntityScripts.clear();
+        scriptSystem = std::make_unique<ixscript::ScriptSystem>(scriptApi);
+        // Particles: drop the previous session's simulators. The per-frame update creates one per
+        // emitting entity lazily (also for entities spawned mid-Play).
+        entityParticles.clear();
+        particleRenderer.ResetGpuEmitters();
+        for (const MeshSceneEntity& scriptMesh : editorMeshEntities)
+        {
+            if (!scriptMesh.hasScript || !scriptMesh.script.enabled)
+                continue;
+            std::unique_ptr<ixscript::ScriptInstance> instance =
+                scriptSystem->CreateInstance(scriptMesh.id, scriptMesh.script);
+            if (!instance)
+                continue;
+            try
+            {
+                if (scriptMesh.effectiveEnabled) {
+                    startedEntityScripts.insert(scriptMesh.id);
+                    instance->OnStart();
+                }
+            }
+            catch (const std::exception& e)
+            {
+                TraceError("[SCRIPT] OnStart threw entity=%u: %s", scriptMesh.id, e.what());
+            }
+            catch (...)
+            {
+                TraceError("[SCRIPT] OnStart threw entity=%u (unknown)", scriptMesh.id);
+            }
+            entityScripts[scriptMesh.id] = std::move(instance);
+        }
+        Tracenf("[SCRIPT] Play started: %zu live script instance(s)", entityScripts.size());
+        editorPlayerLookDx = 0.0f;
+        editorPlayerLookDy = 0.0f;
+        editorPlay.state.frameCount = 0;
+        editorPlay.state.elapsedSeconds = 0.0;
+        editorPlay.appliedMode = editorPlay.state.mode;
+        Tracenf("[PLAY] session started: player character=%s", hasPlayerCharacter ? "yes" : "no");
+    };
+    // Ground collision for particles: the terrain's height where the scene has terrain, else the
+    // emitter's fallback plane (the context is per-emitter, passed with each Update call).
+    struct ParticleGroundContext
+    {
+        const TerrainRenderer* terrain = nullptr;
+        float planeY = 0.0f;
+    };
+    auto particleGroundHeight = +[](void* user, float x, float z) -> float {
+        const auto* context = static_cast<const ParticleGroundContext*>(user);
+        return context->terrain != nullptr
+            ? context->terrain->SampleHeight(WorldVec3{x, 0.0f, z})
+            : context->planeY;
+    };
+    // Particles: keep one CPU simulator per emitting entity in sync with the scene, and step it.
+    // In Play this runs after physics/scripts/audio settle; in Edit it runs once per frame (the
+    // render pre-pass) so emitters preview while authoring — the two paths never double-step.
+    // A newly appearing emitter (a spawned prefab, a component just added) starts lazily here;
+    // playOnStart=false emitters wait for a script's ParticlePlay/ParticleEmit.
+    // The entities with an enabled particle system, as indices into editorMeshEntities in entity order:
+    // gathered where they are used (the simulation, the frame's instances), not looked for in every
+    // entity by each emitter loop, view and pass.
+    std::vector<std::uint32_t> particleEntityIndices;
+    auto gatherParticleEntities = [&]() {
+        particleEntityIndices.clear();
+        for (std::uint32_t index = 0; index < static_cast<std::uint32_t>(editorMeshEntities.size()); ++index)
+        {
+            const MeshSceneEntity& mesh = editorMeshEntities[index];
+            if (mesh.effectiveEnabled && mesh.hasParticleSystem && mesh.particleSystem.enabled)
+                particleEntityIndices.push_back(index);
+        }
+    };
+    // Whether a frame's particle work is split over the job system: per emitter, and only once there
+    // is enough of it to pay for the hand-off (IX_PARALLEL_PARTICLES=0: always in order, here).
+    constexpr std::size_t kParallelParticleMinimum = 4096;
+    auto parallelParticles = [](std::size_t particles) {
+        static const bool enabled = ixjobs::FeatureEnabled("IX_PARALLEL_PARTICLES");
+        return enabled && particles >= kParallelParticleMinimum && ixjobs::JobSystem::Instance().Parallel();
+    };
+    struct ParticleStep
+    {
+        ixparticle::ParticleSimulator* simulator = nullptr;
+        const MeshSceneEntity* mesh = nullptr;
+    };
+    std::vector<ParticleStep> particleSteps;
+    auto updateParticleSimulators = [&](float dt) {
+        gatherParticleEntities();
+        for (std::uint32_t index : particleEntityIndices)
+        {
+            const MeshSceneEntity& mesh = editorMeshEntities[index];
+            if (!mesh.particleSystem.playOnStart || mesh.particleSystem.gpuSimulation)
+                continue;
+            if (entityParticles.find(mesh.id) == entityParticles.end())
+                entityParticles[mesh.id].Reset(mesh.particleSystem, mesh.id);
+        }
+        particleSteps.clear();
+        std::size_t particleCount = 0;
+        for (auto it = entityParticles.begin(); it != entityParticles.end();)
+        {
+            // By id (a scan per emitter was 10 000 entities x 50 emitters a frame); the scan stays for
+            // an entity the lookup does not hold yet.
+            const MeshSceneEntity* meshIt = findMeshEntityById(it->first);
+            if (!meshIt)
+            {
+                const auto found = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                    [&](const MeshSceneEntity& m) { return m.id == it->first; });
+                meshIt = found != editorMeshEntities.end() ? &*found : nullptr;
+            }
+            if (!meshIt || !meshIt->hasParticleSystem ||
+                !meshIt->particleSystem.enabled || meshIt->particleSystem.gpuSimulation)
+            {
+                it = entityParticles.erase(it);
+                continue;
+            }
+            if (!meshIt->effectiveEnabled) { ++it; continue; }
+            particleSteps.push_back({&it->second, meshIt});
+            particleCount += it->second.AliveCount();
+            ++it;
+        }
+        // Each emitter steps on its own: its simulator and random stream, a ground query that only reads
+        // the terrain. So they step in parallel, one emitter a task, with the same results in any order.
+        const auto step = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+            for (std::uint32_t stepIndex = begin; stepIndex < end; ++stepIndex)
+            {
+                ixparticle::ParticleSimulator& simulator = *particleSteps[stepIndex].simulator;
+                const MeshSceneEntity* meshIt = particleSteps[stepIndex].mesh;
+                float emitterPosition[3] = {
+                    meshIt->position[0], meshIt->position[1], meshIt->position[2]};
+                float emitterDirection[3] = {
+                    meshIt->particleSystem.direction[0], meshIt->particleSystem.direction[1],
+                    meshIt->particleSystem.direction[2]};
+                float emitterAxes[9] = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+                const float* spawnAxes = nullptr;  // local space: the renderer applies the rotation
+                if (meshIt->particleSystem.localSpace)
+                {
+                    // Local space: simulate around the origin along the emitter's own axes; the
+                    // renderer transforms each particle by the emitter's transform.
+                    emitterPosition[0] = 0.0f;
+                    emitterPosition[1] = 0.0f;
+                    emitterPosition[2] = 0.0f;
+                }
+                else
+                {
+                    const xm::Quat rotation = xm::FromEulerRadians(
+                        {meshIt->rotation[0], meshIt->rotation[1], meshIt->rotation[2]});
+                    const xm::Vec3 direction = xm::Rotate(rotation,
+                        {meshIt->particleSystem.direction[0], meshIt->particleSystem.direction[1],
+                         meshIt->particleSystem.direction[2]});
+                    emitterDirection[0] = direction.x;
+                    emitterDirection[1] = direction.y;
+                    emitterDirection[2] = direction.z;
+                    // The spawn shape (box, disc, edge) turns with the entity too.
+                    const xm::Vec3 axes[3] = {xm::Rotate(rotation, {1.0f, 0.0f, 0.0f}),
+                        xm::Rotate(rotation, {0.0f, 1.0f, 0.0f}), xm::Rotate(rotation, {0.0f, 0.0f, 1.0f})};
+                    for (int row = 0; row < 3; ++row)
+                    {
+                        emitterAxes[row * 3 + 0] = axes[row].x;
+                        emitterAxes[row * 3 + 1] = axes[row].y;
+                        emitterAxes[row * 3 + 2] = axes[row].z;
+                    }
+                    spawnAxes = emitterAxes;
+                }
+                const ixparticle::GroundHeightFn groundQuery =
+                    (meshIt->particleSystem.collideWithGround && !meshIt->particleSystem.localSpace)
+                    ? particleGroundHeight : nullptr;
+                ParticleGroundContext groundContext{
+                    terrainOk ? &terrain : nullptr, meshIt->particleSystem.groundPlaneY};
+                simulator.Update(meshIt->particleSystem, emitterPosition, emitterDirection, dt,
+                    groundQuery, groundQuery != nullptr ? &groundContext : nullptr, spawnAxes);
+            }
+        };
+        const std::uint32_t stepCount = static_cast<std::uint32_t>(particleSteps.size());
+        if (parallelParticles(particleCount))
+            ixjobs::JobSystem::Instance().ParallelFor(stepCount, 1, step);
+        else
+            step(0, stepCount, 0);
+    };
+    // The frame's CPU particle instances, every emitter's. They are in world space, so all views and
+    // passes share them: written once, straight into the frame's instance buffer (the emitters in
+    // parallel, each into its own range); collectParticleDraws gives each view's draws their ranges.
+    struct ParticleDrawEmitter
+    {
+        const MeshSceneEntity* mesh = nullptr;
+        const ixparticle::ParticleSimulator* simulator = nullptr;  // null: a GPU emitter
+        std::uint32_t instanceBase = 0;
+        std::uint32_t instanceCount = 0;
+    };
+    std::vector<ParticleDrawEmitter> particleDrawEmitters;
+    // Writes the emitter's instances (as many as fit: count) to out, GPU memory: written only.
+    auto fillParticleInstances = [&](const ParticleDrawEmitter& emitter, ParticleRenderer::InstanceData* out,
+                                     std::uint32_t count) {
+        const MeshSceneEntity& particleMesh = *emitter.mesh;
+        const std::vector<ixparticle::Particle>& particles = emitter.simulator->Particles();
+        // Flipbook: the atlas cell for each particle's current frame (over its lifetime).
+        const int atlasColumns = std::max(1, particleMesh.particleSystem.atlasColumns);
+        const int atlasRows = std::max(1, particleMesh.particleSystem.atlasRows);
+        const int atlasFrames = atlasColumns * atlasRows;
+        const float cellWidth = 1.0f / static_cast<float>(atlasColumns);
+        const float cellHeight = 1.0f / static_cast<float>(atlasRows);
+        // Local-space emitters store particle positions in their own axes: transform them by the
+        // emitter's transform here.
+        const bool localSpace = particleMesh.particleSystem.localSpace;
+        xm::Quat localRotation;  // identity unless localSpace
+        if (localSpace)
+            localRotation = xm::FromEulerRadians(
+                {particleMesh.rotation[0], particleMesh.rotation[1], particleMesh.rotation[2]});
+        for (std::uint32_t k = 0; k < count; ++k)
+        {
+            const ixparticle::Particle& particle = particles[k];
+            ParticleRenderer::InstanceData data;
+            if (localSpace)
+            {
+                const xm::Vec3 world = xm::Rotate(localRotation,
+                    {particle.position[0], particle.position[1], particle.position[2]});
+                data.position[0] = particleMesh.position[0] + world.x;
+                data.position[1] = particleMesh.position[1] + world.y;
+                data.position[2] = particleMesh.position[2] + world.z;
+            }
+            else
+            {
+                data.position[0] = particle.position[0];
+                data.position[1] = particle.position[1];
+                data.position[2] = particle.position[2];
+            }
+            data.size = particle.size;
+            data.rotation = particle.rotation;
+            data.color[0] = particle.color[0];
+            data.color[1] = particle.color[1];
+            data.color[2] = particle.color[2];
+            data.color[3] = particle.color[3];
+            if (atlasFrames > 1)
+            {
+                const float lifeT = std::clamp(particle.age / std::max(particle.lifetime, 1e-4f), 0.0f, 1.0f);
+                const int frame = std::min(static_cast<int>(lifeT * atlasFrames), atlasFrames - 1);
+                data.uvRect[0] = static_cast<float>(frame % atlasColumns) * cellWidth;
+                data.uvRect[1] = static_cast<float>(frame / atlasColumns) * cellHeight;
+                data.uvRect[2] = cellWidth;
+                data.uvRect[3] = cellHeight;
+            }
+            out[k] = data;
+        }
+    };
+    auto buildParticleInstances = [&](const ixrhi::IXRHIFrameInfo& frame) {
+        particleDrawEmitters.clear();
+        if (!particleRendererOk)
+            return;
+        gatherParticleEntities();
+        std::uint32_t total = 0;
+        for (std::uint32_t index : particleEntityIndices)
+        {
+            const MeshSceneEntity& mesh = editorMeshEntities[index];
+            ParticleDrawEmitter emitter;
+            emitter.mesh = &mesh;
+            if (!mesh.particleSystem.gpuSimulation)
+            {
+                // A CPU emitter without a simulator or particles has nothing to draw.
+                const auto simIt = entityParticles.find(mesh.id);
+                if (simIt == entityParticles.end() || simIt->second.Particles().empty())
+                    continue;
+                emitter.simulator = &simIt->second;
+                emitter.instanceBase = total;
+                emitter.instanceCount = static_cast<std::uint32_t>(simIt->second.Particles().size());
+                total += emitter.instanceCount;
+            }
+            particleDrawEmitters.push_back(emitter);
+        }
+        if (total == 0)
+            return;
+        std::uint32_t granted = 0;
+        ParticleRenderer::InstanceData* instances = particleRenderer.BeginCpuInstances(frame, total, granted);
+        if (!instances)
+            return;
+        const auto fill = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+            for (std::uint32_t i = begin; i < end; ++i)
+            {
+                const ParticleDrawEmitter& emitter = particleDrawEmitters[i];
+                if (emitter.simulator && emitter.instanceBase < granted)
+                    fillParticleInstances(emitter, instances + emitter.instanceBase,
+                        std::min(emitter.instanceCount, granted - emitter.instanceBase));
+            }
+        };
+        const std::uint32_t emitterCount = static_cast<std::uint32_t>(particleDrawEmitters.size());
+        if (parallelParticles(total))
+            ixjobs::JobSystem::Instance().ParallelFor(emitterCount, 1, fill);
+        else
+            fill(0, emitterCount, 0);
+    };
+    // GPU particle emitters: one compute dispatch per emitter per frame, outside any render pass
+    // (the compute writes the state buffer the transparent queue draws later). Runs in Play and in
+    // Edit alike, so GPU emitters preview while authoring.
+    auto simulateGpuParticleEmitters = [&](ixrhi::IXRHICommandList& cmd,
+                                            const ixrhi::IXRHIFrameInfo& frame, float dt) {
+        if (!particleRendererOk)
+            return;
+        gatherParticleEntities();
+        for (std::uint32_t index : particleEntityIndices)
+        {
+            const MeshSceneEntity& mesh = editorMeshEntities[index];
+            const ixparticle::ParticleSystemComponent& component = mesh.particleSystem;
+            if (!component.gpuSimulation)
+                continue;
+            ParticleRenderer::GpuEmitterParams params;
+            params.emitterPosition[0] = mesh.position[0];
+            params.emitterPosition[1] = mesh.position[1];
+            params.emitterPosition[2] = mesh.position[2];
+            const xm::Quat rotation = xm::FromEulerRadians(
+                {mesh.rotation[0], mesh.rotation[1], mesh.rotation[2]});
+            const xm::Vec3 direction = xm::Rotate(rotation,
+                {component.direction[0], component.direction[1], component.direction[2]});
+            params.emitterDirection[0] = direction.x;
+            params.emitterDirection[1] = direction.y;
+            params.emitterDirection[2] = direction.z;
+            params.gravity = component.gravity;
+            params.drag = component.drag;
+            params.coneAngle = component.coneAngle;
+            params.rotationSpeed = component.rotationSpeed;
+            params.shapeRadius = component.shapeRadius;
+            params.shapeArc = component.shapeArc;
+            params.shape = static_cast<float>(static_cast<int>(component.shape));
+            params.shapeExtents[0] = component.shapeExtents[0];
+            params.shapeExtents[1] = component.shapeExtents[1];
+            params.shapeExtents[2] = component.shapeExtents[2];
+            params.lifetimeMin = component.startLifetimeMin;
+            params.lifetimeMax = component.startLifetimeMax;
+            params.speedMin = component.startSpeedMin;
+            params.speedMax = component.startSpeedMax;
+            params.sizeMin = component.startSizeMin;
+            params.sizeMax = component.startSizeMax;
+            std::memcpy(params.sizeOverLife, component.sizeOverLife, sizeof(params.sizeOverLife));
+            std::memcpy(params.colorOverLife, component.colorOverLife, sizeof(params.colorOverLife));
+            params.atlasColumns = component.atlasColumns;
+            params.atlasRows = component.atlasRows;
+            params.maxParticles = component.maxParticles;
+            params.emissionRate = component.emissionRate;
+            params.burstCount = component.burstCount;
+            params.startPlaying = component.playOnStart;
+            // The spawn shape turns with the entity (the GPU path is world space only).
+            const xm::Vec3 axes[3] = {xm::Rotate(rotation, {1.0f, 0.0f, 0.0f}),
+                xm::Rotate(rotation, {0.0f, 1.0f, 0.0f}), xm::Rotate(rotation, {0.0f, 0.0f, 1.0f})};
+            for (int row = 0; row < 3; ++row)
+            {
+                params.emitterAxes[row * 3 + 0] = axes[row].x;
+                params.emitterAxes[row * 3 + 1] = axes[row].y;
+                params.emitterAxes[row * 3 + 2] = axes[row].z;
+            }
+            particleRenderer.SimulateGpuEmitter(cmd, frame, mesh.id, params, dt);
+        }
+    };
+    // The game's camera (the editor's Game view, the standalone game's screen): the scene's Main
+    // Camera, or in Play the first active player character's camera (follow / first-person /
+    // top-down per its CameraMode). None when the scene has neither.
+    auto buildGameCamera = [&](std::uint32_t width, std::uint32_t height) -> std::optional<WorldCamera> {
+        const CameraEntity* mainCameraEntity = nullptr;
+        for (const CameraEntity& cameraEntity : editorCameras)
+        {
+            if (cameraEntity.effectiveEnabled && cameraEntity.id == editorMainCameraId)
+            {
+                mainCameraEntity = &cameraEntity;
+                break;
+            }
+        }
+        if (!mainCameraEntity)
+            for (const auto& camera : editorCameras)
+                if (camera.effectiveEnabled) { mainCameraEntity = &camera; break; }
+        std::optional<CameraEntity> gameCameraEntity;
+        if (mainCameraEntity)
+            gameCameraEntity = *mainCameraEntity;
+        if (editorPlay.state.mode == EditorPlayMode::Play)
+        {
+            for (const MeshSceneEntity& characterMesh : editorMeshEntities)
+            {
+                if (!characterMesh.effectiveEnabled || !characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
+                    continue;
+                auto stateIt = editorCharacterStates.find(characterMesh.id);
+                if (stateIt == editorCharacterStates.end() || !stateIt->second.initialized)
+                    continue;
+                phys::CharacterControllerComponent cc = characterMesh.characterController;
+                phys::Sanitize(cc);
+                gameCameraEntity = ComputeCharacterCameraEntity(
+                    mainCameraEntity ? *mainCameraEntity : CameraEntity{}, characterMesh, cc, stateIt->second);
+                break;
+            }
+        }
+        if (!gameCameraEntity)
+            return std::nullopt;
+        return BuildCameraFromEntity(*gameCameraEntity, width, height);
+    };
 #if !defined(IXTREEME_WITH_EDITOR)
     // ---- Standalone runtime boot ----------------------------------------------------------------
     // No editor: find the packaged game (project.ixproj sits next to the runtime exe, placed there by
@@ -4777,7 +6424,12 @@ int RunGame(NativeWindow& window,
                 std::getline(cfg, line);
                 while (!line.empty() && (line.back() == '\r' || line.back() == '\n' || line.back() == ' '))
                     line.pop_back();
-                addProjectCandidate(std::filesystem::path(line));
+                // A relative path is relative to the game folder, not the working directory (a shortcut
+                // may start the game from anywhere).
+                std::filesystem::path gamePath(line);
+                if (!line.empty() && gamePath.is_relative())
+                    gamePath = engineRoot / gamePath;
+                addProjectCandidate(gamePath);
             }
             // (2) Packaged layout: the project sits next to the exe (or an ancestor dir of it).
             for (std::filesystem::path d = engineRoot; ; d = d.parent_path())
@@ -4810,6 +6462,21 @@ int RunGame(NativeWindow& window,
                 ProjectManager& projects = ProjectManager::Instance();
                 Tracenf("[RUNTIME-BOOT] project '%s' at %s",
                     projects.CurrentProject().name.c_str(), projects.ProjectRoot().generic_string().c_str());
+                // The window shows the game's name (not the editor's "<scene> - Editor" title).
+                const std::string gameTitle = projects.CurrentProject().name.empty() ? "Game" : projects.CurrentProject().name;
+                SceneManager::Instance().SetWindowTitleCallback([&window, gameTitle](const std::string&) {
+                    window.SetTitle(gameTitle);
+                });
+                window.SetTitle(gameTitle);
+                // GUIDs of every asset (materials find their textures, models their materials).
+                AssetDatabase::Instance().scan(projects.ProjectRoot());
+                // The project's physics layer collision matrix (rows of '0'/'1', as the editor saves it).
+                const std::vector<std::string>& matrixRows = projects.CurrentProject().physicsCollisionMatrixRows;
+                for (std::size_t row = 0; row < matrixRows.size() && row < editorPhysicsLayerMatrix.size(); ++row)
+                {
+                    for (std::size_t col = 0; col < matrixRows[row].size() && col < editorPhysicsLayerMatrix[row].size(); ++col)
+                        editorPhysicsLayerMatrix[row][col] = matrixRows[row][col] == '1';
+                }
                 syncTerrainAssetRoots();
                 // The scene-mesh + terrain render path is driven by the "map editor open" signal (the
                 // editor sets it at boot); the runtime needs it on too so the loaded scene is drawn. The
@@ -4817,8 +6484,8 @@ int RunGame(NativeWindow& window,
                 runtimeSession->SetMapEditorOpen(true);
                 if (terrainOk)
                     terrain.SetMapEditorOpen(true);
+                // Reads the manifest the editor wrote (no folder scan, nothing written in the game folder).
                 editorImGui.InitializeProjectAssetLibrary(projects.ProjectRoot(), projects.AssetRootPath());
-                editorImGui.RefreshAssetLibrary();
                 editorImGui.LoadProjectGameModules(projects.ProjectRoot());  // native C++ game-module DLLs
                 const std::string startupScene = projects.CurrentProject().startupScene;
                 if (!startupScene.empty() && SceneManager::Instance().LoadScene(startupScene))
@@ -4834,15 +6501,82 @@ int RunGame(NativeWindow& window,
         }
     }
 #endif
+#if defined(IXTREEME_WITH_EDITOR)
+    // The Scene View and Game targets follow their panels' sizes. A size is applied once it has held
+    // for a moment, so dragging a dock splitter does not recreate the targets (and pipelines) on every
+    // frame; meanwhile the panel shows the old image letterboxed.
+    struct ViewResize
+    {
+        VkExtent2D pending{};
+        std::chrono::steady_clock::time_point since{};
+        // True when `wanted` differs from `current` and has stayed the same long enough.
+        bool Due(VkExtent2D wanted, VkExtent2D current)
+        {
+            if (wanted.width == current.width && wanted.height == current.height)
+            {
+                pending = {};
+                return false;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (wanted.width != pending.width || wanted.height != pending.height)
+            {
+                pending = wanted;
+                since = now;
+                return false;
+            }
+            return now - since >= std::chrono::milliseconds(150);
+        }
+    };
+    ViewResize sceneViewResize;
+    ViewResize gameViewResize;
+    std::uint64_t syncedWaterMaterialsRevision = 0;
+    bool waterMaterialsSynced = false;
+#endif
     bool running = true;
     while (running)
     {
         const auto frameCpuStart = std::chrono::steady_clock::now();
         FrameCpuProfile frameProfile{};
         running = window.PumpMessages();
+        if (!running)
+            break;
+#if defined(IXTREEME_WITH_EDITOR)
+        const auto impostorChanges = editorImGui.TakeTreeImpostorChanges();
+        if (!impostorChanges.empty())
+        {
+            rhiDevice->WaitIdle();
+            for (const auto& changed : impostorChanges)
+                for (auto& [path, entry] : staticMeshCache)
+                    if (entry.renderer && entry.renderer->IsLoaded() &&
+                        std::filesystem::path(path).lexically_normal() == changed.lexically_normal())
+                        entry.renderer->ReloadTreeImpostor();
+        }
+#endif
+        validateMeshCaches();
+        // The mesh render records are checked again (once) in each frame that asks for them; those of
+        // entities that are gone (not asked for in a while) are dropped here, between frames.
+        ++renderRecordFrame;
+        pumpModelLoads();
+        if ((renderRecordFrame & 63u) == 0u)
+        {
+            for (std::uint32_t slot = 0; slot < staticMeshRenderRecords.size(); ++slot)
+            {
+                StaticMeshRenderRecord& record = staticMeshRenderRecords[slot];
+                if (record.inUse && (record.validatedFrame == std::numeric_limits<std::uint64_t>::max() ||
+                                        record.validatedFrame + 120u < renderRecordFrame))
+                {
+                    leaveStaticShadow(record);
+                    record = {};
+                    freeStaticMeshRenderRecords.push_back(slot);
+                }
+            }
+        }
 
 #if defined(IXTREEME_WITH_EDITOR)
-        const std::uint64_t assetLibraryDiagFrame = device.GetFrameNumber() + 1u;
+        // Local discovery batch id (monotonic per loop iteration; the legacy
+        // device frame mirror is gone — graphics frames come from IXRHI).
+        static std::uint64_t assetDiscoveryFrameId = 0;
+        const std::uint64_t assetLibraryDiagFrame = ++assetDiscoveryFrameId;
         bool assetLibraryDiagFrameActive = false;
         const auto assetDiscoveryBegin = std::chrono::steady_clock::now();
         if (!debugDisableAssetLibraryDiscovery)
@@ -4860,9 +6594,24 @@ int RunGame(NativeWindow& window,
 
         if (assetWatcherChanged)
         {
+            assetRefreshLastChange = std::chrono::steady_clock::now();
+            if (!assetRefreshPending)
+                assetRefreshFirstChange = assetRefreshLastChange;
+            assetRefreshPending = true;
+        }
+        const auto assetRefreshCheck = std::chrono::steady_clock::now();
+        if (assetRefreshPending &&
+            (assetRefreshCheck - assetRefreshLastChange >= kAssetRefreshQuietTime ||
+             assetRefreshCheck - assetRefreshFirstChange >= kAssetRefreshMaxDelay))
+        {
+            assetRefreshPending = false;
             const auto assetRefreshBegin = std::chrono::steady_clock::now();
             if (!debugDisableAssetLibraryDiscovery)
+            {
                 editorImGui.RefreshAssetLibrary();
+                resolvedMeshPathCache.clear();  // the asset file set may have changed
+                lodDefaultCache.clear();        // LOD defaults may have been edited
+            }
             frameProfile.assetLibraryPollMs += MillisecondsBetween(assetRefreshBegin, std::chrono::steady_clock::now());
         }
 
@@ -4870,25 +6619,32 @@ int RunGame(NativeWindow& window,
         EditorImGui::ScriptFileChanges scriptChanges = std::move(editorImGui.m_pendingScriptChanges);
         editorImGui.m_pendingScriptChanges = {};
 
-        // Lua hot-reload (no build): if a live .lua changed, rebuild every Play-live instance bound to it
-        // from fresh source — instantly. scriptSystem is non-null only in Play/PlayPaused; in Edit nothing
-        // is live and the per-Play backend is recreated fresh on the next Play-enter, so Edit is a no-op.
-        if (!scriptChanges.changedLua.empty() && scriptSystem)
-        {
-            const std::unordered_set<std::string> changedSet(
-                scriptChanges.changedLua.begin(), scriptChanges.changedLua.end());
+        // Script hot-reload (no build): if a live .lua or .as changed, rebuild every Play-live
+        // instance bound to it from fresh source — instantly. scriptSystem is non-null only in
+        // Play/PlayPaused; in Edit nothing is live and the per-Play backend is recreated fresh on the
+        // next Play-enter, so Edit is a no-op.
+        const auto hotReloadScripts = [&](const std::vector<std::string>& changedAssets,
+                                          ixscript::ScriptBackendType backend, const char* language) {
+            if (changedAssets.empty() || !scriptSystem)
+                return;
+            const std::unordered_set<std::string> changedSet(changedAssets.begin(), changedAssets.end());
             for (const std::string& assetId : changedSet)
-                scriptSystem->InvalidateLuaSource(assetId);
+            {
+                if (backend == ixscript::ScriptBackendType::Lua)
+                    scriptSystem->InvalidateLuaSource(assetId);
+                else
+                    scriptSystem->InvalidateAngelScriptSource(assetId);
+            }
             for (MeshSceneEntity& reloadMesh : editorMeshEntities)
             {
                 if (!reloadMesh.hasScript || !reloadMesh.script.enabled ||
-                    reloadMesh.script.backend != ixscript::ScriptBackendType::Lua ||
+                    reloadMesh.script.backend != backend ||
                     changedSet.find(reloadMesh.script.scriptAssetId) == changedSet.end())
                     continue;
                 auto it = entityScripts.find(reloadMesh.id);
                 if (it == entityScripts.end())
                     continue;  // not live yet; a later CreateInstance will use the fresh source
-                // Destroy the old instance (releasing its sol::environment) BEFORE recreating.
+                // Destroy the old instance (releasing its VM state) BEFORE recreating.
                 if (it->second)
                 {
                     try { it->second->OnDestroy(); }
@@ -4902,13 +6658,16 @@ int RunGame(NativeWindow& window,
                     entityScripts.erase(it);  // recompile failed — drop (the backend logged the error)
                     continue;
                 }
-                try { fresh->OnStart(); }
+                startedEntityScripts.erase(reloadMesh.id);
+                try { if (reloadMesh.effectiveEnabled) { startedEntityScripts.insert(reloadMesh.id); fresh->OnStart(); } }
                 catch (...) { TraceError("[SCRIPT] OnStart threw entity=%u", reloadMesh.id); }
                 it->second = std::move(fresh);
-                Tracenf("[SCRIPT] hot-reloaded Lua entity=%u asset=%s",
-                    reloadMesh.id, reloadMesh.script.scriptAssetId.c_str());
+                Tracenf("[SCRIPT] hot-reloaded %s entity=%u asset=%s",
+                    language, reloadMesh.id, reloadMesh.script.scriptAssetId.c_str());
             }
-        }
+        };
+        hotReloadScripts(scriptChanges.changedLua, ixscript::ScriptBackendType::Lua, "Lua");
+        hotReloadScripts(scriptChanges.changedAngelScript, ixscript::ScriptBackendType::AngelScript, "AngelScript");
         // scriptChanges.changedCpp is consumed in the command block below (where `commands` is in scope).
 #endif
 
@@ -4935,13 +6694,13 @@ int RunGame(NativeWindow& window,
                         for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
                         {
                             (void)skinnedPath;
-                            if (skinnedEntry.renderer)
+                            if (skinnedEntry.state == SkinnedMeshCacheEntry::State::Loaded)
                                 skinnedEntry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                         }
                         for (auto& [path, entry] : staticMeshCache)
                         {
                             (void)path;
-                            if (entry.renderer)
+                            if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
                                 entry.renderer->SetTargetPass(offscreenScene.GetTargetPass());
                         }
                         if (terrainOk)
@@ -4954,21 +6713,26 @@ int RunGame(NativeWindow& window,
                                 offscreenScene.Height());
                         }
                         if (selectionOutlinesOk)
-                            selectionOutlines.SetTargetPass(offscreenScene.GetTargetPass());
+                            selectionOutlines.SetTargetPass(offscreenScene.GetDisplayPass());
+                        if (skyOk)
+                            skyRenderer.SetTargetPass(offscreenScene.GetTargetPass());
+                        if (particleRendererOk)
+                            particleRenderer.SetTargetPass(offscreenScene.GetTargetPass());
 #if defined(IXTREEME_WITH_EDITOR)
-                        editorAdapter->SetSceneViewTexture(offscreenScene.GetColorTexture(),
+                        editorAdapter->SetSceneViewTexture(offscreenScene.GetDisplayTexture(),
                             offscreenScene.GetSampler(),
                             offscreenScene.Width(),
                             offscreenScene.Height());
                         if (gameViewOk)
                         {
+                            const VkExtent2D gameExtent = gameViewRenderExtent();
                             gameViewOk = gameView.Recreate(*rhiDevice,
-                                renderSize.width,
-                                renderSize.height,
+                                gameExtent.width,
+                                gameExtent.height,
                                 offscreenColorFormat,
                                 offscreenDepthFormat);
                             if (gameViewOk)
-                                editorAdapter->SetGameViewTexture(gameView.GetColorTexture(),
+                                editorAdapter->SetGameViewTexture(gameView.GetDisplayTexture(),
                                     gameView.GetSampler(),
                                     gameView.Width(),
                                     gameView.Height());
@@ -4987,22 +6751,30 @@ int RunGame(NativeWindow& window,
                 for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
                 {
                     (void)skinnedPath;
-                    if (skinnedEntry.renderer)
+                    if (skinnedEntry.state == SkinnedMeshCacheEntry::State::Loaded)
                         skinnedEntry.renderer->RecreatePipeline(*rhiDevice);
                 }
                 for (auto& [path, entry] : staticMeshCache)
                 {
                     (void)path;
-                    if (entry.renderer)
+                    if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
                         entry.renderer->RecreatePipeline(*rhiDevice);
                 }
                 if (terrainOk)
-                    terrain.RecreatePipeline(device);
+                    terrain.RecreatePipeline(*rhiDevice);
                 if (selectionOutlinesOk)
                     selectionOutlines.RecreatePipeline(*rhiDevice);
+                if (skyOk)
+                    skyRenderer.RecreatePipeline(*rhiDevice);
                 if (worldLabelsOk)
                     worldLabels.RecreatePipeline(*rhiDevice);
-                runtimeSession->OnRenderPassChanged(device);
+                if (particleRendererOk)
+                    particleRenderer.RecreatePipeline(*rhiDevice);
+                runtimeSession->OnRenderPassChanged();
+#if defined(IXTREEME_WITH_EDITOR)
+                // The game's UI draws into the Game view (recreated above): bake against its new pass.
+                rmlUi.SetTargetPass(gameViewOk ? gameView.GetDisplayPass() : nullptr);
+#endif
                 rmlUi.RecreatePipeline(*rhiDevice);
 #if defined(IXTREEME_WITH_EDITOR)
                 editorAdapter->OnRenderPassChanged();
@@ -5037,6 +6809,8 @@ int RunGame(NativeWindow& window,
 #if defined(IXTREEME_WITH_EDITOR)
         const double frameMs = std::max(0.0, deltaSeconds * 1000.0);
         statsAccumSeconds += std::max(0.0, deltaSeconds);
+        sceneViewStatsAccumSeconds += std::max(0.0, deltaSeconds);
+        gameViewStatsAccumSeconds += std::max(0.0, deltaSeconds);
         statsFrameMsAccum += frameMs;
         statsMinFrameMs = std::min(statsMinFrameMs, frameMs);
         statsMaxFrameMs = std::max(statsMaxFrameMs, frameMs);
@@ -5079,6 +6853,30 @@ int RunGame(NativeWindow& window,
             statsFrameCount = 0;
         }
 #endif
+#if defined(IXTREEME_WITH_EDITOR)
+        // Count only completed Scene View render passes. Cached empty-editor frames and
+        // frames where the panel is hidden intentionally contribute zero here.
+        if (sceneViewStatsAccumSeconds >= 0.25)
+        {
+            sceneViewFps = static_cast<double>(sceneViewStatsFrameCount) / sceneViewStatsAccumSeconds;
+            sceneViewStatsAccumSeconds = 0.0;
+            sceneViewStatsFrameCount = 0;
+        }
+        engineStats.sceneViewFps = sceneViewFps;
+        engineStats.sceneViewFrameMs = sceneViewFps > 0.0 ? 1000.0 / sceneViewFps : 0.0;
+        if (gameViewStatsAccumSeconds >= 0.25)
+        {
+            gameViewFps = static_cast<double>(gameViewStatsFrameCount) / gameViewStatsAccumSeconds;
+            gameViewStatsAccumSeconds = 0.0;
+            gameViewStatsFrameCount = 0;
+        }
+        engineStats.gameViewFps = gameViewFps;
+        performanceMonitor.Sample(seconds);
+        engineStats.gpuUsagePercent = performanceMonitor.gpuUsagePercent;
+        engineStats.gpuUsageAvailable = performanceMonitor.gpuUsageAvailable;
+        engineStats.ramUsagePercent = performanceMonitor.ramUsagePercent;
+        engineStats.processRamMb = performanceMonitor.processRamMb;
+#endif
         terrain.SetPerformanceFps(engineStats.fps);
 #if defined(IXTREEME_WITH_EDITOR)
         if (runtimeSession->IsMapEditorOpen() && cameraController.IsFreeCameraEnabled())
@@ -5091,6 +6889,7 @@ int RunGame(NativeWindow& window,
         // Per-frame game simulation — runs in BOTH the editor (Play mode) and the standalone runtime
         // (which forces mode=Play at boot). The state it touches is all shared/unguarded; only the
         // editor's Edit-mode tooling around it stays gated.
+        const auto simulationBegin = std::chrono::steady_clock::now();
         if (editorPlay.state.mode == EditorPlayMode::Play)
         {
             editorPlay.state.elapsedSeconds += deltaSeconds;
@@ -5109,6 +6908,7 @@ int RunGame(NativeWindow& window,
             editorScriptInput.mouseLeft = editorLeftMouseHeld;
             editorScriptInput.mouseRight = editorRightMouseHeld;
             scriptApi.input = &editorScriptInput;
+            const auto physicsBegin = std::chrono::steady_clock::now();
             // Drive player character controllers BEFORE the physics step: each writes its
             // resolved transform to the mesh; the kinematic sync in stepEditorPhysicsWorld
             // then moves the Jolt body to match (so it pushes dynamic objects).
@@ -5118,7 +6918,7 @@ int RunGame(NativeWindow& window,
                 const bool characterInputActive = !runtimeSession->IsTextInputFocused();
                 for (MeshSceneEntity& characterMesh : editorMeshEntities)
                 {
-                    if (!characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
+                    if (!characterMesh.effectiveEnabled || !characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
                         continue;
                     phys::CharacterControllerComponent cc = characterMesh.characterController;
                     phys::Sanitize(cc);
@@ -5144,6 +6944,8 @@ int RunGame(NativeWindow& window,
                 editorPlayerLookDy = 0.0f;
             }
             stepEditorPhysicsWorld(static_cast<float>(deltaSeconds));
+            frameProfile.physicsMs = MillisecondsBetween(physicsBegin, std::chrono::steady_clock::now());
+            const auto scriptsBegin = std::chrono::steady_clock::now();
 
             // Scripting: drive each live instance's OnUpdate after physics/character have settled, so a
             // script's SetPosition wins for this frame (and the audio push below sees the new transform).
@@ -5165,13 +6967,14 @@ int RunGame(NativeWindow& window,
                         it = entityScripts.erase(it);
                         continue;
                     }
-                    if (!meshIt->script.enabled)  // disabled mid-Play: keep the instance, skip its update
+                    if (!meshIt->effectiveEnabled || !meshIt->script.enabled)  // disabled mid-Play: keep the instance, skip its update
                     {
                         ++it;
                         continue;
                     }
                     try
                     {
+                        if (startedEntityScripts.insert(it->first).second) it->second->OnStart();
                         it->second->OnUpdate(static_cast<float>(deltaSeconds));
                     }
                     catch (const std::exception& e)
@@ -5197,7 +7000,8 @@ int RunGame(NativeWindow& window,
                     std::min(editorLastStepEntityEventCount, editorPhysicsEntityEvents.size());
                 auto fireCollision = [&](std::uint32_t self, std::uint32_t other) {
                     auto it = entityScripts.find(self);
-                    if (it == entityScripts.end() || !it->second)
+                    const MeshSceneEntity* eventMesh = findMeshEntityById(self);
+                    if (!eventMesh || !eventMesh->effectiveEnabled || it == entityScripts.end() || !it->second)
                         return;
                     try { it->second->OnCollision(other); }
                     catch (...) { TraceError("[SCRIPT] OnCollision threw entity=%u", self); }
@@ -5222,11 +7026,40 @@ int RunGame(NativeWindow& window,
                 // legally enqueue more ops, reallocating the vector — a range-for/reference would dangle.
                 // Ops queued during the drain run next frame.
                 const std::size_t drainCount = scriptApi.deferredOps.size();
+                // The physics world changes body by body: a spawned entity's body is added, a destroyed
+                // one's removed (removeStaticMeshSpatialEntity), the rest keep moving as they were. Only
+                // an entity in a joint (or no world yet) builds the world again. The destroyed entities
+                // leave the entity list at once, after the drain.
+                const bool spawnsOrDestroys = std::any_of(scriptApi.deferredOps.begin(),
+                    scriptApi.deferredOps.begin() + static_cast<std::ptrdiff_t>(drainCount),
+                    [](const ScriptApiImpl::DeferredOp& queued) {
+                        return queued.kind == ScriptApiImpl::DeferredKind::SpawnMesh ||
+                            queued.kind == ScriptApiImpl::DeferredKind::SpawnPrefab ||
+                            queued.kind == ScriptApiImpl::DeferredKind::Destroy;
+                    });
+                bool rebuildPhysics = spawnsOrDestroys && !editorPhysicsWorldActive;
+                bool activationDirty = spawnsOrDestroys;
+                const std::unordered_set<std::uint32_t> jointEntities =
+                    spawnsOrDestroys ? physicsJointEntities() : std::unordered_set<std::uint32_t>{};
+                std::unordered_set<std::uint32_t> destroyedEntities;
+                std::vector<std::uint32_t> spawnedPrefabMeshes;
+                // An entity by id that is not destroyed in this drain (by the lookup, else a search).
+                auto findLiveEntity = [&](std::uint32_t id) -> MeshSceneEntity* {
+                    if (destroyedEntities.count(id) > 0)
+                        return nullptr;
+                    if (MeshSceneEntity* found = findMeshEntityById(id))
+                        return found;
+                    const auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& m) { return m.id == id; });
+                    return it != editorMeshEntities.end() ? &*it : nullptr;
+                };
                 for (std::size_t opIdx = 0; opIdx < drainCount; ++opIdx)
                 {
                     const ScriptApiImpl::DeferredOp op = scriptApi.deferredOps[opIdx];
                     if (op.kind == ScriptApiImpl::DeferredKind::Destroy)
                     {
+                        if (jointEntities.count(op.id) > 0)
+                            rebuildPhysics = true;
                         if (auto sit = entityScripts.find(op.id); sit != entityScripts.end())
                         {
                             if (sit->second)
@@ -5236,34 +7069,193 @@ int RunGame(NativeWindow& window,
                             }
                             entityScripts.erase(sit);
                         }
+                        startedEntityScripts.erase(op.id);
                         entityAudioSources.erase(op.id);
+                        entityParticles.erase(op.id);
+                        particleRenderer.GpuEmitterSetEntityPaused(op.id, false);
                         removeStaticMeshSpatialEntity(op.id);
-                        auto meshIt = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
-                            [&](const MeshSceneEntity& m) { return m.id == op.id; });
-                        if (meshIt != editorMeshEntities.end())
-                            editorMeshEntities.erase(meshIt);
+                        destroyedEntities.insert(op.id);
                         if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
                             selectedEditorObject.id == op.id)
                             selectedEditorObject = {};
                     }
+                    else if (op.kind == ScriptApiImpl::DeferredKind::SetEnabled)
+                    {
+                        if (auto* mesh = findLiveEntity(op.id); mesh && mesh->enabled != op.enabled) {
+                            mesh->enabled = op.enabled; activationDirty = true;
+                        }
+                    }
+                    else if (op.kind == ScriptApiImpl::DeferredKind::SetMaterial)
+                    {
+                        // A material GUID (as in a scene's "materials" slots) or a project asset id.
+                        std::string guid;
+                        if (const auto parsed = Guid::fromString(op.assetId);
+                            parsed && AssetDatabase::Instance().resolveGuid(*parsed))
+                            guid = parsed->toString();
+                        else if (ProjectManager::Instance().HasProject())
+                        {
+                            AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
+                                ProjectManager::Instance().AssetRootPath());
+                            if (projectAssets.InitializeReadOnly())
+                                if (auto e = projectAssets.FindById(op.assetId);
+                                    e && e->category == AssetLibrary::Category::Material)
+                                    guid = AssetDatabase::Instance().getOrCreateGuid(projectAssets.AbsolutePath(*e)).toString();
+                        }
+                        MeshSceneEntity* meshIt = findLiveEntity(op.id);
+                        if (guid.empty() || !meshIt)
+                        {
+                            TraceError("[SCRIPT] SetMaterial: unknown %s (entity=%u material=%s)",
+                                guid.empty() ? "material" : "entity", op.id, op.assetId.c_str());
+                            continue;
+                        }
+                        if (meshIt->materialSlots.size() <= op.slot)
+                            meshIt->materialSlots.resize(op.slot + 1u);
+                        meshIt->materialSlots[op.slot] = guid;
+                    }
                     else if (op.kind == ScriptApiImpl::DeferredKind::SpawnPrefab)
                     {
-                        Tracenf("[SCRIPT] SpawnPrefab not yet supported (entity=%u asset=%s) — use SpawnMesh",
-                            op.id, op.assetId.c_str());
+                        const auto loaded = loadPrefabDocument(op.assetId);
+                        if (!loaded)
+                            continue;
+                        const auto& document = loaded->first;
+                        const auto pointCount = std::count_if(document.entities.begin(), document.entities.end(),
+                            [](const prefab::PrefabEntity& e) { return e.kind == prefab::PrefabTemplate::Kind::PointLight; });
+                        const auto spotCount = std::count_if(document.entities.begin(), document.entities.end(),
+                            [](const prefab::PrefabEntity& e) { return e.kind == prefab::PrefabTemplate::Kind::SpotLight; });
+                        if (editorPointLights.size() + pointCount > kMaxDynamicPointLights ||
+                            editorSpotLights.size() + spotCount > kMaxDynamicSpotLights)
+                        {
+                            TraceError("[SCRIPT] SpawnPrefab failed root=%u: light limit", op.id);
+                            continue;
+                        }
+                        prefab::RuntimePrefabInstance instance;
+                        std::string error;
+                        if (!prefab::InstantiateRuntime(document, op.assetId, op.id, op.pos,
+                            [&] { return nextEditorMeshEntityId++; }, [&] { return nextEditorLightId++; }, instance, error))
+                        {
+                            TraceError("[SCRIPT] SpawnPrefab failed root=%u: %s", op.id, error.c_str());
+                            continue;
+                        }
+                        editorMeshEntities.reserve(editorMeshEntities.size() + instance.meshes.size());
+                        for (auto& mesh : instance.meshes)
+                        {
+                            mesh.name = makeUniqueSceneEntityName(mesh.name.empty() ? "Spawned Prefab" : mesh.name);
+                            if (mesh.materialSlots.empty())
+                                mesh.materialSlots = LoadDefaultMaterialSlotGuids(mesh.meshAssetPath, ResolveModelSubmeshCount(mesh.meshAssetPath));
+                            const auto id = mesh.id;
+                            editorMeshEntities.push_back(std::move(mesh));
+                            auto& liveMesh = editorMeshEntities.back();
+                            editorMeshEntityLookup[id] = editorMeshEntities.size() - 1u;
+                            syncStaticMeshSpatialEntity(liveMesh);
+                            if ((liveMesh.hasFixedJoint && liveMesh.fixedJoint.enabled) ||
+                                (liveMesh.hasHingeJoint && liveMesh.hingeJoint.enabled))
+                                rebuildPhysics = true;
+                            else if (!rebuildPhysics)
+                            {
+                                PhysicsBodyCounts counts;
+                                createPhysicsBodyForEntity(liveMesh, counts);
+                            }
+                            spawnedPrefabMeshes.push_back(id);
+                        }
+                        for (auto& light : instance.points)
+                        {
+                            light.name = makeUniqueSceneEntityName(light.name.empty() ? "Spawned Point Light" : light.name);
+                            editorPointLights.push_back(std::move(light));
+                        }
+                        for (auto& light : instance.spots)
+                        {
+                            light.name = makeUniqueSceneEntityName(light.name.empty() ? "Spawned Spot Light" : light.name);
+                            editorSpotLights.push_back(std::move(light));
+                        }
+                        Tracenf("[SCRIPT] SpawnPrefab root=%u asset=%s meshes=%zu points=%zu spots=%zu", op.id,
+                            op.assetId.c_str(), instance.meshes.size(), instance.points.size(), instance.spots.size());
                     }
                     else  // SpawnMesh
                     {
                         spawnMeshEntityForScript(op.assetId, op.pos, op.id);
+                        if (jointEntities.count(op.id) > 0)
+                            rebuildPhysics = true;
+                        else if (!rebuildPhysics)
+                        {
+                            PhysicsBodyCounts counts;
+                            createPhysicsBodyForEntity(editorMeshEntities.back(), counts);
+                        }
                     }
                 }
                 // Erase only what we drained; any ops a hook queued during the drain stay for next frame.
                 scriptApi.deferredOps.erase(scriptApi.deferredOps.begin(),
                     scriptApi.deferredOps.begin() + static_cast<std::ptrdiff_t>(drainCount));
-                rebuildMeshEntityLookup();
-                rebuildEditorPhysicsWorld();  // the entity set changed
+                if (!destroyedEntities.empty())
+                {
+                    editorMeshEntities.erase(std::remove_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& m) { return destroyedEntities.count(m.id) > 0; }),
+                        editorMeshEntities.end());
+                    rebuildMeshEntityLookup();  // the indices moved (a spawn adds its own entry)
+                }
+                // Resolve inherited flags once at commit, then update spatial/shadow membership and
+                // physics bodies. Existing bodies retain transforms and velocities while suspended.
+                if (activationDirty) rebuildMeshEntityLookup();
+                if (rebuildPhysics) {
+                    // A joint requires rebuilding the world; unaffected bodies still keep motion,
+                    // including the snapshots of bodies currently disabled outside the broad phase.
+                    struct Motion { float linear[3], angular[3]; };
+                    std::unordered_map<std::uint32_t, Motion> motion;
+                    for (const auto& [id,body] : editorPhysicsBodies) {
+                        Motion saved{};
+                        if (editorPhysicsWorld.GetLinearVelocity(body,saved.linear) &&
+                            editorPhysicsWorld.GetAngularVelocity(body,saved.angular)) motion.emplace(id,saved);
+                    }
+                    rebuildEditorPhysicsWorld();
+                    for (const auto& [id,saved] : motion)
+                        if (const auto body=editorPhysicsBodies.find(id); body!=editorPhysicsBodies.end()) {
+                            editorPhysicsWorld.SetLinearVelocity(body->second,saved.linear);
+                            editorPhysicsWorld.SetAngularVelocity(body->second,saved.angular);
+                        }
+                }
+                if (activationDirty) for (auto& mesh : editorMeshEntities) {
+                    if (!mesh.activationChanged && std::find(spawnedPrefabMeshes.begin(),spawnedPrefabMeshes.end(),mesh.id)==spawnedPrefabMeshes.end()) continue;
+                    syncStaticMeshSpatialEntity(mesh);
+                    mesh.activationChanged = false;
+                    particleRenderer.GpuEmitterSetEntityPaused(mesh.id, !mesh.effectiveEnabled);
+                    if (const auto body = editorPhysicsBodies.find(mesh.id); body != editorPhysicsBodies.end()) {
+                        if (mesh.effectiveEnabled)
+                            editorPhysicsWorld.SetBodyTransform(body->second, PhysicsTransformFromMesh(mesh));
+                        editorPhysicsWorld.SetBodyEnabled(body->second, mesh.effectiveEnabled);
+                    }
+                }
+                // Publish the whole prefab before OnStart: every sibling is visible to script queries.
+                // Hooks may enqueue more operations, which the next frame drains.
+                for (const auto id : spawnedPrefabMeshes)
+                {
+                    const MeshSceneEntity* mesh = findMeshEntityById(id);
+                    if (!mesh) continue; // also destroyed in this drain
+                    if (audioEngine.IsInitialized() && mesh->hasAudioSource && mesh->audioSource.enabled &&
+                        !mesh->audioSource.clipAssetId.empty())
+                    {
+                        const std::string path = editorImGui.AudioClipFilePath(mesh->audioSource.clipAssetId);
+                        ixaudio::AudioSourceRuntime source;
+                        if (!path.empty() && audioEngine.CreateSource(source, mesh->audioSource, path))
+                        {
+                            audioEngine.SetSourcePaused(source, !mesh->effectiveEnabled);
+                            if (mesh->audioSource.playOnStart) audioEngine.StartSource(source);
+                            entityAudioSources[id] = std::move(source);
+                        }
+                    }
+                    if (scriptSystem && mesh->hasScript && mesh->script.enabled)
+                    {
+                        auto script = scriptSystem->CreateInstance(id, mesh->script);
+                        if (script)
+                        {
+                            try { if (mesh->effectiveEnabled) { startedEntityScripts.insert(id); script->OnStart(); } }
+                            catch (...) { TraceError("[SCRIPT] OnStart threw entity=%u", id); }
+                            entityScripts[id] = std::move(script);
+                        }
+                    }
+                }
                 SceneManager::Instance().MarkDirty();
             }
 
+            frameProfile.scriptsMs = MillisecondsBetween(scriptsBegin, std::chrono::steady_clock::now());
             // Audio: push live AudioSource state (volume/pitch/3D position) each Play frame, after
             // transforms settle. Drop sources whose entity vanished (the dtor stops the sound).
             if (audioEngine.IsInitialized() && !entityAudioSources.empty())
@@ -5278,17 +7270,29 @@ int RunGame(NativeWindow& window,
                         continue;
                     }
                     const float audioPos[3] = {meshIt->position[0], meshIt->position[1], meshIt->position[2]};
+                    audioEngine.SetSourcePaused(it->second, !meshIt->effectiveEnabled || !meshIt->audioSource.enabled);
                     audioEngine.UpdateSource(it->second, meshIt->audioSource, audioPos);
                     ++it;
                 }
             }
+
+            // Particles: step each live emitter after physics/scripts/audio settle. World-space, so
+            // the emitter may move without dragging its particles along.
+            const auto particlesBegin = std::chrono::steady_clock::now();
+            updateParticleSimulators(static_cast<float>(deltaSeconds));
+            frameProfile.particlesMs = MillisecondsBetween(particlesBegin, std::chrono::steady_clock::now());
         }
+        frameProfile.simulationMs = MillisecondsBetween(simulationBegin, std::chrono::steady_clock::now());
         {
             const auto ecsUpdateBegin = std::chrono::steady_clock::now();
             runtimeSession->UpdateNetwork();
             runtimeSession->SendMoveInput(movement.DirectionAngle(cameraController.MovementYaw()), movement.State());
             runtimeSession->Update(seconds);
-            rmlUi.Update();
+            // RmlUi's Context::Update() walks every document's layout and animations; skip it while
+            // nothing is visible (the editor's normal state — it is a measurable per-frame cost), but
+            // not on the frame after the last one goes (its hide / close is applied in an Update).
+            if (rmlUi.NeedsUpdate())
+                rmlUi.Update();
 #if defined(IXTREEME_WITH_EDITOR)
             frameProfile.ecsSystemsUpdateMs = MillisecondsBetween(ecsUpdateBegin, std::chrono::steady_clock::now());
 #endif
@@ -5300,7 +7304,16 @@ int RunGame(NativeWindow& window,
         if (runtimeSession->IsInWorld())
         {
             frameEntities = runtimeSession->GetWorldEntities();
+#if defined(IXTREEME_WITH_EDITOR)
             frameCamera = cameraController.BuildCamera(renderSize.width, renderSize.height);
+#else
+            // The game looks through its own camera (Main Camera / player character, as the editor's
+            // Game view); the free-fly camera only when the scene has none.
+            if (const std::optional<WorldCamera> gameCamera = buildGameCamera(renderSize.width, renderSize.height))
+                frameCamera = *gameCamera;
+            else
+                frameCamera = cameraController.BuildCamera(renderSize.width, renderSize.height);
+#endif
             hasFrameCamera = true;
             lastPickEntities = frameEntities;
             lastPickCamera = frameCamera;
@@ -5313,7 +7326,7 @@ int RunGame(NativeWindow& window,
                 const WorldVec3 listenForward = WorldCameraForward(frameCamera);
                 WorldVec3 listenPos = frameCamera.eye;
                 for (const MeshSceneEntity& listenerMesh : editorMeshEntities)
-                    if (listenerMesh.hasAudioListener && listenerMesh.audioListener.enabled)
+                    if (listenerMesh.effectiveEnabled && listenerMesh.hasAudioListener && listenerMesh.audioListener.enabled)
                     {
                         listenPos = WorldVec3{listenerMesh.position[0], listenerMesh.position[1], listenerMesh.position[2]};
                         break;
@@ -5365,10 +7378,17 @@ int RunGame(NativeWindow& window,
             // Standalone runtime: materialize a freshly-loaded scene into the live entity set (the editor
             // does this inside its own block below). Without this, editorMeshEntities stays empty -> the
             // scene never renders. ApplySceneData also applies the scene's saved camera.
+            if (SceneManager::Instance().HasPendingScene())
             {
                 SceneData runtimePendingScene;
                 if (SceneManager::Instance().ConsumePendingScene(runtimePendingScene))
+                {
                     sceneRuntime.ApplySceneData(runtimePendingScene);
+                    // The game plays from its first frame: start the simulation of the scene just built
+                    // (the boot forced Play; this is what the editor's Play button does).
+                    if (editorPlay.state.mode == EditorPlayMode::Play)
+                        startPlaySession();
+                }
             }
 #endif
 #if defined(IXTREEME_WITH_EDITOR)
@@ -5377,9 +7397,20 @@ int RunGame(NativeWindow& window,
                 terrain.SetMapEditorOpen(runtimeSession->IsMapEditorOpen());
                 const MapEditorSettings editorSettings = editorImGui.GetMapEditorSettings();
                 terrain.SetMapEditorSettings(editorSettings);
-                SceneData pendingScene;
-                if (SceneManager::Instance().ConsumePendingScene(pendingScene))
-                    sceneRuntime.ApplySceneData(pendingScene);
+                // (A SceneData only when one is waiting: building and freeing an empty one every frame
+                // is not free.)
+                if (SceneManager::Instance().HasPendingScene())
+                {
+                    SceneData pendingScene;
+                    if (SceneManager::Instance().ConsumePendingScene(pendingScene))
+                    {
+                        sceneRuntime.ApplySceneData(pendingScene);
+                        layerAuthoringPreview = {};
+                        layerGroundProbe.reset();
+                        layerGroundWorld.reset();
+                        editorImGui.SetLayerAuthoringStatus("Scene changed: generate layers from collision.");
+                    }
+                }
                 MapEditorCommands commands = runtimeSession->ConsumeMapEditorCommands();
                 MergeMapEditorCommands(commands, editorImGui.ConsumeCommands());
                 // Native C++ auto-build-on-save: a changed Scripts/*.cpp raises the SAME build the manual
@@ -6178,6 +8209,17 @@ int RunGame(NativeWindow& window,
 
                     if (!setHierarchyParent(type, id, parent))
                         return false;
+                    rebuildMeshEntityLookup();
+                    for (auto& mesh : editorMeshEntities) if (mesh.activationChanged) {
+                        syncStaticMeshSpatialEntity(mesh);
+                        mesh.activationChanged = false;
+                        particleRenderer.GpuEmitterSetEntityPaused(mesh.id,!mesh.effectiveEnabled);
+                        if (const auto body=editorPhysicsBodies.find(mesh.id); body!=editorPhysicsBodies.end()) {
+                            if (mesh.effectiveEnabled)
+                                editorPhysicsWorld.SetBodyTransform(body->second,PhysicsTransformFromMesh(mesh));
+                            editorPhysicsWorld.SetBodyEnabled(body->second,mesh.effectiveEnabled);
+                        }
+                    }
                     SceneManager::Instance().MarkDirty();
                     runtimeSession->SetEditorStatus(parent.IsValid()
                         ? "Hierarchy parent changed"
@@ -6226,7 +8268,7 @@ int RunGame(NativeWindow& window,
                     else if (type == HierarchyEntityType::Terrain)
                     {
                         if (terrainOk)
-                            terrain.ClearTerrain(device);
+                            terrain.ClearTerrain();
                     }
                     else if (type == HierarchyEntityType::PointLight)
                     {
@@ -6351,7 +8393,7 @@ int RunGame(NativeWindow& window,
                     {
                         if (terrainOk && terrain.HasTerrain())
                         {
-                            TerrainSceneData data = terrain.GetTerrainSceneData();
+                            TerrainSceneData data = terrain.GetTerrainSceneInfo();
                             data.name = name;
                             terrain.SetTerrainSceneData(data);
                         }
@@ -6398,7 +8440,7 @@ int RunGame(NativeWindow& window,
                     {
                         if (terrainOk && terrain.HasTerrain())
                         {
-                            TerrainSceneData data = terrain.GetTerrainSceneData();
+                            TerrainSceneData data = terrain.GetTerrainSceneInfo();
                             data.editorHidden = !data.editorHidden;
                             hidden = data.editorHidden;
                             terrain.SetTerrainSceneData(data);
@@ -6601,6 +8643,58 @@ int RunGame(NativeWindow& window,
                 if (commands.resumePlayMode && editorPlay.state.mode == EditorPlayMode::PlayPaused)
                     editorPlay.state.mode = EditorPlayMode::Play;
 
+                // "Build Game" (Edit, with a project, nothing else building): package the project with the
+                // editor-less runtime player. The C++ scripts are compiled first when asked (the package
+                // then waits for that build, below); the editor saved the project and scene before this.
+                if (commands.buildGame &&
+                    editorPlay.state.mode == EditorPlayMode::Edit &&
+                    ProjectManager::Instance().HasProject() &&
+                    !gamePackage.IsRunning() && !gamePackageAfterScripts && !gameScriptBuild.IsRunning())
+                {
+                    ProjectManager& projects = ProjectManager::Instance();
+                    ixeditor::build::GamePackageRequest request;
+                    const std::filesystem::path exeDir(ExecutableDirectory());
+                    // A runtime player shipped with the editor (binary distribution) ...
+                    request.prebuiltRuntimeDir = exeDir / "Runtime";
+                    // ... else built from the engine sources, configured like this editor's build.
+                    for (std::filesystem::path dir = exeDir; !dir.empty(); dir = dir.parent_path())
+                    {
+                        std::error_code ec;
+                        if (request.editorBuildDir.empty() && std::filesystem::exists(dir / "CMakeCache.txt", ec))
+                            request.editorBuildDir = dir;
+                        if (request.engineSourceDir.empty() && std::filesystem::exists(dir / "CMakeLists.txt", ec))
+                        {
+                            std::ifstream rootCmake(dir / "CMakeLists.txt");
+                            const std::string text((std::istreambuf_iterator<char>(rootCmake)), std::istreambuf_iterator<char>());
+                            if (text.find("IXTREEME_WITH_EDITOR") != std::string::npos)
+                                request.engineSourceDir = dir;
+                        }
+                        if (dir == dir.parent_path())
+                            break;
+                    }
+                    request.buildConfig = ixeditor::build::GameScriptBuildService::BuildConfigForCurrentBinary();
+                    request.projectRoot = projects.ProjectRoot();
+                    request.assetRoot = projects.AssetRootPath();
+                    request.outputDir = std::filesystem::path(commands.buildGameOutputDir);
+                    request.gameName = commands.buildGameName;
+                    request.startupScene = commands.buildGameStartupScene;
+                    gamePackageRunWhenDone = commands.buildGameRunWhenDone;
+                    Tracenf("[BUILD-GAME] requested name=%s output=%s scene=%s scripts=%s",
+                        request.gameName.c_str(),
+                        request.outputDir.generic_string().c_str(),
+                        request.startupScene.c_str(),
+                        commands.buildGameCompileScripts ? "yes" : "no");
+                    if (commands.buildGameCompileScripts)
+                    {
+                        gamePackageAfterScripts = std::move(request);
+                        commands.buildGameScripts = true;  // handled right below, this frame
+                    }
+                    else if (gamePackage.RequestPackage(std::move(request)))
+                    {
+                        editorImGui.SetGameBuildRunning();
+                    }
+                }
+
                 // Build the project's native C++ game scripts (only in Edit, with a project, one at a
                 // time). MUST unload the module first so cmake can overwrite the locked DLL; the worker
                 // thread runs cmake and the main-thread poll (below) reloads on success.
@@ -6612,20 +8706,37 @@ int RunGame(NativeWindow& window,
                     !gameScriptBuild.IsRunning())
                 {
                     const std::filesystem::path projectRoot = ProjectManager::Instance().ProjectRoot();
-                    const std::filesystem::path scriptsDir =
-                        ixeditor::build::GameScriptBuildService::ScriptsDirFor(projectRoot);
-                    const std::filesystem::path buildDir =
-                        ixeditor::build::GameScriptBuildService::BuildDirFor(projectRoot);
-                    editorImGui.EnsureProjectScriptsScaffold(projectRoot);
-                    editorImGui.UnloadGameModules();  // *** release the LoadLibrary lock before overwrite ***
-                    // The module MUST be built with the SAME config (CRT + iterator-debug-level) as the
-                    // running engine, or const std::string&/STL params across the boundary corrupt: a
-                    // Release engine is /MT (IDL=0), a Debug engine /MTd (IDL=2). Match it.
-                    const std::string buildConfig =
-                        ixeditor::build::GameScriptBuildService::BuildConfigForCurrentBinary();
-                    Tracenf("[BUILD] game scripts: starting cmake (config=%s)", buildConfig.c_str());
-                    if (gameScriptBuild.RequestBuild(scriptsDir, buildDir, buildConfig))
-                        editorImGui.SetBuildRunning();
+                    // C++ is legacy-only now: with no .cpp script sources there is nothing to compile,
+                    // so a waiting "Build Game" goes straight on to packaging.
+                    if (!editorImGui.EnsureProjectScriptsScaffold(projectRoot))
+                    {
+                        Tracen("[BUILD] game scripts: nothing to compile (no legacy C++ scripts)");
+                        editorImGui.SetBuildResult(true,
+                            "[BUILD] nothing to compile: the project has no legacy C++ scripts.\n"
+                            "AngelScript (.as) and Lua (.lua) scripts run without a build step.\n");
+                        if (gamePackageAfterScripts)
+                        {
+                            if (gamePackage.RequestPackage(std::move(*gamePackageAfterScripts)))
+                                editorImGui.SetGameBuildRunning();
+                            gamePackageAfterScripts.reset();
+                        }
+                    }
+                    else
+                    {
+                        const std::filesystem::path scriptsDir =
+                            ixeditor::build::GameScriptBuildService::ScriptsDirFor(projectRoot);
+                        const std::filesystem::path buildDir =
+                            ixeditor::build::GameScriptBuildService::BuildDirFor(projectRoot);
+                        editorImGui.UnloadGameModules();  // *** release the LoadLibrary lock before overwrite ***
+                        // The module MUST be built with the SAME config (CRT + iterator-debug-level) as the
+                        // running engine, or const std::string&/STL params across the boundary corrupt: a
+                        // Release engine is /MT (IDL=0), a Debug engine /MTd (IDL=2). Match it.
+                        const std::string buildConfig =
+                            ixeditor::build::GameScriptBuildService::BuildConfigForCurrentBinary();
+                        Tracenf("[BUILD] game scripts: starting cmake (config=%s)", buildConfig.c_str());
+                        if (gameScriptBuild.RequestBuild(scriptsDir, buildDir, buildConfig))
+                            editorImGui.SetBuildRunning();
+                    }
                 }
 
                 // Build completion (main thread): reload the module on success — the registry mutation
@@ -6636,8 +8747,31 @@ int RunGame(NativeWindow& window,
                     const bool ok = buildResult.ok;
                     if (ok && ProjectManager::Instance().HasProject())
                         editorImGui.LoadProjectGameModules(ProjectManager::Instance().ProjectRoot());
+                    // A waiting "Build Game" goes on only with freshly built scripts.
+                    if (gamePackageAfterScripts)
+                    {
+                        if (ok && gamePackage.RequestPackage(std::move(*gamePackageAfterScripts)))
+                            editorImGui.SetGameBuildRunning();
+                        else if (!ok)
+                            editorImGui.SetGameBuildResult(false,
+                                "[BUILD-GAME] stopped: the C++ game scripts did not build.\n\n" + buildResult.log, {});
+                        gamePackageAfterScripts.reset();
+                    }
                     editorImGui.SetBuildResult(ok, std::move(buildResult.log));
                     Tracenf("[BUILD] game scripts %s", ok ? "OK" : "FAILED");
+                }
+
+                // "Build Game" completion: report, and start the game when asked.
+                if (ixeditor::build::GamePackageResult packageResult{}; gamePackage.TryTakeResult(packageResult))
+                {
+                    Tracenf("[BUILD-GAME] %s", packageResult.ok ? "OK" : "FAILED");
+                    if (packageResult.ok && gamePackageRunWhenDone)
+                    {
+                        std::string launchError;
+                        if (!platform::OpenInDefaultApp(packageResult.executable, &launchError))
+                            packageResult.log += "[BUILD-GAME] could not start the game: " + launchError + "\n";
+                    }
+                    editorImGui.SetGameBuildResult(packageResult.ok, std::move(packageResult.log), packageResult.executable);
                 }
 
                 if (editorPlay.appliedMode == EditorPlayMode::Edit &&
@@ -6657,69 +8791,7 @@ int RunGame(NativeWindow& window,
                     waterSculptStrokeActive = false;
                     editorWaterBodiesDirty = true;
                     terrain.SetWaterSculptBrush(false, 0.0f, 0.0f, 0.0f, true);
-                    // With a player character present, Play hands WASD/Space to the character
-                    // (the editor free-fly would otherwise capture those keys via editorFlyCameraKey).
-                    // Without one, keep free-fly so you can fly around the running simulation.
-                    const bool hasPlayerCharacter = std::any_of(
-                        editorMeshEntities.begin(), editorMeshEntities.end(),
-                        [](const MeshSceneEntity& m) { return m.hasCharacterController && m.characterController.enabled; });
-                    cameraController.SetFreeCameraEnabled(!hasPlayerCharacter);
-                    runtimeSession->Start(SceneManager::Instance().GetCurrentScene());
-                    rebuildEditorPhysicsWorld();
-                    editorCharacterStates.clear();
-                    // Audio: create (+ playOnStart-start) each entity's AudioSource for this Play session.
-                    entityAudioSources.clear();
-                    if (audioEngine.IsInitialized())
-                    {
-                        for (const MeshSceneEntity& audioMesh : editorMeshEntities)
-                        {
-                            if (!audioMesh.hasAudioSource || !audioMesh.audioSource.enabled ||
-                                audioMesh.audioSource.clipAssetId.empty())
-                                continue;
-                            const std::string clipPath = editorImGui.AudioClipFilePath(audioMesh.audioSource.clipAssetId);
-                            if (clipPath.empty())
-                                continue;
-                            ixaudio::AudioSourceRuntime rt;
-                            if (audioEngine.CreateSource(rt, audioMesh.audioSource, clipPath))
-                            {
-                                if (audioMesh.audioSource.playOnStart)
-                                    audioEngine.StartSource(rt);
-                                entityAudioSources[audioMesh.id] = std::move(rt);
-                            }
-                        }
-                    }
-                    // Scripting: spin up the subsystem and create one live instance per scripted entity,
-                    // firing OnStart now. A throwing hook must not abort Play, so isolate every call.
-                    entityScripts.clear();
-                    scriptSystem = std::make_unique<ixscript::ScriptSystem>(scriptApi);
-                    for (const MeshSceneEntity& scriptMesh : editorMeshEntities)
-                    {
-                        if (!scriptMesh.hasScript || !scriptMesh.script.enabled)
-                            continue;
-                        std::unique_ptr<ixscript::ScriptInstance> instance =
-                            scriptSystem->CreateInstance(scriptMesh.id, scriptMesh.script);
-                        if (!instance)
-                            continue;
-                        try
-                        {
-                            instance->OnStart();
-                        }
-                        catch (const std::exception& e)
-                        {
-                            TraceError("[SCRIPT] OnStart threw entity=%u: %s", scriptMesh.id, e.what());
-                        }
-                        catch (...)
-                        {
-                            TraceError("[SCRIPT] OnStart threw entity=%u (unknown)", scriptMesh.id);
-                        }
-                        entityScripts[scriptMesh.id] = std::move(instance);
-                    }
-                    Tracenf("[SCRIPT] Play started: %zu live script instance(s)", entityScripts.size());
-                    editorPlayerLookDx = 0.0f;
-                    editorPlayerLookDy = 0.0f;
-                    editorPlay.state.frameCount = 0;
-                    editorPlay.state.elapsedSeconds = 0.0;
-                    editorPlay.appliedMode = editorPlay.state.mode;
+                    startPlaySession();
                     Tracen("[EDIT-PLAY] Default runtime Play mode enabled (no player UI, network, or character)");
                     Tracen("[EDIT-PLAY] Play Mode active");
                 }
@@ -6743,7 +8815,11 @@ int RunGame(NativeWindow& window,
                     }
                     entityScripts.clear();
                     scriptSystem.reset();
+                    scriptApi.ResetTransportAndPrompts();  // close script streams, forget prompts
+                    rmlUi.CloseAllGameDocuments();         // the game's UI ends with the Play session
                     entityAudioSources.clear();  // dtors stop + uninit every ma_sound
+                    entityParticles.clear();     // the simulators are Play-session state
+                    particleRenderer.ResetGpuEmitters();
                     editorWaterBodiesDirty = true;
                     if (editorPlay.playStartSceneWasOpen)
                     {
@@ -6906,7 +8982,7 @@ int RunGame(NativeWindow& window,
                     {
                         AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
                             ProjectManager::Instance().AssetRootPath());
-                        if (projectAssets.Initialize())
+                        if (projectAssets.InitializeReadOnly())
                         {
                             auto entry = projectAssets.FindById(assetId);
                             if (entry && entry->category == AssetLibrary::Category::Model)
@@ -6919,7 +8995,7 @@ int RunGame(NativeWindow& window,
                     if (auto root = assets.RootPath())
                     {
                         AssetLibrary engineAssets(*root);
-                        if (engineAssets.Initialize())
+                        if (engineAssets.InitializeReadOnly())
                         {
                             auto entry = engineAssets.FindById(assetId);
                             if (entry && entry->category == AssetLibrary::Category::Model)
@@ -6997,56 +9073,6 @@ int RunGame(NativeWindow& window,
                         spawn.x,
                         spawn.y,
                         spawn.z);
-                };
-                auto resolvePrefabAssetPath = [&](const std::string& assetId)
-                    -> std::optional<std::pair<AssetLibrary::Entry, std::filesystem::path>> {
-                    if (assetId.empty())
-                        return std::nullopt;
-                    if (ProjectManager::Instance().HasProject())
-                    {
-                        AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
-                            ProjectManager::Instance().AssetRootPath());
-                        if (projectAssets.Initialize())
-                        {
-                            auto entry = projectAssets.FindById(assetId);
-                            if (entry && entry->category == AssetLibrary::Category::Prefab)
-                                return std::make_pair(*entry, projectAssets.AbsolutePath(*entry));
-                        }
-                    }
-                    if (auto root = assets.RootPath())
-                    {
-                        AssetLibrary engineAssets(*root);
-                        if (engineAssets.Initialize())
-                        {
-                            auto entry = engineAssets.FindById(assetId);
-                            if (entry && entry->category == AssetLibrary::Category::Prefab)
-                                return std::make_pair(*entry, engineAssets.AbsolutePath(*entry));
-                        }
-                    }
-                    return std::nullopt;
-                };
-                auto loadPrefabDocument = [&](const std::string& assetId)
-                    -> std::optional<std::pair<prefab::PrefabDocument, std::filesystem::path>> {
-                    const auto resolved = resolvePrefabAssetPath(assetId);
-                    if (!resolved)
-                    {
-                        TraceError("[PREFAB] load failed: asset not found id=%s", assetId.c_str());
-                        return std::nullopt;
-                    }
-                    std::ifstream file(resolved->second, std::ios::binary);
-                    if (!file)
-                    {
-                        TraceError("[PREFAB] load failed: unreadable path=%s", resolved->second.string().c_str());
-                        return std::nullopt;
-                    }
-                    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-                    prefab::PrefabDocument prefabData = prefab::ParseDocument(text, resolved->first.displayName);
-                    if (prefabData.entities.empty())
-                    {
-                        TraceError("[PREFAB] load failed: unsupported file=%s", resolved->second.string().c_str());
-                        return std::nullopt;
-                    }
-                    return std::make_pair(std::move(prefabData), resolved->second);
                 };
                 auto selectedPrefabRoot = [&]() -> std::optional<std::pair<HierarchyEntityType, std::uint32_t>> {
                     if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
@@ -7219,7 +9245,7 @@ int RunGame(NativeWindow& window,
 
                     AssetLibrary projectAssets(ProjectManager::Instance().ProjectRoot(),
                         ProjectManager::Instance().AssetRootPath());
-                    if (!projectAssets.Initialize())
+                    if (!projectAssets.InitializeReadOnly())
                     {
                         std::filesystem::remove(tempPath, ec);
                         runtimeSession->SetEditorStatus("Prefab create failed: asset library");
@@ -7227,6 +9253,7 @@ int RunGame(NativeWindow& window,
                     }
                     AssetLibrary::ImportOptions options;
                     options.displayName = prefabName;
+                    options.subpath = editorImGui.CurrentAssetFolder();  // where the asset browser is
                     options.tags = {"prefab"};
                     AssetLibrary::Entry entry;
                     std::string error;
@@ -8506,7 +10533,7 @@ int RunGame(NativeWindow& window,
                         [](const EditorAttachedComponent& component) { return component.type == "rendering.lod"; });
                     if (existing == it->editorComponents.end())
                         it->editorComponents.push_back({"rendering.lod", "LOD Group", "Rendering", {}});
-                    const std::optional<LodConfig> assetDefault = editorImGui.FindModelLodDefault(it->meshAssetId);
+                    const std::optional<LodConfig> assetDefault = findModelLodDefault(it->meshAssetId);
                     it->lod.enabled = true;
                     it->lod.overrideAssetDefault = false;
                     it->lod.config = assetDefault.value_or(LodConfig{});
@@ -8611,6 +10638,17 @@ int RunGame(NativeWindow& window,
                         Tracenf("[INSPECTOR-COMP] remove entity=%u component=Script", it->id);
                         return true;
                     }
+                    if (componentType == "effects.particle_system")
+                    {
+                        if (!it->hasParticleSystem)
+                            return false;
+                        it->hasParticleSystem = false;
+                        it->particleSystem = {};
+                        entityParticles.erase(it->id);
+                        SceneManager::Instance().MarkDirty();
+                        Tracenf("[INSPECTOR-COMP] remove entity=%u component=Particle System", it->id);
+                        return true;
+                    }
                     const std::size_t oldSize = it->editorComponents.size();
                     it->editorComponents.erase(std::remove_if(it->editorComponents.begin(), it->editorComponents.end(),
                         [&](const EditorAttachedComponent& component) { return component.type == componentType; }),
@@ -8640,7 +10678,8 @@ int RunGame(NativeWindow& window,
                         it->hasScript = true;
                         it->script = {};
                         it->script.backend = commands.attachScriptBackend;
-                        if (commands.attachScriptBackend == ixscript::ScriptBackendType::Lua)
+                        if (commands.attachScriptBackend == ixscript::ScriptBackendType::Lua ||
+                            commands.attachScriptBackend == ixscript::ScriptBackendType::AngelScript)
                             it->script.scriptAssetId = commands.attachScriptAssetId;
                         else
                             it->script.nativeClassName = commands.attachScriptClassName;
@@ -8674,7 +10713,8 @@ int RunGame(NativeWindow& window,
                         commands.addComponentType == EditorComponentType::CharacterController ||
                         commands.addComponentType == EditorComponentType::AudioSource ||
                         commands.addComponentType == EditorComponentType::AudioListener ||
-                        commands.addComponentType == EditorComponentType::Script)
+                        commands.addComponentType == EditorComponentType::Script ||
+                        commands.addComponentType == EditorComponentType::ParticleSystem)
                     {
                         if (selectedEditorObject.type == SelectedEditorObjectType::MeshEntity)
                         {
@@ -8761,6 +10801,13 @@ int RunGame(NativeWindow& window,
                                     it->script = {};
                                     Tracenf("[INSPECTOR-COMP] add entity=%u component=Script", it->id);
                                     runtimeSession->SetEditorStatus("Added Script component");
+                                }
+                                else if (commands.addComponentType == EditorComponentType::ParticleSystem)
+                                {
+                                    it->hasParticleSystem = true;
+                                    it->particleSystem = {};
+                                    Tracenf("[INSPECTOR-COMP] add entity=%u component=Particle System", it->id);
+                                    runtimeSession->SetEditorStatus("Added Particle System component");
                                 }
                                 else
                                 {
@@ -8955,7 +11002,7 @@ int RunGame(NativeWindow& window,
                     TerrainSceneData next = NormalizeTerrainCreateRequest(commands.terrainCreate);
                     if (next.name.empty())
                         next.name = makeUniqueSceneEntityName("Terrain");
-                    if (terrain.CreateFlatTerrain(device, next))
+                    if (terrain.CreateFlatTerrain(*rhiDevice, next))
                     {
                         editorWaterBodies.clear();
                         editorWaterBodiesDirty = true;
@@ -9276,6 +11323,212 @@ int RunGame(NativeWindow& window,
                     SceneManager::Instance().MarkDirty();
                 }
 
+                showLayerVolumes = commands.showLayerVolumes;
+                if (commands.generateLayers || commands.exportLayers)
+                {
+                    // Bake only on explicit authoring actions, using the latest
+                    // scene state and the collision triangles used by physics.
+                    const auto sourceScene = sceneRuntime.BuildSceneSnapshot();
+                    const auto bakeBegin = std::chrono::steady_clock::now();
+                    const bool generated = GenerateSceneLayers(sourceScene,
+                        [&](const MeshSceneEntity& mesh,
+                            std::vector<std::array<float, 3>>& vertices,
+                            std::vector<std::uint32_t>& indices) {
+                            auto* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+                            return renderer && renderer->CopyPhysicsMesh(vertices, indices);
+                        }, layerAuthoringPreview);
+                    const double bakeMs = MillisecondsBetween(bakeBegin, std::chrono::steady_clock::now());
+                    Tracenf("[LAYER-AUTHORING] generated=%s sources=%zu triangles=%zu volumes=%zu elapsed_ms=%.3f",
+                        generated ? "yes" : "no", layerAuthoringPreview.geometry.meshes_seen,
+                        layerAuthoringPreview.geometry.triangles_seen, layerAuthoringPreview.world.volumes.size(), bakeMs);
+                    std::string status;
+                    if (!generated)
+                    {
+                        status = "Layer generation failed";
+                        for (const auto& error : layerAuthoringPreview.errors)
+                        {
+                            status += "\n" + error;
+                            Tracenf("[LAYER-AUTHORING] %s", error.c_str());
+                        }
+                    }
+                    else
+                    {
+                        const auto& clearance = layerAuthoringPreview.clearance;
+                        status = "Generated " + std::to_string(layerAuthoringPreview.world.volumes.size()) +
+                            " volumes from collision. Snapshot: regenerate after edits.";
+                        status += "\nClearance (capsule r=0.35 h=1.8): " + std::to_string(clearance.cells_blocked) +
+                            " of " + std::to_string(clearance.cells_total) + " cells blocked by " +
+                            std::to_string(layerAuthoringPreview.obstructionSources) + " static colliders" +
+                            (clearance.terrain_quads_tested > 0 ? " + terrain" : "") + " or open ledges (" +
+                            std::to_string(clearance.cells_eroded) + " ledge cells).";
+                        status += "\nProven step/ramp portals: " + std::to_string(clearance.portals_derived) +
+                            " (edges above step height: " + std::to_string(clearance.edges_rejected_step) + ").";
+                        status += "\nProven terrain edges: " + std::to_string(clearance.terrain_edges_derived) +
+                            " (volume sides level with the terrain, step <= 0.35 m).";
+                        status += "\nPreview draws up to 256 volumes. Terrain retains its heightfield.";
+                        Tracenf("[LAYER-CLEARANCE] cells=%llu blocked=%llu eroded=%llu corridor_eroded=%llu obstruction_sources=%zu mesh_triangles=%zu terrain_quads=%llu portals=%zu terrain_edges=%zu rejected_steps=%zu corridor_cells=%llu corridor_blocked=%llu",
+                            static_cast<unsigned long long>(clearance.cells_total),
+                            static_cast<unsigned long long>(clearance.cells_blocked),
+                            static_cast<unsigned long long>(clearance.cells_eroded),
+                            static_cast<unsigned long long>(clearance.corridor_slots_eroded),
+                            layerAuthoringPreview.obstructionSources, clearance.obstruction_triangles,
+                            static_cast<unsigned long long>(clearance.terrain_quads_tested), clearance.portals_derived,
+                            clearance.terrain_edges_derived,
+                            clearance.edges_rejected_step, static_cast<unsigned long long>(clearance.corridor_slots),
+                            static_cast<unsigned long long>(clearance.corridor_slots_blocked));
+                        for (std::size_t i = 0; i < std::min<std::size_t>(8, layerAuthoringPreview.world.volumes.size()); ++i)
+                        {
+                            const auto& volume = layerAuthoringPreview.world.volumes[i];
+                            status += "\n#" + std::to_string(volume.id) + " " + mx::map::ToString(volume.kind) +
+                                " height [" + std::to_string(volume.min_z) + ", " + std::to_string(volume.max_z) + ") m";
+                        }
+                        if (commands.exportLayers)
+                        {
+                            const std::filesystem::path scenePath(SceneManager::Instance().GetCurrentScenePath());
+                            if (scenePath.empty())
+                                status += "\nSave the scene before exporting layer metadata.";
+                            else
+                            {
+                                const auto suffix = std::chrono::system_clock::now().time_since_epoch().count();
+                                auto layerDirectory = scenePath.stem();
+                                layerDirectory += ".layers";
+                                const auto exportPath = scenePath.parent_path() / layerDirectory /
+                                    ("export-" + std::to_string(suffix)) / "layered_world.mx3d";
+                                std::string error;
+                                if (ExportSceneLayerSidecar(exportPath, layerAuthoringPreview, error))
+                                    status += "\nExported: " + exportPath.string();
+                                else
+                                    status += "\nExport failed: " + error;
+                            }
+                        }
+                    }
+                    editorImGui.SetLayerAuthoringStatus(status);
+                    runtimeSession->SetEditorStatus(status);
+                }
+                if (commands.exportServerWorld && editorPlay.state.mode == EditorPlayMode::Edit)
+                {
+                    const std::filesystem::path scenePath(SceneManager::Instance().GetCurrentScenePath());
+                    std::string status;
+                    if (scenePath.empty())
+                        status = "Save the scene before exporting a server world.";
+                    else
+                    {
+                        const auto suffix = std::chrono::system_clock::now().time_since_epoch().count();
+                        auto worldDirectory = scenePath.stem();
+                        worldDirectory += ".server-worlds";
+                        const auto exportPath = scenePath.parent_path() / worldDirectory /
+                            ("export-" + std::to_string(suffix));
+                        SceneWorldExportOptions options;
+                        options.worldId = commands.serverWorldId;
+                        options.spawnX = commands.serverWorldSpawnX;
+                        options.spawnZ = commands.serverWorldSpawnZ;
+                        options.spawnVolumeId = commands.serverWorldSpawnVolume;
+                        SceneWorldPackageResult result;
+                        const bool exported = ExportSceneServerWorld(exportPath, sceneRuntime.BuildSceneSnapshot(),
+                            [&](const MeshSceneEntity& mesh, std::vector<std::array<float, 3>>& vertices,
+                                std::vector<std::uint32_t>& indices) {
+                                auto* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+                                return renderer && renderer->CopyPhysicsMesh(vertices, indices);
+                            }, options, result);
+                        if (exported)
+                        {
+                            layerAuthoringPreview = std::move(result.layers);
+                            const auto pathUtf8 = exportPath.u8string();
+                            status = "Strict server world exported: " + std::string(pathUtf8.begin(), pathUtf8.end());
+                            status += "\nPhysical terrain diagonal; height layer v3. Files: " +
+                                std::to_string(result.files.size());
+                            status += "\nMaximum vertex height quantization error: " +
+                                std::to_string(result.maxHeightErrorMeters) + " m.";
+                            status += "\nMaximum grid position difference: " +
+                                std::to_string(result.maxGridPositionErrorMeters) + " m.";
+                        }
+                        else
+                        {
+                            status = "Server world export failed";
+                            for (std::size_t i = 0; i < std::min<std::size_t>(8, result.errors.size()); ++i)
+                                status += "\n" + result.errors[i];
+                        }
+                        Tracenf("[WORLD-AUTHORING] exported=%s files=%zu max_height_error_m=%.8f",
+                            exported ? "yes" : "no", result.files.size(), result.maxHeightErrorMeters);
+                    }
+                    editorImGui.SetLayerAuthoringStatus(status);
+                    runtimeSession->SetEditorStatus(status);
+                }
+                if ((commands.placeLayerGround || commands.moveLayerGround) &&
+                    editorPlay.state.mode == EditorPlayMode::Edit)
+                {
+                    auto freshWorld = std::make_unique<SceneLayerAuthoringResult>();
+                    const bool generated = GenerateSceneLayers(sceneRuntime.BuildSceneSnapshot(),
+                        [&](const MeshSceneEntity& mesh, std::vector<std::array<float, 3>>& vertices,
+                            std::vector<std::uint32_t>& indices) {
+                            auto* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(mesh));
+                            return renderer && renderer->CopyPhysicsMesh(vertices, indices);
+                        }, *freshWorld);
+                    std::string status;
+                    mx::map::LayerGroundResult result;
+                    bool queried = false;
+                    if (!generated)
+                    {
+                        status = "Support probe: scene support generation failed.";
+                        for (std::size_t i = 0; i < std::min<std::size_t>(8, freshWorld->errors.size()); ++i)
+                            status += "\n" + freshWorld->errors[i];
+                    }
+                    else if (commands.placeLayerGround)
+                    {
+                        // 3D-4B: the probe is the default character capsule.
+                        auto freshProbe = std::make_unique<SceneLayerGround>(freshWorld->world, SceneLayerActorProfile());
+                        if (!freshProbe->MatchesWorld(freshWorld->world))
+                            status = "Support probe: scene bake cannot be encoded; placement refused.";
+                        else
+                        {
+                            result = freshProbe->Place(commands.layerGroundVolume,
+                                commands.layerGroundX, commands.layerGroundZ);
+                            queried = true;
+                            if (result.Ok())
+                            {
+                                layerGroundProbe.reset();
+                                layerGroundWorld = std::move(freshWorld);
+                                layerGroundProbe = std::move(freshProbe);
+                                layerAuthoringPreview = *layerGroundWorld;
+                            }
+                        }
+                    }
+                    else if (!layerGroundProbe)
+                        status = "Support probe: place a probe before moving it.";
+                    else if (!layerGroundProbe->MatchesWorld(freshWorld->world))
+                    {
+                        layerGroundProbe.reset();
+                        layerGroundWorld.reset();
+                        status = "Support probe: scene changed; place a new probe for this bake.";
+                    }
+                    else
+                    {
+                        result = layerGroundProbe->Move(commands.layerGroundVolume,
+                            commands.layerGroundX, commands.layerGroundZ);
+                        queried = true;
+                    }
+                    if (queried)
+                    {
+                        status = "Support probe: " + std::string(mx::map::ToString(result.status));
+                        if (result.Ok() && result.portal_id != 0)
+                            status += " via proven portal " + std::to_string(result.portal_id);
+                        if (layerGroundProbe && layerGroundProbe->HasState())
+                        {
+                            const auto& pose = layerGroundProbe->State();
+                            const auto& enginePoint = layerGroundProbe->EnginePosition();
+                            status += "\nVolume " + std::to_string(pose.volume_id) +
+                                ", layer " + std::to_string(pose.layer_id);
+                            status += "\nEngine X/Y/Z (m): " + std::to_string(enginePoint[0]) + ", " +
+                                std::to_string(enginePoint[1]) + ", " + std::to_string(enginePoint[2]);
+                        }
+                        status += "\nCapsule r=0.35 h=1.8 against cooked clearance; no server connection.";
+                        Tracenf("[LAYER-SUPPORT] action=%s status=%s portal=%u target_volume=%u x=%.6f z=%.6f",
+                            commands.placeLayerGround ? "place" : "move", mx::map::ToString(result.status),
+                            result.portal_id, commands.layerGroundVolume, commands.layerGroundX, commands.layerGroundZ);
+                    }
+                    editorImGui.SetLayerAuthoringStatus(status);
+                    runtimeSession->SetEditorStatus(status);
+                }
                 logStaticMeshSpatialMutations();
 
                 auto floatDiffers = [](float a, float b, float epsilon = 0.0005f) {
@@ -9713,7 +11966,7 @@ int RunGame(NativeWindow& window,
                 TerrainEditorState terrainState{};
                 if (terrainOk && terrain.HasTerrain())
                 {
-                    const TerrainSceneData terrainData = terrain.GetTerrainSceneData();
+                    const TerrainSceneData terrainData = terrain.GetTerrainSceneInfo();
                     terrainState = BuildTerrainEditorState(
                         terrainData,
                         selectedEditorObject.type == SelectedEditorObjectType::Terrain);
@@ -9730,12 +11983,14 @@ int RunGame(NativeWindow& window,
                 }
                 frameProfile.hierarchyIterationMs = MillisecondsBetween(hierarchyBegin, std::chrono::steady_clock::now());
 
+                // The Sky panel edits the editor's copy; the renderer and the scene snapshot use sceneSky.
+                sceneSky = editorImGui.GetSkySettings();
                 LightingState lightingState = editorImGui.GetLightingState();
                 const bool editorHideEntities = editorPlay.state.mode == EditorPlayMode::Edit;
                 lightingState.numPointLights = 0;
                 for (const PointLight& light : editorPointLights)
                 {
-                    if (editorHideEntities && light.editorHidden)
+                    if (!light.effectiveEnabled || (editorHideEntities && light.editorHidden))
                         continue;
                     if (lightingState.numPointLights >= kMaxDynamicPointLights)
                         break;
@@ -9744,11 +11999,19 @@ int RunGame(NativeWindow& window,
                 lightingState.numSpotLights = 0;
                 for (const SpotLight& light : editorSpotLights)
                 {
-                    if (editorHideEntities && light.editorHidden)
+                    if (!light.effectiveEnabled || (editorHideEntities && light.editorHidden))
                         continue;
                     if (lightingState.numSpotLights >= kMaxDynamicSpotLights)
                         break;
                     lightingState.spotLights[lightingState.numSpotLights++] = light;
+                }
+                if (sceneSky.ambientFromSky && skyOk)
+                {
+                    // Last frame's sky average (the sky updates during rendering): close enough.
+                    const std::array<float, 3> skyAmbient = skyRenderer.AverageColor();
+                    lightingState.ambient.r = skyAmbient[0];
+                    lightingState.ambient.g = skyAmbient[1];
+                    lightingState.ambient.b = skyAmbient[2];
                 }
                 editorImGui.SetLightingState(lightingState);
                 terrain.SetLightingState(lightingState);
@@ -9764,9 +12027,17 @@ int RunGame(NativeWindow& window,
                     waterMaterialUsageCounts.push_back(usage);
                 editorImGui.SetWaterMaterialUsageCounts(std::move(waterMaterialUsageCounts));
 
-                const auto waterMaterials = editorImGui.GetWaterMaterialsSnapshot();
-                editorImGui.SetWaterMaterials(waterMaterials);
-                terrain.SetWaterMaterials(waterMaterials);
+                // Reading the water materials walks the asset library and the terrain rebuilds their
+                // signatures from it (~0.25 ms): only when they may have changed.
+                const std::uint64_t waterMaterialsRevision = editorImGui.WaterMaterialsRevision();
+                if (!waterMaterialsSynced || waterMaterialsRevision != syncedWaterMaterialsRevision)
+                {
+                    const auto waterMaterials = editorImGui.GetWaterMaterialsSnapshot();
+                    editorImGui.SetWaterMaterials(waterMaterials);
+                    terrain.SetWaterMaterials(waterMaterials);
+                    syncedWaterMaterialsRevision = waterMaterialsRevision;
+                    waterMaterialsSynced = true;
+                }
                 if (editorWaterBodiesDirty)
                 {
                     std::vector<WaterBody> terrainWaterBodies = editorWaterBodies;
@@ -9778,11 +12049,11 @@ int RunGame(NativeWindow& window,
                         terrainWaterBodies.erase(std::remove_if(terrainWaterBodies.begin(),
                             terrainWaterBodies.end(),
                             [](const WaterBody& body) { return body.editorHidden; }), terrainWaterBodies.end());
-                        terrain.SetWaterBodies(device, terrainWaterBodies);
+                        terrain.SetWaterBodies(*rhiDevice, terrainWaterBodies);
                     }
                     else
                     {
-                        terrain.SetWaterBodies(device, terrainWaterBodies);
+                        terrain.SetWaterBodies(*rhiDevice, terrainWaterBodies);
                         editorWaterBodies = terrain.GetWaterBodies();
                     }
                     if (waterSculptMeshRegenPending &&
@@ -9805,20 +12076,20 @@ int RunGame(NativeWindow& window,
                     waterSculptMeshRegenPending = false;
                     editorWaterBodiesDirty = false;
                 }
-                terrain.SetSelectedWaterBodyHighlight(device, 0u);
-                // Push the finalized lighting to every cached skinned model, and stash it so a
-                // model loaded later this frame is seeded lit at create time (getSkinnedMeshRenderer).
-                skinnedCacheLighting = lightingState;
+                terrain.SetSelectedWaterBodyHighlight(*rhiDevice, 0u);
+                // Push the finalized lighting to every cached skinned model, and stash it for the
+                // static meshes' draws and a model finished later (finishSkinnedMeshLoad).
+                frameLighting = lightingState;
                 for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
                 {
                     (void)skinnedPath;
-                    if (skinnedEntry.renderer)
+                    if (skinnedEntry.state == SkinnedMeshCacheEntry::State::Loaded)
                         skinnedEntry.renderer->SetLightingState(lightingState);
                 }
                 if (commands.paletteSlotChanged)
                 {
                     syncTerrainAssetRoots();
-                    if (!terrain.ApplyPaletteSlotChange(device, commands.paletteSlotData))
+                    if (!terrain.ApplyPaletteSlotChange(*rhiDevice, commands.paletteSlotData))
                     {
                         Tracenf("[MAIN] failed to apply terrain palette slot %u", commands.paletteSlot);
                     }
@@ -9866,7 +12137,7 @@ int RunGame(NativeWindow& window,
                 }
                 if (commands.undo)
                     terrain.RequestEditorUndo();
-                terrain.UpdateEditor(device, deltaSeconds, frameCamera, renderSize.width, renderSize.height);
+                terrain.UpdateEditor(*rhiDevice, deltaSeconds, frameCamera, renderSize.width, renderSize.height);
                 if (commands.reload)
                 {
                     editorWaterBodies = terrain.GetWaterBodies();
@@ -9874,7 +12145,37 @@ int RunGame(NativeWindow& window,
                     for (const WaterBody& body : editorWaterBodies)
                         nextEditorWaterBodyId = std::max(nextEditorWaterBodyId, body.id + 1u);
                 }
-                SceneManager::Instance().SetCurrentSceneSnapshot(sceneRuntime.BuildSceneSnapshot());
+                // The scene snapshot mirrors the editor state for the save / status bar / settings /
+                // physics readers; it does not need a rebuild every frame (it copies the whole scene
+                // twice). A save refreshes the full snapshot on demand (SnapshotRefresher), so a low
+                // cadence is safe: every 4th frame while the scene is dirty, otherwise every 60th.
+                if (SceneManager::Instance().IsDirty()
+                        ? (editorSnapshotTick % 4u) == 0u
+                        : (editorSnapshotTick % 60u) == 0u)
+                {
+                    sceneRuntime.BuildSceneSnapshot(frameSceneSnapshot, /*includeTerrainGrids=*/false);
+                    SceneManager::Instance().SetCurrentSceneSnapshot(frameSceneSnapshot);
+                }
+                ++editorSnapshotTick;
+            }
+#else
+            // Include spawned lights and inherited activation in standalone games too.
+            frameLighting = editorImGui.GetLightingState();
+            frameLighting.numPointLights = 0;
+            for (const auto& light : editorPointLights)
+                if (light.effectiveEnabled && frameLighting.numPointLights < kMaxDynamicPointLights)
+                    frameLighting.pointLights[frameLighting.numPointLights++] = light;
+            frameLighting.numSpotLights = 0;
+            for (const auto& light : editorSpotLights)
+                if (light.effectiveEnabled && frameLighting.numSpotLights < kMaxDynamicSpotLights)
+                    frameLighting.spotLights[frameLighting.numSpotLights++] = light;
+            editorImGui.SetLightingState(frameLighting);
+            terrain.SetLightingState(frameLighting);
+            for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
+            {
+                (void)skinnedPath;
+                if (skinnedEntry.state == SkinnedMeshCacheEntry::State::Loaded)
+                    skinnedEntry.renderer->SetLightingState(frameLighting);
             }
 #endif
         }
@@ -9882,7 +12183,32 @@ int RunGame(NativeWindow& window,
         // IXRHI frame authority (Phase 3C): the backend acquires, records,
         // submits and presents. SwapchainRecreated runs the shared resize
         // orchestration; Skip renders nothing; DeviceLost exits gracefully.
+#if defined(IXTREEME_WITH_EDITOR)
+        // Before the frame records anything: recreating a target waits for the GPU and swaps the
+        // textures the editor UI shows.
+        if (offscreenSceneOk && renderResolutionUseNative && editorImGui.IsSceneViewVisible() &&
+            sceneViewResize.Due(effectiveRenderExtent(), VkExtent2D{offscreenScene.Width(), offscreenScene.Height()}))
+        {
+            recreateOffscreenScene("view-panel-size");
+        }
+        if (gameViewOk && renderResolutionUseNative && runtimeSession->IsMapEditorOpen() && editorImGui.IsGameViewVisible() &&
+            gameViewResize.Due(gameViewRenderExtent(), VkExtent2D{gameView.Width(), gameView.Height()}))
+        {
+            const VkExtent2D gameExtent = gameViewRenderExtent();
+            Tracenf("[RENDER-RES] game view %ux%u -> %ux%u (panel size)",
+                gameView.Width(), gameView.Height(), gameExtent.width, gameExtent.height);
+            gameViewOk = gameView.Recreate(*rhiDevice, gameExtent.width, gameExtent.height,
+                offscreenColorFormat, offscreenDepthFormat);
+            if (gameViewOk)
+                editorAdapter->SetGameViewTexture(gameView.GetDisplayTexture(), gameView.GetSampler(),
+                    gameView.Width(), gameView.Height());
+            else
+                editorAdapter->SetGameViewTexture(nullptr, nullptr, 0, 0);
+        }
+#endif
+        const auto frameWaitBegin = std::chrono::steady_clock::now();
         ixrhi::IXRHIFrame rhiFrame = rhiDevice->BeginFrame();
+        frameProfile.frameWaitMs = MillisecondsBetween(frameWaitBegin, std::chrono::steady_clock::now());
         if (rhiFrame.result == ixrhi::IXRHIFrameResult::SwapchainRecreated)
             handleSwapchainChanged();
         if (rhiFrame.result == ixrhi::IXRHIFrameResult::DeviceLost)
@@ -9895,35 +12221,26 @@ int RunGame(NativeWindow& window,
             const ixrhi::IXRHIFrameInfo& frameInfo = rhiFrame.info;
             const uint64_t frameNumber = frameInfo.frameNumber;
             // Per-frame skin-slot allocation over the per-model skinned cache. Each entry owns
-            // its own MaxSkinSlots() pool; Scene view (+ water reflection) consumes bottom-up,
-            // Game view top-down, both reset lazily once per device frame, so a model drawn in
+            // its own MaxSkinSlots() pool; the Scene view (+ water reflection) and the Game view
+            // take slots from one cursor, reset lazily once per device frame, so a model drawn in
             // BOTH views in one command buffer never overwrites its own poses. UINT32_MAX = skip.
-            auto resetSkinnedCursorsIfNewFrame = [&](SkinnedMeshCacheEntry& e) {
+            auto allocSkinSlot = [&](SkinnedMeshCacheEntry& e) -> std::uint32_t {
                 if (e.cursorsResetFrame != frameNumber)
                 {
-                    e.sceneSlotCursor = 0;
-                    e.gameSlotCursor = SkinnedMeshRenderer::MaxSkinSlots();
+                    e.slotCursor = 0;
                     e.cursorsResetFrame = frameNumber;
                 }
-            };
-            auto allocSceneSkinSlot = [&](SkinnedMeshCacheEntry& e) -> std::uint32_t {
-                resetSkinnedCursorsIfNewFrame(e);
-                if (e.sceneSlotCursor >= e.gameSlotCursor)
+                if (e.slotCursor >= SkinnedMeshRenderer::MaxSkinSlots())
                     return std::numeric_limits<std::uint32_t>::max();
-                return e.sceneSlotCursor++;
-            };
-            auto allocGameSkinSlot = [&](SkinnedMeshCacheEntry& e) -> std::uint32_t {
-                resetSkinnedCursorsIfNewFrame(e);
-                if (e.gameSlotCursor == 0 || e.gameSlotCursor <= e.sceneSlotCursor)
-                    return std::numeric_limits<std::uint32_t>::max();
-                return --e.gameSlotCursor;
+                return e.slotCursor++;
             };
             // Skinned draws recorded by the pre-pass (which issues the compute SkinInstance
             // BEFORE any render pass begins — a compute dispatch + barrier inside a render pass
             // is illegal). The render passes only replay these as RenderInWorld draws:
             //   sceneSkinnedDraws       — networked entities (Scene/offscreen + water reflection)
-            //   sceneEditorSkinnedDraws — editor mesh entities, Scene-view (bottom-up) slots
-            //   gameEditorSkinnedDraws  — editor mesh entities, Game-view (top-down) slots
+            //   sceneEditorSkinnedDraws — editor mesh entities, Scene-view slots
+            //   gameEditorSkinnedDraws  — editor mesh entities, Game-view slots
+            const auto animationBegin = std::chrono::steady_clock::now();
             std::vector<SkinnedDrawRecord> sceneSkinnedDraws;
             std::vector<SkinnedDrawRecord> sceneEditorSkinnedDraws;
             std::vector<SkinnedDrawRecord> gameEditorSkinnedDraws;
@@ -9936,6 +12253,7 @@ int RunGame(NativeWindow& window,
             size_t frameStaticMeshSubmitted = 0;
             size_t frameStaticMeshDrawCalls = 0;
             size_t frameStaticMeshTriangles = 0;
+            size_t frameTreeImpostors = 0;
             size_t frameStaticMeshUniformUpdates = 0;
             size_t frameStaticMeshOverrideActiveDraws = 0;
             size_t frameStaticMeshFrustumCulled = 0;
@@ -9969,7 +12287,7 @@ int RunGame(NativeWindow& window,
                     SkinnedMeshCacheEntry& defaultEntry = skinnedMeshCache[kDefaultCharacterModelPath];
                     for (const auto& entity : entities)
                     {
-                        const std::uint32_t slot = allocSceneSkinSlot(defaultEntry);
+                        const std::uint32_t slot = allocSkinSlot(defaultEntry);
                         if (slot == std::numeric_limits<std::uint32_t>::max())
                             break;
                         defaultSkinned->SkinInstance(*frameInfo.commandList,
@@ -10005,30 +12323,48 @@ int RunGame(NativeWindow& window,
                         ? static_cast<float>(std::clamp(seconds - animPrevFrameSeconds, 0.0, 0.25))
                         : 0.0f;
                     animPrevFrameSeconds = seconds;
+                    const auto renderRecordsBegin = std::chrono::steady_clock::now();
+                    validateStaticMeshRenderRecords();
+                    frameProfile.renderRecordsMs = MillisecondsBetween(renderRecordsBegin, std::chrono::steady_clock::now());
+                    // Each character's pose for the frame, in three steps: here, per entity, what it
+                    // plays (animator, clip or motion state) and its skin slots; then the poses and
+                    // bone palettes, in parallel (IX_PARALLEL_ANIMATION); then the skinning dispatches,
+                    // recorded on this thread in entity order.
+                    struct SkinWork
+                    {
+                        SkinnedMeshRenderer* renderer = nullptr;
+                        ixanim::AnimatorRuntime* animator = nullptr;  // evaluated first, wins
+                        ixanim::ClipPlayback* playback = nullptr;     // the debug clip, else
+                        SkinnedMeshRenderer::MotionState motion = SkinnedMeshRenderer::MotionState::Idle;
+                        std::uint32_t slots[2] = {};                  // Scene view, Game view
+                        std::uint32_t slotCount = 0;
+                    };
+                    std::vector<SkinWork> skinWorks;
                     for (MeshSceneEntity& skinnedEntity : editorMeshEntities)
                     {
-                        if (editorPlay.state.mode == EditorPlayMode::Edit && skinnedEntity.editorHidden)
+                        if (!skinnedEntity.effectiveEnabled || (editorPlay.state.mode == EditorPlayMode::Edit && skinnedEntity.editorHidden))
                             continue;
-                        const std::string skinnedRuntimePath = resolveMeshRuntimePath(skinnedEntity);
+                        const StaticMeshRenderRecord& meshRecord = staticMeshRenderRecord(skinnedEntity);
+                        const std::string& skinnedRuntimePath = meshRecord.runtimePath;
                         // Self-heal: an entity flagged static whose model is actually a rigged
                         // glTF/FBX (static path reports UnsupportedSkinned) is promoted to skinned.
-                        if (!skinnedEntity.skinned)
+                        if (!skinnedEntity.skinned && meshRecord.modelIsSkinned)
                         {
-                            auto skinnedCacheIt = staticMeshCache.find(skinnedRuntimePath);
-                            if (skinnedCacheIt != staticMeshCache.end() &&
-                                skinnedCacheIt->second.state == StaticMeshCacheEntry::State::UnsupportedSkinned)
-                            {
-                                skinnedEntity.skinned = true;
-                                SceneManager::Instance().MarkDirty();
-                            }
+                            skinnedEntity.skinned = true;
+                            SceneManager::Instance().MarkDirty();
                         }
                         if (!skinnedEntity.skinned)
                             continue;
-                        const std::size_t beforeSlotCount = skinnedEntity.materialSlots.size();
-                        EnsureMeshEntityMaterialSlots(skinnedEntity);
-                        if (skinnedEntity.materialSlots.size() != beforeSlotCount)
-                            SceneManager::Instance().MarkDirty();
-                        SkinnedMeshRenderer* skinnedRenderer = getSkinnedMeshRenderer(skinnedRuntimePath);
+                        // (Only when its record was built again: the model or its materials changed.)
+                        if (skinnedEntity.materialSlots.empty() || meshRecord.changedFrame == renderRecordFrame)
+                        {
+                            const std::size_t beforeSlotCount = skinnedEntity.materialSlots.size();
+                            EnsureMeshEntityMaterialSlots(skinnedEntity);
+                            if (skinnedEntity.materialSlots.size() != beforeSlotCount)
+                                SceneManager::Instance().MarkDirty();
+                        }
+                        // Not waited for: the character shows once its model is loaded.
+                        SkinnedMeshRenderer* skinnedRenderer = requestSkinnedMeshRenderer(skinnedRuntimePath);
                         if (!skinnedRenderer)
                             continue;
                         SkinnedMeshCacheEntry& skinnedEntry = skinnedMeshCache[skinnedRuntimePath];
@@ -10041,14 +12377,18 @@ int RunGame(NativeWindow& window,
                             selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
                             selectedEditorObject.id == skinnedEntity.id;
                         const WorldVec3 skinnedPosition{skinnedEntity.position[0],
-                            skinnedEntity.position[1] + skinnedRenderer->GroundOffsetY(),
+                            skinnedEntity.position[1] + skinnedRenderer->GroundOffsetY() * skinnedEntity.scale[1],
                             skinnedEntity.position[2]};
                         const float skinnedYaw = skinnedEntity.rotation[1];
+                        const std::array<float, 3> skinnedScale{skinnedEntity.scale[0], skinnedEntity.scale[1], skinnedEntity.scale[2]};
 
                         // Stage-4 Animator: if an AnimatorController is assigned, evaluate the FSM
                         // and use its pose (highest priority — over the debug clip and MotionState).
-                        ozz::span<const ozz::math::SoaTransform> animatorPose;
-#if defined(IXTREEME_WITH_EDITOR)
+                        // (Its controller and clips resolve through the project asset library, in the
+                        // editor and in the built game alike.)
+                        SkinWork work;
+                        work.renderer = skinnedRenderer;
+                        work.motion = editorMeshMotion;
                         if (!skinnedEntity.animatorControllerId.empty())
                         {
                             const std::string& ctrlId = skinnedEntity.animatorControllerId;
@@ -10109,9 +12449,7 @@ int RunGame(NativeWindow& window,
                                     if (csIt->second.jumpedThisFrame)
                                         ixanim::SetTrigger(animator, "Jump");
                                 }
-                                animatorPose = ixanim::EvaluateAnimator(animator, animDeltaSeconds,
-                                    skinnedRenderer->RestPoseLocals(),
-                                    [&](const std::string& clipId) { return editorImGui.AnimationClipFilePath(clipId); });
+                                work.animator = &animator;
                             }
                         }
                         else
@@ -10120,15 +12458,12 @@ int RunGame(NativeWindow& window,
                             entityControllers.erase(skinnedEntity.id);
                             entityBoundControllerId.erase(skinnedEntity.id);
                         }
-#endif
 
                         // Stage-3 temp binding: if a debug clip is assigned, (re)bind it retargeted
                         // onto this character's skeleton and sample it ONCE this frame. The slots
                         // below then skin from that pose (SkinInstanceFromPose) instead of the
                         // built-in MotionState clip. Sampling here (pre-pass) keeps Scene + Game in
                         // lockstep on the same pose and advances the clock exactly once per frame.
-                        ozz::span<const ozz::math::SoaTransform> retargetedPose;
-#if defined(IXTREEME_WITH_EDITOR)
                         {
                             const std::string& clipId = skinnedEntity.debugAnimationClipId;
                             if (clipId.empty())
@@ -10157,25 +12492,20 @@ int RunGame(NativeWindow& window,
                                 if (auto pbIt = entityClipPlaybacks.find(skinnedEntity.id);
                                     pbIt != entityClipPlaybacks.end() && pbIt->second.ready)
                                 {
-                                    retargetedPose = ixanim::SampleAndRetarget(pbIt->second,
-                                        skinnedRenderer->RestPoseLocals(), animDeltaSeconds);
+                                    work.playback = &pbIt->second;
                                 }
                             }
                         }
-#endif
 
-                        const std::uint32_t sceneSlot = allocSceneSkinSlot(skinnedEntry);
-                        if (sceneSlot != std::numeric_limits<std::uint32_t>::max())
+                        const std::uint32_t sceneSlot = allocSkinSlot(skinnedEntry);
+                        if (sceneSlot != std::numeric_limits<std::uint32_t>::max() &&
+                            skinnedRenderer->ReserveSkinSlot(sceneSlot))
                         {
-                            if (animatorPose.size() != 0)
-                                skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, sceneSlot, animatorPose);
-                            else if (retargetedPose.size() != 0)
-                                skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, sceneSlot, retargetedPose);
-                            else
-                                skinnedRenderer->SkinInstance(*frameInfo.commandList, frameInfo, sceneSlot, editorMeshMotion, static_cast<float>(seconds));
+                            work.slots[work.slotCount++] = sceneSlot;
                             sceneEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, sceneSlot, skinnedPosition, skinnedYaw,
                                 skinnedSelected ? std::array<float, 4>{1.25f, 1.15f, 0.65f, 1.0f}
-                                                : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}});
+                                                : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f},
+                                skinnedScale});
                         }
                         else
                         {
@@ -10190,17 +12520,13 @@ int RunGame(NativeWindow& window,
 
                         if (willRenderGameView)
                         {
-                            const std::uint32_t gameSlot = allocGameSkinSlot(skinnedEntry);
-                            if (gameSlot != std::numeric_limits<std::uint32_t>::max())
+                            const std::uint32_t gameSlot = allocSkinSlot(skinnedEntry);
+                            if (gameSlot != std::numeric_limits<std::uint32_t>::max() &&
+                                skinnedRenderer->ReserveSkinSlot(gameSlot))
                             {
-                                if (animatorPose.size() != 0)
-                                    skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, gameSlot, animatorPose);
-                                else if (retargetedPose.size() != 0)
-                                    skinnedRenderer->SkinInstanceFromPose(*frameInfo.commandList, frameInfo, gameSlot, retargetedPose);
-                                else
-                                    skinnedRenderer->SkinInstance(*frameInfo.commandList, frameInfo, gameSlot, editorMeshMotion, static_cast<float>(seconds));
+                                work.slots[work.slotCount++] = gameSlot;
                                 gameEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, gameSlot, skinnedPosition, skinnedYaw,
-                                    std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}});
+                                    std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f}, skinnedScale});
                             }
                             else
                             {
@@ -10213,7 +12539,62 @@ int RunGame(NativeWindow& window,
                                 }
                             }
                         }
+                        if (work.slotCount > 0 || work.animator || work.playback)
+                            skinWorks.push_back(work);
                     }
+
+                    // The poses and palettes. Each work touches only its entity's animator / clip
+                    // state and its own slots' palettes; a thread samples into scratch of its own.
+                    ixjobs::JobSystem& jobs = ixjobs::JobSystem::Instance();
+                    static const bool parallelAnimation = ixjobs::FeatureEnabled("IX_PARALLEL_ANIMATION");
+                    const std::uint32_t poseThreads = parallelAnimation ? jobs.WorkerCount() + 1u : 1u;
+                    for (const SkinWork& work : skinWorks)
+                        work.renderer->ReserveParallelPalettes(poseThreads);
+                    const ixanim::ClipPathResolver resolveClipPath = [&](const std::string& clipId) {
+                        return editorImGui.AnimationClipFilePath(clipId);
+                    };
+                    const auto prepare = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+                        for (std::uint32_t i = begin; i < end; ++i)
+                        {
+                            SkinWork& work = skinWorks[i];
+                            const ozz::span<const ozz::math::SoaTransform> rest = work.renderer->RestPoseLocals();
+                            ozz::span<const ozz::math::SoaTransform> animatorPose;
+                            ozz::span<const ozz::math::SoaTransform> retargetedPose;
+                            if (work.animator)
+                                animatorPose = ixanim::EvaluateAnimator(*work.animator, animDeltaSeconds, rest, resolveClipPath);
+                            if (work.playback)
+                                retargetedPose = ixanim::SampleAndRetarget(*work.playback, rest, animDeltaSeconds);
+                            const ozz::span<const ozz::math::SoaTransform> pose =
+                                animatorPose.size() != 0 ? animatorPose : retargetedPose;
+                            if (work.slotCount > 0 &&
+                                !work.renderer->PreparePalette(frameInfo, work.slots, work.slotCount, pose,
+                                    work.motion, static_cast<float>(seconds)))
+                                work.slotCount = 0;  // nothing to skin from
+                        }
+                    };
+                    if (parallelAnimation)
+                        jobs.ParallelFor(static_cast<std::uint32_t>(skinWorks.size()), 4, prepare);
+                    else
+                        prepare(0, static_cast<std::uint32_t>(skinWorks.size()), 0);
+                    // The dispatches by model (one pipeline bind each), then one barrier for all their
+                    // outputs before the passes draw them.
+                    std::vector<std::pair<SkinnedMeshRenderer*, std::vector<std::uint32_t>>> skinSlotsByRenderer;
+                    for (const SkinWork& work : skinWorks)
+                    {
+                        if (work.slotCount == 0)
+                            continue;
+                        auto group = std::find_if(skinSlotsByRenderer.begin(), skinSlotsByRenderer.end(),
+                            [&](const auto& entry) { return entry.first == work.renderer; });
+                        if (group == skinSlotsByRenderer.end())
+                            group = skinSlotsByRenderer.insert(skinSlotsByRenderer.end(), {work.renderer, {}});
+                        group->second.insert(group->second.end(), work.slots, work.slots + work.slotCount);
+                    }
+                    for (const auto& [renderer, slots] : skinSlotsByRenderer)
+                        renderer->RecordSkins(*frameInfo.commandList, frameInfo, slots.data(),
+                            static_cast<std::uint32_t>(slots.size()), /*withoutBarrier=*/true);
+                    if (!skinSlotsByRenderer.empty())
+                        frameInfo.commandList->BufferMemoryBarrier(ixrhi::IXRHIBufferState::ShaderWrite,
+                            ixrhi::IXRHIBufferState::VertexRead);
                 }
             }
             else if (runtimeSession->IsLobbyActive())
@@ -10222,31 +12603,610 @@ int RunGame(NativeWindow& window,
                     lobbySkinned->Skin(*frameInfo.commandList, frameInfo, seconds);
             }
 
+            frameProfile.animationMs = MillisecondsBetween(animationBegin, std::chrono::steady_clock::now());
+            frameProfile.skinnedInstances = static_cast<std::uint32_t>(
+                sceneSkinnedDraws.size() + sceneEditorSkinnedDraws.size() + gameEditorSkinnedDraws.size());
             const auto sceneRenderBegin = std::chrono::steady_clock::now();
-            if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableShadowPass)
+            const bool useOffscreenScene = offscreenSceneOk && frameInfo.frameActive;
+            // The editor shows the offscreen scene as its Scene View panel: while that is hidden (the
+            // Game tab in front, as in Play) its draws are skipped; the pass still opens and closes.
+            bool drawSceneView = true;
+            // How the views' floating-point light reaches the screen (Scene Settings > Tone mapping).
+            const ToneMapSettings frameToneMap{std::clamp<std::int32_t>(sceneSky.toneMapping, 0, 2), std::exp2(sceneSky.exposureEv)};
+            // The Scene View's editor outlines: drawn over its tone-mapped image, not into the light.
+            std::vector<SelectionOutlineRenderer::Line> sceneViewOutlineLines;
+            // Each view's alpha-blended draws (Blend materials): after its opaque scene and sky, the
+            // farthest first; those wholly under a water surface before the water, which refracts them.
+            struct TransparentDraw
             {
-                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
-                terrain.RenderSunShadowMap(device, frameCamera);
-                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
+                float distanceSq = 0.0f;  // from the view's camera to the box's centre
+                bool underWater = false;
+                StaticMeshRenderer* renderer = nullptr;
+                StaticMeshRenderer::Instance instance;
+                // Particle emitters: `particleRenderer` set, `particleBatch` points at the emitter's instances.
+                ParticleRenderer* particleRenderer = nullptr;
+                ParticleRenderer::Batch particleBatch;
+            };
+            auto addTransparentDraw = [&](std::vector<TransparentDraw>& draws,
+                                          StaticMeshRenderer* renderer,
+                                          const StaticMeshRenderer::Instance& instance,
+                                          const SpatialIndex::Aabb& bounds,
+                                          const WorldCamera& viewCamera) {
+                TransparentDraw& draw = draws.emplace_back();
+                const float dx = 0.5f * (bounds.min.x + bounds.max.x) - viewCamera.eye.x;
+                const float dy = 0.5f * (bounds.min.y + bounds.max.y) - viewCamera.eye.y;
+                const float dz = 0.5f * (bounds.min.z + bounds.max.z) - viewCamera.eye.z;
+                draw.distanceSq = dx * dx + dy * dy + dz * dz;
+                draw.underWater = terrainOk && terrain.BoxUnderWater(bounds.min, bounds.max);
+                draw.renderer = renderer;
+                draw.instance = instance;
+            };
+            auto sortTransparentDraws = [](std::vector<TransparentDraw>& draws) {
+                std::stable_sort(draws.begin(), draws.end(), [](const TransparentDraw& a, const TransparentDraw& b) {
+                    return a.distanceSq > b.distanceSq;
+                });
+            };
+            auto drawTransparents = [&](const std::vector<TransparentDraw>& draws,
+                                        bool underWater,
+                                        const WorldCamera& viewCamera,
+                                        std::uint32_t width,
+                                        std::uint32_t height) {
+                for (const TransparentDraw& draw : draws)
+                {
+                    if (draw.underWater != underWater)
+                        continue;
+                    if (draw.particleRenderer)
+                    {
+                        draw.particleRenderer->RenderInWorld(*frameInfo.commandList,
+                            frameInfo,
+                            viewCamera,
+                            draw.particleBatch,
+                            width,
+                            height);
+                        continue;
+                    }
+                    draw.renderer->RenderTransparentInWorld(*frameInfo.commandList,
+                        frameInfo,
+                        seconds,
+                        viewCamera,
+                        draw.instance,
+                        width,
+                        height);
+                }
+            };
+            std::vector<TransparentDraw> sceneTransparentDraws;
+            std::vector<TransparentDraw> gameTransparentDraws;
+            // Particle emitters join the same sorted queue as the blend meshes: the water pass splits
+            // them under/above the surface and they blend back-to-front with the transparent meshes.
+            auto collectParticleDraws = [&](std::vector<TransparentDraw>& draws, const WorldCamera& viewCamera,
+                                            bool allowSoftParticles) {
+                // The frame's emitters, in entity order (buildParticleInstances): the GPU ones and the
+                // CPU ones with particles.
+                if (!particleRendererOk)
+                    return;
+                for (const ParticleDrawEmitter& emitter : particleDrawEmitters)
+                {
+                    const MeshSceneEntity& particleMesh = *emitter.mesh;
+                    if (particleMesh.particleSystem.gpuSimulation)
+                    {
+                        // GPU emitter: its state buffer is drawn directly (the compute ran in the
+                        // render pre-pass). The fixed instance count comes from maxParticles.
+                        TransparentDraw& draw = draws.emplace_back();
+                        const float gdx = particleMesh.position[0] - viewCamera.eye.x;
+                        const float gdy = particleMesh.position[1] - viewCamera.eye.y;
+                        const float gdz = particleMesh.position[2] - viewCamera.eye.z;
+                        draw.distanceSq = gdx * gdx + gdy * gdy + gdz * gdz;
+                        const SpatialIndex::Aabb gbounds = {
+                            {particleMesh.position[0] - 0.5f, particleMesh.position[1] - 0.5f,
+                             particleMesh.position[2] - 0.5f},
+                            {particleMesh.position[0] + 0.5f, particleMesh.position[1] + 0.5f,
+                             particleMesh.position[2] + 0.5f}};
+                        draw.underWater = terrainOk && terrain.BoxUnderWater(gbounds.min, gbounds.max);
+                        draw.particleRenderer = &particleRenderer;
+                        ParticleRenderer::Batch& gpuBatch = draw.particleBatch;
+                        gpuBatch.gpu = true;
+                        gpuBatch.gpuEntityId = particleMesh.id;
+                        gpuBatch.additive =
+                            particleMesh.particleSystem.blendMode == ixparticle::ParticleBlendMode::Additive;
+                        gpuBatch.textureAssetId = particleMesh.particleSystem.textureAssetId;
+                        gpuBatch.softParticles =
+                            allowSoftParticles && particleMesh.particleSystem.softParticles;
+                        gpuBatch.softDistance = particleMesh.particleSystem.softDistance;
+                        continue;
+                    }
+
+                    TransparentDraw& draw = draws.emplace_back();
+                    const float dx = particleMesh.position[0] - viewCamera.eye.x;
+                    const float dy = particleMesh.position[1] - viewCamera.eye.y;
+                    const float dz = particleMesh.position[2] - viewCamera.eye.z;
+                    draw.distanceSq = dx * dx + dy * dy + dz * dz;
+                    const SpatialIndex::Aabb bounds = {
+                        {particleMesh.position[0] - 0.5f, particleMesh.position[1] - 0.5f,
+                         particleMesh.position[2] - 0.5f},
+                        {particleMesh.position[0] + 0.5f, particleMesh.position[1] + 0.5f,
+                         particleMesh.position[2] + 0.5f}};
+                    draw.underWater = terrainOk && terrain.BoxUnderWater(bounds.min, bounds.max);
+                    draw.particleRenderer = &particleRenderer;
+
+                    ParticleRenderer::Batch& batch = draw.particleBatch;
+                    batch.additive =
+                        particleMesh.particleSystem.blendMode == ixparticle::ParticleBlendMode::Additive;
+                    batch.textureAssetId = particleMesh.particleSystem.textureAssetId;
+                    // Soft particles only where the scene depth snapshot is bound for this view (the
+                    // Scene View / the game; the editor's Game View has no per-view snapshot yet).
+                    batch.softParticles = allowSoftParticles && particleMesh.particleSystem.softParticles;
+                    batch.softDistance = particleMesh.particleSystem.softDistance;
+                    batch.instanceBase = emitter.instanceBase;
+                    batch.instanceCount = emitter.instanceCount;
+                }
+            };
+            bool sceneWaterPass = false;  // the Scene View's water gets its own pass (after a snapshot)
+            bool sceneSnapshotPass = false;  // the Scene View closes/snapshots/reopens (water)
+            bool sceneParticleSoft = false;  // a visible emitter wants the soft-particle depth fade
+            // The sun shadow map is rendered once and sampled by every view; its cascades are fitted
+            // to the Scene View camera, or to the Game view's while only the Game view is drawn (Play).
+            const WorldCamera* shadowCamera = &frameCamera;
+#if defined(IXTREEME_WITH_EDITOR)
+            drawSceneView = !useOffscreenScene || !runtimeSession->IsMapEditorOpen() || editorImGui.IsSceneViewVisible();
+            // No project or open scene: the panel keeps its image (the default sky) until its camera, size or tone
+            // mapping changes — redrawing the same sky every frame was most of the empty editor's GPU work.
+            if (drawSceneView && useOffscreenScene && runtimeSession->IsMapEditorOpen() &&
+                !ProjectManager::Instance().HasProject() && !SceneManager::Instance().HasOpenScene())
+            {
+                EmptySceneViewKey key;
+                std::memcpy(key.viewProjection, frameCamera.viewProjection.m, sizeof(key.viewProjection));
+                key.width = renderSize.width;
+                key.height = renderSize.height;
+                key.toneMapMode = frameToneMap.mode;
+                key.exposure = frameToneMap.exposure;
+                key.display = offscreenScene.GetDisplayTexture().get();
+                if (emptySceneViewDrawn && *emptySceneViewDrawn == key)
+                    drawSceneView = false;
+                else
+                    emptySceneViewDrawn = key;
             }
-            if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass)
+            else
+            {
+                emptySceneViewDrawn.reset();
+            }
+            // The Game view's camera: the project Main Camera, or in Play the first active player
+            // character's camera (follow/first-person/top-down per its CameraMode).
+            const std::optional<WorldCamera> gameViewCamera = [&]() -> std::optional<WorldCamera> {
+                if (!gameViewOk || !runtimeSession->IsMapEditorOpen() || !editorImGui.IsGameViewVisible())
+                    return std::nullopt;
+                return buildGameCamera(gameView.Width(), gameView.Height());
+            }();
+            if (!drawSceneView && gameViewCamera)
+                shadowCamera = &*gameViewCamera;
+#endif
+            // Particles preview in Edit: keep the emitters simulating while authoring, so the effect
+            // is visible without entering Play. Play steps them in the simulation block instead.
+            if (editorPlay.state.mode == EditorPlayMode::Edit)
+            {
+                const auto particlesBegin = std::chrono::steady_clock::now();
+                updateParticleSimulators(static_cast<float>(deltaSeconds));
+                frameProfile.particlesMs = MillisecondsBetween(particlesBegin, std::chrono::steady_clock::now());
+            }
+            // GPU particle emitters simulate once per frame outside any render pass, in Play and in
+            // Edit alike (the compute writes the buffer the transparent queue draws later).
+            simulateGpuParticleEmitters(*frameInfo.commandList, frameInfo,
+                static_cast<float>(deltaSeconds));
+            // The static models' data finished since (a model's, a material texture's): copied in
+            // before any pass draws them.
+            for (auto& [path, entry] : staticMeshCache)
+            {
+                (void)path;
+                if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
+                    entry.renderer->RecordPendingUploads(*frameInfo.commandList, frameInfo);
+            }
+            {
+                const auto instancesBegin = std::chrono::steady_clock::now();
+                buildParticleInstances(frameInfo);
+                frameProfile.particleInstancesMs = MillisecondsBetween(instancesBegin, std::chrono::steady_clock::now());
+            }
+
+            // The sky's parameters for this frame, before any pass draws it (outside render passes:
+            // a changed sky image is loaded here). Its sun follows the scene's Sun light.
+            // The Sun the sky and the god rays follow.
+#if defined(IXTREEME_WITH_EDITOR)
+            const LightingState frameSunLighting = editorImGui.GetLightingState();
+#else
+            const LightingState frameSunLighting = SceneManager::Instance().GetCurrentScene().lighting;
+#endif
+            if (skyOk && isInWorld)
+            {
+#if defined(IXTREEME_WITH_EDITOR)
+                editorImGui.SetSkyStatus(skyRenderer.Status());
+#endif
+                skyRenderer.Update(frameInfo,
+                    sceneSky,
+                    frameSunLighting,
+                    ProjectManager::Instance().HasProject() ? ProjectManager::Instance().ProjectRoot()
+                                                            : std::filesystem::path{});
+            }
+            // Sculpted terrain vertices reach the drawn vertex buffer before any pass draws the terrain
+            // (outside render passes: nothing is open yet here).
+            if (isInWorld && hasSceneTerrain)
+                terrain.UploadEditedTerrain(*frameInfo.commandList, frameInfo);
+            // Every terrain and mesh draw binds the sun shadow map: shader-readable from the start.
+            if (terrainOk)
+                terrain.EnsureSunShadowMapReadable(*frameInfo.commandList);
+            // The editor panels show the views' display images, even on frames a view is not drawn.
+            if (offscreenSceneOk)
+                offscreenScene.EnsureDisplayReadable(*frameInfo.commandList);
+            if (gameViewOk)
+                gameView.EnsureDisplayReadable(*frameInfo.commandList);
+            if (terrainOk && isInWorld && hasFrameCamera && !debugDisableShadowPass)
+            {
+                const auto shadowPassBegin = std::chrono::steady_clock::now();
+                // The meshes cast into the cascades too: the shown static meshes (each cascade gets
+                // those over its footprint) and this frame's skinned instances (their Scene-view
+                // skin slots: the pose both views draw).
+                // The casters' render records (kept between frames), by renderer: each cascade draws
+                // one batch per renderer of those over its footprint.
+                for (ShadowCasterBatch& batch : settledShadowCasterBatches)
+                    batch.casters.clear();
+                for (ShadowCasterBatch& batch : movingShadowCasterBatches)
+                    batch.casters.clear();
+                bool anyStaticCasters = false;
+                // The settled casters joining the static cache, and those leaving it (moved, or not
+                // drawn any more); staticShadowRevision moves on with any of it.
+                staticShadowJoined.clear();
+                std::uint32_t seenInStaticShadow = 0;
+                if (runtimeSession->IsMapEditorOpen())
+                {
+                    std::size_t lastSettled = 0;
+                    std::size_t lastMoving = 0;
+                    // Few renderers: the previous entity's batch, else a scan.
+                    const auto addTo = [](std::vector<ShadowCasterBatch>& batches, std::size_t& last,
+                                           const StaticMeshRenderRecord& record) {
+                        if (last >= batches.size() || batches[last].renderer != record.renderer)
+                        {
+                            last = 0;
+                            while (last < batches.size() && batches[last].renderer != record.renderer)
+                                ++last;
+                            if (last == batches.size())
+                                batches.push_back({record.renderer, {}});
+                        }
+                        batches[last].casters.push_back(&record);
+                    };
+                    for (const MeshSceneEntity& mesh : editorMeshEntities)
+                    {
+                        if (!mesh.effectiveEnabled || mesh.skinned || (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden))
+                        {
+                            // Not a static caster now: out of the cache if it was in (its record, if any).
+                            const std::uint32_t slot = mesh.renderRecordSlot;
+                            if (staticShadowCount > 0 && slot < staticMeshRenderRecords.size() &&
+                                staticMeshRenderRecords[slot].inUse && staticMeshRenderRecords[slot].entityId == mesh.id)
+                                leaveStaticShadow(staticMeshRenderRecords[slot]);
+                            continue;
+                        }
+                        StaticMeshRenderRecord& record = staticMeshRenderRecord(mesh);
+                        if (!record.renderer)
+                        {
+                            leaveStaticShadow(record);
+                            continue;
+                        }
+                        anyStaticCasters = true;
+                        if (record.changedFrame + kShadowSettleFrames < renderRecordFrame)
+                        {
+                            addTo(settledShadowCasterBatches, lastSettled, record);
+                            if (!record.inStaticShadow)
+                            {
+                                record.inStaticShadow = true;
+                                record.staticShadowBounds = {record.worldBounds.min, record.worldBounds.max};
+                                ++staticShadowCount;
+                                staticShadowJoined.push_back(&record);
+                            }
+                            ++seenInStaticShadow;
+                        }
+                        else
+                        {
+                            addTo(movingShadowCasterBatches, lastMoving, record);
+                            leaveStaticShadow(record);
+                        }
+                    }
+                }
+                // Those in the cache not seen left it too: their entity is gone (its record was not
+                // asked for this frame; every entity's is, the casters' above).
+                if (seenInStaticShadow < staticShadowCount)
+                {
+                    for (StaticMeshRenderRecord& record : staticMeshRenderRecords)
+                    {
+                        if (record.inStaticShadow && record.validatedFrame != renderRecordFrame)
+                            leaveStaticShadow(record);
+                    }
+                }
+                const std::uint64_t staticShadowDeltaFrom = staticShadowRevision;
+                if (!staticShadowJoined.empty() || !staticShadowLeft.empty())
+                    ++staticShadowRevision;
+                // (The joined by renderer, one batch each when drawn.)
+                std::stable_sort(staticShadowJoined.begin(), staticShadowJoined.end(),
+                    [](const StaticMeshRenderRecord* a, const StaticMeshRenderRecord* b) {
+                        return std::less<const StaticMeshRenderer*>()(a->renderer, b->renderer);
+                    });
+                std::vector<const SkinnedDrawRecord*> skinnedShadowCasters;
+                for (const std::vector<SkinnedDrawRecord>* records : {&sceneSkinnedDraws, &sceneEditorSkinnedDraws})
+                {
+                    for (const SkinnedDrawRecord& record : *records)
+                    {
+                        if (record.renderer)
+                            skinnedShadowCasters.push_back(&record);
+                    }
+                }
+                // Whether a box lies wholly off one side of a cascade (orthographic: x and y only; a
+                // caster sun-wards of its depth range still shades it).
+                auto outsideCascadeFootprint = [](const WorldMat4& lightViewProj, const std::array<WorldVec3, 8>& corners) {
+                    bool left = true;
+                    bool right = true;
+                    bool bottom = true;
+                    bool top = true;
+                    const float* m = lightViewProj.m;
+                    for (const WorldVec3& p : corners)
+                    {
+                        const float x = p.x * m[0] + p.y * m[4] + p.z * m[8] + m[12];
+                        const float y = p.x * m[1] + p.y * m[5] + p.z * m[9] + m[13];
+                        left = left && x < -1.0f;
+                        right = right && x > 1.0f;
+                        bottom = bottom && y < -1.0f;
+                        top = top && y > 1.0f;
+                    }
+                    return left || right || bottom || top;
+                };
+                // Whether a skinned caster's shadow can reach the camera distances a cascade serves: its
+                // distance plus its size and the length of its shadow on the ground (by the sun's
+                // elevation). Characters near the camera stay out of the far cascades, so those keep what
+                // they hold while the characters animate. (Never left out of a finer cascade: the meshes
+                // and the volumetric light take the finest cascade holding a point, which reaches past
+                // its radius along the sunlight.)
+                const float sunElevation =
+                    xm::DegreesToRadians(std::clamp(frameLighting.directional.elevationDegrees, 3.0f, 90.0f));
+                auto skinnedInCascade = [&](const SkinnedDrawRecord& record, std::uint32_t cascade) {
+                    const float scale = std::max({std::abs(record.scale[0]), std::abs(record.scale[1]), std::abs(record.scale[2])});
+                    const float size = record.renderer->LocalExtent() * scale;
+                    const float reach = size * (1.0f + 1.0f / std::tan(sunElevation));
+                    const float dx = record.position.x - shadowCamera->eye.x;
+                    const float dy = record.position.y - shadowCamera->eye.y;
+                    const float dz = record.position.z - shadowCamera->eye.z;
+                    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    float nearest = 0.0f;
+                    float farthest = 0.0f;
+                    TerrainRenderer::SunShadowCascadeServes(cascade, nearest, farthest);
+                    return distance + reach >= nearest;
+                };
+                // Per cascade, a hash of what is drawn into it (the static meshes over its footprint, the
+                // skinned ones whose shadow reaches it, animated: every frame); an unchanged cascade is kept.
+                terrain.UpdateSunShadowCascades(*shadowCamera);
+                const WorldMat4* cascadeViewProj = terrain.SunShadowCascadeViewProj();
+                TerrainRenderer::ShadowCasters shadowCasters;
+                for (std::uint32_t cascade = 0; cascade < shadowCasters.staticRevisions.size(); ++cascade)
+                {
+                    shadowCasters.staticRevisions[cascade] = staticShadowRevision;
+                    // The moving casters over the cascade's footprint, and the characters whose shadow
+                    // reaches it (0: none, the cascade is the static cache alone).
+                    std::uint64_t revision = 1469598103934665603ull;  // FNV-1a
+                    bool movingHere = false;
+                    auto hash = [&revision](const void* data, std::size_t size) {
+                        const auto* bytes = static_cast<const unsigned char*>(data);
+                        for (std::size_t i = 0; i < size; ++i)
+                            revision = (revision ^ bytes[i]) * 1099511628211ull;
+                    };
+                    for (const ShadowCasterBatch& batch : movingShadowCasterBatches)
+                    {
+                        for (const StaticMeshRenderRecord* caster : batch.casters)
+                        {
+                            if (outsideCascadeFootprint(cascadeViewProj[cascade], caster->corners))
+                                continue;
+                            movingHere = true;
+                            hash(&caster->renderer, sizeof(caster->renderer));
+                            hash(&caster->instance.entityId, sizeof(caster->instance.entityId));
+                            hash(&caster->instance.position, sizeof(caster->instance.position));
+                            hash(caster->instance.rotation, sizeof(caster->instance.rotation));
+                            hash(caster->instance.scale, sizeof(caster->instance.scale));
+                            hash(&caster->changedFrame, sizeof(caster->changedFrame));
+                        }
+                    }
+                    const bool skinnedHere = std::any_of(skinnedShadowCasters.begin(), skinnedShadowCasters.end(),
+                        [&](const SkinnedDrawRecord* record) { return skinnedInCascade(*record, cascade); });
+                    // An animated caster changes the cascade every frame. The far cascades follow it every
+                    // 2nd / 4th frame: a pose a few frames old in a shadow that far away does not show, and
+                    // each cascade redraw is ~0.025 ms. (The camera moving still redraws them at once:
+                    // their matrices change.)
+                    if (skinnedHere)
+                    {
+                        const std::uint64_t period = cascade < 2 ? 1u : (cascade == 2 ? 2u : 4u);
+                        // (Cascade 3 offset by a frame: it redraws on an odd frame, cascade 2 on the even ones.)
+                        const std::uint64_t animationTick = (frameInfo.frameNumber + (cascade == 3 ? 1u : 0u)) / period;
+                        hash(&animationTick, sizeof(animationTick));
+                    }
+                    shadowCasters.dynamicRevisions[cascade] = movingHere || skinnedHere ? (revision | 1u) : 0u;
+                }
+                StaticMeshRenderer::InstanceList cascadeInstances;
+                std::vector<SkinnedMeshRenderer::ShadowCasterInstance> skinnedCascadeInstances;
+                std::vector<SkinnedMeshRenderer*> skinnedCascadeRenderers;
+                // (filterViewProj picks the casters drawn: those over its clip square. The cascade's texel
+                // size picks each one's shadow detail level.)
+                const auto drawMeshBatches = [&](const std::vector<ShadowCasterBatch>& batches, std::uint32_t cascade,
+                                                 const WorldMat4& lightViewProj, const WorldMat4& filterViewProj,
+                                                 const ixrhi::IXRHIRenderPass* pass) {
+                    const float texelMeters = terrain.SunShadowCascadeTexelSize(cascade);
+                    for (const ShadowCasterBatch& batch : batches)
+                    {
+                        cascadeInstances.clear();
+                        for (const StaticMeshRenderRecord* caster : batch.casters)
+                        {
+                            if (!outsideCascadeFootprint(filterViewProj, caster->corners))
+                                cascadeInstances.push_back(&caster->instance);
+                        }
+                        if (!cascadeInstances.empty())
+                            batch.renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj,
+                                cascadeInstances, pass, texelMeters);
+                    }
+                };
+                shadowCasters.drawStatic =
+                    [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                        drawMeshBatches(settledShadowCasterBatches, cascade, lightViewProj, lightViewProj, pass);
+                    };
+                shadowCasters.staticDeltaFrom = staticShadowDeltaFrom;
+                shadowCasters.staticJoined = static_cast<std::uint32_t>(staticShadowJoined.size());
+                shadowCasters.staticLeft = &staticShadowLeft;
+                shadowCasters.drawStaticJoined =
+                    [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                        const float texelMeters = terrain.SunShadowCascadeTexelSize(cascade);
+                        for (std::size_t first = 0; first < staticShadowJoined.size();)
+                        {
+                            StaticMeshRenderer* renderer = staticShadowJoined[first]->renderer;
+                            cascadeInstances.clear();
+                            std::size_t end = first;
+                            for (; end < staticShadowJoined.size() && staticShadowJoined[end]->renderer == renderer; ++end)
+                            {
+                                if (!outsideCascadeFootprint(lightViewProj, staticShadowJoined[end]->corners))
+                                    cascadeInstances.push_back(&staticShadowJoined[end]->instance);
+                            }
+                            if (!cascadeInstances.empty())
+                                renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj,
+                                    cascadeInstances, pass, texelMeters);
+                            first = end;
+                        }
+                    };
+                // A region the change draws again: the settled casters over it, picked by their clip-space
+                // extent in the cascade, worked out once a frame per cascade for all its regions.
+                shadowCasters.drawStaticRegion = [&](std::uint32_t cascade, const WorldMat4& lightViewProj,
+                                                     const TerrainRenderer::ShadowRegion& region,
+                                                     const ixrhi::IXRHIRenderPass* pass) {
+                    std::vector<CasterClipRect>& rects = settledCasterClipRects[cascade];
+                    if (settledCasterClipRectsFrame[cascade] != frameInfo.frameNumber)
+                    {
+                        settledCasterClipRectsFrame[cascade] = frameInfo.frameNumber;
+                        // The settled casters in batch order, once a frame (for every cascade with regions).
+                        if (settledCasterListFrame != frameInfo.frameNumber)
+                        {
+                            settledCasterListFrame = frameInfo.frameNumber;
+                            settledCasterList.clear();
+                            for (const ShadowCasterBatch& batch : settledShadowCasterBatches)
+                                settledCasterList.insert(settledCasterList.end(), batch.casters.begin(), batch.casters.end());
+                        }
+                        rects.resize(settledCasterList.size());
+                        // A box's clip x, y extent: its centre's, plus its half size through the matrix's magnitudes.
+                        const float* m = lightViewProj.m;
+                        const auto computeRects = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+                            for (std::uint32_t i = begin; i < end; ++i)
+                            {
+                                const SpatialIndex::Aabb& bounds = settledCasterList[i]->worldBounds;
+                                const float cx = 0.5f * (bounds.min.x + bounds.max.x);
+                                const float cy = 0.5f * (bounds.min.y + bounds.max.y);
+                                const float cz = 0.5f * (bounds.min.z + bounds.max.z);
+                                const float ex = 0.5f * (bounds.max.x - bounds.min.x);
+                                const float ey = 0.5f * (bounds.max.y - bounds.min.y);
+                                const float ez = 0.5f * (bounds.max.z - bounds.min.z);
+                                const float x = cx * m[0] + cy * m[4] + cz * m[8] + m[12];
+                                const float y = cx * m[1] + cy * m[5] + cz * m[9] + m[13];
+                                const float hx = std::abs(ex * m[0]) + std::abs(ey * m[4]) + std::abs(ez * m[8]);
+                                const float hy = std::abs(ex * m[1]) + std::abs(ey * m[5]) + std::abs(ez * m[9]);
+                                rects[i] = {x - hx, y - hy, x + hx, y + hy};
+                            }
+                        };
+                        const std::uint32_t count = static_cast<std::uint32_t>(settledCasterList.size());
+                        if (ixjobs::JobSystem::Instance().Parallel() && count >= 2048u)
+                            ixjobs::JobSystem::Instance().ParallelFor(count, 1024, computeRects);
+                        else
+                            computeRects(0, count, 0);
+                    }
+                    const float texelMeters = terrain.SunShadowCascadeTexelSize(cascade);
+                    std::size_t index = 0;
+                    for (const ShadowCasterBatch& batch : settledShadowCasterBatches)
+                    {
+                        cascadeInstances.clear();
+                        for (const StaticMeshRenderRecord* caster : batch.casters)
+                        {
+                            const CasterClipRect& rect = rects[index++];
+                            if (rect.maxX >= region.clipMin[0] && rect.minX <= region.clipMax[0] &&
+                                rect.maxY >= region.clipMin[1] && rect.minY <= region.clipMax[1])
+                                cascadeInstances.push_back(&caster->instance);
+                        }
+                        if (!cascadeInstances.empty())
+                            batch.renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj,
+                                cascadeInstances, pass, texelMeters);
+                    }
+                };
+                shadowCasters.drawDynamic =
+                    [&](std::uint32_t cascade, const WorldMat4& lightViewProj, const ixrhi::IXRHIRenderPass* pass) {
+                        drawMeshBatches(movingShadowCasterBatches, cascade, lightViewProj, lightViewProj, pass);
+                        // The characters by model: the pipeline and index buffer set once per model.
+                        skinnedCascadeRenderers.clear();
+                        for (const SkinnedDrawRecord* record : skinnedShadowCasters)
+                        {
+                            if (std::find(skinnedCascadeRenderers.begin(), skinnedCascadeRenderers.end(), record->renderer) ==
+                                skinnedCascadeRenderers.end())
+                                skinnedCascadeRenderers.push_back(record->renderer);
+                        }
+                        for (SkinnedMeshRenderer* renderer : skinnedCascadeRenderers)
+                        {
+                            skinnedCascadeInstances.clear();
+                            for (const SkinnedDrawRecord* record : skinnedShadowCasters)
+                            {
+                                if (record->renderer == renderer && skinnedInCascade(*record, cascade))
+                                    skinnedCascadeInstances.push_back({record->position, record->yaw, record->slot, record->scale});
+                            }
+                            renderer->RenderShadowCasters(*frameInfo.commandList, frameInfo, lightViewProj, pass,
+                                skinnedCascadeInstances.data(), skinnedCascadeInstances.size());
+                        }
+                    };
+                if (!anyStaticCasters && skinnedShadowCasters.empty())
+                    shadowCasters = {};
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassBegin);
+                terrain.RenderSunShadowMap(*frameInfo.commandList, frameInfo, *shadowCamera, shadowCasters);
+                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ShadowPassEnd);
+                staticShadowLeft.clear();  // taken (a layer that missed it is drawn whole: the revision moved on)
+                frameProfile.shadowPassMs = MillisecondsBetween(shadowPassBegin, std::chrono::steady_clock::now());
+            }
+            // The meshes sample this frame's cascades (or see none drawn: all lit).
+            if (terrainOk)
+            {
+                const SunShadowReceive meshShadow = terrain.SunShadowForMeshes(frameInfo.frameNumber);
+                for (auto& [path, entry] : staticMeshCache)
+                {
+                    (void)path;
+                    if (entry.state == StaticMeshCacheEntry::State::LoadedStatic)
+                        entry.renderer->SetSunShadow(meshShadow);
+                }
+                for (auto& [path, entry] : skinnedMeshCache)
+                {
+                    (void)path;
+                    if (entry.state == SkinnedMeshCacheEntry::State::Loaded)
+                        entry.renderer->SetSunShadow(meshShadow);
+                }
+            }
+            // The Scene view's water visibility query (see QueryWaterVisibility below): its slot is read
+            // back and reset here, outside any pass, before the reflection and the water decide on it.
+            const bool sceneWaterQuery = useOffscreenScene && drawSceneView && hasSceneTerrain && isInWorld;
+            if (sceneWaterQuery)
+                terrain.BeginWaterVisibility(*frameInfo.commandList, frameInfo);
+            // The reflection follows the camera the shadows do; a Scene view whose water is hidden
+            // behind the scene needs none.
+            if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass &&
+                !(sceneWaterQuery && shadowCamera == &frameCamera && !terrain.WaterMayBeVisible(frameInfo.frameNumber)))
             {
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionBegin);
-                terrain.RenderWaterReflection(device,
-                    frameCamera,
+                // One reflection per frame, mirrored for the view actually drawn (as the shadow map):
+                // the water samples it at its own screen position, so it must match that camera.
+                const bool reflectionForSceneView = shadowCamera == &frameCamera;
+                terrain.RenderWaterReflection(*frameInfo.commandList,
+                    frameInfo,
+                    *shadowCamera,
+                    reflectionForSceneView ? renderSize.width : gameView.Width(),
+                    reflectionForSceneView ? renderSize.height : gameView.Height(),
                     seconds,
                     [&](const WorldCamera& mirrorCamera,
-                        VkExtent2D reflectionExtent,
-                        VkRenderPass reflectionRenderPass,
+                        std::uint32_t reflectionWidth,
+                        std::uint32_t reflectionHeight,
+                        const ixrhi::IXRHIRenderPass* reflectionPass,
                         float waterLevelY)
                     {
-                        // The native reflection pass handle stays on the terrain side: the
-                        // skinned reflection pipeline is baked against the borrowed IXRHI
-                        // pass token (attachment-compatible formats), so only the extent
-                        // crosses here.
-                        (void)reflectionRenderPass;
                         // Redraw the exact (renderer, slot) recorded by the Scene pre-pass — the
                         // output buffers are already skinned, so no fresh slot allocation here.
+                        // The borrowed reflection pass bakes the skinned reflection pipeline
+                        // against the real target (Phase-3F seam).
                         for (const SkinnedDrawRecord& rec : sceneSkinnedDraws)
                         {
                             if (!rec.renderer)
@@ -10254,15 +13214,21 @@ int RunGame(NativeWindow& window,
                             rec.renderer->RenderInWorldReflection(*frameInfo.commandList,
                                 frameInfo,
                                 mirrorCamera,
-                                reflectionExtent.width,
-                                reflectionExtent.height,
-                                nullptr,
+                                reflectionWidth,
+                                reflectionHeight,
+                                reflectionPass,
                                 waterLevelY,
                                 rec.position,
                                 rec.yaw,
                                 rec.slot,
-                                rec.tint);
+                                rec.tint,
+                                rec.scale);
                         }
+
+                        // The mirrored sky last: it fills only what no reflected geometry covered.
+                        if (skyOk)
+                            skyRenderer.Render(*frameInfo.commandList, frameInfo, mirrorCamera,
+                                reflectionWidth, reflectionHeight, reflectionPass);
 
                         // (Editor lights are not drawn as the skinned character model in the
                         // water reflection either — removed old debug visualization.)
@@ -10270,7 +13236,6 @@ int RunGame(NativeWindow& window,
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionEnd);
             }
 
-            const bool useOffscreenScene = offscreenSceneOk && frameInfo.frameActive;
             // Main-window pass ownership (Phase 3C): exactly one Begin/End per
             // frame around ALL swapchain rendering (direct or composite + UI).
             bool mainPassOpen = false;
@@ -10283,21 +13248,40 @@ int RunGame(NativeWindow& window,
                     mainPassOpen = true;
                 }
             };
-            if (useOffscreenScene)
+            // A hidden Scene View draws nothing: skip its whole pass (full-res clear + tone map) —
+            // the panel keeps showing its last image until it is shown again.
+            if (useOffscreenScene && drawSceneView)
+            {
+                // The refraction inputs (this view's snapshots) are handed over before the water is
+                // bound this frame, not only in frames that draw it: its descriptor sets are rewritten
+                // when they change.
+                if (hasSceneTerrain && isInWorld)
+                    terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
+                        offscreenScene.GetDepthSnapshotTexture(),
+                        offscreenScene.GetSampler(),
+                        offscreenScene.Width(),
+                        offscreenScene.Height());
                 offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo);
-            else
+            }
+            else if (!useOffscreenScene)
                 beginMainPass(); // direct mode renders straight into the swapchain pass
 
             std::vector<WorldLabelRenderer::Label> plates;
-            if (isInWorld)
+            if (isInWorld && drawSceneView)
             {
-                if (hasSceneTerrain)
-                {
+                // Into the offscreen target (its pass clears depth) the terrain is drawn after the
+                // opaque meshes, so the terrain they cover is depth-rejected instead of shaded (with
+                // its shadow lookups) and overdrawn. Direct swapchain rendering keeps the old order.
+                const bool terrainAfterMeshes = useOffscreenScene;
+                auto renderSceneTerrain = [&](bool clearDepth) {
                     frameSceneRenderCalled = true;
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainBegin);
-                    terrain.Render(device, camera, renderSize);
+                    terrain.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height,
+                        /*viewIndex=*/0, clearDepth);
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainEnd);
-                }
+                };
+                if (hasSceneTerrain && !terrainAfterMeshes)
+                    renderSceneTerrain(true);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
 
                 plates.reserve(entities.size());
@@ -10316,7 +13300,8 @@ int RunGame(NativeWindow& window,
                         rec.slot,
                         rec.tint,
                         renderSize.width,
-                        renderSize.height);
+                        renderSize.height,
+                        rec.scale);
                 }
                 // Name plates over each networked entity. The label sits a fixed height above
                 // the model's grounded origin (the default character's ground offset, if any).
@@ -10383,10 +13368,13 @@ int RunGame(NativeWindow& window,
                             rec.slot,
                             rec.tint,
                             renderSize.width,
-                            renderSize.height);
+                            renderSize.height,
+                            rec.scale);
                         ++frameStaticMeshDrawCalls;
                     }
                     auto logLodDisposition = [&](const StaticMeshLodBatch::LodDispositionRecord& record) {
+                        if (!LodLogsEnabled())
+                            return;  // the state map below only exists for the log's change detection
                         const char* disposition = "DRAWN";
                         if (record.fullResFallback && record.submitted)
                             disposition = "DRAWN";
@@ -10465,37 +13453,93 @@ int RunGame(NativeWindow& window,
                         return "none";
                     };
                     std::unordered_set<std::uint32_t> currentCulledMeshLogSet;
-                    for (std::uint32_t meshId : spatialCandidates)
+                    const xm::Frustum sceneViewFrustum = xm::ExtractFrustumVulkan(camera.viewProjection);
+                    // The lighting is per renderer, not per entity: several entities usually share
+                    // one renderer, so apply it once per renderer per frame (it is a large struct).
+                    std::unordered_set<StaticMeshRenderer*> litStaticRenderers;
+                    // Each candidate's entity, record and frustum test, worked out in parallel up front
+                    // (IX_PARALLEL_CULL): each writes only its own entry, read in order below. The
+                    // records were all checked this frame already (validateStaticMeshRenderRecords).
+                    enum class ViewCandidateState : std::uint8_t { Skip, Culled, Visible, Serial };
+                    struct ViewCandidate
                     {
-                        MeshSceneEntity* meshPtr = findMeshEntityById(meshId);
-                        if (!meshPtr)
+                        MeshSceneEntity* mesh = nullptr;
+                        const StaticMeshRenderRecord* record = nullptr;
+                        ViewCandidateState state = ViewCandidateState::Skip;
+                    };
+                    std::vector<ViewCandidate> viewCandidates(spatialCandidates.size());
+                    {
+                        const bool hideEditorHidden = editorPlay.state.mode == EditorPlayMode::Edit;
+                        const auto classify = [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+                            for (std::uint32_t i = begin; i < end; ++i)
+                            {
+                                ViewCandidate& candidate = viewCandidates[i];
+                                MeshSceneEntity* candidateMesh = findMeshEntityById(spatialCandidates[i]);
+                                // Skinned mesh entities are handled in the dedicated skinned pass above
+                                // (they are not tracked in the static spatial index), so skip them here.
+                                if (!candidateMesh || !candidateMesh->effectiveEnabled || (hideEditorHidden && candidateMesh->editorHidden) ||
+                                    candidateMesh->skinned)
+                                    continue;
+                                candidate.mesh = candidateMesh;
+                                const std::uint32_t slot = candidateMesh->renderRecordSlot;
+                                const StaticMeshRenderRecord* record = slot < staticMeshRenderRecords.size()
+                                    ? &staticMeshRenderRecords[slot]
+                                    : nullptr;
+                                if (!record || !record->inUse || record->entityId != candidateMesh->id ||
+                                    record->validatedFrame != renderRecordFrame || candidateMesh->materialSlots.empty())
+                                {
+                                    candidate.state = ViewCandidateState::Serial;  // needs writes: below
+                                    continue;
+                                }
+                                candidate.record = record;
+                                if (!record->renderer)
+                                    continue;
+                                candidate.state = xm::Intersects(sceneViewFrustum, record->worldBounds)
+                                    ? ViewCandidateState::Visible
+                                    : ViewCandidateState::Culled;
+                            }
+                        };
+                        static const bool parallelCull = ixjobs::FeatureEnabled("IX_PARALLEL_CULL");
+                        const std::uint32_t candidateCount = static_cast<std::uint32_t>(viewCandidates.size());
+                        if (parallelCull)
+                            ixjobs::JobSystem::Instance().ParallelFor(candidateCount, 512, classify);
+                        else
+                            classify(0, candidateCount, 0);
+                    }
+                    for (const ViewCandidate& candidate : viewCandidates)
+                    {
+                        if (candidate.state == ViewCandidateState::Skip)
                             continue;
+                        MeshSceneEntity* meshPtr = candidate.mesh;
                         const MeshSceneEntity& mesh = *meshPtr;
-                        if (editorPlay.state.mode == EditorPlayMode::Edit && mesh.editorHidden)
-                            continue;
-                        const std::string runtimePath = resolveMeshRuntimePath(mesh);
-                        // Skinned mesh entities are handled in the dedicated skinned pass above
-                        // (they are not tracked in the static spatial index), so skip them here.
-                        if (mesh.skinned)
-                            continue;
-                        if (StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath))
+                        const StaticMeshRenderRecord* meshRecord =
+                            candidate.state == ViewCandidateState::Serial ? &staticMeshRenderRecord(mesh) : candidate.record;
+                        const std::string& runtimePath = meshRecord->runtimePath;
+                        if (StaticMeshRenderer* renderer = meshRecord->renderer)
                         {
                             if (meshPtr->materialSlots.empty())
                             {
                                 EnsureMeshEntityMaterialSlots(*meshPtr);
                                 if (!meshPtr->materialSlots.empty())
+                                {
                                     SceneManager::Instance().MarkDirty();
+                                    // Drawn with its slots this frame already: check its record again.
+                                    meshRecord = &staticMeshRenderRecord(mesh, /*recheck=*/true);
+                                }
                             }
-                            const SpatialIndex::Aabb worldBounds = StaticMeshWorldAabb(mesh, *renderer);
-                            if (renderer->IsLoaded() &&
-                                WorldAabbOutsideCameraFrustum(camera, SpatialAabbCorners(worldBounds)))
+                            const SpatialIndex::Aabb& worldBounds = meshRecord->worldBounds;
+                            const bool culled = candidate.state == ViewCandidateState::Serial
+                                ? !xm::Intersects(sceneViewFrustum, worldBounds)
+                                : candidate.state == ViewCandidateState::Culled;
+                            if (culled)
                             {
                                 ++frameStaticMeshFrustumCulled;
-                                currentCulledMeshLogSet.insert(mesh.id);
+                                if (LodLogsEnabled())
+                                    currentCulledMeshLogSet.insert(mesh.id);
                                 if (mesh.lod.enabled)
                                 {
                                     LodConfig cullLodConfig{};
-                                    const std::optional<LodConfig> assetDefault = editorImGui.FindModelLodDefault(mesh.meshAssetId);
+                                    const std::optional<LodConfig> assetDefault = findModelLodDefault(mesh.meshAssetId);
                                     cullLodConfig = (!mesh.lod.overrideAssetDefault && assetDefault)
                                         ? *assetDefault
                                         : mesh.lod.config;
@@ -10535,7 +13579,9 @@ int RunGame(NativeWindow& window,
                                     record.drawIndexCount = 0;
                                     logLodDisposition(record);
                                 }
-                                const bool cullLogChanged = previousCulledMeshLogSet.find(mesh.id) == previousCulledMeshLogSet.end();
+                                // (Tracked with the LOD diagnostics: a set entry per culled mesh per frame.)
+                                const bool cullLogChanged = LodLogsEnabled() &&
+                                    previousCulledMeshLogSet.find(mesh.id) == previousCulledMeshLogSet.end();
                                 if (cullLogChanged)
                                 {
                                     Tracenf("[MESH-CULL] culled id=%u name=%s path=%s",
@@ -10545,20 +13591,12 @@ int RunGame(NativeWindow& window,
                                 }
                                 continue;
                             }
-                            renderer->SetLightingState(runtimeSession->GetLightingState());
-                            StaticMeshRenderer::Instance instance{};
-                            instance.entityId = mesh.id;
-                            instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
-                            instance.rotation[0] = mesh.rotation[0];
-                            instance.rotation[1] = mesh.rotation[1];
-                            instance.rotation[2] = mesh.rotation[2];
-                            instance.scale[0] = mesh.scale[0];
-                            instance.scale[1] = mesh.scale[1];
-                            instance.scale[2] = mesh.scale[2];
-                            instance.tint = {1.0f, 1.0f, 1.0f, 1.0f};
-                            instance.selectedForOutline = false;
-                            instance.materialSlots = mesh.materialSlots;
-                            instance.materialOverrides = mesh.materialOverrides;
+                            if (litStaticRenderers.insert(renderer).second)
+                                renderer->SetLightingState(frameLighting);
+                            // The record's instance (untinted, not outlined): drawn from where it is kept.
+                            const StaticMeshRenderer::Instance& instance = meshRecord->instance;
+                            if (renderer->HasTransparentDraws(instance))
+                                addTransparentDraw(sceneTransparentDraws, renderer, instance, worldBounds, camera);
                             LodConfig effectiveLodConfig{};
                             std::uint64_t lodConfigHash = 0;
                             std::uint32_t lodLevel = 0;
@@ -10567,7 +13605,7 @@ int RunGame(NativeWindow& window,
                             if (mesh.lod.enabled)
                             {
                                 ++frameLodActiveInstances;
-                                const std::optional<LodConfig> assetDefault = editorImGui.FindModelLodDefault(mesh.meshAssetId);
+                                const std::optional<LodConfig> assetDefault = findModelLodDefault(mesh.meshAssetId);
                                 effectiveLodConfig = (!mesh.lod.overrideAssetDefault && assetDefault)
                                     ? *assetDefault
                                     : mesh.lod.config;
@@ -10617,6 +13655,10 @@ int RunGame(NativeWindow& window,
                                     cfgRatios[i] = effectiveLodConfig.targetRatios[i];
                                     cfgDistances[i] = effectiveLodConfig.distances[i];
                                 }
+                                // The cfg/pick log states below only exist for the log's change
+                                // detection; skip their map/string bookkeeping when logging is off.
+                                if (LodLogsEnabled())
+                                {
                                 LodCfgLogState& cfgLogState = lodCfgLogStates[mesh.id];
                                 const bool cfgChanged =
                                     !cfgLogState.initialized ||
@@ -10710,16 +13752,18 @@ int RunGame(NativeWindow& window,
                                         }
                                     }
                                 }
+                                }
                             }
                             else
                             {
                                 ++frameNonLodEntities;
-                                staticMeshSelectedLods.erase(mesh.id);
+                                if (!staticMeshSelectedLods.empty())
+                                    staticMeshSelectedLods.erase(mesh.id);
                             }
                             StaticMeshLodBatchKey key{renderer, lodConfigHash, lodLevel};
                             StaticMeshLodBatch& batch = staticMeshBatches[key];
                             batch.config = effectiveLodConfig;
-                            batch.instances.push_back(std::move(instance));
+                            batch.instances.push_back(&instance);
                             if (lodDispositionActive)
                                 batch.lodDispositionRecords.push_back(lodDispositionRecord);
                         }
@@ -10727,7 +13771,7 @@ int RunGame(NativeWindow& window,
                     for (auto& [key, batch] : staticMeshBatches)
                     {
                         StaticMeshRenderer* renderer = key.renderer;
-                        std::vector<StaticMeshRenderer::Instance>& instances = batch.instances;
+                        const StaticMeshRenderer::InstanceList& instances = batch.instances;
                         if (!renderer || instances.empty())
                             continue;
                         if (key.configHash != 0)
@@ -10765,9 +13809,8 @@ int RunGame(NativeWindow& window,
                         frameStaticMeshMaxBatchSize = std::max(frameStaticMeshMaxBatchSize, instances.size());
                         frameStaticMeshSubmitted += submittedInstances;
                         frameStaticMeshDrawCalls += submittedDrawCalls;
-                        frameStaticMeshTriangles += (renderer->LastUsedFullResFallback()
-                            ? renderer->TriangleCount()
-                            : renderer->TriangleCountForLod(key.configHash, key.lodLevel)) * submittedInstances;
+                        frameStaticMeshTriangles += renderer->LastSubmittedTriangles();
+                        frameTreeImpostors += renderer->LastImpostorTrees();
                         frameStaticMeshUniformUpdates += renderer->LastMaterialUniformUpdates();
                         frameStaticMeshOverrideActiveDraws += renderer->LastOverrideActiveDraws();
                         frameStaticMeshInstanceBufferBytes += renderer->LastInstanceBufferBytes();
@@ -10819,6 +13862,37 @@ int RunGame(NativeWindow& window,
                     previousFrameNonLodInitialized = true;
                     previousCulledMeshLogSet = std::move(currentCulledMeshLogSet);
                 }
+                if (hasSceneTerrain && terrainAfterMeshes)
+                    renderSceneTerrain(false);
+                // The sky after the opaque geometry: it sits at the far plane and is depth tested, so
+                // only the pixels nothing covers are shaded.
+                if (skyOk)
+                    skyRenderer.Render(*frameInfo.commandList, frameInfo, camera, renderSize.width, renderSize.height);
+                // The water is drawn in a pass of its own (over a snapshot of this one) when it is in view
+                // and not hidden behind the opaque scene: an occlusion query of its surface, against
+                // this pass's finished depth, answers for the frames to come (the snapshot alone is
+                // ~0.09 ms at 1510x832).
+                if (useOffscreenScene && hasSceneTerrain)
+                    terrain.QueryWaterVisibility(*frameInfo.commandList, frameInfo, camera, renderSize.width,
+                        renderSize.height);
+                sceneWaterPass = useOffscreenScene && hasSceneTerrain && terrain.AnyWaterBodyInView(camera) &&
+                    terrain.WaterMayBeVisible(frameInfo.frameNumber);
+                // Soft particles read the scene depth snapshot. Closing/reopening the main pass for
+                // them cost ~1 ms a frame, so the pass is only split for the water; the depth for the
+                // soft fade is copied at the END of the frame and used (one frame stale) next frame.
+                collectParticleDraws(sceneTransparentDraws, camera, /*allowSoftParticles=*/true);
+                sceneParticleSoft = useOffscreenScene && std::any_of(sceneTransparentDraws.begin(),
+                    sceneTransparentDraws.end(),
+                    [](const TransparentDraw& draw) {
+                        return draw.particleRenderer != nullptr && draw.particleBatch.softParticles;
+                    });
+                sceneSnapshotPass = useOffscreenScene && sceneWaterPass;
+                // Transparent draws over the sky: those under water now; the rest after the water (its
+                // pass, or right below in direct mode), or now when no water follows.
+                sortTransparentDraws(sceneTransparentDraws);
+                drawTransparents(sceneTransparentDraws, /*underWater=*/true, camera, renderSize.width, renderSize.height);
+                if (useOffscreenScene && !sceneSnapshotPass)
+                    drawTransparents(sceneTransparentDraws, /*underWater=*/false, camera, renderSize.width, renderSize.height);
                 if (selectionOutlinesOk)
                 {
                     std::vector<SelectionOutlineRenderer::Line> selectionLines =
@@ -10839,6 +13913,119 @@ int RunGame(NativeWindow& window,
                         selectedObjectLines.end());
                     std::vector<SelectionOutlineRenderer::Line> selectedColliderLines =
                         BuildPhysicsColliderLines(selectedEditorObject, editorMeshEntities, debugShowPhysicsColliders);
+                    if (showLayerVolumes)
+                    {
+                        // Existing line renderer; no renderer or backend change.
+                        constexpr std::array<std::array<unsigned, 2>, 12> edges{{
+                            {{0,1}}, {{0,2}}, {{1,3}}, {{2,3}},
+                            {{4,5}}, {{4,6}}, {{5,7}}, {{6,7}},
+                            {{0,4}}, {{1,5}}, {{2,6}}, {{3,7}}}};
+                        for (std::size_t i = 0; i < std::min<std::size_t>(256, layerAuthoringPreview.world.volumes.size()); ++i)
+                        {
+                            const auto& volume = layerAuthoringPreview.world.volumes[i];
+                            const std::array<WorldVec3, 8> corners{{
+                                {volume.bounds.min_x, volume.min_z, volume.bounds.min_y},
+                                {volume.bounds.max_x, volume.min_z, volume.bounds.min_y},
+                                {volume.bounds.min_x, volume.min_z, volume.bounds.max_y},
+                                {volume.bounds.max_x, volume.min_z, volume.bounds.max_y},
+                                {volume.bounds.min_x, volume.max_z, volume.bounds.min_y},
+                                {volume.bounds.max_x, volume.max_z, volume.bounds.min_y},
+                                {volume.bounds.min_x, volume.max_z, volume.bounds.max_y},
+                                {volume.bounds.max_x, volume.max_z, volume.bounds.max_y}}};
+                            const float hue = static_cast<float>(i % 3);
+                            const std::array<float, 4> color{hue == 0 ? 0.9f : 0.25f,
+                                hue == 1 ? 0.9f : 0.4f, hue == 2 ? 0.9f : 0.45f, 0.85f};
+                            for (const auto& edge : edges)
+                                selectedColliderLines.push_back({corners[edge[0]], corners[edge[1]], color});
+                        }
+                        // 3D-4B: blocked clearance cells (red X just above the
+                        // support plane), proven portal edges (green) and the
+                        // support probe (yellow capsule axis).
+                        const auto& world = layerAuthoringPreview.world;
+                        if (world.clearance_profile)
+                        {
+                            const double cell = world.clearance_profile->cell_size_m;
+                            std::size_t drawn = 0;
+                            constexpr std::size_t kMaxBlockedCellsDrawn = 20000;
+                            const std::array<float, 4> red{1.0f, 0.15f, 0.1f, 0.9f};
+                            for (const auto& volume : world.volumes)
+                            {
+                                if (!volume.clearance || !volume.ground_support) continue;
+                                const auto& grid = *volume.clearance;
+                                for (std::uint32_t j = 0; j < grid.cells_y && drawn < kMaxBlockedCellsDrawn; ++j)
+                                {
+                                    for (std::uint32_t c = 0; c < grid.cells_x && drawn < kMaxBlockedCellsDrawn; ++c)
+                                    {
+                                        if (!grid.Blocked(c, j)) continue;
+                                        const double x0 = volume.bounds.min_x + c * cell, y0 = volume.bounds.min_y + j * cell;
+                                        const double x1 = std::min(x0 + cell, static_cast<double>(volume.bounds.max_x));
+                                        const double y1 = std::min(y0 + cell, static_cast<double>(volume.bounds.max_y));
+                                        auto at = [&](double x, double y) {
+                                            return WorldVec3{static_cast<float>(x),
+                                                static_cast<float>(volume.ground_support->Height(x, y) + 0.03),
+                                                static_cast<float>(y)};
+                                        };
+                                        selectedColliderLines.push_back({at(x0, y0), at(x1, y1), red});
+                                        selectedColliderLines.push_back({at(x0, y1), at(x1, y0), red});
+                                        ++drawn;
+                                    }
+                                }
+                            }
+                            const std::array<float, 4> green{0.15f, 1.0f, 0.3f, 1.0f};
+                            for (const auto& portal : world.portals)
+                            {
+                                if (!portal.proof) continue;
+                                const auto& proof = *portal.proof;
+                                const mx::map::LayerVolume* a = nullptr;
+                                for (const auto& volume : world.volumes)
+                                    if (volume.id == portal.source_volume) a = &volume;
+                                if (!a || !a->ground_support) continue;
+                                const double x0 = proof.axis == 0 ? proof.edge : proof.span_min;
+                                const double y0 = proof.axis == 0 ? proof.span_min : proof.edge;
+                                const double x1 = proof.axis == 0 ? proof.edge : proof.span_max;
+                                const double y1 = proof.axis == 0 ? proof.span_max : proof.edge;
+                                for (const double lift : {0.05, 0.25})
+                                    selectedColliderLines.push_back({
+                                        {static_cast<float>(x0), static_cast<float>(a->ground_support->Height(x0, y0) + lift), static_cast<float>(y0)},
+                                        {static_cast<float>(x1), static_cast<float>(a->ground_support->Height(x1, y1) + lift), static_cast<float>(y1)},
+                                        green});
+                            }
+                            // 3D-5B2 proven terrain edges (cyan): one segment per
+                            // crossable slot, drawn just above the support plane.
+                            const std::array<float, 4> cyan{0.1f, 0.85f, 1.0f, 1.0f};
+                            for (const auto& edge : world.terrain_edges)
+                            {
+                                const mx::map::LayerVolume* volume = nullptr;
+                                for (const auto& candidate : world.volumes)
+                                    if (candidate.id == edge.volume_id) volume = &candidate;
+                                if (!volume || !volume->ground_support) continue;
+                                const std::uint32_t adjacent = edge.terrain_side == 0 ? 0u : edge.across - 1u;
+                                for (std::uint32_t slot = 0; slot < edge.slots; ++slot)
+                                {
+                                    if (edge.CellBlocked(slot, adjacent)) continue;
+                                    const double a0 = edge.span_min + slot * cell;
+                                    const double a1 = std::min(a0 + cell, static_cast<double>(edge.span_max));
+                                    const double x0 = edge.axis == 0 ? edge.edge : a0;
+                                    const double y0 = edge.axis == 0 ? a0 : edge.edge;
+                                    const double x1 = edge.axis == 0 ? edge.edge : a1;
+                                    const double y1 = edge.axis == 0 ? a1 : edge.edge;
+                                    selectedColliderLines.push_back({
+                                        {static_cast<float>(x0), static_cast<float>(volume->ground_support->Height(x0, y0) + 0.08), static_cast<float>(y0)},
+                                        {static_cast<float>(x1), static_cast<float>(volume->ground_support->Height(x1, y1) + 0.08), static_cast<float>(y1)},
+                                        cyan});
+                                }
+                            }
+                        }
+                        if (layerGroundProbe && layerGroundProbe->HasState())
+                        {
+                            const auto& p = layerGroundProbe->EnginePosition();
+                            const std::array<float, 4> yellow{1.0f, 0.9f, 0.1f, 1.0f};
+                            const float x = static_cast<float>(p[0]), y = static_cast<float>(p[1]), z = static_cast<float>(p[2]);
+                            selectedColliderLines.push_back({{x, y, z}, {x, y + 1.8f, z}, yellow});
+                            selectedColliderLines.push_back({{x - 0.35f, y + 0.02f, z}, {x + 0.35f, y + 0.02f, z}, yellow});
+                            selectedColliderLines.push_back({{x, y + 0.02f, z - 0.35f}, {x, y + 0.02f, z + 0.35f}, yellow});
+                        }
+                    }
                     selectionLines.insert(selectionLines.end(),
                         selectedColliderLines.begin(),
                         selectedColliderLines.end());
@@ -10883,17 +14070,22 @@ int RunGame(NativeWindow& window,
                             break;
                         }
                     }
-                    selectionOutlines.Render(*frameInfo.commandList,
-                        frameInfo,
-                        camera,
-                        selectionLines,
-                        renderSize.width,
-                        renderSize.height);
+                    if (useOffscreenScene)
+                        sceneViewOutlineLines = std::move(selectionLines);
+                    else
+                        selectionOutlines.Render(*frameInfo.commandList,
+                            frameInfo,
+                            camera,
+                            selectionLines,
+                            renderSize.width,
+                            renderSize.height);
                 }
                 if (!useOffscreenScene && hasSceneTerrain)
                 {
-                    terrain.RenderWater(device, camera, seconds, renderSize);
+                    terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
                 }
+                if (!useOffscreenScene)
+                    drawTransparents(sceneTransparentDraws, /*underWater=*/false, camera, renderSize.width, renderSize.height);
                 if (!useOffscreenScene && worldLabelsOk)
                     worldLabels.Render(*frameInfo.commandList, frameInfo, camera, plates);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherEnd);
@@ -10911,63 +14103,100 @@ int RunGame(NativeWindow& window,
 
             if (useOffscreenScene)
             {
-                offscreenScene.EndMainPass(*frameInfo.commandList);
-                if (isInWorld && hasSceneTerrain)
+                // A hidden Scene View drew nothing: its pass, water, god rays and depth copy are skipped
+                // (the panel keeps its last image); the Game view and the window pass below still run.
+                if (drawSceneView)
                 {
-                    offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
-                    terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
-                        offscreenScene.GetDepthSnapshotTexture(),
-                        offscreenScene.GetSampler(),
-                        offscreenScene.Width(),
-                        offscreenScene.Height());
-                    offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo, false);
-                    terrain.RenderWater(device, camera, seconds, renderSize);
                     offscreenScene.EndMainPass(*frameInfo.commandList);
+#if defined(IXTREEME_WITH_EDITOR)
+                    if (runtimeSession->IsMapEditorOpen() && editorImGui.IsSceneViewVisible() &&
+                        editorImGui.ShowsSceneViewAsPanel())
+                        ++sceneViewStatsFrameCount;
+#endif
+                    bool sceneDepthSnapshotted = false;
+                    // The water needs a copy of the finished scene (refraction, depth fade) and a pass of
+                    // its own. (Decided where the main pass ended.)
+                    if (sceneSnapshotPass)
+                    {
+                        offscreenScene.SnapshotScene(*frameInfo.commandList, frameInfo);
+                        sceneDepthSnapshotted = true;
+                        terrain.SetWaterRefractionInputs(offscreenScene.GetColorSnapshotTexture(),
+                            offscreenScene.GetDepthSnapshotTexture(),
+                            offscreenScene.GetSampler(),
+                            offscreenScene.Width(),
+                            offscreenScene.Height());
+                        // The above-water particles fade against THIS frame's depth (copied just above).
+                        particleRenderer.SetSceneDepth(offscreenScene.GetDepthSnapshotTexture(),
+                            offscreenScene.GetSampler(), camera.nearPlane, camera.farPlane);
+                        offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo, false);
+                        terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
+                        // The transparent draws above the water (and the soft particles), over it.
+                        drawTransparents(sceneTransparentDraws, /*underWater=*/false, camera, renderSize.width, renderSize.height);
+                        offscreenScene.EndMainPass(*frameInfo.commandList);
+                    }
+                    // God rays over the finished scene (water included). They read the depth: the snapshot
+                    // taken above for the water, or else the depth itself (the pass is over: no copy).
+                    if (godRaysOk && isInWorld && drawSceneView)
+                    {
+                        const GodRayRenderer::SunShadow sunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
+                            terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias,
+                            TerrainRenderer::SunShadowExtraDepthPaddingMeters()};
+                        std::shared_ptr<ixrhi::IXRHITexture> rayDepth = offscreenScene.GetDepthSnapshotTexture();
+                        if (!sceneSnapshotPass && godRays.IsVisible(sceneSky, frameSunLighting, camera, sunShadow))
+                            rayDepth = offscreenScene.ReadableDepth(*frameInfo.commandList, frameInfo);
+                        // The scene's tone-map draw adds them (no pass of their own over the image).
+                        GodRayRenderer::AddedLight rays;
+                        if (rayDepth &&
+                            godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/0, sceneSky, frameSunLighting,
+                                camera, rayDepth, sunShadow, renderSize.width, renderSize.height) &&
+                            godRays.TakeAddedLight(/*view=*/0, rays))
+                        {
+                            offscreenScene.SetAddedLight(rays.shafts, rays.shaftsWeight, rays.volume, rays.volumeWeight);
+                        }
+                    }
+                    // Soft particles without water: copy the depth at the end of the frame, at most every
+                    // 4th frame (a full-resolution depth copy is ~1 ms at 4K; the fade being a few frames
+                    // stale is invisible). A snapshot already taken this frame (water / god rays) is reused.
+                    if (sceneParticleSoft && !sceneDepthSnapshotted && (frameInfo.frameNumber % 4u) == 0u)
+                    {
+                        offscreenScene.SnapshotDepth(*frameInfo.commandList, frameInfo);
+                        sceneDepthSnapshotted = true;
+                    }
+                    if (sceneParticleSoft && sceneDepthSnapshotted)
+                        particleRenderer.SetSceneDepth(offscreenScene.GetDepthSnapshotTexture(),
+                            offscreenScene.GetSampler(), camera.nearPlane, camera.farPlane);
+                    if (sceneParticleSoft && !loggedParticleSoftDepth)
+                    {
+                        loggedParticleSoftDepth = true;
+                        Tracenf("[PARTICLE] soft particles active: depth snapshot %ux%u (every 4th frame)",
+                            offscreenScene.Width(), offscreenScene.Height());
+                    }
                 }
 #if defined(IXTREEME_WITH_EDITOR)
+                // The Scene View panel shows the tone-mapped image, with the editor outlines over it.
+                if (drawSceneView && runtimeSession->IsMapEditorOpen() && editorImGui.ShowsSceneViewAsPanel())
+                {
+                    offscreenScene.BeginDisplayPass(*frameInfo.commandList, frameInfo, frameToneMap);
+                    if (selectionOutlinesOk && !sceneViewOutlineLines.empty())
+                        selectionOutlines.Render(*frameInfo.commandList,
+                            frameInfo,
+                            camera,
+                            sceneViewOutlineLines,
+                            renderSize.width,
+                            renderSize.height);
+                    offscreenScene.EndDisplayPass(*frameInfo.commandList);
+                }
                 // --- Game view: render the scene from the main camera into the second offscreen target.
-                // Reuses this frame's shadow map (light-space, view-independent) and water reflection.
+                // Reuses this frame's shadow map (its cascades follow this camera while the Scene View
+                // is hidden, see shadowCamera) and water reflection.
                 // Only render the Game view when its panel is actually visible (active dock
                 // tab / not collapsed). Skipping it when hidden avoids a full second scene
                 // render every frame — the biggest editor perf win.
-                if (gameViewOk && runtimeSession->IsMapEditorOpen() && editorImGui.IsGameViewVisible())
                 {
-                    const CameraEntity* mainCameraEntity = nullptr;
-                    for (const CameraEntity& cameraEntity : editorCameras)
-                    {
-                        if (cameraEntity.id == editorMainCameraId)
-                        {
-                            mainCameraEntity = &cameraEntity;
-                            break;
-                        }
-                    }
-                    if (!mainCameraEntity && !editorCameras.empty())
-                        mainCameraEntity = &editorCameras.front();
-                    if (mainCameraEntity)
+                    if (gameViewCamera)  // set while the Game view panel is visible (computed above)
                     {
                         const VkExtent2D gameExtent{gameView.Width(), gameView.Height()};
-                        // In Play, the first active player character drives the Game camera
-                        // (follow/first-person/top-down per its CameraMode). Otherwise the
-                        // scene's static Main Camera is used.
-                        CameraEntity gameCameraEntity = *mainCameraEntity;
-                        if (editorPlay.state.mode == EditorPlayMode::Play)
-                        {
-                            for (const MeshSceneEntity& characterMesh : editorMeshEntities)
-                            {
-                                if (!characterMesh.hasCharacterController || !characterMesh.characterController.enabled)
-                                    continue;
-                                auto stateIt = editorCharacterStates.find(characterMesh.id);
-                                if (stateIt == editorCharacterStates.end() || !stateIt->second.initialized)
-                                    continue;
-                                phys::CharacterControllerComponent cc = characterMesh.characterController;
-                                phys::Sanitize(cc);
-                                gameCameraEntity = ComputeCharacterCameraEntity(
-                                    *mainCameraEntity, characterMesh, cc, stateIt->second);
-                                break;
-                            }
-                        }
-                        const WorldCamera gameCamera =
-                            BuildCameraFromEntity(gameCameraEntity, gameExtent.width, gameExtent.height);
+                        const WorldCamera& gameCamera = *gameViewCamera;
                         gameView.BeginMainPass(*frameInfo.commandList, frameInfo);
                         // Terrain is drawn from the project Main Camera using the secondary
                         // camera-uniform path (viewIndex=1). That path has its own per-frame
@@ -10979,41 +14208,36 @@ int RunGame(NativeWindow& window,
                         // (viewIndex=1) so it can be drawn from the Main Camera without
                         // clobbering the Scene View's water; reflection/refraction reuse this
                         // frame's Scene-view textures (acceptable; per-view RTs are a refinement).
-                        if (hasSceneTerrain)
-                        {
-                            terrain.Render(device, gameCamera, gameExtent, /*viewIndex=*/1);
-                        }
+                        // The terrain is drawn after the opaque meshes (see the Scene View): the
+                        // Game view pass clears depth, so the terrain needs no clear of its own.
                         if (isInWorld)
                         {
                             // Batch + frustum-cull the Game view meshes (mirroring the Scene
                             // view) instead of one un-batched RenderInWorld per entity. This
                             // collapses N per-entity draws into one instanced draw per renderer
                             // and skips off-screen meshes — the main per-mesh cost of the Game view.
-                            std::unordered_map<StaticMeshRenderer*, std::vector<StaticMeshRenderer::Instance>> gameMeshBatches;
+                            std::unordered_map<StaticMeshRenderer*, StaticMeshRenderer::InstanceList> gameMeshBatches;
                             const std::vector<std::uint32_t> gameMeshCandidates =
                                 staticMeshSpatialIndex.QueryFrustum(SpatialFrustumFromCamera(gameCamera));
                             for (std::uint32_t candidateId : gameMeshCandidates)
                             {
                                 const MeshSceneEntity* mesh = findMeshEntityById(candidateId);
-                                if (!mesh || mesh->editorHidden || mesh->skinned)
+                                if (!mesh || !mesh->effectiveEnabled || mesh->editorHidden || mesh->skinned)
                                     continue;
-                                StaticMeshRenderer* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(*mesh));
-                                if (!renderer || !renderer->IsLoaded())
+                                const StaticMeshRenderRecord& meshRecord = staticMeshRenderRecord(*mesh);
+                                StaticMeshRenderer* renderer = meshRecord.renderer;
+                                if (!renderer)
                                     continue;
-                                StaticMeshRenderer::Instance instance{};
-                                instance.entityId = mesh->id;
-                                instance.position = {mesh->position[0], mesh->position[1], mesh->position[2]};
-                                instance.rotation[0] = mesh->rotation[0];
-                                instance.rotation[1] = mesh->rotation[1];
-                                instance.rotation[2] = mesh->rotation[2];
-                                instance.scale[0] = mesh->scale[0];
-                                instance.scale[1] = mesh->scale[1];
-                                instance.scale[2] = mesh->scale[2];
-                                instance.materialSlots = mesh->materialSlots;
-                                instance.materialOverrides = mesh->materialOverrides;
-                                gameMeshBatches[renderer].push_back(std::move(instance));
+                                if (renderer->HasTransparentDraws(meshRecord.instance))
+                                    addTransparentDraw(gameTransparentDraws, renderer, meshRecord.instance,
+                                        meshRecord.worldBounds, gameCamera);
+                                gameMeshBatches[renderer].push_back(&meshRecord.instance);
                             }
                             for (auto& [gameRenderer, gameInstances] : gameMeshBatches)
+                            {
+                                // Set here too: the Scene View pass (which also sets it) may have
+                                // skipped this renderer (culled there) or not run at all (hidden).
+                                gameRenderer->SetLightingState(frameLighting);
                                 gameRenderer->RenderBatchInWorld(*frameInfo.commandList,
                                     frameInfo,
                                     seconds,
@@ -11021,6 +14245,7 @@ int RunGame(NativeWindow& window,
                                     gameInstances,
                                     gameExtent.width,
                                     gameExtent.height);
+                            }
 
                             // Skinned meshes (incl. the player character) were compute-skinned in
                             // the pre-pass into their own top-of-range Game slots; here we only
@@ -11030,21 +14255,82 @@ int RunGame(NativeWindow& window,
                                 if (!rec.renderer)
                                     continue;
                                 rec.renderer->RenderInWorld(*frameInfo.commandList, frameInfo, seconds, gameCamera,
-                                    rec.position, rec.yaw, rec.slot, rec.tint, gameExtent.width, gameExtent.height);
+                                    rec.position, rec.yaw, rec.slot, rec.tint, gameExtent.width, gameExtent.height, rec.scale);
                             }
                         }
                         if (hasSceneTerrain)
                         {
-                            terrain.RenderWater(device, gameCamera, seconds, gameExtent, /*viewIndex=*/1);
+                            terrain.Render(*frameInfo.commandList, frameInfo, gameCamera, gameExtent.width, gameExtent.height,
+                                /*viewIndex=*/1, /*clearDepth=*/false);
                         }
+                        // The sky after the opaque geometry (as in the Scene View), under the water.
+                        if (skyOk && isInWorld)
+                            skyRenderer.Render(*frameInfo.commandList, frameInfo, gameCamera,
+                                gameExtent.width, gameExtent.height);
+                        // Transparent draws: those under water, the water, then the rest over it.
+                        collectParticleDraws(gameTransparentDraws, gameCamera, /*allowSoftParticles=*/false);
+                        sortTransparentDraws(gameTransparentDraws);
+                        drawTransparents(gameTransparentDraws, /*underWater=*/true, gameCamera, gameExtent.width, gameExtent.height);
+                        if (hasSceneTerrain)
+                            terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
+                        drawTransparents(gameTransparentDraws, /*underWater=*/false, gameCamera, gameExtent.width, gameExtent.height);
+                        // God rays over the game image, under the game's UI: after the pass, from its depth;
+                        // the game view's tone-map draw adds them.
+                        const GodRayRenderer::SunShadow gameSunShadow{terrain.SunShadowTexture(frameInfo.frameNumber),
+                            terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias,
+                            TerrainRenderer::SunShadowExtraDepthPaddingMeters()};
                         gameView.EndMainPass(*frameInfo.commandList);
+#if defined(IXTREEME_WITH_EDITOR)
+                        if (runtimeSession->IsMapEditorOpen() && editorImGui.IsGameViewVisible())
+                            ++gameViewStatsFrameCount;
+#endif
+                        if (godRaysOk && isInWorld && godRays.IsVisible(sceneSky, frameSunLighting, gameCamera, gameSunShadow))
+                        {
+                            // God rays only read the depth, and the pass is over: the depth itself, no copy.
+                            const std::shared_ptr<ixrhi::IXRHITexture> gameDepth =
+                                gameView.ReadableDepth(*frameInfo.commandList, frameInfo);
+                            GodRayRenderer::AddedLight gameRays;
+                            if (gameDepth &&
+                                godRays.RenderRays(*frameInfo.commandList, frameInfo, /*view=*/1, sceneSky, frameSunLighting,
+                                    gameCamera, gameDepth, gameSunShadow, gameExtent.width, gameExtent.height) &&
+                                godRays.TakeAddedLight(/*view=*/1, gameRays))
+                            {
+                                gameView.SetAddedLight(gameRays.shafts, gameRays.shaftsWeight, gameRays.volume,
+                                    gameRays.volumeWeight);
+                            }
+                        }
+                        // The panel shows the tone-mapped image, with the game's own UI (a HUD a script
+                        // opened) over it, as the built game draws it over its tone-mapped window.
+                        gameView.BeginDisplayPass(*frameInfo.commandList, frameInfo, frameToneMap);
+                        if (rmlUi.HasVisibleGameDocuments())
+                        {
+                            if (rmlUi.TargetPass() != gameView.GetDisplayPass())
+                            {
+                                rhiDevice->WaitIdle();  // the old pipeline may still be in flight
+                                rmlUi.SetTargetPass(gameView.GetDisplayPass());
+                                rmlUi.RecreatePipeline(*rhiDevice);
+                            }
+                            if (rmlUi.Width() != gameView.Width() || rmlUi.Height() != gameView.Height())
+                                rmlUi.Resize(gameView.Width(), gameView.Height());
+                            rmlUi.Render(*frameInfo.commandList, frameInfo);
+                        }
+                        gameView.EndDisplayPass(*frameInfo.commandList);
                     }
                 }
 #endif
                 beginMainPass(); // composite + labels + UI share one swapchain pass
-                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeBegin);
-                offscreenScene.RenderComposite(*frameInfo.commandList, frameInfo);
-                rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeEnd);
+                // The editor shows the offscreen scene as its Scene View panel image: a full-window
+                // composite of it under the editor UI would only be covered (the pass clears instead).
+                bool compositeScene = true;
+#if defined(IXTREEME_WITH_EDITOR)
+                compositeScene = !(runtimeSession->IsMapEditorOpen() && editorImGui.ShowsSceneViewAsPanel());
+#endif
+                if (compositeScene)
+                {
+                    rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeBegin);
+                    offscreenScene.RenderComposite(*frameInfo.commandList, frameInfo, frameToneMap);
+                    rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::CompositeEnd);
+                }
                 if (isInWorld && worldLabelsOk)
                     worldLabels.Render(*frameInfo.commandList, frameInfo, camera, plates);
             }
@@ -11052,7 +14338,9 @@ int RunGame(NativeWindow& window,
             const auto editorUiBegin = std::chrono::steady_clock::now();
             frameRmlUiRenderCalled = true;
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiBegin);
-            rmlUi.Render(*frameInfo.commandList, frameInfo);
+#if !defined(IXTREEME_WITH_EDITOR)
+            rmlUi.Render(*frameInfo.commandList, frameInfo);  // the editor draws the game UI into the Game view
+#endif
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiEnd);
 #if defined(IXTREEME_WITH_EDITOR)
             frameImGuiRenderCalled = true;
@@ -11093,7 +14381,25 @@ int RunGame(NativeWindow& window,
             }
             editorImGui.SetEngineStats(engineStats);
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ImGuiBegin);
+            // Script text prompts (IScriptApi::PromptText): the editor UI draws the open ones and hands
+            // the answers back right after the panels are built.
+            scriptApi.promptsAvailable = true;
+            {
+                std::vector<EditorImGui::ScriptPromptView> promptViews;
+                for (const auto& [promptId, prompt] : scriptApi.Prompts())
+                    if (prompt.status == 0)
+                        promptViews.push_back({promptId, prompt.title, prompt.label, prompt.secret});
+                editorImGui.SetScriptPrompts(std::move(promptViews));
+            }
             editorImGui.RenderPanels();
+            for (EditorImGui::ScriptPromptAnswer& answer : editorImGui.TakeScriptPromptAnswers())
+            {
+                if (answer.submitted)
+                    scriptApi.SubmitPrompt(answer.id, answer.text);
+                else
+                    scriptApi.CancelPrompt(answer.id);
+                std::fill(answer.text.begin(), answer.text.end(), '\0');  // may be a password
+            }
             editorAdapter->DrawFrame(*frameInfo.commandList, frameInfo.frameNumber);
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::ImGuiEnd);
 #else
@@ -11111,6 +14417,9 @@ int RunGame(NativeWindow& window,
                 : (frameNumber < 3 || (frameNumber % 60u) == 0u);
             if (frameHeartbeatLog)
             {
+                if (frameTreeImpostors != 0)
+                    Tracenf("[TREE-IMPOSTOR] main trees=%zu colour_triangles=%zu drawcalls=%zu",
+                        frameTreeImpostors, frameStaticMeshTriangles, frameStaticMeshDrawCalls);
                 if (!QuietLogsForLodDiag())
                 {
                     TraceDiagf("[FRAME] static_mesh entities=%zu submitted=%zu drawcalls=%zu",
@@ -11253,6 +14562,10 @@ int RunGame(NativeWindow& window,
         // no submission; the backend asserts pairing in Debug).
         if (rhiFrame)
             rhiDevice->EndFrame(rhiFrame);
+        else if (rhiFrame.result == ixrhi::IXRHIFrameResult::Skip)
+            // No frame to draw (minimized window): the loop would otherwise spin a core tens of
+            // thousands of times a second until it is restored.
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
         frameProfile.submitPresentMs = MillisecondsBetween(submitPresentBegin, std::chrono::steady_clock::now());
         frameProfile.totalCpuFrameMs = MillisecondsBetween(frameCpuStart, std::chrono::steady_clock::now());
         // Carry this frame's CPU profile + present mode into engineStats so next frame's
@@ -11264,12 +14577,105 @@ int RunGame(NativeWindow& window,
         engineStats.cpuSubmitPresentMs = frameProfile.submitPresentMs;
         engineStats.cpuEcsUpdateMs = frameProfile.ecsSystemsUpdateMs;
         engineStats.cpuAssetWatcherMs = frameProfile.assetWatcherPollMs;
+        if (perfLog.intervalSeconds > 0.0)
+        {
+            const auto perfNow = std::chrono::steady_clock::now();
+            if (perfLog.frames == 0)
+            {
+                perfLog.windowStart = perfNow;
+                perfLog.presentedAtWindowStart = rhiDevice->GetPresentedFrameCount();
+            }
+            FrameCpuProfile& sum = perfLog.sum;
+            sum.totalCpuFrameMs += frameProfile.totalCpuFrameMs;
+            sum.frameWaitMs += frameProfile.frameWaitMs;
+            sum.simulationMs += frameProfile.simulationMs;
+            sum.physicsMs += frameProfile.physicsMs;
+            sum.scriptsMs += frameProfile.scriptsMs;
+            sum.particlesMs += frameProfile.particlesMs;
+            sum.particleInstancesMs += frameProfile.particleInstancesMs;
+            sum.animationMs += frameProfile.animationMs;
+            sum.renderRecordsMs += frameProfile.renderRecordsMs;
+            sum.sceneRenderMs += frameProfile.sceneRenderMs;
+            sum.shadowPassMs += frameProfile.shadowPassMs;
+            sum.editorUiRenderMs += frameProfile.editorUiRenderMs;
+            sum.submitPresentMs += frameProfile.submitPresentMs;
+            perfLog.maxFrameMs = std::max(perfLog.maxFrameMs, frameProfile.totalCpuFrameMs);
+            perfLog.skinnedSum += frameProfile.skinnedInstances;
+            ++perfLog.frames;
+
+            // GPU passes (IX_GPU_PROFILE=1), one frame in 64: a capture waits for the GPU, so sampling
+            // more often would slow the very frames it measures.
+            ixrhi::IXRHITimestampResults gpu{};
+            ixrhi::IXRHICpuFrameTiming gpuCpu{};
+            if (rhiDevice->TryReadTimestamps(gpu, gpuCpu))
+            {
+                using P = ixrhi::IXRHITimestampPoint;
+                const auto span = [&gpu](P from, P to) -> double {
+                    const auto a = static_cast<std::uint32_t>(from);
+                    const auto b = static_cast<std::uint32_t>(to);
+                    if (!gpu.pointValid[a] || !gpu.pointValid[b] || gpu.pointNanoseconds[b] < gpu.pointNanoseconds[a])
+                        return 0.0;
+                    return static_cast<double>(gpu.pointNanoseconds[b] - gpu.pointNanoseconds[a]) / 1.0e6;
+                };
+                perfLog.gpuFrame += span(P::FrameBegin, P::FrameEnd);
+                perfLog.gpuShadow += span(P::ShadowPassBegin, P::ShadowPassEnd);
+                perfLog.gpuReflection += span(P::WaterReflectionBegin, P::WaterReflectionEnd);
+                perfLog.gpuTerrain += span(P::TerrainMainBegin, P::TerrainMainEnd);
+                perfLog.gpuScene += span(P::SceneOtherBegin, P::SceneOtherEnd);
+                perfLog.gpuPost += span(P::SceneOtherEnd, P::RmlUiBegin);
+                perfLog.gpuUi += span(P::RmlUiBegin, P::RmlUiEnd) + span(P::ImGuiBegin, P::ImGuiEnd);
+                for (std::uint32_t cascade = 0; cascade < perfLog.gpuCascades.size(); ++cascade)
+                {
+                    const auto begin = static_cast<P>(static_cast<std::uint32_t>(P::ShadowCascade0Begin) + cascade * 2u);
+                    perfLog.gpuCascades[cascade] += span(begin, static_cast<P>(static_cast<std::uint32_t>(begin) + 1u));
+                }
+                ++perfLog.gpuSamples;
+            }
+            if ((++perfLog.frameCounter % 64u) == 0u)
+                rhiDevice->RequestGpuFrameCapture();
+
+            const double windowSeconds = std::chrono::duration<double>(perfNow - perfLog.windowStart).count();
+            if (windowSeconds >= perfLog.intervalSeconds && perfLog.frames > 1)
+            {
+                const double n = static_cast<double>(perfLog.frames);
+                const double presented =
+                    static_cast<double>(rhiDevice->GetPresentedFrameCount() - perfLog.presentedAtWindowStart);
+                std::size_t aliveParticles = 0;
+                for (const auto& [particleEntityId, simulator] : entityParticles)
+                {
+                    (void)particleEntityId;
+                    aliveParticles += simulator.AliveCount();
+                }
+                Tracenf("[PERF] loop %.0f fps, presented %.0f fps | cpu ms: frame %.3f (max %.3f) wait %.3f "
+                        "sim %.3f (physics %.3f scripts %.3f particles %.3f) anim %.3f (records %.3f) render %.3f (shadow %.3f "
+                        "particles %.3f) ui %.3f submit %.3f | scene: %zu meshes, %.0f skinned, %zu cpu emitters, %zu particles",
+                    n / windowSeconds, presented / windowSeconds, sum.totalCpuFrameMs / n, perfLog.maxFrameMs,
+                    sum.frameWaitMs / n, sum.simulationMs / n, sum.physicsMs / n, sum.scriptsMs / n,
+                    sum.particlesMs / n, sum.animationMs / n, sum.renderRecordsMs / n, sum.sceneRenderMs / n,
+                    sum.shadowPassMs / n, sum.particleInstancesMs / n,
+                    sum.editorUiRenderMs / n, sum.submitPresentMs / n, editorMeshEntities.size(),
+                    static_cast<double>(perfLog.skinnedSum) / n, entityParticles.size(), aliveParticles);
+                if (perfLog.gpuSamples > 0)
+                {
+                    const double g = static_cast<double>(perfLog.gpuSamples);
+                    Tracenf("[PERF] gpu ms (%u samples): frame %.3f shadow %.3f (cascades %.2f %.2f %.2f %.2f) "
+                            "reflection %.3f terrain %.3f scene %.3f post %.3f ui %.3f",
+                        perfLog.gpuSamples, perfLog.gpuFrame / g, perfLog.gpuShadow / g, perfLog.gpuCascades[0] / g,
+                        perfLog.gpuCascades[1] / g, perfLog.gpuCascades[2] / g, perfLog.gpuCascades[3] / g,
+                        perfLog.gpuReflection / g, perfLog.gpuTerrain / g, perfLog.gpuScene / g, perfLog.gpuPost / g,
+                        perfLog.gpuUi / g);
+                }
+                const double interval = perfLog.intervalSeconds;
+                perfLog = PerfLogState{};
+                perfLog.intervalSeconds = interval;
+            }
+        }
 #if defined(IXTREEME_WITH_EDITOR)
         if (dumpFrameProfileRequested)
         {
             dumpFrameProfileRequested = false;
             TraceDiagf("[FRAME-PROFILE] frame=%llu",
-                static_cast<unsigned long long>(device.GetFrameNumber()));
+                static_cast<unsigned long long>(frameNumber));
             TraceDiagf("[FRAME-PROFILE]   asset_library_poll = %.3f ms",
                 frameProfile.assetLibraryPollMs);
             TraceDiagf("[FRAME-PROFILE]   asset_watcher_poll = %.3f ms",
@@ -11391,6 +14797,7 @@ int RunGame(NativeWindow& window,
     // Wait out any in-flight game-script build so its worker thread can't outlive this scope.
     // (GameScriptBuildService joins its worker; paths are captured by value — no RunGame refs.)
     gameScriptBuild.Shutdown();
+    gamePackage.Shutdown();
     // Closing the window while still in Play must still honor the script lifecycle: fire OnDestroy on
     // every live instance before the maps unwind (their dtors would otherwise free without the hook).
     for (auto& [scriptEntityId, instance] : entityScripts)
@@ -11402,13 +14809,31 @@ int RunGame(NativeWindow& window,
     }
     entityScripts.clear();
     scriptSystem.reset();
+    scriptApi.ResetTransportAndPrompts();
 #endif
 
     device.WaitIdle();
     if (worldLabelsOk)
         worldLabels.Destroy();
+    if (particleRendererOk)
+        particleRenderer.Destroy();
     if (selectionOutlinesOk)
         selectionOutlines.Destroy();
+    if (skyOk)
+        skyRenderer.Destroy();
+    if (godRaysOk)
+        godRays.Destroy();
+    // Loads still running are waited for first (freeing a load waits for it).
+    for (auto& [path, entry] : staticMeshCache)
+    {
+        (void)path;
+        entry.load.reset();
+    }
+    for (auto& [skinnedPath, skinnedEntry] : skinnedMeshCache)
+    {
+        (void)skinnedPath;
+        skinnedEntry.load.reset();
+    }
     for (auto& [path, entry] : staticMeshCache)
     {
         (void)path;
@@ -11444,6 +14869,8 @@ int RunGame(NativeWindow& window,
     // releases frame contexts, swapchain object, query pool and upload pool.
     rhiDevice->Shutdown();
     device.Destroy();
+    // The workers finish and leave before the process tears down what their tasks reach.
+    ixjobs::JobSystem::Instance().Stop();
     return 0;
 }
 }

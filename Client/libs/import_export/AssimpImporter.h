@@ -88,6 +88,8 @@ public:
         std::uint32_t embeddedTextures = 0;
         std::uint32_t externalTextures = 0;
         std::uint32_t missingTextures = 0;
+        std::vector<std::filesystem::path> texturePaths;
+        std::vector<std::string> missingTexturePaths;
         bool skeletalIgnored = false;
         bool hasSkeletal = false;
     };
@@ -95,6 +97,7 @@ public:
     struct ImportOptions
     {
         std::filesystem::path textureOutputDir;
+        std::filesystem::path textureSourceDir; // Original FBX folder, before the model was copied.
         bool extractTextures = false;
     };
 
@@ -105,4 +108,10 @@ public:
                           const std::vector<std::filesystem::path>& animationPaths,
                           std::string& error,
                           std::vector<std::string>* outJointNames = nullptr) const;
+    // True when the ozz skeleton at skeletonPath is the one writeOzzSidecars would write for
+    // `result` now (same joints, same rest pose). False when it is missing, unreadable, or was
+    // written by an older importer — e.g. before FBX pivot nodes were collapsed, when Mixamo rigs
+    // lost most bone offsets and rendered scrambled whenever no animation overrode every bone.
+    bool ozzSkeletonSidecarMatches(const ImportResult& result,
+                                   const std::filesystem::path& skeletonPath) const;
 };

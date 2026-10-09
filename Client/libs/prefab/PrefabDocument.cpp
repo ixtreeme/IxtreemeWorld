@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cmath>
+#include <set>
 #include <map>
 #include <sstream>
 
@@ -365,6 +367,77 @@ ixscript::ScriptComponent ReadScript(const std::string& object)
     return s;
 }
 
+ixparticle::ParticleSystemComponent ReadParticleSystem(const std::string& object)
+{
+    ixparticle::ParticleSystemComponent p;
+    const std::string component = ExtractNamedObject(object, "particle_system");
+    if (component.empty())
+        return p;
+    p.textureAssetId = ixtreeme::common::JsonStringValue(component, "texture_asset_id");
+    p.effectAssetId = ixtreeme::common::JsonStringValue(component, "effect_asset_id");
+    p.enabled = ixtreeme::common::JsonBoolValue(component, "enabled", p.enabled);
+    p.playOnStart = ixtreeme::common::JsonBoolValue(component, "play_on_start", p.playOnStart);
+    p.loop = ixtreeme::common::JsonBoolValue(component, "loop", p.loop);
+    p.gpuSimulation = ixtreeme::common::JsonBoolValue(component, "gpu_simulation", p.gpuSimulation);
+    p.blendMode = ixparticle::ParseBlendMode(ixtreeme::common::JsonStringValue(component, "blend_mode"));
+    p.duration = ixtreeme::common::JsonFloatValue(component, "duration", p.duration);
+    p.emissionRate = ixtreeme::common::JsonFloatValue(component, "emission_rate", p.emissionRate);
+    p.burstCount = static_cast<int>(ixtreeme::common::JsonFloatValue(
+        component, "burst_count", static_cast<float>(p.burstCount)));
+    p.maxParticles = static_cast<int>(ixtreeme::common::JsonFloatValue(
+        component, "max_particles", static_cast<float>(p.maxParticles)));
+    p.startLifetimeMin = ixtreeme::common::JsonFloatValue(component, "start_lifetime_min", p.startLifetimeMin);
+    p.startLifetimeMax = ixtreeme::common::JsonFloatValue(component, "start_lifetime_max", p.startLifetimeMax);
+    p.startSpeedMin = ixtreeme::common::JsonFloatValue(component, "start_speed_min", p.startSpeedMin);
+    p.startSpeedMax = ixtreeme::common::JsonFloatValue(component, "start_speed_max", p.startSpeedMax);
+    p.startSizeMin = ixtreeme::common::JsonFloatValue(component, "start_size_min", p.startSizeMin);
+    p.startSizeMax = ixtreeme::common::JsonFloatValue(component, "start_size_max", p.startSizeMax);
+    // Backward compatibility: pre-curve files stored a linear start/end pair + an end size scale.
+    {
+        float startColor[4] = {p.colorOverLife[0], p.colorOverLife[1], p.colorOverLife[2], p.colorOverLife[3]};
+        float endColor[4] = {p.colorOverLife[12], p.colorOverLife[13], p.colorOverLife[14], p.colorOverLife[15]};
+        ixtreeme::common::JsonFloatArrayValue(component, "start_color", startColor, 4);
+        ixtreeme::common::JsonFloatArrayValue(component, "end_color", endColor, 4);
+        for (int c = 0; c < 4; ++c)
+        {
+            p.colorOverLife[c] = startColor[c];
+            p.colorOverLife[12 + c] = endColor[c];
+            p.colorOverLife[4 + c] = startColor[c] + (endColor[c] - startColor[c]) * (1.0f / 3.0f);
+            p.colorOverLife[8 + c] = startColor[c] + (endColor[c] - startColor[c]) * (2.0f / 3.0f);
+        }
+        ixtreeme::common::JsonFloatArrayValue(component, "color_over_life", p.colorOverLife, 16);
+
+        const float endSizeScale = ixtreeme::common::JsonFloatValue(component, "end_size_scale", p.sizeOverLife[3]);
+        p.sizeOverLife[0] = 1.0f;
+        p.sizeOverLife[1] = 1.0f;
+        p.sizeOverLife[2] = 1.0f;
+        p.sizeOverLife[3] = endSizeScale;
+        ixtreeme::common::JsonFloatArrayValue(component, "size_over_life", p.sizeOverLife, 4);
+    }
+    ixtreeme::common::JsonFloatArrayValue(component, "direction", p.direction, 3);
+    p.coneAngle = ixtreeme::common::JsonFloatValue(component, "cone_angle", p.coneAngle);
+    p.shapeRadius = ixtreeme::common::JsonFloatValue(component, "shape_radius", p.shapeRadius);
+    p.gravity = ixtreeme::common::JsonFloatValue(component, "gravity", p.gravity);
+    p.drag = ixtreeme::common::JsonFloatValue(component, "drag", p.drag);
+    p.rotationSpeed = ixtreeme::common::JsonFloatValue(component, "rotation_speed", p.rotationSpeed);
+    p.softParticles = ixtreeme::common::JsonBoolValue(component, "soft_particles", p.softParticles);
+    p.softDistance = ixtreeme::common::JsonFloatValue(component, "soft_distance", p.softDistance);
+    p.atlasColumns = static_cast<int>(ixtreeme::common::JsonFloatValue(
+        component, "atlas_columns", static_cast<float>(p.atlasColumns)));
+    p.atlasRows = static_cast<int>(ixtreeme::common::JsonFloatValue(
+        component, "atlas_rows", static_cast<float>(p.atlasRows)));
+    p.shape = ixparticle::ParseShape(ixtreeme::common::JsonStringValue(component, "shape"));
+    p.localSpace = ixtreeme::common::JsonBoolValue(component, "local_space", p.localSpace);
+    ixtreeme::common::JsonFloatArrayValue(component, "shape_extents", p.shapeExtents, 3);
+    p.shapeArc = ixtreeme::common::JsonFloatValue(component, "shape_arc", p.shapeArc);
+    p.collideWithGround = ixtreeme::common::JsonBoolValue(component, "collide_with_ground", p.collideWithGround);
+    p.collisionBounce = ixtreeme::common::JsonFloatValue(component, "collision_bounce", p.collisionBounce);
+    p.collisionFriction = ixtreeme::common::JsonFloatValue(component, "collision_friction", p.collisionFriction);
+    p.groundPlaneY = ixtreeme::common::JsonFloatValue(component, "ground_plane_y", p.groundPlaneY);
+    ixparticle::Sanitize(p);
+    return p;
+}
+
 ixtreeme::physics::RigidbodyComponent ReadRigidbody(const std::string& object)
 {
     ixtreeme::physics::RigidbodyComponent rigidbody;
@@ -546,6 +619,8 @@ PrefabInstanceState ReadPrefabInstance(const std::string& object, const std::str
     return prefab;
 }
 
+void WriteParticleSystem(std::ostream& out, const ixparticle::ParticleSystemComponent& p, const std::string& indent);
+
 void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::string& displayName, const std::string& indent)
 {
     WritePrefabInstance(out, mesh.prefabAssetId, mesh.prefabInstance, indent);
@@ -557,6 +632,10 @@ void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::
     out << indent << "\"rotation\": " << FloatArray(mesh.rotation, 3) << ",\n";
     out << indent << "\"scale\": " << FloatArray(mesh.scale, 3) << ",\n";
     out << indent << "\"skinned\": " << (mesh.skinned ? "true" : "false");
+    out << ",\n" << indent << "\"enabled\": " << (mesh.enabled ? "true" : "false");
+    if (!mesh.animatorControllerId.empty())
+        out << ",\n" << indent << "\"animator_controller_id\": \""
+            << ixtreeme::common::EscapeJson(mesh.animatorControllerId) << "\"";
     WriteMaterials(out, mesh.materialSlots, indent);
     WriteMaterialOverrides(out, mesh.materialOverrides, indent);
     if (mesh.hasRigidbody)
@@ -580,8 +659,57 @@ void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::
     }
     if (mesh.hasScript)
         WriteScript(out, mesh.script, indent);
+    if (mesh.hasParticleSystem)
+        WriteParticleSystem(out, mesh.particleSystem, indent);
     out << "\n";
 }
+
+void WriteParticleSystem(std::ostream& out, const ixparticle::ParticleSystemComponent& p, const std::string& indent)
+{
+    out << ",\n";
+    out << indent << "\"particle_system\": {\n";
+    out << indent << "  \"texture_asset_id\": \"" << ixtreeme::common::EscapeJson(p.textureAssetId) << "\",\n";
+    out << indent << "  \"effect_asset_id\": \"" << ixtreeme::common::EscapeJson(p.effectAssetId) << "\",\n";
+    out << indent << "  \"enabled\": " << (p.enabled ? "true" : "false") << ",\n";
+    out << indent << "  \"play_on_start\": " << (p.playOnStart ? "true" : "false") << ",\n";
+    out << indent << "  \"loop\": " << (p.loop ? "true" : "false") << ",\n";
+    out << indent << "  \"gpu_simulation\": " << (p.gpuSimulation ? "true" : "false") << ",\n";
+    out << indent << "  \"blend_mode\": \"" << ixparticle::BlendModeName(p.blendMode) << "\",\n";
+    out << indent << "  \"duration\": " << p.duration << ",\n";
+    out << indent << "  \"emission_rate\": " << p.emissionRate << ",\n";
+    out << indent << "  \"burst_count\": " << p.burstCount << ",\n";
+    out << indent << "  \"max_particles\": " << p.maxParticles << ",\n";
+    out << indent << "  \"start_lifetime_min\": " << p.startLifetimeMin << ",\n";
+    out << indent << "  \"start_lifetime_max\": " << p.startLifetimeMax << ",\n";
+    out << indent << "  \"start_speed_min\": " << p.startSpeedMin << ",\n";
+    out << indent << "  \"start_speed_max\": " << p.startSpeedMax << ",\n";
+    out << indent << "  \"start_size_min\": " << p.startSizeMin << ",\n";
+    out << indent << "  \"start_size_max\": " << p.startSizeMax << ",\n";
+    out << indent << "  \"size_over_life\": " << FloatArray(p.sizeOverLife, 4) << ",\n";
+    out << indent << "  \"direction\": " << FloatArray(p.direction, 3) << ",\n";
+    out << indent << "  \"cone_angle\": " << p.coneAngle << ",\n";
+    out << indent << "  \"shape_radius\": " << p.shapeRadius << ",\n";
+    out << indent << "  \"gravity\": " << p.gravity << ",\n";
+    out << indent << "  \"drag\": " << p.drag << ",\n";
+    out << indent << "  \"rotation_speed\": " << p.rotationSpeed << ",\n";
+    out << indent << "  \"soft_particles\": " << (p.softParticles ? "true" : "false") << ",\n";
+    out << indent << "  \"soft_distance\": " << p.softDistance << ",\n";
+    out << indent << "  \"atlas_columns\": " << p.atlasColumns << ",\n";
+    out << indent << "  \"atlas_rows\": " << p.atlasRows << ",\n";
+    out << indent << "  \"shape\": \"" << ixparticle::ShapeName(p.shape) << "\",\n";
+    out << indent << "  \"local_space\": " << (p.localSpace ? "true" : "false") << ",\n";
+    out << indent << "  \"shape_extents\": " << FloatArray(p.shapeExtents, 3) << ",\n";
+    out << indent << "  \"shape_arc\": " << p.shapeArc << ",\n";
+    out << indent << "  \"collide_with_ground\": " << (p.collideWithGround ? "true" : "false") << ",\n";
+    out << indent << "  \"collision_bounce\": " << p.collisionBounce << ",\n";
+    out << indent << "  \"collision_friction\": " << p.collisionFriction << ",\n";
+    out << indent << "  \"ground_plane_y\": " << p.groundPlaneY << ",\n";
+    out << indent << "  \"start_color\": " << FloatArray(p.colorOverLife, 4) << ",\n";
+    out << indent << "  \"end_color\": " << FloatArray(p.colorOverLife + 12, 4) << ",\n";
+    out << indent << "  \"color_over_life\": " << FloatArray(p.colorOverLife, 16) << "\n";
+    out << indent << "}";
+}
+
 
 void WritePointObject(std::ostream& out, const PointLight& light, const std::string& displayName, const std::string& indent)
 {
@@ -638,6 +766,8 @@ PrefabEntity ParseEntityObject(const std::string& object, const std::string& fal
         ixtreeme::common::JsonFloatArrayValue(object, "rotation", entity.mesh.rotation, 3);
         ixtreeme::common::JsonFloatArrayValue(object, "scale", entity.mesh.scale, 3);
         entity.mesh.skinned = ixtreeme::common::JsonBoolValue(object, "skinned", entity.mesh.skinned);
+        entity.mesh.enabled = ixtreeme::common::JsonBoolValue(object, "enabled", true);
+        entity.mesh.animatorControllerId = ixtreeme::common::JsonStringValue(object, "animator_controller_id");
         entity.mesh.materialSlots = ixtreeme::common::JsonStringArrayValue(object, "materials");
         const std::vector<std::string> materialOverrides = ExtractNamedArrayObjects(object, "material_overrides");
         for (const std::string& materialOverride : materialOverrides)
@@ -681,6 +811,11 @@ PrefabEntity ParseEntityObject(const std::string& object, const std::string& fal
         {
             entity.mesh.hasScript = true;
             entity.mesh.script = ReadScript(object);
+        }
+        if (!ExtractNamedObject(object, "particle_system").empty())
+        {
+            entity.mesh.hasParticleSystem = true;
+            entity.mesh.particleSystem = ReadParticleSystem(object);
         }
         return entity;
     }
@@ -772,6 +907,15 @@ void WriteSpotLight(std::ostream& out, const SpotLight& light, const std::string
 
 void WriteDocument(std::ostream& out, const PrefabDocument& document)
 {
+    // A document built from a live scene holds world IDs in its joints. Store local references,
+    // so a runtime instance never binds a prefab joint to an unrelated live scene entity.
+    std::map<std::uint32_t, std::uint32_t> localMeshIds;
+    for (std::size_t i = 0; i < document.entities.size(); ++i)
+    {
+        const auto& entity = document.entities[i];
+        if (entity.kind == PrefabTemplate::Kind::Mesh && entity.mesh.id != 0)
+            localMeshIds.emplace(entity.mesh.id, entity.localId == 0 ? static_cast<std::uint32_t>(i + 1) : entity.localId);
+    }
     out << "{\n";
     out << "  \"version\": 2,\n";
     out << "  \"name\": \"" << ixtreeme::common::EscapeJson(document.name.empty() ? "Prefab" : document.name) << "\",\n";
@@ -783,7 +927,18 @@ void WriteDocument(std::ostream& out, const PrefabDocument& document)
         out << "      \"local_id\": " << (entity.localId == 0 ? static_cast<std::uint32_t>(i + 1) : entity.localId) << ",\n";
         out << "      \"parent_local_id\": " << entity.parentLocalId << ",\n";
         if (entity.kind == PrefabTemplate::Kind::Mesh)
-            WriteMeshObject(out, entity.mesh, entity.name.empty() ? entity.mesh.name : entity.name, "      ");
+        {
+            MeshSceneEntity mesh = entity.mesh;
+            const auto localJoint = [&](std::uint32_t id) {
+                const auto found = localMeshIds.find(id);
+                // Scene captures carry live ids; parsed documents already carry local ids.
+                // External scene joints cannot target another prefab instance by accident.
+                return found != localMeshIds.end() ? found->second : localMeshIds.empty() ? id : 0u;
+            };
+            if (mesh.hasFixedJoint) mesh.fixedJoint.connectedEntityId = localJoint(mesh.fixedJoint.connectedEntityId);
+            if (mesh.hasHingeJoint) mesh.hingeJoint.connectedEntityId = localJoint(mesh.hingeJoint.connectedEntityId);
+            WriteMeshObject(out, mesh, entity.name.empty() ? mesh.name : entity.name, "      ");
+        }
         else if (entity.kind == PrefabTemplate::Kind::PointLight)
             WritePointObject(out, entity.point, entity.name.empty() ? entity.point.name : entity.name, "      ");
         else if (entity.kind == PrefabTemplate::Kind::SpotLight)
@@ -834,6 +989,132 @@ PrefabTemplate ParseTemplate(const std::string& text, const std::string& fallbac
     prefab.point = entity.point;
     prefab.spot = entity.spot;
     return prefab;
+}
+
+bool InstantiateRuntime(const PrefabDocument& document, const std::string& assetId,
+    std::uint32_t rootId, const float position[3],
+    const std::function<std::uint32_t()>& allocateMeshId,
+    const std::function<std::uint32_t()>& allocateLightId,
+    RuntimePrefabInstance& result, std::string& error)
+{
+    result = {};
+    error.clear();
+    if (rootId == 0 || document.entities.empty() ||
+        document.entities.front().kind != PrefabTemplate::Kind::Mesh)
+    {
+        error = "runtime prefab requires a mesh root";
+        return false;
+    }
+    std::map<std::uint32_t, const PrefabEntity*> sources;
+    for (const auto& entity : document.entities)
+    {
+        if (entity.localId == 0 || !sources.emplace(entity.localId, &entity).second ||
+            entity.kind == PrefabTemplate::Kind::Unsupported)
+        {
+            error = "invalid or duplicate prefab local id/type";
+            return false;
+        }
+    }
+    const auto rootLocalId = document.entities.front().localId;
+    if (document.entities.front().parentLocalId != 0)
+    {
+        error = "prefab root has a parent";
+        return false;
+    }
+    for (const auto& entity : document.entities)
+    {
+        const PrefabEntity* ancestor = &entity;
+        std::size_t hops = 0;
+        while (ancestor->localId != rootLocalId)
+        {
+            const auto parent = sources.find(ancestor->parentLocalId);
+            if (parent == sources.end() || ++hops >= sources.size())
+            {
+                error = "prefab parent is missing or cyclic";
+                return false;
+            }
+            ancestor = parent->second;
+        }
+        if (entity.kind == PrefabTemplate::Kind::Mesh)
+        {
+            const auto validateJoint = [&](std::uint32_t id) {
+                const auto target = sources.find(id);
+                return id == 0 || (target != sources.end() && target->second->kind == PrefabTemplate::Kind::Mesh);
+            };
+            if ((entity.mesh.hasFixedJoint && entity.mesh.fixedJoint.enabled && !validateJoint(entity.mesh.fixedJoint.connectedEntityId)) ||
+                (entity.mesh.hasHingeJoint && entity.mesh.hingeJoint.enabled && !validateJoint(entity.mesh.hingeJoint.connectedEntityId)))
+            {
+                error = "prefab joint target must be a local mesh id";
+                return false;
+            }
+        }
+    }
+    if (!allocateMeshId || !allocateLightId || !position ||
+        !std::isfinite(position[0]) || !std::isfinite(position[1]) || !std::isfinite(position[2])) {
+        error = "invalid prefab allocator or spawn position"; return false;
+    }
+    std::map<std::uint32_t, SceneParentRef> refs;
+    std::set<std::uint32_t> meshIds, lightIds;
+    for (const auto& entity : document.entities)
+    {
+        const bool mesh = entity.kind == PrefabTemplate::Kind::Mesh;
+        const auto id = entity.localId == rootLocalId ? rootId : mesh ? allocateMeshId() : allocateLightId();
+        if (!id || !(mesh ? meshIds : lightIds).insert(id).second) {
+            error = "prefab allocator returned zero or a duplicate id"; return false;
+        }
+        refs.emplace(entity.localId, SceneParentRef{
+            mesh ? "mesh_entity" : entity.kind == PrefabTemplate::Kind::PointLight ? "point_light" : "spot_light",
+            id});
+    }
+    const auto& root = document.entities.front().mesh;
+    const auto apply = [&](auto& object, const PrefabEntity& entity) {
+        object.id = refs.at(entity.localId).id;
+        object.name = entity.name.empty() ? object.name : entity.name;
+        object.parent = entity.parentLocalId == 0 ? SceneParentRef{} : refs.at(entity.parentLocalId);
+        for (int axis = 0; axis < 3; ++axis)
+            object.position[axis] += position[axis] - root.position[axis];
+        const std::string nestedAsset = !object.prefabInstance.assetId.empty()
+            ? object.prefabInstance.assetId : object.prefabAssetId;
+        if (nestedAsset.empty() || nestedAsset == assetId)
+        {
+            object.prefabAssetId = assetId;
+            object.prefabInstance = {};
+            object.prefabInstance.assetId = assetId;
+            object.prefabInstance.localId = entity.localId;
+        }
+        else
+        {
+            object.prefabAssetId = nestedAsset;
+            object.prefabInstance.assetId = nestedAsset;
+        }
+        object.prefabInstance.linked = true;
+    };
+    for (const auto& entity : document.entities)
+    {
+        if (entity.kind == PrefabTemplate::Kind::Mesh)
+        {
+            auto& mesh = result.meshes.emplace_back(entity.mesh);
+            apply(mesh, entity);
+            if (mesh.hasFixedJoint && mesh.fixedJoint.connectedEntityId != 0)
+            {
+                const auto target = refs.find(mesh.fixedJoint.connectedEntityId);
+                mesh.fixedJoint.connectedEntityId = target == refs.end() ? 0 : target->second.id;
+            }
+            if (mesh.hasHingeJoint && mesh.hingeJoint.connectedEntityId != 0)
+            {
+                const auto target = refs.find(mesh.hingeJoint.connectedEntityId);
+                mesh.hingeJoint.connectedEntityId = target == refs.end() ? 0 : target->second.id;
+            }
+            mesh.effectiveEnabled = true;
+            mesh.activationChanged = false;
+            mesh.renderRecordSlot = ~0u; // no link into a previous live world's render cache
+        }
+        else if (entity.kind == PrefabTemplate::Kind::PointLight)
+            apply(result.points.emplace_back(entity.point), entity);
+        else if (entity.kind == PrefabTemplate::Kind::SpotLight)
+            apply(result.spots.emplace_back(entity.spot), entity);
+    }
+    return true;
 }
 
 } // namespace ixtreeme::prefab

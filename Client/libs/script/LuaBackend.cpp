@@ -5,6 +5,8 @@
 
 #include <sol/sol.hpp>
 
+#include <algorithm>
+#include <iterator>
 #include <tuple>
 #include <utility>
 
@@ -12,26 +14,6 @@ namespace ixscript
 {
 namespace
 {
-
-// String -> ScriptKey, the single source of truth for the Lua key names. Case-sensitive; an unknown
-// name yields false from IsKeyDown rather than an error. Mirrors the ScriptKey enum in ScriptApi.h.
-bool ParseKey(const std::string& name, ScriptKey& out)
-{
-    if (name == "W") { out = ScriptKey::W; return true; }
-    if (name == "A") { out = ScriptKey::A; return true; }
-    if (name == "S") { out = ScriptKey::S; return true; }
-    if (name == "D") { out = ScriptKey::D; return true; }
-    if (name == "Space") { out = ScriptKey::Space; return true; }
-    if (name == "Shift") { out = ScriptKey::Shift; return true; }
-    if (name == "Ctrl") { out = ScriptKey::Ctrl; return true; }
-    if (name == "Up") { out = ScriptKey::Up; return true; }
-    if (name == "Down") { out = ScriptKey::Down; return true; }
-    if (name == "Left") { out = ScriptKey::Left; return true; }
-    if (name == "Right") { out = ScriptKey::Right; return true; }
-    if (name == "MouseLeft") { out = ScriptKey::MouseLeft; return true; }
-    if (name == "MouseRight") { out = ScriptKey::MouseRight; return true; }
-    return false;
-}
 
 // Reads a hook function out of a script's environment; returns an invalid function if absent (so an
 // optional hook like OnCollision is simply skipped, matching a native script not overriding it).
@@ -170,7 +152,7 @@ struct LuaBackend::Impl
         });
 
         t.set_function("IsKeyDown", [a](const std::string& key) {
-            ScriptKey k; return ParseKey(key, k) ? a->IsKeyDown(k) : false;
+            ScriptKey k; return ParseKeyName(key, k) ? a->IsKeyDown(k) : false;
         });
         t.set_function("MouseDelta", [a]() {
             float dx = 0.0f, dy = 0.0f; a->GetMouseDelta(dx, dy); return std::make_tuple(dx, dy);
@@ -196,6 +178,27 @@ struct LuaBackend::Impl
             return std::make_tuple(h.hit, h.entityId,
                 h.point[0], h.point[1], h.point[2], h.normal[0], h.normal[1], h.normal[2], h.distance);
         });
+        t.set_function("SetEntityEnabled", [a](std::uint32_t id, bool enabled) { a->SetEntityEnabled(id, enabled); });
+        t.set_function("RaycastFiltered", [a](float ox,float oy,float oz,float dx,float dy,float dz,float distance,
+            std::uint32_t mask, bool triggers, std::uint32_t ignore) {
+            const QueryFilter f{mask, triggers ? 1u : 0u, ignore, 0};
+            const auto h = a->RaycastFiltered(ox,oy,oz,dx,dy,dz,distance,&f);
+            return std::make_tuple(h.hit,h.entityId,h.point[0],h.point[1],h.point[2],
+                h.normal[0],h.normal[1],h.normal[2],h.distance);
+        });
+        t.set_function("OverlapSphere", [a](sol::this_state state, float x,float y,float z,float radius,
+            std::uint32_t mask, bool triggers, std::uint32_t ignore, std::uint32_t capacity) {
+            const QueryFilter f{mask,triggers ? 1u : 0u,ignore,0};
+            std::vector<SphereOverlapHit> hits(std::min(capacity,kMaxOverlapResults));
+            std::uint32_t truncated=0;
+            const auto count=a->OverlapSphere(x,y,z,radius,&f,hits.data(),static_cast<std::uint32_t>(hits.size()),&truncated);
+            sol::state_view lua(state); auto results=lua.create_table();
+            for (std::uint32_t i=0;i<count;++i) {
+                auto hit=lua.create_table(); hit["entityId"]=hits[i].entityId; hit["trigger"]=(hits[i].flags&1u)!=0;
+                results[i+1]=hit;
+            }
+            return std::make_tuple(results,truncated!=0);
+        });
         t.set_function("SetAnimatorFloat", [a](std::uint32_t id, const std::string& n, float v) {
             a->SetAnimatorFloat(id, n, v);
         });
@@ -206,10 +209,100 @@ struct LuaBackend::Impl
             a->SetAnimatorTrigger(id, n);
         });
 
+        // --- generic TCP transport + text prompts (bytes travel as binary-safe Lua strings) ---
+        t.set_function("NetConnect", [a](const std::string& host, std::uint32_t port) {
+            return a->NetConnect(host, port);
+        });
+        t.set_function("NetState", [a](std::uint32_t handle) { return a->NetState(handle); });
+        t.set_function("NetSend", [a](std::uint32_t handle, const std::string& bytes) {
+            return a->NetSend(handle, reinterpret_cast<const std::uint8_t*>(bytes.data()),
+                static_cast<std::uint32_t>(bytes.size()));
+        });
+        // NetReceive(handle[, maxBytes = 65536]) -> string (empty when nothing arrived)
+        t.set_function("NetReceive", [a](std::uint32_t handle, sol::optional<std::uint32_t> maxBytes) {
+            std::string bytes(std::min<std::uint32_t>(maxBytes.value_or(65536u), 1u << 20), '\0');
+            if (bytes.empty())
+                return bytes;
+            bytes.resize(a->NetReceive(handle, reinterpret_cast<std::uint8_t*>(bytes.data()),
+                static_cast<std::uint32_t>(bytes.size())));
+            return bytes;
+        });
+        t.set_function("NetClose", [a](std::uint32_t handle) { a->NetClose(handle); });
+        t.set_function("PromptText", [a](const std::string& title, const std::string& label, sol::optional<bool> secret) {
+            return a->PromptText(title, label, secret.value_or(false));
+        });
+        // PromptResult(id) -> status (0 open, 1 submitted, -1 cancelled), text
+        t.set_function("PromptResult", [a](std::uint32_t id) {
+            char buffer[257] = {};
+            const int status = a->PromptResult(id, buffer, sizeof(buffer));
+            std::string text = status == 1 ? std::string(buffer) : std::string();
+            std::fill(std::begin(buffer), std::end(buffer), '\0');
+            return std::make_tuple(status, text);
+        });
+
+        // SetMaterial(id, slot, materialGuidOrAssetId) — deferred, like spawn/destroy (v5)
+        t.set_function("SetMaterial", [a](std::uint32_t id, std::uint32_t slot, const std::string& material) {
+            a->SetMaterial(id, slot, material);
+        });
+
+        // GetCharacterState(id) -> grounded, moving, running, jumped, planarSpeed (nil if no controller);
+        // SetCharacterAbilities(id, canRun, canJump) (v6)
+        t.set_function("GetCharacterState", [a](sol::this_state s, std::uint32_t id) -> sol::object {
+            sol::state_view lua(s);
+            CharacterState state{};
+            if (!a->GetCharacterState(id, state))
+                return sol::make_object(lua, sol::lua_nil);
+            sol::table result = lua.create_table();
+            result["grounded"] = state.grounded;
+            result["moving"] = state.moving;
+            result["running"] = state.running;
+            result["jumped"] = state.jumped;
+            result["planarSpeed"] = state.planarSpeed;
+            return result;
+        });
+        t.set_function("SetCharacterAbilities", [a](std::uint32_t id, bool canRun, bool canJump) {
+            a->SetCharacterAbilities(id, canRun, canJump);
+        });
+
+        // Game UI documents (v6): UiOpen("ui/hud.rml") -> handle (0 = failed), then by element id.
+        t.set_function("UiOpen", [a](const std::string& path) { return a->UiOpen(path); });
+        t.set_function("UiClose", [a](std::uint32_t doc) { a->UiClose(doc); });
+        t.set_function("UiSetVisible", [a](std::uint32_t doc, bool visible) { a->UiSetVisible(doc, visible); });
+        t.set_function("UiSetText", [a](std::uint32_t doc, const std::string& id, sol::object text) {
+            // Numbers are fine too: UiSetText(doc, "hp", 42)
+            std::string value;
+            if (text.is<std::string>())
+                value = text.as<std::string>();
+            else if (text.is<double>())
+            {
+                char buffer[64];
+                std::snprintf(buffer, sizeof(buffer), "%g", text.as<double>());
+                value = buffer;
+            }
+            a->UiSetText(doc, id, value);
+        });
+        t.set_function("UiSetProperty", [a](std::uint32_t doc, const std::string& id, const std::string& prop,
+                                            const std::string& value) { a->UiSetProperty(doc, id, prop, value); });
+        t.set_function("UiSetClass", [a](std::uint32_t doc, const std::string& id, const std::string& cls, bool on) {
+            a->UiSetClass(doc, id, cls, on);
+        });
+        t.set_function("UiConsumeClick", [a](std::uint32_t doc, const std::string& id) {
+            return a->UiConsumeClick(doc, id);
+        });
+
+        // --- particles (v7): the entity's Particle System component ---
+        t.set_function("ParticlePlay", [a](std::uint32_t id) { a->ParticlePlay(id); });
+        t.set_function("ParticleStop", [a](std::uint32_t id) { a->ParticleStop(id); });
+        t.set_function("ParticleRestart", [a](std::uint32_t id) { a->ParticleRestart(id); });
+        t.set_function("ParticleEmit", [a](std::uint32_t id, std::uint32_t count) {
+            a->ParticleEmit(id, count);
+        });
+
         // Ergonomic Key.* table: names map to the same strings IsKeyDown accepts (Key.W == "W").
         sol::table keys = lua.create_table();
         for (const char* name : {"W", "A", "S", "D", "Space", "Shift", "Ctrl",
-                                 "Up", "Down", "Left", "Right", "MouseLeft", "MouseRight"})
+                                 "Up", "Down", "Left", "Right", "MouseLeft", "MouseRight",
+                                 "Q", "E", "R", "F", "Num1", "Num2", "Num3", "Num4", "Num5"})
             keys[name] = name;
         t["Key"] = keys;
     }

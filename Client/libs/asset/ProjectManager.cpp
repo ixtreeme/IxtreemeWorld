@@ -17,6 +17,7 @@ namespace
 {
 using ixtreeme::common::EscapeJson;
 using ixtreeme::common::JsonStringValue;
+using ixtreeme::common::LegacyTextToUtf8;
 using ixtreeme::common::TimestampUtc;
 
 bool JsonArrayBody(const std::string& text, const std::string& key, std::string& out)
@@ -99,7 +100,7 @@ std::vector<std::string> JsonStringArrayValue(const std::string& object, const s
         }
         if (c == '"')
         {
-            values.push_back(value);
+            values.push_back(LegacyTextToUtf8(value));
             inString = false;
             continue;
         }
@@ -264,6 +265,46 @@ void ProjectManager::AddRecentProject(const std::filesystem::path& manifestPath)
     m_recentProjects.insert(m_recentProjects.begin(), normalized);
     if (m_recentProjects.size() > 8)
         m_recentProjects.resize(8);
+    SaveRecentProjects();
+}
+
+void ProjectManager::SetRecentProjectsFile(const std::filesystem::path& path)
+{
+    std::error_code ec;
+    const std::filesystem::path absolutePath = std::filesystem::absolute(path, ec);
+    m_recentProjectsFile = ec ? path : absolutePath;
+
+    // Earlier entries (this session) come first; the stored ones follow, without duplicates.
+    std::ifstream file(m_recentProjectsFile, std::ios::binary);
+    std::string line;
+    while (file && std::getline(file, line) && m_recentProjects.size() < 8)
+    {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (line.empty())
+            continue;
+        const std::filesystem::path manifest(std::u8string(line.begin(), line.end()));
+        if (!std::filesystem::is_regular_file(manifest, ec))
+            continue;  // moved or deleted since
+        if (std::find(m_recentProjects.begin(), m_recentProjects.end(), manifest) == m_recentProjects.end())
+            m_recentProjects.push_back(manifest);
+    }
+    Tracenf("[PROJECT] recent projects file=%s entries=%zu",
+        m_recentProjectsFile.generic_string().c_str(),
+        m_recentProjects.size());
+}
+
+void ProjectManager::SaveRecentProjects() const
+{
+    if (m_recentProjectsFile.empty())
+        return;
+    std::ofstream file(m_recentProjectsFile, std::ios::binary | std::ios::trunc);
+    for (const std::filesystem::path& manifest : m_recentProjects)
+    {
+        const std::u8string text = manifest.generic_u8string();
+        file.write(reinterpret_cast<const char*>(text.data()), static_cast<std::streamsize>(text.size()));
+        file.put('\n');
+    }
 }
 
 bool ProjectManager::WriteManifest(std::string& error)

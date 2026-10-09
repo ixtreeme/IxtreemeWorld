@@ -1,8 +1,8 @@
 #pragma once
 
-// A backend (Native C++ / Lua / ...) creates live per-entity ScriptInstances and is the only thing
-// the engine's Play loop talks to per language. ScriptSystem owns the backends and routes by
-// ScriptComponent::backend.
+// A backend (AngelScript / Lua / legacy Native C++) creates live per-entity ScriptInstances and is
+// the only thing the engine's Play loop talks to per language. ScriptSystem owns the backends and
+// routes by ScriptComponent::backend.
 
 #include "ScriptComponent.h"
 

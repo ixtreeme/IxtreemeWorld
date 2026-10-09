@@ -1,10 +1,20 @@
+#include "asset/ExrImage.h"
 #include "TerrainRenderer.h"
 
+#include "JobSystem.h"
+#include "SceneClearColor.h"
+
 #include "Debug.h"
-#include "IXRHIDevice.h" // WriteTimestamp (backend timestamp markers)
+#include "IXRHIBinding.h"
+#include "IXRHIBuffer.h"
+#include "IXRHICommandList.h"
+#include "IXRHIDevice.h"
+#include "IXRHIPipeline.h"
 #include "IXRHIQuery.h"
-#include "IXVulkanBridge.h" // NativeViewOf/NativeSamplerOf: transition-only native
-                            // resolution for refraction inputs (documented seam)
+#include "IXRHIRenderPass.h"
+#include "IXRHIRenderTarget.h"
+#include "IXRHIShader.h"
+#include "IXRHITexture.h"
 #include "WaterBodyIO.h"
 #include "asset/IAssetReader.h"
 #include "map/MapData.h"
@@ -42,34 +52,26 @@ namespace xm = ixtreeme::math;
 
 constexpr uint32_t kMaxWaterBodyDraws = 64;
 
-bool HasStencilAspect(VkFormat format)
+// m_sceneTerrain keeps the scene's terrain settings; the live grids are m_heightCmGrid & co. A copy of
+// the loaded grids kept there is dead weight that every GetTerrainSceneData() call used to copy too.
+void ReleaseTerrainGrids(TerrainSceneData& terrain)
 {
-    return format == VK_FORMAT_D24_UNORM_S8_UINT ||
-           format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
-           format == VK_FORMAT_S8_UINT;
+    std::vector<float>().swap(terrain.heightCmGrid);
+    std::vector<std::uint16_t>().swap(terrain.attributes);
+    std::vector<std::uint8_t>().swap(terrain.splatABytes);
+    std::vector<std::uint8_t>().swap(terrain.splatBBytes);
 }
 
-const char* VkResultName(VkResult result)
+const char* RhiFormatName(ixrhi::IXRHIFormat format)
 {
-    switch (result)
+    switch (format)
     {
-    case VK_SUCCESS: return "VK_SUCCESS";
-    case VK_ERROR_OUT_OF_HOST_MEMORY: return "VK_ERROR_OUT_OF_HOST_MEMORY";
-    case VK_ERROR_OUT_OF_DEVICE_MEMORY: return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
-    case VK_ERROR_INITIALIZATION_FAILED: return "VK_ERROR_INITIALIZATION_FAILED";
-    case VK_ERROR_DEVICE_LOST: return "VK_ERROR_DEVICE_LOST";
-    case VK_ERROR_MEMORY_MAP_FAILED: return "VK_ERROR_MEMORY_MAP_FAILED";
-    case VK_ERROR_LAYER_NOT_PRESENT: return "VK_ERROR_LAYER_NOT_PRESENT";
-    case VK_ERROR_EXTENSION_NOT_PRESENT: return "VK_ERROR_EXTENSION_NOT_PRESENT";
-    case VK_ERROR_FEATURE_NOT_PRESENT: return "VK_ERROR_FEATURE_NOT_PRESENT";
-    case VK_ERROR_INCOMPATIBLE_DRIVER: return "VK_ERROR_INCOMPATIBLE_DRIVER";
-    case VK_ERROR_TOO_MANY_OBJECTS: return "VK_ERROR_TOO_MANY_OBJECTS";
-    case VK_ERROR_FORMAT_NOT_SUPPORTED: return "VK_ERROR_FORMAT_NOT_SUPPORTED";
-    case VK_ERROR_SURFACE_LOST_KHR: return "VK_ERROR_SURFACE_LOST_KHR";
-    case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR: return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
-    case VK_SUBOPTIMAL_KHR: return "VK_SUBOPTIMAL_KHR";
-    case VK_ERROR_OUT_OF_DATE_KHR: return "VK_ERROR_OUT_OF_DATE_KHR";
-    default: return "VK_RESULT_UNKNOWN";
+    case ixrhi::IXRHIFormat::R8Unorm: return "R8_UNORM";
+    case ixrhi::IXRHIFormat::R8G8B8A8Unorm: return "R8G8B8A8_UNORM";
+    case ixrhi::IXRHIFormat::R8G8B8A8Srgb: return "R8G8B8A8_SRGB";
+    case ixrhi::IXRHIFormat::R32Float: return "R32_SFLOAT";
+    case ixrhi::IXRHIFormat::D32Float: return "D32_SFLOAT";
+    default: return "UNDEFINED";
     }
 }
 
@@ -179,20 +181,6 @@ float BilinearSampleWaterDistance(const std::vector<float>& distanceField,
     return lerp(lerp(d00, d10, tx), lerp(d01, d11, tx), ty);
 }
 
-void CheckVk(VkResult result, const char* call, const char* file, int line)
-{
-    if (result == VK_SUCCESS)
-        return;
-
-    char buffer[512];
-    std::snprintf(buffer, sizeof(buffer), "%s:%d: Vulkan call failed: %s -> %s (%d)",
-        file, line, call, VkResultName(result), result);
-    Tracen(buffer);
-    std::abort();
-}
-
-#define VK_CHECK(call) CheckVk((call), #call, __FILE__, __LINE__)
-
 template <typename UniformBlockT>
 void FillDynamicLightingUniforms(const LightingState& lighting, UniformBlockT& uniform)
 {
@@ -238,19 +226,6 @@ void FillDynamicLightingUniforms(const LightingState& lighting, UniformBlockT& u
         out.color[3] = xm::Cos(xm::DegreesToRadians(spot.outerConeDegrees));
         out.direction[3] = std::max(out.direction[3], out.color[3]);
     }
-}
-
-std::vector<char> ReadBinaryFile(client::asset::IAssetReader& assets, const std::string& path)
-{
-    auto bytes = assets.ReadAll(path);
-    if (!bytes)
-    {
-        const std::string message = "Failed to open shader: " + path;
-        Tracen(message.c_str());
-        std::abort();
-    }
-
-    return std::vector<char>(bytes->begin(), bytes->end());
 }
 
 std::string NormalizeTerrainAssetPath(std::string_view path)
@@ -311,20 +286,6 @@ uint32_t MakeFourCC(char a, char b, char c, char d)
         (static_cast<uint32_t>(d) << 24);
 }
 
-const char* VkFormatName(VkFormat format)
-{
-    switch (format)
-    {
-    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return "VK_FORMAT_BC1_RGBA_SRGB_BLOCK";
-    case VK_FORMAT_BC2_SRGB_BLOCK: return "VK_FORMAT_BC2_SRGB_BLOCK";
-    case VK_FORMAT_BC3_SRGB_BLOCK: return "VK_FORMAT_BC3_SRGB_BLOCK";
-    case VK_FORMAT_R8G8B8A8_SRGB: return "VK_FORMAT_R8G8B8A8_SRGB";
-    case VK_FORMAT_R8G8B8A8_UNORM: return "VK_FORMAT_R8G8B8A8_UNORM";
-    case VK_FORMAT_R8_UNORM: return "VK_FORMAT_R8_UNORM";
-    default: return "VK_FORMAT_UNDEFINED";
-    }
-}
-
 #pragma pack(push, 1)
 struct DdsPixelFormat
 {
@@ -359,6 +320,18 @@ struct DdsHeader
 
 struct DdsImage
 {
+    // Local DDS pixel-format marker (decode-time only; GPU upload always
+    // goes through decoded RGBA or the CPU mip-chain builders, so no
+    // compressed format ever reaches IXRHI).
+    enum class Format
+    {
+        Unknown,
+        R8G8B8A8_SRGB,
+        BC1_SRGB,
+        BC2_SRGB,
+        BC3_SRGB,
+    };
+
     std::string filename;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -366,16 +339,8 @@ struct DdsImage
     uint32_t blockBytes = 0;
     uint32_t bytesPerPixel = 0;
     bool compressed = false;
-    VkFormat format = VK_FORMAT_UNDEFINED;
+    Format format = Format::Unknown;
     std::vector<uint8_t> pixels;
-    std::vector<VkBufferImageCopy> regions;
-};
-
-struct TextureSetEntry
-{
-    std::string path;
-    float scaleU = 1.0f;
-    float scaleV = 1.0f;
 };
 
 struct RgbaImage
@@ -426,19 +391,19 @@ bool LoadDdsImage(client::asset::IAssetReader& assets,
     {
         if (header->pixelFormat.fourCC == MakeFourCC('D', 'X', 'T', '1'))
         {
-            out.format = VK_FORMAT_BC1_RGBA_SRGB_BLOCK;
+            out.format = DdsImage::Format::BC1_SRGB;
             out.blockBytes = 8;
             out.compressed = true;
         }
         else if (header->pixelFormat.fourCC == MakeFourCC('D', 'X', 'T', '3'))
         {
-            out.format = VK_FORMAT_BC2_SRGB_BLOCK;
+            out.format = DdsImage::Format::BC2_SRGB;
             out.blockBytes = 16;
             out.compressed = true;
         }
         else if (header->pixelFormat.fourCC == MakeFourCC('D', 'X', 'T', '5'))
         {
-            out.format = VK_FORMAT_BC3_SRGB_BLOCK;
+            out.format = DdsImage::Format::BC3_SRGB;
             out.blockBytes = 16;
             out.compressed = true;
         }
@@ -450,7 +415,7 @@ bool LoadDdsImage(client::asset::IAssetReader& assets,
     }
     else if ((header->pixelFormat.flags & ddpfRGB) && header->pixelFormat.rgbBitCount == 32)
     {
-        out.format = VK_FORMAT_R8G8B8A8_SRGB;
+        out.format = DdsImage::Format::R8G8B8A8_SRGB;
         out.bytesPerPixel = 4;
         out.compressed = false;
     }
@@ -470,15 +435,11 @@ bool LoadDdsImage(client::asset::IAssetReader& assets,
         if (offset + mipSize > bytes.size())
             return false;
 
-        VkBufferImageCopy region{};
-        region.bufferOffset = static_cast<VkDeviceSize>(out.pixels.size());
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.mipLevel = mip;
-        region.imageSubresource.baseArrayLayer = 0;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent = {mipWidth, mipHeight, 1};
-        out.regions.push_back(region);
-        out.pixels.insert(out.pixels.end(), bytes.begin() + offset, bytes.begin() + offset + mipSize);
+        // Only the base level is retained: all DDS consumers decode to RGBA
+        // (compressed) or take the base level (uncompressed); mip chains for
+        // GPU arrays are regenerated on the CPU by the array builders.
+        if (mip == 0)
+            out.pixels.assign(bytes.begin() + offset, bytes.begin() + offset + mipSize);
         offset += mipSize;
     }
 
@@ -519,7 +480,7 @@ bool DecodeDxtToRgba(const DdsImage& image, RgbaImage& out)
             size_t colorOffset = 0;
             if (image.blockBytes == 16)
             {
-                if (image.format == VK_FORMAT_BC2_SRGB_BLOCK)
+                if (image.format == DdsImage::Format::BC2_SRGB)
                 {
                     for (uint32_t i = 0; i < 16; ++i)
                     {
@@ -607,7 +568,7 @@ bool DdsToRgba(const DdsImage& dds, RgbaImage& out)
 {
     if (dds.compressed)
         return DecodeDxtToRgba(dds, out);
-    if (dds.format != VK_FORMAT_R8G8B8A8_SRGB || dds.pixels.size() < static_cast<size_t>(dds.width) * dds.height * 4u)
+    if (dds.format != DdsImage::Format::R8G8B8A8_SRGB || dds.pixels.size() < static_cast<size_t>(dds.width) * dds.height * 4u)
         return false;
     out = {};
     out.filename = dds.filename;
@@ -620,11 +581,24 @@ bool DdsToRgba(const DdsImage& dds, RgbaImage& out)
 bool LoadStbImage(client::asset::IAssetReader& assets,
     const std::string& path,
     RgbaImage& out,
-    const std::vector<std::filesystem::path>* additionalRoots = nullptr)
+    const std::vector<std::filesystem::path>* additionalRoots = nullptr, bool srgbColor = false)
 {
     auto bytes = ReadTerrainAssetBytes(assets, path, additionalRoots);
     if (!bytes)
         return false;
+    if (client::asset::IsExr(*bytes) || client::asset::IsExrPath(path))
+    {
+        std::string error;
+        auto exr = client::asset::DecodeExr(*bytes, error);
+        if (!exr) { TraceError("[TERRAIN-EXR] %s", error.c_str()); return false; }
+        out = {};
+        out.filename = std::filesystem::path(path).filename().generic_string();
+        out.width = static_cast<std::uint32_t>(exr->width);
+        out.height = static_cast<std::uint32_t>(exr->height);
+        // Terrain's mixed-format atlas stores normalized RGBA8 data, not radiance.
+        out.pixels = client::asset::ExrRgba8(*exr, srgbColor ? client::asset::ExrByteMode::SrgbColor : client::asset::ExrByteMode::LinearData);
+        return true;
+    }
     int width = 0;
     int height = 0;
     int channels = 0;
@@ -647,7 +621,7 @@ bool LoadStbImage(client::asset::IAssetReader& assets,
 bool LoadAnyTerrainImage(client::asset::IAssetReader& assets,
     const std::string& path,
     RgbaImage& out,
-    const std::vector<std::filesystem::path>* additionalRoots = nullptr)
+    const std::vector<std::filesystem::path>* additionalRoots = nullptr, bool srgbColor = false)
 {
     std::string ext = std::filesystem::path(path).extension().string();
     std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
@@ -659,12 +633,24 @@ bool LoadAnyTerrainImage(client::asset::IAssetReader& assets,
         return LoadDdsImage(assets, path, dds, additionalRoots) && DdsToRgba(dds, out);
     }
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" || ext == ".bmp")
-        return LoadStbImage(assets, path, out, additionalRoots);
+        return LoadStbImage(assets, path, out, additionalRoots, srgbColor);
 
     DdsImage dds{};
     if (LoadDdsImage(assets, path, dds, additionalRoots))
         return DdsToRgba(dds, out);
-    return LoadStbImage(assets, path, out, additionalRoots);
+    return LoadStbImage(assets, path, out, additionalRoots, srgbColor);
+}
+
+// The water reflection's size as a divisor of its view's size.
+std::uint32_t WaterReflectionDivisor(WaterConfig::ReflectionQuality quality)
+{
+    switch (quality)
+    {
+    case WaterConfig::ReflectionQuality::Quarter: return 4u;
+    case WaterConfig::ReflectionQuality::Full: return 1u;
+    case WaterConfig::ReflectionQuality::Half: break;
+    }
+    return 2u;
 }
 
 bool TerrainAabbOutsideCameraFrustum(const WorldCamera& camera, WorldVec3 min, WorldVec3 max)
@@ -701,6 +687,31 @@ bool TerrainAabbOutsideCameraFrustum(const WorldCamera& camera, WorldVec3 min, W
         outsideFar = outsideFar && (clipZ > clipW);
     }
     return outsideLeft || outsideRight || outsideBottom || outsideTop || outsideNear || outsideFar;
+}
+
+// A shadow cascade's light projection is orthographic along the sun: a caster outside the cascade's
+// side planes cannot shadow anything inside it. Near/far are left to the rasterizer, as before.
+bool TerrainAabbOutsideCascadeFootprint(const WorldMat4& viewProjection, WorldVec3 min, WorldVec3 max)
+{
+    bool outsideLeft = true;
+    bool outsideRight = true;
+    bool outsideBottom = true;
+    bool outsideTop = true;
+    const float* m = viewProjection.m;
+    for (int corner = 0; corner < 8; ++corner)
+    {
+        const float x = (corner & 1) ? max.x : min.x;
+        const float y = (corner & 2) ? max.y : min.y;
+        const float z = (corner & 4) ? max.z : min.z;
+        const float clipX = x * m[0] + y * m[4] + z * m[8] + m[12];
+        const float clipY = x * m[1] + y * m[5] + z * m[9] + m[13];
+        const float clipW = x * m[3] + y * m[7] + z * m[11] + m[15];
+        outsideLeft = outsideLeft && (clipX < -clipW);
+        outsideRight = outsideRight && (clipX > clipW);
+        outsideBottom = outsideBottom && (clipY < -clipW);
+        outsideTop = outsideTop && (clipY > clipW);
+    }
+    return outsideLeft || outsideRight || outsideBottom || outsideTop;
 }
 
 RgbaImage ResizeNearest(const RgbaImage& src, uint32_t width, uint32_t height)
@@ -740,255 +751,192 @@ std::vector<uint8_t> ExtractR8Channel(const RgbaImage& image)
     return out;
 }
 
+// Three single-channel layers (ambient occlusion, roughness, metallic) as one RGBA image (A = 255):
+// the terrain shader reads all three with one fetch per layer and projection.
+std::vector<uint8_t> PackOcclusionRoughnessMetallic(const std::vector<uint8_t>& ao,
+                                                    const std::vector<uint8_t>& roughness,
+                                                    const std::vector<uint8_t>& metallic)
+{
+    std::vector<uint8_t> out(ao.size() * 4u, 255);
+    for (size_t i = 0; i < ao.size(); ++i)
+    {
+        out[i * 4u + 0] = ao[i];
+        out[i * 4u + 1] = i < roughness.size() ? roughness[i] : 128;
+        out[i * 4u + 2] = i < metallic.size() ? metallic[i] : 0;
+    }
+    return out;
+}
+
+// A tileable ripple normal map, Y-up encoded (g = up, as Water.hlsl reads it). It is the slope field
+// of a height made of many waves with integer wave vectors (so the tile wraps seamlessly), random
+// directions and phases, and an amplitude falling with frequency. Two crossing sine waves (the old
+// generator) have two dominant directions: tiled across the water they drew a regular grid.
 std::vector<std::uint8_t> GenerateWaterNormalPixels(uint32_t width,
                                                     uint32_t height,
-                                                    float frequencyA,
-                                                    float frequencyB,
-                                                    float amplitude)
+                                                    std::uint32_t seed,
+                                                    float minCyclesPerTile,
+                                                    float maxCyclesPerTile,
+                                                    float rmsSlope)
 {
-    std::vector<std::uint8_t> pixels(static_cast<size_t>(width) * height * 4u, 255);
-    constexpr float pi = xm::Pi;
+    struct Wave
+    {
+        float kx = 0.0f;
+        float ky = 0.0f;
+        float amplitude = 0.0f;
+        float phase = 0.0f;
+    };
+    constexpr float twoPi = xm::Pi * 2.0f;
+    std::uint32_t state = seed * 747796405u + 2891336453u;
+    const auto random01 = [&state]() {
+        state = state * 1664525u + 1013904223u;
+        return static_cast<float>((state >> 8u) & 0xFFFFFFu) / 16777215.0f;
+    };
+    std::vector<Wave> waves;
+    for (int attempt = 0; attempt < 512 && waves.size() < 56u; ++attempt)
+    {
+        const float angle = random01() * twoPi;
+        // Log-uniform over the band: as many short as long ripples per octave.
+        const float cycles = minCyclesPerTile * std::pow(maxCyclesPerTile / minCyclesPerTile, random01());
+        const float kx = std::round(std::cos(angle) * cycles);
+        const float ky = std::round(std::sin(angle) * cycles);
+        if (kx == 0.0f && ky == 0.0f)
+            continue;
+        const float k = std::sqrt(kx * kx + ky * ky);
+        waves.push_back({kx, ky, 1.0f / std::pow(k, 1.6f), random01() * twoPi});
+    }
+
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    std::vector<float> slopeX(pixelCount, 0.0f);
+    std::vector<float> slopeZ(pixelCount, 0.0f);
+    double sumSquares = 0.0;
     for (uint32_t y = 0; y < height; ++y)
     {
         for (uint32_t x = 0; x < width; ++x)
         {
             const float u = static_cast<float>(x) / static_cast<float>(width);
             const float v = static_cast<float>(y) / static_cast<float>(height);
-            const float h0 = xm::Sin((u * frequencyA + v * 0.35f) * pi * 2.0f);
-            const float h1 = xm::Cos((v * frequencyB - u * 0.28f) * pi * 2.0f);
-            const float dx = amplitude * (xm::Cos((u * frequencyA + v * 0.35f) * pi * 2.0f) * frequencyA -
-                xm::Sin((v * frequencyB - u * 0.28f) * pi * 2.0f) * 0.28f * frequencyB);
-            const float dz = amplitude * (xm::Cos((u * frequencyA + v * 0.35f) * pi * 2.0f) * 0.35f * frequencyA +
-                -xm::Sin((v * frequencyB - u * 0.28f) * pi * 2.0f) * frequencyB);
-            const float ripple = (h0 + h1) * 0.04f;
-            WorldVec3 n = xm::Normalize(WorldVec3{-dx + ripple, 1.0f, -dz - ripple});
-            const size_t offset = (static_cast<size_t>(y) * width + x) * 4u;
-            pixels[offset + 0] = static_cast<std::uint8_t>(std::clamp(n.x * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
-            pixels[offset + 1] = static_cast<std::uint8_t>(std::clamp(n.y * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
-            pixels[offset + 2] = static_cast<std::uint8_t>(std::clamp(n.z * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f);
-            pixels[offset + 3] = 255;
+            float dx = 0.0f;
+            float dz = 0.0f;
+            for (const Wave& wave : waves)
+            {
+                const float c = std::cos(twoPi * (wave.kx * u + wave.ky * v) + wave.phase) * wave.amplitude * twoPi;
+                dx += c * wave.kx;
+                dz += c * wave.ky;
+            }
+            const size_t index = static_cast<size_t>(y) * width + x;
+            slopeX[index] = dx;
+            slopeZ[index] = dz;
+            sumSquares += static_cast<double>(dx) * dx + static_cast<double>(dz) * dz;
         }
+    }
+    const float rms = static_cast<float>(std::sqrt(sumSquares / std::max<double>(1.0, 2.0 * pixelCount)));
+    const float scale = rms > 0.0f ? rmsSlope / rms : 0.0f;
+
+    std::vector<std::uint8_t> pixels(pixelCount * 4u, 255);
+    for (size_t index = 0; index < pixelCount; ++index)
+    {
+        const WorldVec3 n = xm::Normalize(WorldVec3{-slopeX[index] * scale, 1.0f, -slopeZ[index] * scale});
+        pixels[index * 4u + 0] = static_cast<std::uint8_t>(std::clamp(n.x * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f + 0.5f);
+        pixels[index * 4u + 1] = static_cast<std::uint8_t>(std::clamp(n.y * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f + 0.5f);
+        pixels[index * 4u + 2] = static_cast<std::uint8_t>(std::clamp(n.z * 0.5f + 0.5f, 0.0f, 1.0f) * 255.0f + 0.5f);
     }
     return pixels;
 }
 
-VkShaderModule CreateShaderModule(VkDevice device, client::asset::IAssetReader& assets,
-    const std::string& path)
+// Standard tangent-space normal maps keep "up" in blue; the water shader reads green as up (like the
+// generated ripple maps). Swap them so authored water normal maps tilt the surface as intended.
+void ConvertTangentNormalMapToYUp(std::vector<std::uint8_t>& pixels)
 {
-    const std::vector<char> code = ReadBinaryFile(assets, path);
-    VkShaderModuleCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    create.codeSize = code.size();
-    create.pCode = reinterpret_cast<const uint32_t*>(code.data());
-
-    VkShaderModule module = VK_NULL_HANDLE;
-    VK_CHECK(vkCreateShaderModule(device, &create, nullptr, &module));
-    return module;
+    for (size_t offset = 0; offset + 3u < pixels.size(); offset += 4u)
+        std::swap(pixels[offset + 1], pixels[offset + 2]);
 }
 
-bool CreateHostVisibleBuffer(VulkanDevice& device, VkDevice vkDevice, VkDeviceSize size,
-    VkBufferUsageFlags usage, const void* initialData, TerrainRenderer::Buffer& out)
+// Loads SPIR-V words via the asset reader (aborts like the old shader loader
+// when the asset is missing or misaligned).
+std::vector<std::uint32_t> ReadSpirv(client::asset::IAssetReader& assets, const std::string& path)
 {
-    VkBufferCreateInfo buffer{};
-    buffer.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer.size = size;
-    buffer.usage = usage;
-    buffer.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VK_CHECK(vkCreateBuffer(vkDevice, &buffer, nullptr, &out.buffer));
-
-    VkMemoryRequirements req{};
-    vkGetBufferMemoryRequirements(vkDevice, out.buffer, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &out.memory));
-    VK_CHECK(vkBindBufferMemory(vkDevice, out.buffer, out.memory, 0));
-
-    if (initialData)
+    auto bytes = assets.ReadAll(path);
+    if (!bytes || bytes->empty() || bytes->size() % sizeof(std::uint32_t) != 0)
     {
-        void* mapped = nullptr;
-        VK_CHECK(vkMapMemory(vkDevice, out.memory, 0, size, 0, &mapped));
-        std::memcpy(mapped, initialData, static_cast<size_t>(size));
-        vkUnmapMemory(vkDevice, out.memory);
+        Tracenf("[TERRAIN] failed to read shader: %s", path.c_str());
+        std::abort();
     }
-
-    return true;
+    const auto* words = reinterpret_cast<const std::uint32_t*>(bytes->data());
+    return std::vector<std::uint32_t>(words, words + bytes->size() / sizeof(std::uint32_t));
 }
 
-void CopyBuffer(VkCommandBuffer cmd, VkBuffer src, VkBuffer dst, VkDeviceSize size)
+std::shared_ptr<ixrhi::IXRHIShader> LoadShader(ixrhi::IXRHIDevice& rhi,
+                                               client::asset::IAssetReader& assets,
+                                               const std::string& path,
+                                               ixrhi::IXRHIShaderStage stage,
+                                               const char* entry)
 {
-    VkBufferCopy copy{};
-    copy.size = size;
-    vkCmdCopyBuffer(cmd, src, dst, 1, &copy);
+    ixrhi::IXRHIShaderDesc desc;
+    desc.stage = stage;
+    desc.entryPoint = entry;
+    desc.spirv = ReadSpirv(assets, path);
+    desc.debugName = path;
+    return rhi.CreateShader(desc);
 }
 
-VkCommandBuffer BeginOneTimeCommands(VkDevice vkDevice, uint32_t queueFamily, VkCommandPool& pool)
+std::shared_ptr<ixrhi::IXRHIBuffer> CreateRhiBuffer(ixrhi::IXRHIDevice& rhi,
+                                                    std::uint64_t sizeBytes,
+                                                    ixrhi::IXRHIBufferUsage usage,
+                                                    const void* initialData,
+                                                    const char* debugName)
 {
-    VkCommandPoolCreateInfo poolInfo{};
-    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-    poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    poolInfo.queueFamilyIndex = queueFamily;
-    VK_CHECK(vkCreateCommandPool(vkDevice, &poolInfo, nullptr, &pool));
-
-    VkCommandBufferAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc.commandPool = pool;
-    alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    alloc.commandBufferCount = 1;
-
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    VK_CHECK(vkAllocateCommandBuffers(vkDevice, &alloc, &cmd));
-
-    VkCommandBufferBeginInfo begin{};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
-    return cmd;
+    ixrhi::IXRHIBufferDesc desc;
+    desc.sizeBytes = sizeBytes;
+    desc.usage = usage;
+    desc.cpuAccess = ixrhi::IXRHICpuAccess::Write;
+    desc.debugName = debugName ? debugName : "";
+    const std::size_t bytes = static_cast<std::size_t>(sizeBytes);
+    return rhi.CreateBuffer(desc, initialData, initialData != nullptr ? bytes : 0);
 }
 
-void EndOneTimeCommands(VkDevice vkDevice, VkQueue queue, VkCommandPool pool, VkCommandBuffer cmd)
+// Device-local, for data the CPU never touches after creation. A host-visible buffer lives in system
+// memory: the GPU then reads it over the bus in every pass that draws it (the terrain index buffer is
+// drawn by the main pass and each shadow cascade).
+std::shared_ptr<ixrhi::IXRHIBuffer> CreateStaticRhiBuffer(ixrhi::IXRHIDevice& rhi,
+                                                          std::uint64_t sizeBytes,
+                                                          ixrhi::IXRHIBufferUsage usage,
+                                                          const void* initialData,
+                                                          const char* debugName)
 {
-    VK_CHECK(vkEndCommandBuffer(cmd));
-
-    VkSubmitInfo submit{};
-    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit.commandBufferCount = 1;
-    submit.pCommandBuffers = &cmd;
-    VK_CHECK(vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE));
-    VK_CHECK(vkQueueWaitIdle(queue));
-    vkDestroyCommandPool(vkDevice, pool, nullptr);
+    ixrhi::IXRHIBufferDesc desc;
+    desc.sizeBytes = sizeBytes;
+    desc.usage = usage;
+    desc.cpuAccess = ixrhi::IXRHICpuAccess::None;
+    desc.debugName = debugName ? debugName : "";
+    const std::size_t bytes = static_cast<std::size_t>(sizeBytes);
+    return rhi.CreateBuffer(desc, initialData, initialData != nullptr ? bytes : 0);
 }
 
-bool CreateDeviceLocalImage(VulkanDevice& device, VkDevice vkDevice, uint32_t width, uint32_t height,
-    uint32_t mipLevels, VkFormat format, VkImage& image, VkDeviceMemory& memory)
+std::shared_ptr<ixrhi::IXRHISampler> CreateRhiSampler(ixrhi::IXRHIDevice& rhi,
+                                                      ixrhi::IXRHISamplerAddress addressMode,
+                                                      bool trilinear,
+                                                      float maxLod,
+                                                      float mipLodBias,
+                                                      const char* debugName)
 {
-    VkImageCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    create.imageType = VK_IMAGE_TYPE_2D;
-    create.format = format;
-    create.extent = {width, height, 1};
-    create.mipLevels = mipLevels;
-    create.arrayLayers = 1;
-    create.samples = VK_SAMPLE_COUNT_1_BIT;
-    create.tiling = VK_IMAGE_TILING_OPTIMAL;
-    create.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(vkDevice, &create, nullptr, &image));
-
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(vkDevice, image, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &memory));
-    VK_CHECK(vkBindImageMemory(vkDevice, image, memory, 0));
-    return true;
-}
-
-bool CreateDeviceLocalAttachmentImage(VulkanDevice& device, VkDevice vkDevice, uint32_t width, uint32_t height,
-    VkFormat format, VkImageUsageFlags usage, VkImage& image, VkDeviceMemory& memory)
-{
-    VkImageCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    create.imageType = VK_IMAGE_TYPE_2D;
-    create.format = format;
-    create.extent = {width, height, 1};
-    create.mipLevels = 1;
-    create.arrayLayers = 1;
-    create.samples = VK_SAMPLE_COUNT_1_BIT;
-    create.tiling = VK_IMAGE_TILING_OPTIMAL;
-    create.usage = usage;
-    create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(vkDevice, &create, nullptr, &image));
-
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(vkDevice, image, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &memory));
-    VK_CHECK(vkBindImageMemory(vkDevice, image, memory, 0));
-    return true;
-}
-
-void TransitionImageLayout(VkCommandBuffer cmd, VkImage image, uint32_t mipLevels,
-    VkImageLayout oldLayout, VkImageLayout newLayout)
-{
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = mipLevels;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
-
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-        newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-    {
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    }
-    else if (oldLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL &&
-             newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-    {
-        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    }
-    else
-    {
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-}
-
-bool CreateDeviceLocalImageArray(VulkanDevice& device, VkDevice vkDevice, uint32_t width, uint32_t height,
-    uint32_t mipLevels, uint32_t arrayLayers, VkFormat format, VkImage& image, VkDeviceMemory& memory)
-{
-    VkImageCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    create.imageType = VK_IMAGE_TYPE_2D;
-    create.format = format;
-    create.extent = {width, height, 1};
-    create.mipLevels = mipLevels;
-    create.arrayLayers = arrayLayers;
-    create.samples = VK_SAMPLE_COUNT_1_BIT;
-    create.tiling = VK_IMAGE_TILING_OPTIMAL;
-    create.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(vkDevice, &create, nullptr, &image));
-
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(vkDevice, image, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &memory));
-    VK_CHECK(vkBindImageMemory(vkDevice, image, memory, 0));
-    return true;
+    const ixrhi::IXRHICapabilities& caps = rhi.GetCapabilities();
+    ixrhi::IXRHISamplerDesc desc;
+    desc.minFilter = ixrhi::IXRHISamplerFilter::Linear;
+    desc.magFilter = ixrhi::IXRHISamplerFilter::Linear;
+    desc.mipmapFilter = trilinear ? ixrhi::IXRHISamplerFilter::Linear : ixrhi::IXRHISamplerFilter::Nearest;
+    desc.addressU = addressMode;
+    desc.addressV = addressMode;
+    desc.addressW = addressMode;
+    // Anisotropy only for repeat (tiling) samplers on capable hardware, at most 4x: the terrain is
+    // seen at grazing angles over most of the screen, where 16x took ~0.07 ms of the terrain pass's
+    // ~0.37 ms (1510x832) for no visible difference (8x: ~0.01 ms).
+    constexpr std::uint32_t kMaxTerrainAnisotropy = 4;
+    if (addressMode == ixrhi::IXRHISamplerAddress::Repeat && caps.supportsAnisotropy)
+        desc.maxAnisotropy = std::min(caps.maxAnisotropy, kMaxTerrainAnisotropy);
+    desc.maxLod = maxLod;
+    desc.mipLodBias = mipLodBias;
+    desc.debugName = debugName ? debugName : "";
+    return rhi.CreateSampler(desc);
 }
 
 uint32_t FullMipCount(uint32_t width, uint32_t height)
@@ -1022,10 +970,35 @@ uint8_t QuantizeByte(float value)
 
 struct ArrayMipUpload
 {
+    // Tight layer-major/mip-minor packing consumed directly by
+    // IXRHITexture creation (same layout the backend re-derives).
     std::vector<uint8_t> pixels;
-    std::vector<VkBufferImageCopy> regions;
     uint32_t mipLevels = 1;
 };
+
+// sRGB byte -> linear, and linear (in kLinearSteps steps) -> the nearest sRGB byte: the mip chains'
+// gamma-correct box filter looked both up per pixel with powf (most of a terrain palette's load).
+constexpr uint32_t kLinearSteps = 16384;
+const std::array<float, 256>& SrgbByteToLinearTable()
+{
+    static const std::array<float, 256> table = [] {
+        std::array<float, 256> values{};
+        for (uint32_t i = 0; i < 256; ++i)
+            values[i] = SrgbToLinear(static_cast<float>(i) / 255.0f);
+        return values;
+    }();
+    return table;
+}
+const std::vector<uint8_t>& LinearToSrgbByteTable()
+{
+    static const std::vector<uint8_t> table = [] {
+        std::vector<uint8_t> values(kLinearSteps + 1u);
+        for (uint32_t i = 0; i <= kLinearSteps; ++i)
+            values[i] = QuantizeByte(LinearToSrgb(static_cast<float>(i) / static_cast<float>(kLinearSteps)));
+        return values;
+    }();
+    return table;
+}
 
 ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
                                        uint32_t height,
@@ -1036,27 +1009,29 @@ ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
 {
     ArrayMipUpload upload{};
     upload.mipLevels = FullMipCount(width, height);
-    upload.regions.reserve(static_cast<size_t>(layers) * upload.mipLevels);
 
     const size_t baseLayerBytes = static_cast<size_t>(width) * height * 4u;
-    for (uint32_t layer = 0; layer < layers; ++layer)
+    // Layer-major, mip-minor: each layer's chain has its own place, so the layers are filtered in
+    // parallel on the shared pool.
+    size_t layerChainBytes = 0;
+    for (uint32_t mip = 0, w = width, h = height; mip < upload.mipLevels; ++mip, w = std::max(1u, w >> 1u), h = std::max(1u, h >> 1u))
+        layerChainBytes += static_cast<size_t>(w) * h * 4u;
+    upload.pixels.resize(layerChainBytes * layers);
+    const std::array<float, 256>& toLinear = SrgbByteToLinearTable();
+    const std::vector<uint8_t>& toSrgb = LinearToSrgbByteTable();
+    ixjobs::JobSystem::Instance().ParallelFor(layers, 1, [&](uint32_t layerBegin, uint32_t layerEnd, uint32_t) {
+    for (uint32_t layer = layerBegin; layer < layerEnd; ++layer)
     {
         std::vector<uint8_t> current(baseLayerBytes);
         std::memcpy(current.data(), basePixels.data() + static_cast<size_t>(layer) * baseLayerBytes, baseLayerBytes);
         uint32_t mipWidth = width;
         uint32_t mipHeight = height;
+        size_t writeOffset = layerChainBytes * layer;
 
         for (uint32_t mip = 0; mip < upload.mipLevels; ++mip)
         {
-            VkBufferImageCopy region{};
-            region.bufferOffset = static_cast<VkDeviceSize>(upload.pixels.size());
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.mipLevel = mip;
-            region.imageSubresource.baseArrayLayer = layer;
-            region.imageSubresource.layerCount = 1;
-            region.imageExtent = {mipWidth, mipHeight, 1};
-            upload.regions.push_back(region);
-            upload.pixels.insert(upload.pixels.end(), current.begin(), current.end());
+            std::memcpy(upload.pixels.data() + writeOffset, current.data(), current.size());
+            writeOffset += current.size();
 
             if (mip + 1u >= upload.mipLevels)
                 break;
@@ -1087,9 +1062,9 @@ ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
                             }
                             else if (srgbColor)
                             {
-                                accum[0] += SrgbToLinear(static_cast<float>(current[src + 0]) / 255.0f);
-                                accum[1] += SrgbToLinear(static_cast<float>(current[src + 1]) / 255.0f);
-                                accum[2] += SrgbToLinear(static_cast<float>(current[src + 2]) / 255.0f);
+                                accum[0] += toLinear[current[src + 0]];
+                                accum[1] += toLinear[current[src + 1]];
+                                accum[2] += toLinear[current[src + 2]];
                                 accum[3] += static_cast<float>(current[src + 3]) / 255.0f;
                             }
                             else
@@ -1115,9 +1090,13 @@ ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
                     }
                     else if (srgbColor)
                     {
-                        next[dst + 0] = QuantizeByte(LinearToSrgb(accum[0] / samples));
-                        next[dst + 1] = QuantizeByte(LinearToSrgb(accum[1] / samples));
-                        next[dst + 2] = QuantizeByte(LinearToSrgb(accum[2] / samples));
+                        const auto srgb = [&](float linear) {
+                            const float step = std::clamp(linear, 0.0f, 1.0f) * static_cast<float>(kLinearSteps);
+                            return toSrgb[static_cast<size_t>(step + 0.5f)];
+                        };
+                        next[dst + 0] = srgb(accum[0] / samples);
+                        next[dst + 1] = srgb(accum[1] / samples);
+                        next[dst + 2] = srgb(accum[2] / samples);
                         next[dst + 3] = QuantizeByte(accum[3] / samples);
                     }
                     else
@@ -1134,6 +1113,7 @@ ArrayMipUpload BuildRgbaArrayMipUpload(uint32_t width,
             mipHeight = nextHeight;
         }
     }
+    });
 
     return upload;
 }
@@ -1145,7 +1125,6 @@ ArrayMipUpload BuildR8ArrayMipUpload(uint32_t width,
 {
     ArrayMipUpload upload{};
     upload.mipLevels = FullMipCount(width, height);
-    upload.regions.reserve(static_cast<size_t>(layers) * upload.mipLevels);
 
     const size_t baseLayerBytes = static_cast<size_t>(width) * height;
     for (uint32_t layer = 0; layer < layers; ++layer)
@@ -1157,14 +1136,6 @@ ArrayMipUpload BuildR8ArrayMipUpload(uint32_t width,
 
         for (uint32_t mip = 0; mip < upload.mipLevels; ++mip)
         {
-            VkBufferImageCopy region{};
-            region.bufferOffset = static_cast<VkDeviceSize>(upload.pixels.size());
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.mipLevel = mip;
-            region.imageSubresource.baseArrayLayer = layer;
-            region.imageSubresource.layerCount = 1;
-            region.imageExtent = {mipWidth, mipHeight, 1};
-            upload.regions.push_back(region);
             upload.pixels.insert(upload.pixels.end(), current.begin(), current.end());
 
             if (mip + 1u >= upload.mipLevels)
@@ -1310,129 +1281,12 @@ double EstimateAverageSlopeAxes(const std::vector<float>& heightCmGrid,
     return samples == 0 ? 1.0 : axesTotal / static_cast<double>(samples);
 }
 
-bool CreateDepthImageArray(VulkanDevice& device, VkDevice vkDevice, uint32_t width, uint32_t height,
-    uint32_t arrayLayers, VkFormat format, VkImage& image, VkDeviceMemory& memory)
-{
-    VkImageCreateInfo create{};
-    create.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    create.imageType = VK_IMAGE_TYPE_2D;
-    create.format = format;
-    create.extent = {width, height, 1};
-    create.mipLevels = 1;
-    create.arrayLayers = arrayLayers;
-    create.samples = VK_SAMPLE_COUNT_1_BIT;
-    create.tiling = VK_IMAGE_TILING_OPTIMAL;
-    create.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-    create.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    create.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    VK_CHECK(vkCreateImage(vkDevice, &create, nullptr, &image));
-
-    VkMemoryRequirements req{};
-    vkGetImageMemoryRequirements(vkDevice, image, &req);
-
-    VkMemoryAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    alloc.allocationSize = req.size;
-    alloc.memoryTypeIndex = device.FindMemoryType(req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-    VK_CHECK(vkAllocateMemory(vkDevice, &alloc, nullptr, &memory));
-    VK_CHECK(vkBindImageMemory(vkDevice, image, memory, 0));
-    return true;
-}
-
-void TransitionDepthArrayLayout(VkCommandBuffer cmd, VkImage image, uint32_t arrayLayers,
-    VkImageLayout oldLayout, VkImageLayout newLayout)
-{
-    if (oldLayout == newLayout)
-        return;
-
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = arrayLayers;
-
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    if (oldLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL &&
-        newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
-    {
-        barrier.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        srcStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        dstStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    }
-    else if (newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)
-    {
-        barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        srcStage = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    }
-    else
-    {
-        barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    }
-
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
-}
-
-WorldMat4 WorldOrthographicOffCenter(float left, float right, float bottom, float top, float zNear, float zFar)
-{
-    WorldMat4 r{};
-    r.m[0] = 2.0f / (right - left);
-    r.m[5] = 2.0f / (top - bottom);
-    r.m[10] = 1.0f / (zFar - zNear);
-    r.m[12] = -(right + left) / (right - left);
-    r.m[13] = -(top + bottom) / (top - bottom);
-    r.m[14] = -zNear / (zFar - zNear);
-    r.m[15] = 1.0f;
-    return r;
-}
-
 WorldVec3 TransformWorldPointNoPerspective(const WorldMat4& m, WorldVec3 p)
 {
     return {
         p.x * m.m[0] + p.y * m.m[4] + p.z * m.m[8] + m.m[12],
         p.x * m.m[1] + p.y * m.m[5] + p.z * m.m[9] + m.m[13],
         p.x * m.m[2] + p.y * m.m[6] + p.z * m.m[10] + m.m[14]};
-}
-
-void TransitionImageLayoutArray(VkCommandBuffer cmd, VkImage image, uint32_t mipLevels, uint32_t arrayLayers,
-    VkImageLayout oldLayout, VkImageLayout newLayout)
-{
-    VkImageMemoryBarrier barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = oldLayout;
-    barrier.newLayout = newLayout;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.levelCount = mipLevels;
-    barrier.subresourceRange.layerCount = arrayLayers;
-
-    VkPipelineStageFlags srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-    VkPipelineStageFlags dstStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL &&
-        newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
-    {
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        srcStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-        dstStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    }
-    else
-    {
-        barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
-    vkCmdPipelineBarrier(cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
 std::string LowerCopy(std::string value)
@@ -1627,221 +1481,6 @@ float BilinearHeightCm(const std::vector<float>& grid, uint32_t width, uint32_t 
     return h0 + (h1 - h0) * ty;
 }
 
-std::string Trim(std::string value)
-{
-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
-        value.erase(value.begin());
-    while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
-        value.pop_back();
-    if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
-        value = value.substr(1, value.size() - 2);
-    return value;
-}
-
-std::string ResolveTerrainTexturePath(const std::string& textureSetPath)
-{
-    const std::string lower = LowerCopy(textureSetPath);
-    const std::string marker = "terrainmaps\\";
-    size_t pos = lower.find(marker);
-    if (pos == std::string::npos)
-        pos = lower.find("terrainmaps/");
-
-    if (pos != std::string::npos)
-    {
-        std::string relative = textureSetPath.substr(pos + marker.size());
-        std::replace(relative.begin(), relative.end(), '\\', '/');
-        const std::string lowerRelative = LowerCopy(relative);
-        const size_t slash = relative.find_last_of('/');
-        const std::string fileName = slash == std::string::npos ? relative : relative.substr(slash + 1);
-        const std::string lowerFileName = LowerCopy(fileName);
-
-        std::string category = "egyeb";
-        if (lowerRelative.find("flame area/") != std::string::npos ||
-            lowerFileName.find("magma") != std::string::npos ||
-            lowerFileName.find("valcano") != std::string::npos ||
-            lowerFileName.find("volcano") != std::string::npos)
-            category = "lava";
-        else if (lowerFileName.find("water") != std::string::npos)
-            category = "viz";
-        else if (lowerFileName.find("ice") != std::string::npos)
-            category = "jeges";
-        else if (lowerFileName.find("snow") != std::string::npos)
-            category = "ho";
-        else if (lowerFileName.find("tile") != std::string::npos)
-            category = "kavicsos";
-        else if (lowerFileName.find("sand") != std::string::npos ||
-                 lowerRelative.rfind("b/beach/", 0) == 0 ||
-                 lowerRelative.rfind("n/desert/sand/", 0) == 0)
-            category = "homokos";
-        else if (lowerFileName.find("grass") != std::string::npos)
-            category = "fu";
-        else if (lowerFileName.find("field") != std::string::npos)
-            category = "foldes";
-        else if (lowerFileName.find("stone") != std::string::npos ||
-                 lowerFileName.find("rock") != std::string::npos)
-            category = "szikla";
-
-        std::string movedName = fileName;
-        if (lowerRelative.rfind("n/desert/field/", 0) == 0)
-            movedName = "n_desert_field_" + fileName;
-        else if (lowerRelative.rfind("n/desert/grass/", 0) == 0)
-            movedName = "n_desert_grass_" + fileName;
-        else if (lowerRelative.rfind("n/desert/stone/", 0) == 0)
-            movedName = "n_desert_stone_" + fileName;
-        else if (lowerRelative.rfind("n/desert/tile/", 0) == 0)
-            movedName = "n_desert_tile_" + fileName;
-        else if (lowerRelative.rfind("n/snow.m/", 0) == 0 &&
-                 (lowerFileName.find("field") != std::string::npos ||
-                  lowerFileName.find("grass") != std::string::npos ||
-                  lowerFileName.find("stone") != std::string::npos ||
-                  lowerFileName.find("tile") != std::string::npos))
-            movedName = "n_snow_m_" + fileName;
-
-        return "assets/Textures/" + category + "/" + movedName;
-    }
-
-    return textureSetPath;
-}
-
-float ParseFloatOrDefault(const std::string& value, float fallback)
-{
-    const std::string trimmed = Trim(value);
-    char* end = nullptr;
-    const char* begin = trimmed.c_str();
-    const float parsed = std::strtof(begin, &end);
-    return end != begin ? parsed : fallback;
-}
-
-std::string ReadTextureSetPathFromSetting(client::asset::IAssetReader& assets,
-    const std::string& settingPath)
-{
-    auto text = assets.ReadText(settingPath);
-    if (!text)
-        return "assets/textureset/metin2_c1.txt";
-    std::istringstream file(*text);
-
-    std::string key;
-    while (file >> key)
-    {
-        key = LowerCopy(key);
-        if (key == "textureset")
-        {
-            std::string value;
-            file >> value;
-            value = Trim(value);
-            std::replace(value.begin(), value.end(), '\\', '/');
-            if (value.find(':') != std::string::npos || value.rfind("\\\\", 0) == 0)
-                return value;
-            return value.rfind("assets/", 0) == 0 ? value : "assets/" + value;
-        }
-
-        std::string rest;
-        std::getline(file, rest);
-    }
-
-    return "assets/textureset/metin2_c1.txt";
-}
-
-std::vector<TextureSetEntry> LoadTextureSetEntries(client::asset::IAssetReader& assets,
-    const std::string& path)
-{
-    std::vector<TextureSetEntry> entries(1);
-    auto text = assets.ReadText(path);
-    if (!text)
-        return entries;
-    std::istringstream file(*text);
-
-    std::string line;
-    int currentIndex = 0;
-    while (std::getline(file, line))
-    {
-        const std::string lower = LowerCopy(Trim(line));
-        if (lower.rfind("start texture", 0) == 0)
-        {
-            currentIndex = std::atoi(lower.c_str() + std::strlen("start texture"));
-            if (currentIndex >= static_cast<int>(entries.size()))
-                entries.resize(static_cast<size_t>(currentIndex) + 1);
-            continue;
-        }
-
-        if (currentIndex > 0 && lower.find(".dds") != std::string::npos)
-        {
-            TextureSetEntry& entry = entries[static_cast<size_t>(currentIndex)];
-            entry.path = ResolveTerrainTexturePath(Trim(line));
-
-            std::string scaleULine;
-            std::string scaleVLine;
-            if (std::getline(file, scaleULine))
-                entry.scaleU = ParseFloatOrDefault(scaleULine, 1.0f);
-            if (std::getline(file, scaleVLine))
-                entry.scaleV = ParseFloatOrDefault(scaleVLine, 1.0f);
-            currentIndex = 0;
-        }
-    }
-
-    return entries;
-}
-
-std::vector<std::string> LoadTextureSetPaths(client::asset::IAssetReader& assets,
-    const std::string& path)
-{
-    const std::vector<TextureSetEntry> entries = LoadTextureSetEntries(assets, path);
-    std::vector<std::string> paths(entries.size());
-    for (size_t i = 1; i < entries.size(); ++i)
-        paths[i] = entries[i].path;
-    return paths;
-}
-
-bool ReadTileRaw(client::asset::IAssetReader& assets, const std::string& path, std::vector<uint8_t>& outInterior)
-{
-    auto bytes = assets.ReadAll(path);
-    if (!bytes)
-        return false;
-
-    if (bytes->size() != 258u * 258u)
-        return false;
-
-    outInterior.resize(256u * 256u);
-    for (uint32_t y = 0; y < 256u; ++y)
-    {
-        const uint8_t* src = bytes->data() + (static_cast<size_t>(y) + 1u) * 258u + 1u;
-        std::memcpy(outInterior.data() + static_cast<size_t>(y) * 256u, src, 256u);
-    }
-    return true;
-}
-
-uint8_t DominantTileIndex(client::asset::IAssetReader& assets, const std::string& mapDirectory,
-    uint32_t mapSizeX, uint32_t mapSizeY)
-{
-    std::array<uint32_t, 256> counts{};
-    for (uint32_t cellX = 0; cellX < mapSizeX; ++cellX)
-    {
-        for (uint32_t cellY = 0; cellY < mapSizeY; ++cellY)
-        {
-            const uint32_t cellId = cellX * 1000u + cellY;
-            char folder[16]{};
-            std::snprintf(folder, sizeof(folder), "%06u", cellId);
-            auto bytes = assets.ReadAll(mapDirectory + "/" + folder + "/tile.raw");
-            if (!bytes)
-                continue;
-
-            for (std::size_t i = 0; i < bytes->size(); ++i)
-            {
-                if ((*bytes)[i] != 0)
-                    ++counts[(*bytes)[i]];
-            }
-        }
-    }
-
-    uint8_t best = 0;
-    for (uint32_t i = 1; i < counts.size(); ++i)
-    {
-        if (counts[i] > counts[best])
-            best = static_cast<uint8_t>(i);
-    }
-    return best;
-}
-
 const char* TeditToolModeName(MapEditorToolMode mode)
 {
     switch (mode)
@@ -1868,21 +1507,49 @@ const char* TeditToolName(MapEditorTool tool)
 }
 }
 
-bool TerrainRenderer::Create(VulkanDevice& device, client::asset::IAssetReader& assets)
+float SampleTerrainCollisionHeightCm(const std::vector<float>& grid,
+                                    std::uint32_t width, std::uint32_t height,
+                                    float localXcm, float localYcm, float cellScaleCm)
+{
+    if (width < 2 || height < 2 || grid.size() < static_cast<std::size_t>(width) * height ||
+        !std::isfinite(localXcm) || !std::isfinite(localYcm) ||
+        !std::isfinite(cellScaleCm) || cellScaleCm <= 0)
+        return 0.0f;
+    const float maxX = static_cast<float>(width - 1) * cellScaleCm;
+    const float maxY = static_cast<float>(height - 1) * cellScaleCm;
+    if (!std::isfinite(maxX) || !std::isfinite(maxY))
+        return 0.0f;
+    const float gx = std::clamp(localXcm, 0.0f, maxX) / cellScaleCm;
+    const float gy = std::clamp(localYcm, 0.0f, maxY) / cellScaleCm;
+    const std::uint32_t x0 = std::min(static_cast<std::uint32_t>(gx), width - 2);
+    const std::uint32_t y0 = std::min(static_cast<std::uint32_t>(gy), height - 2);
+    const float tx = std::clamp(gx - static_cast<float>(x0), 0.0f, 1.0f);
+    const float ty = std::clamp(gy - static_cast<float>(y0), 0.0f, 1.0f);
+    const auto offset = static_cast<std::size_t>(y0) * width + x0;
+    const float h00 = grid[offset];
+    const float h10 = grid[offset + 1];
+    const float h01 = grid[offset + width];
+    const float h11 = grid[offset + width + 1];
+    // Match PhysicsWorld::CreateTerrainCollider: source diagonal v10-v01.
+    if (tx + ty <= 1.0f)
+        return h00 + (h10 - h00) * tx + (h01 - h00) * ty;
+    return h11 + (h01 - h11) * (1.0f - tx) + (h10 - h11) * (1.0f - ty);
+}
+
+bool TerrainRenderer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader& assets)
 {
     Destroy();
-    m_device = device.GetDevice();
-    m_deviceOwner = &device;
+    m_rhi = &rhi;
     m_assets = &assets;
     LoadEditorConfig();
 
-    const bool texture = CreateFallbackTexture(device);
-    const bool mask = texture ? CreateFallbackSplatTextures(device) : false;
-    const bool buffers = mask ? CreateBuffers(device) : false;
-    const bool shadows = buffers ? CreateShadowResources(device) : false;
-    const bool descriptors = shadows ? CreateDescriptors() : false;
-    const bool pipeline = descriptors ? CreatePipeline(device) : false;
-    const bool water = pipeline ? CreateWaterResources(device) : false;
+    const bool texture = CreateFallbackTexture(rhi);
+    const bool mask = texture ? CreateFallbackSplatTextures(rhi) : false;
+    const bool buffers = mask ? CreateBuffers(rhi) : false;
+    const bool shadows = buffers ? CreateShadowResources(rhi) : false;
+    const bool descriptors = shadows ? CreateBindGroup(rhi) : false;
+    const bool pipeline = descriptors ? CreatePipeline(rhi) : false;
+    const bool water = pipeline ? CreateWaterResources(rhi) : false;
     m_sceneTerrainActive = false;
     m_sceneTerrain = {};
     Tracenf("[TERRAIN] Create: texture=%d mask=%d buffers=%d shadows=%d descriptors=%d pipeline=%d",
@@ -1910,24 +1577,22 @@ void TerrainRenderer::SetAdditionalAssetRoots(std::vector<std::filesystem::path>
     }
 }
 
-bool TerrainRenderer::LoadMap(VulkanDevice& device, const std::string& mapDirectory, int32_t serverX, int32_t serverY)
+bool TerrainRenderer::LoadMap(ixrhi::IXRHIDevice& rhi, const std::string& mapDirectory, int32_t serverX, int32_t serverY)
 {
-    if (!m_device)
+    if (!m_rhi)
         return false;
 
-    device.WaitIdle();
-    DestroyBuffer(m_vertexBuffer);
-    DestroyBuffer(m_indexBuffer);
-    DestroyBuffer(m_debugVertexBuffer);
-    DestroyBuffer(m_debugIndexBuffer);
-    DestroyBuffer(m_logicVertexBuffer);
-    DestroyBuffer(m_logicIndexBuffer);
-    DestroyBuffer(m_selectedWaterBodyVertexBuffer);
-    DestroyBuffer(m_selectedWaterBodyIndexBuffer);
+    rhi.WaitIdle();
+    m_vertexBuffer.reset();
+    m_vertexEditBuffer.reset();
+    m_indexBuffer.reset();
+    m_debugVertexBuffer.reset();
+    m_debugIndexBuffer.reset();
+    m_logicVertexBuffer.reset();
+    m_logicIndexBuffer.reset();
+    m_selectedWaterBodyVertexBuffer.reset();
+    m_selectedWaterBodyIndexBuffer.reset();
     DestroyTerrainLayers();
-    m_tileIndices.clear();
-    m_tileGridWidth = 0;
-    m_tileGridHeight = 0;
     m_indexCount = 0;
     m_debugIndexCount = 0;
     m_spawnDebugIndexOffset = 0;
@@ -1947,7 +1612,7 @@ bool TerrainRenderer::LoadMap(VulkanDevice& device, const std::string& mapDirect
     m_editorRaiseHeld = false;
     m_editorLowerHeld = false;
 
-    if (!CreateMapBuffers(device, mapDirectory, serverX, serverY))
+    if (!CreateMapBuffers(rhi, mapDirectory, serverX, serverY))
     {
         Tracen("[TERRAIN-MAP] LoadMap failed; restoring flat fallback terrain");
         m_mapLoaded = false;
@@ -1955,6 +1620,7 @@ bool TerrainRenderer::LoadMap(VulkanDevice& device, const std::string& mapDirect
         m_attributes.clear();
         m_splatABytes.clear();
         m_splatBBytes.clear();
+        m_activeSplatLayerSpan = -1;
         m_splatWidth = 0;
         m_splatHeight = 0;
         m_chunkSplatWidth = 0;
@@ -1962,14 +1628,14 @@ bool TerrainRenderer::LoadMap(VulkanDevice& device, const std::string& mapDirect
         m_terrainChunks.clear();
         m_visibleTerrainChunksScratch.clear();
         m_undoStack.clear();
-        const bool flat = CreateFlatBuffers(device);
-        LoadWaterBodies(device, mapDirectory);
-        CreateDescriptors();
+        const bool flat = CreateFlatBuffers(rhi);
+        LoadWaterBodies(rhi, mapDirectory);
+        CreateBindGroup(rhi);
         return flat;
     }
 
-    LoadWaterBodies(device, mapDirectory);
-    CreateDescriptors();
+    LoadWaterBodies(rhi, mapDirectory);
+    CreateBindGroup(rhi);
     m_sceneTerrainActive = true;
     m_sceneTerrain.exists = true;
     m_sceneTerrain.name = "Terrain";
@@ -1981,9 +1647,9 @@ bool TerrainRenderer::LoadMap(VulkanDevice& device, const std::string& mapDirect
     return true;
 }
 
-bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainSceneData& terrain)
+bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSceneData& terrain)
 {
-    if (!m_device)
+    if (!m_rhi)
         return false;
 
     TerrainSceneData next = terrain;
@@ -2001,23 +1667,42 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     next.triplanarSharpness = std::clamp(next.triplanarSharpness, 1.0f, 16.0f);
     next.triplanarSlopeThreshold = std::clamp(next.triplanarSlopeThreshold, 0.0f, 1.0f);
     next.triplanarSlopeTransition = std::clamp(next.triplanarSlopeTransition, 0.001f, 1.0f);
+    const std::size_t expectedHeightCount =
+        (static_cast<std::size_t>(next.cellsX) + 1) * (static_cast<std::size_t>(next.cellsZ) + 1);
+    if (!next.heightCmGrid.empty() && next.heightCmGrid.size() != expectedHeightCount)
+    {
+        TraceError("[TERRAIN-CREATE] invalid height count: expected=%zu actual=%zu",
+            expectedHeightCount, next.heightCmGrid.size());
+        return false;
+    }
+    if (!std::all_of(next.heightCmGrid.begin(), next.heightCmGrid.end(),
+        [](float value) { return std::isfinite(value); }))
+    {
+        TraceError("[TERRAIN-CREATE] non-finite terrain height");
+        return false;
+    }
+    const std::size_t expectedAttributeCount = static_cast<std::size_t>(next.cellsX) * next.cellsZ;
+    if (!next.attributes.empty() && next.attributes.size() != expectedAttributeCount)
+    {
+        TraceError("[TERRAIN-CREATE] invalid attribute count: expected=%zu actual=%zu",
+            expectedAttributeCount, next.attributes.size());
+        return false;
+    }
 
-    device.WaitIdle();
-    DestroyBuffer(m_vertexBuffer);
-    DestroyBuffer(m_indexBuffer);
-    DestroyBuffer(m_debugVertexBuffer);
-    DestroyBuffer(m_debugIndexBuffer);
-    DestroyBuffer(m_logicVertexBuffer);
-    DestroyBuffer(m_logicIndexBuffer);
-    DestroyBuffer(m_selectedWaterBodyVertexBuffer);
-    DestroyBuffer(m_selectedWaterBodyIndexBuffer);
+    rhi.WaitIdle();
+    m_vertexBuffer.reset();
+    m_vertexEditBuffer.reset();
+    m_indexBuffer.reset();
+    m_debugVertexBuffer.reset();
+    m_debugIndexBuffer.reset();
+    m_logicVertexBuffer.reset();
+    m_logicIndexBuffer.reset();
+    m_selectedWaterBodyVertexBuffer.reset();
+    m_selectedWaterBodyIndexBuffer.reset();
     DestroyTerrainLayers();
     DestroyWaterBodyResources();
-    DestroyTexture(m_splatA);
-    DestroyTexture(m_splatB);
-    m_tileIndices.clear();
-    m_tileGridWidth = 0;
-    m_tileGridHeight = 0;
+    m_splatA = {};
+    m_splatB = {};
     m_indexCount = 0;
     m_debugIndexCount = 0;
     m_selectedWaterBodyIndexCount = 0;
@@ -2029,6 +1714,7 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     m_attributes.clear();
     m_splatABytes.clear();
     m_splatBBytes.clear();
+    m_activeSplatLayerSpan = -1;
     m_dirtyChunkTexels.clear();
     m_undoStack.clear();
 
@@ -2043,11 +1729,13 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     m_spawnLocalXcm = next.widthMeters * 50.0f;
     m_spawnLocalYcm = next.depthMeters * 50.0f;
     m_spawnHeightCm = 0.0f;
-    const size_t expectedHeightCount = static_cast<size_t>(m_heightGridWidth) * m_heightGridHeight;
     if (next.heightCmGrid.size() == expectedHeightCount)
         m_heightCmGrid = next.heightCmGrid;
     else
         m_heightCmGrid.assign(expectedHeightCount, 0.0f);
+    m_attributes = next.attributes;
+    if (m_attributes.empty())
+        m_attributes.assign(expectedAttributeCount, 0);
     m_heightUndoRecorded.assign(m_heightCmGrid.size(), 0);
     m_splatWidth = std::max(1u, next.cellsX);
     m_splatHeight = std::max(1u, next.cellsZ);
@@ -2062,20 +1750,22 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
         m_splatBBytes = next.splatBBytes;
     else
         m_splatBBytes.assign(expectedSplatBytes, 0);
+    m_activeSplatLayerSpan = -1;
     m_splatUndoRecorded.assign(m_splatABytes.size() + m_splatBBytes.size(), 0);
     const uint32_t chunksX = (m_mapSizeX + m_chunkSizeCells - 1u) / m_chunkSizeCells;
     const uint32_t chunksY = (m_mapSizeY + m_chunkSizeCells - 1u) / m_chunkSizeCells;
     m_dirtyChunkTexels.assign(static_cast<size_t>(chunksX) * chunksY, 0);
 
-    if (!CreateFlatBuffers(device))
+    if (!CreateFlatBuffers(rhi))
         return false;
-    if (!CreateSceneSplatTextures(device))
+    if (!CreateSceneSplatTextures(rhi))
         return false;
-    CreateDescriptors();
+    CreateBindGroup(rhi);
 
     m_mapLoaded = true;
     m_sceneTerrainActive = true;
     m_sceneTerrain = next;
+    ReleaseTerrainGrids(m_sceneTerrain);
     m_triplanarParamsDirty = true;
     m_terrainShaderOptimDiagLogged = false;
     Tracenf("[TERRAIN-CREATE] dims=%.2fx%.2f m, cellSize=%.2f m, cells=%ux%u, verts=%zu, pos=(0.00,0.00,0.00)",
@@ -2110,29 +1800,30 @@ bool TerrainRenderer::CreateFlatTerrain(VulkanDevice& device, const TerrainScene
     return true;
 }
 
-void TerrainRenderer::ClearTerrain(VulkanDevice& device)
+void TerrainRenderer::ClearTerrain()
 {
-    if (!m_device)
+    if (!m_rhi)
         return;
-    device.WaitIdle();
-    DestroyBuffer(m_vertexBuffer);
-    DestroyBuffer(m_indexBuffer);
-    DestroyBuffer(m_debugVertexBuffer);
-    DestroyBuffer(m_debugIndexBuffer);
-    DestroyBuffer(m_logicVertexBuffer);
-    DestroyBuffer(m_logicIndexBuffer);
-    DestroyBuffer(m_selectedWaterBodyVertexBuffer);
-    DestroyBuffer(m_selectedWaterBodyIndexBuffer);
+    m_rhi->WaitIdle();
+    m_vertexBuffer.reset();
+    m_vertexEditBuffer.reset();
+    m_indexBuffer.reset();
+    m_debugVertexBuffer.reset();
+    m_debugIndexBuffer.reset();
+    m_logicVertexBuffer.reset();
+    m_logicIndexBuffer.reset();
+    m_selectedWaterBodyVertexBuffer.reset();
+    m_selectedWaterBodyIndexBuffer.reset();
     DestroyTerrainLayers();
     DestroyWaterBodyResources();
-    DestroyTexture(m_splatA);
-    DestroyTexture(m_splatB);
+    m_splatA = {};
+    m_splatB = {};
     m_waterBodies.clear();
-    m_tileIndices.clear();
     m_heightCmGrid.clear();
     m_attributes.clear();
     m_splatABytes.clear();
     m_splatBBytes.clear();
+    m_activeSplatLayerSpan = -1;
     m_dirtyChunkTexels.clear();
     m_heightUndoRecorded.clear();
     m_splatUndoRecorded.clear();
@@ -2146,13 +1837,14 @@ void TerrainRenderer::ClearTerrain(VulkanDevice& device)
     m_sceneTerrainActive = false;
     m_terrainShaderOptimDiagLogged = false;
     m_sceneTerrain = {};
-    CreateDescriptors();
+    if (m_rhi)
+        CreateBindGroup(*m_rhi);
     Tracenf("[TEDIT-DIAG] active terrain cleared id=%p activeTerrain=NULL", static_cast<void*>(this));
 }
 
-TerrainSceneData TerrainRenderer::GetTerrainSceneData() const
+TerrainSceneData TerrainRenderer::GetTerrainSceneInfo() const
 {
-    TerrainSceneData data = m_sceneTerrain;
+    TerrainSceneData data = m_sceneTerrain;  // holds no grids (ReleaseTerrainGrids)
     data.exists = m_sceneTerrainActive;
     if (data.exists)
     {
@@ -2166,11 +1858,36 @@ TerrainSceneData TerrainRenderer::GetTerrainSceneData() const
         data.depthMeters = m_flatTerrainDepthMeters > 0.0f
             ? m_flatTerrainDepthMeters
             : static_cast<float>(m_mapSizeY) * m_cellScaleMeters;
-        data.heightCmGrid = m_heightCmGrid;
-        data.splatABytes = m_splatABytes;
-        data.splatBBytes = m_splatBBytes;
     }
     return data;
+}
+
+TerrainSceneData TerrainRenderer::GetTerrainSceneData() const
+{
+    TerrainSceneData data;
+    GetTerrainSceneData(data);
+    return data;
+}
+
+void TerrainRenderer::GetTerrainSceneData(TerrainSceneData& out) const
+{
+    // Keep out's grid buffers: assigning into them reuses their capacity, so a caller refreshing the
+    // same snapshot every frame copies megabytes instead of allocating them.
+    std::vector<float> heights = std::move(out.heightCmGrid);
+    std::vector<std::uint16_t> attributes = std::move(out.attributes);
+    std::vector<std::uint8_t> splatA = std::move(out.splatABytes);
+    std::vector<std::uint8_t> splatB = std::move(out.splatBBytes);
+    out = GetTerrainSceneInfo();
+    if (!out.exists)
+        return;
+    heights.assign(m_heightCmGrid.begin(), m_heightCmGrid.end());
+    attributes.assign(m_attributes.begin(), m_attributes.end());
+    splatA.assign(m_splatABytes.begin(), m_splatABytes.end());
+    splatB.assign(m_splatBBytes.begin(), m_splatBBytes.end());
+    out.heightCmGrid = std::move(heights);
+    out.attributes = std::move(attributes);
+    out.splatABytes = std::move(splatA);
+    out.splatBBytes = std::move(splatB);
 }
 
 void TerrainRenderer::SetTerrainSceneData(const TerrainSceneData& terrain)
@@ -2178,6 +1895,7 @@ void TerrainRenderer::SetTerrainSceneData(const TerrainSceneData& terrain)
     if (!m_sceneTerrainActive)
         return;
     m_sceneTerrain = terrain;
+    ReleaseTerrainGrids(m_sceneTerrain);
     m_sceneTerrain.exists = true;
     m_sceneTerrain.triplanarSharpness = std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f);
     m_sceneTerrain.triplanarSlopeThreshold = std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f);
@@ -2185,28 +1903,31 @@ void TerrainRenderer::SetTerrainSceneData(const TerrainSceneData& terrain)
     m_triplanarParamsDirty = true;
 }
 
-bool TerrainRenderer::RecreatePipeline(VulkanDevice& device)
+bool TerrainRenderer::RecreatePipeline(ixrhi::IXRHIDevice& rhi)
 {
-    if (!m_device)
+    if (!m_rhi)
         return true;
 
     DestroyPipeline();
     DestroyWaterReflectionPipeline();
-    if ((m_mainRenderPass ? m_mainRenderPass : device.GetRenderPass()) == VK_NULL_HANDLE)
+    // Deferred-true while the effective pass is torn down (parity with the
+    // pre-migration null-pass early-out); real failures propagate as false.
+    const ixrhi::IXRHIRenderPass* effectivePass = m_targetPass ? m_targetPass : rhi.GetMainPass();
+    if (effectivePass == nullptr)
         return true;
 
-    const bool terrainPipeline = CreatePipeline(device);
-    const bool reflectionResources = terrainPipeline ? CreateOrRecreateWaterReflectionResources(device, true) : false;
-    const bool reflectionPipeline = reflectionResources ? CreateWaterReflectionPipeline(device) : false;
+    const bool terrainPipeline = CreatePipeline(rhi);
+    const bool reflectionResources = terrainPipeline ? CreateOrRecreateWaterReflectionResources(rhi, true) : false;
+    const bool reflectionPipeline = reflectionResources ? CreateWaterReflectionPipeline(rhi) : false;
     if (reflectionPipeline)
-        UpdateWaterDescriptors();
-    const bool waterPipeline = reflectionPipeline ? CreateWaterPipeline(device) : false;
+        UpdateWaterBindGroup();
+    const bool waterPipeline = reflectionPipeline ? CreateWaterPipeline(rhi) : false;
     return terrainPipeline && reflectionResources && reflectionPipeline && waterPipeline;
 }
 
 void TerrainRenderer::SetTargetPass(const ixrhi::IXRHIRenderPass* pass)
 {
-    m_mainRenderPass = (pass != nullptr) ? ixvulkan::NativePassOf(*pass) : VK_NULL_HANDLE;
+    m_targetPass = pass;
 }
 
 void TerrainRenderer::SetWaterRefractionInputs(std::shared_ptr<ixrhi::IXRHITexture> colorSnapshot,
@@ -2227,32 +1948,47 @@ void TerrainRenderer::SetWaterRefractionInputs(std::shared_ptr<ixrhi::IXRHITextu
     m_waterSceneSampler = std::move(sampler);
     m_waterSceneWidth = width;
     m_waterSceneHeight = height;
-    UpdateWaterDescriptors();
+    UpdateWaterBindGroup();
+}
+
+namespace
+{
+// The cascade split distances from the camera: index 0 the near plane, i the radius of cascade i - 1.
+float ShadowCascadeSplit(std::uint32_t index, std::uint32_t cascadeCount)
+{
+    constexpr float nearPlane = 0.1f;
+    constexpr float farPlane = 200.0f;
+    constexpr float lambda = 0.7f;
+    if (index == 0)
+        return nearPlane;
+    if (index >= cascadeCount)
+        return farPlane;
+    const float p = static_cast<float>(index) / static_cast<float>(cascadeCount);
+    const float logSplit = nearPlane * xm::Pow(farPlane / nearPlane, p);
+    const float uniformSplit = nearPlane + (farPlane - nearPlane) * p;
+    return uniformSplit * (1.0f - lambda) + logSplit * lambda;
+}
+} // namespace
+
+void TerrainRenderer::SunShadowCascadeServes(std::uint32_t cascade, float& nearest, float& farthest)
+{
+    // As Terrain.hlsl SampleShadowBlended: cascade c - 1 blends into c over its last tenth.
+    farthest = ShadowCascadeSplit(cascade + 1, kShadowCascadeCount);
+    if (cascade == 0)
+    {
+        nearest = 0.0f;
+        return;
+    }
+    const float previousRadius = ShadowCascadeSplit(cascade, kShadowCascadeCount);
+    const float previousInner = cascade == 1 ? 0.0f : ShadowCascadeSplit(cascade - 1, kShadowCascadeCount);
+    nearest = previousRadius - 0.1f * (previousRadius - previousInner);
 }
 
 void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
 {
-    const WorldVec3 forward = WorldCameraForward(camera);
-    WorldVec3 right = WorldCameraRight(camera);
-    if (xm::Dot(right, right) <= 0.0001f)
-        right = {1.0f, 0.0f, 0.0f};
-    const WorldVec3 up = WorldCameraUp(camera);
-    const float aspect = 16.0f / 9.0f;
-    constexpr float tanHalfFov = 0.41421356237f;
-    const float nearPlane = 0.1f;
-    const float farPlane = 200.0f;
-    constexpr float lambda = 0.7f;
-
     float splitPlanes[kShadowCascadeCount + 1]{};
-    splitPlanes[0] = nearPlane;
-    for (uint32_t i = 1; i < kShadowCascadeCount; ++i)
-    {
-        const float p = static_cast<float>(i) / static_cast<float>(kShadowCascadeCount);
-        const float logSplit = nearPlane * xm::Pow(farPlane / nearPlane, p);
-        const float uniformSplit = nearPlane + (farPlane - nearPlane) * p;
-        splitPlanes[i] = uniformSplit * (1.0f - lambda) + logSplit * lambda;
-    }
-    splitPlanes[kShadowCascadeCount] = farPlane;
+    for (uint32_t i = 0; i <= kShadowCascadeCount; ++i)
+        splitPlanes[i] = ShadowCascadeSplit(i, kShadowCascadeCount);
 
     const DirectionalLight& sun = m_lightingState.directional;
     const float azimuthRadians = xm::DegreesToRadians(std::clamp(sun.azimuthDegrees, 0.0f, 360.0f));
@@ -2261,86 +1997,442 @@ void TerrainRenderer::UpdateShadowCascades(const WorldCamera& camera)
     if (xm::Dot(sunDir, sunDir) <= 0.0001f)
         sunDir = {0.0f, 1.0f, 0.0f};
 
+    // The light camera sits on the sun's side and looks away from it, so depth grows with the
+    // distance from the sun and the shadow map keeps the surface the sun reaches first. It looks from
+    // a fixed point: only the sun turns it, so each cascade's texel grid stays put in the world while
+    // the camera moves (shadow edges do not crawl).
+    const WorldVec3 lightUp = std::abs(sunDir.y) > 0.999f ? WorldVec3{0.0f, 0.0f, 1.0f} : WorldVec3{0.0f, 1.0f, 0.0f};
+    const WorldMat4 lightView = WorldLookAt(sunDir, WorldVec3{0.0f, 0.0f, 0.0f}, lightUp);
+    const WorldVec3 eye = TransformWorldPointNoPerspective(lightView, camera.eye);
+
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
-        const float zn = splitPlanes[cascade];
-        const float zf = splitPlanes[cascade + 1];
-        const float nearH = 2.0f * tanHalfFov * zn;
-        const float nearW = nearH * aspect;
-        const float farH = 2.0f * tanHalfFov * zf;
-        const float farW = farH * aspect;
-        const WorldVec3 nearCenter = camera.eye + forward * zn;
-        const WorldVec3 farCenter = camera.eye + forward * zf;
-        std::array<WorldVec3, 8> corners = {
-            nearCenter + up * (nearH * 0.5f) + right * (-nearW * 0.5f),
-            nearCenter + up * (nearH * 0.5f) + right * (nearW * 0.5f),
-            nearCenter + up * (-nearH * 0.5f) + right * (-nearW * 0.5f),
-            nearCenter + up * (-nearH * 0.5f) + right * (nearW * 0.5f),
-            farCenter + up * (farH * 0.5f) + right * (-farW * 0.5f),
-            farCenter + up * (farH * 0.5f) + right * (farW * 0.5f),
-            farCenter + up * (-farH * 0.5f) + right * (-farW * 0.5f),
-            farCenter + up * (-farH * 0.5f) + right * (farW * 0.5f),
-        };
-
-        WorldVec3 center{};
-        for (WorldVec3 corner : corners)
-            center = center + corner;
-        center = center * (1.0f / static_cast<float>(corners.size()));
-
-        const WorldVec3 lightEye = center - sunDir * 120.0f;
-        WorldMat4 lightView = WorldLookAt(lightEye, center, {0.0f, 1.0f, 0.0f});
-
-        WorldVec3 minBound{std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max()};
-        WorldVec3 maxBound{-std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max()};
-        for (WorldVec3 corner : corners)
-        {
-            const WorldVec3 p = TransformWorldPointNoPerspective(lightView, corner);
-            minBound.x = std::min(minBound.x, p.x);
-            minBound.y = std::min(minBound.y, p.y);
-            minBound.z = std::min(minBound.z, p.z);
-            maxBound.x = std::max(maxBound.x, p.x);
-            maxBound.y = std::max(maxBound.y, p.y);
-            maxBound.z = std::max(maxBound.z, p.z);
-        }
-
-        constexpr float padding = 20.0f;
-        WorldMat4 lightProj = WorldOrthographicOffCenter(
-            minBound.x - padding, maxBound.x + padding,
-            minBound.y - padding, maxBound.y + padding,
-            minBound.z - 80.0f, maxBound.z + 80.0f);
+        // The terrain picks a cascade by the distance from the camera, the meshes and the volumetric
+        // light take the finest one that holds the point: cascade i covers the ball of radius split i
+        // around the eye whichever way the camera looks (any field of view), with a few texels of room
+        // for the filter.
+        const float radius = splitPlanes[cascade + 1];
+        const float halfSize = radius * (1.0f + 8.0f / static_cast<float>(kShadowResolution));
+        const float texelSize = 2.0f * halfSize / static_cast<float>(kShadowResolution);
+        // The depth range moves in steps of 64 m (the padding has room for them): a cascade stays
+        // exactly the same while the camera moves less than a texel and can be kept, and while it moves
+        // across its texels only, its static cache layer is moved instead of drawn again (a depth step
+        // changes every depth in it: drawn again).
+        static const bool staggerDepth = [] {
+            std::string value;
+#if defined(_WIN32)
+            char* text = nullptr;
+            std::size_t length = 0;
+            if (_dupenv_s(&text, &length, "IX_SHADOW_DEPTH_STAGGER") == 0 && text)
+            {
+                value = text;
+                std::free(text);
+            }
+#else
+            if (const char* text = std::getenv("IX_SHADOW_DEPTH_STAGGER")) value = text;
+#endif
+            return value == "1";
+        }();
+        // Each cascade keeps the same depth span and at most one step of lag. Offsetting its
+        // lattice splits the four depth-refresh events into 16 m intervals instead of one spike.
+        const float phase = staggerDepth ? cascade * (kShadowDepthStepMeters / kShadowCascadeCount) : 0.0f;
+        const float centerZ = std::floor((eye.z - phase) / kShadowDepthStepMeters) * kShadowDepthStepMeters + phase;
+        constexpr float depthPadding = 80.0f + kShadowDepthStepMeters;
+        const WorldMat4 lightProj = MakeSunShadowProjection(eye.x, eye.y, centerZ,
+            halfSize, radius + depthPadding, kShadowResolution);
         m_shadowCascadeViewProj[cascade] = WorldMultiply(lightView, lightProj);
-        m_shadowCascadeSplits[cascade] = zf;
+        m_shadowCascadeSplits[cascade] = radius;
+        // In metres: what one unit of the cascade's depth spans, and one texel of its map.
+        m_shadowCascadeDepthRange[cascade] = 2.0f * (radius + depthPadding);
+        m_shadowCascadeTexelSize[cascade] = texelSize;
     }
 }
 
-void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera& camera)
+void TerrainRenderer::UploadEditedTerrain(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
 {
-    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_lightingState.sunShadowsEnabled || !m_shadowPipeline || !m_shadowImage ||
-        !m_vertexBuffer.buffer || !m_indexBuffer.buffer || m_indexCount == 0 || !device.IsFrameActive())
+    if (m_vertexBufferUploadPending && m_vertexBuffer && m_vertexEditBuffer)
+    {
+        m_vertexBufferUploadPending = false;
+        ++m_terrainGeometryRevision;  // the sun shadow map must be drawn again
+        // Whole-buffer copy (the backend copies from offset 0): only on frames with a sculpt edit. The
+        // barriers order it after earlier frames' vertex reads and before this frame's draws.
+        cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::VertexRead, ixrhi::IXRHIBufferState::TransferDst);
+        cmd.CopyBuffer(*m_vertexEditBuffer, *m_vertexBuffer, std::min(m_vertexEditBuffer->SizeBytes(), m_vertexBuffer->SizeBytes()));
+        cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::VertexRead);
+    }
+    UploadEditedSplat(cmd, frame.frameIndex % kFramesInFlight);
+}
+
+void TerrainRenderer::UploadEditedSplat(ixrhi::IXRHICommandList& cmd, uint32_t frameIndex)
+{
+    if (!m_editorSplatGpuDirty || !m_splatDirtyRect.Valid() || !m_rhi || !m_splatA.image || !m_splatB.image)
+        return;
+    const SplatDirtyRect rect = m_splatDirtyRect;
+    m_splatDirtyRect = {};
+    m_editorSplatGpuDirty = false;
+
+    const std::size_t layerBytes = static_cast<std::size_t>(m_splatWidth) * m_splatHeight * 4u;
+    if (m_splatA.width != m_splatWidth || m_splatA.height != m_splatHeight ||
+        m_splatB.width != m_splatWidth || m_splatB.height != m_splatHeight ||
+        m_splatABytes.size() != layerBytes || m_splatBBytes.size() != layerBytes ||
+        rect.maxX >= m_splatWidth || rect.maxY >= m_splatHeight)
+    {
+        RefreshSplatTextures(*m_rhi);  // unexpected layout: the whole-texture path
+        return;
+    }
+
+    // This frame slot's staging buffer: the GPU copy that last read it (kFramesInFlight frames ago)
+    // is finished, since the frame began after waiting on that slot's fence.
+    std::shared_ptr<ixrhi::IXRHIBuffer>& staging = m_splatStaging[frameIndex];
+    if (!staging || staging->SizeBytes() < 2u * layerBytes)
+    {
+        staging = CreateRhiBuffer(*m_rhi,
+            2u * layerBytes,
+            ixrhi::IXRHIBufferUsage::TransferSrc,
+            nullptr,
+            "Terrain:SplatStaging");
+        if (!staging)
+        {
+            RefreshSplatTextures(*m_rhi);
+            return;
+        }
+    }
+
+    // Only the painted rectangle: its rows go to the same place in the staging buffer as in the CPU
+    // copy (A at 0, B after it), and the copies read them with the full row pitch.
+    const uint32_t width = rect.maxX - rect.minX + 1u;
+    const uint32_t height = rect.maxY - rect.minY + 1u;
+    const std::size_t rowBytes = static_cast<std::size_t>(width) * 4u;
+    for (uint32_t y = rect.minY; y <= rect.maxY; ++y)
+    {
+        const std::size_t offset = (static_cast<std::size_t>(y) * m_splatWidth + rect.minX) * 4u;
+        staging->Write(offset, m_splatABytes.data() + offset, rowBytes);
+        staging->Write(layerBytes + offset, m_splatBBytes.data() + offset, rowBytes);
+    }
+    const std::uint64_t firstTexel = (static_cast<std::uint64_t>(rect.minY) * m_splatWidth + rect.minX) * 4u;
+    using L = ixrhi::IXRHIImageLayout;
+    cmd.TransitionTexture(*m_splatA.image, L::ShaderReadOnly, L::TransferDst);
+    cmd.TransitionTexture(*m_splatB.image, L::ShaderReadOnly, L::TransferDst);
+    cmd.CopyBufferToTexture(*staging, firstTexel, m_splatWidth, *m_splatA.image, 0, 0,
+        rect.minX, rect.minY, width, height);
+    cmd.CopyBufferToTexture(*staging, layerBytes + firstTexel, m_splatWidth, *m_splatB.image, 0, 0,
+        rect.minX, rect.minY, width, height);
+    cmd.TransitionTexture(*m_splatA.image, L::TransferDst, L::ShaderReadOnly);
+    cmd.TransitionTexture(*m_splatB.image, L::TransferDst, L::ShaderReadOnly);
+}
+
+void TerrainRenderer::EnsureSunShadowMapReadable(ixrhi::IXRHICommandList& cmd)
+{
+    if (m_shadowMapReadable || !m_shadowTexture)
+        return;
+    // Every cascade cleared to the far plane (all lit) and left shader-readable: the terrain and
+    // the meshes bind the map in every draw, drawn or not.
+    for (const std::unique_ptr<ixrhi::IXRHIRenderTarget>& target : m_shadowTargets)
+    {
+        if (!target)
+            return;
+        target->Begin(cmd);
+        target->End(cmd);
+    }
+    cmd.TransitionTexture(*m_shadowTexture,
+        ixrhi::IXRHIImageLayout::DepthStencilAttachment,
+        ixrhi::IXRHIImageLayout::ShaderReadOnly);
+    m_shadowMapReadable = true;
+}
+
+SunShadowReceive TerrainRenderer::SunShadowForMeshes(std::uint64_t frameNumber) const
+{
+    // How far a receiving mesh surface must lie behind the stored depth to count as shadowed, and
+    // how far its lookup moves off the surface (about a texel): together they keep curved and
+    // grazing surfaces from shadowing themselves.
+    constexpr float kMeshDepthBiasMeters = 0.04f;
+    constexpr float kMeshNormalOffsetTexels = 1.5f;
+
+    SunShadowReceive out;
+    out.texture = m_shadowTexture;
+    out.sampler = m_shadowSampler;
+    out.enabled = m_shadowTexture && m_shadowDrawnFrame == frameNumber;
+    out.mapSize = static_cast<float>(kShadowResolution);
+    for (std::uint32_t cascade = 0; cascade < kShadowCascadeCount && cascade < SunShadowReceive::kCascades; ++cascade)
+    {
+        out.cascadeViewProj[cascade] = m_shadowCascadeViewProj[cascade];
+        out.depthBias[cascade] = kMeshDepthBiasMeters / std::max(m_shadowCascadeDepthRange[cascade], 0.001f);
+        out.normalOffset[cascade] = m_shadowCascadeTexelSize[cascade] * kMeshNormalOffsetTexels;
+    }
+    return out;
+}
+
+bool TerrainRenderer::StaticShadowShift(const std::array<float, 16>& oldViewProj,
+                                        const std::array<float, 16>& newViewProj,
+                                        std::int32_t& shiftX, std::int32_t& shiftY)
+{
+    // The same light view, size and depth range: only the x, y translation may differ.
+    for (int i = 0; i < 16; ++i)
+    {
+        if (i != 12 && i != 13 && oldViewProj[i] != newViewProj[i])
+            return false;
+    }
+    // A world point's clip x, y move by the translation's change; in texels (the viewport maps clip
+    // [-1, 1] over the layer), that must be whole.
+    const float resolution = static_cast<float>(kShadowResolution);
+    const float x = (newViewProj[12] - oldViewProj[12]) * 0.5f * resolution;
+    const float y = (newViewProj[13] - oldViewProj[13]) * 0.5f * resolution;
+    const float roundedX = std::round(x);
+    const float roundedY = std::round(y);
+    if (std::abs(x - roundedX) > 0.01f || std::abs(y - roundedY) > 0.01f ||
+        std::abs(roundedX) >= resolution || std::abs(roundedY) >= resolution)
+        return false;
+    shiftX = static_cast<std::int32_t>(roundedX);
+    shiftY = static_cast<std::int32_t>(roundedY);
+    return true;
+}
+
+bool TerrainRenderer::StaticShadowRegions(std::uint32_t cascade, const ShadowCasters& casters, std::int32_t shiftX,
+                                          std::int32_t shiftY, std::vector<StaticShadowRegion>& regions) const
+{
+    regions.clear();
+    const float* m = m_shadowCascadeViewProj[cascade].m;
+    const float resolution = static_cast<float>(kShadowResolution);
+    std::uint64_t area = 0;
+    // A region of texels [x0, x1) x [y0, y1); false past the limits.
+    const auto addRegion = [&](float x0, float y0, float x1, float y1) {
+        if (regions.size() == kMaxStaticShadowRegions)
+            return false;
+        StaticShadowRegion region;
+        region.x = static_cast<std::uint32_t>(x0);
+        region.y = static_cast<std::uint32_t>(y0);
+        region.width = static_cast<std::uint32_t>(x1 - x0);
+        region.height = static_cast<std::uint32_t>(y1 - y0);
+        area += static_cast<std::uint64_t>(region.width) * region.height;
+        if (area * 4u > static_cast<std::uint64_t>(kShadowResolution) * kShadowResolution)
+            return false;
+        // The cascade's view-projection with the region's clip range stretched to [-1, 1]: a box over
+        // the region is then over the clip square.
+        const float ax = x0 / resolution * 2.0f - 1.0f;
+        const float bx = x1 / resolution * 2.0f - 1.0f;
+        const float ay = y0 / resolution * 2.0f - 1.0f;
+        const float by = y1 / resolution * 2.0f - 1.0f;
+        const float scaleX = 2.0f / (bx - ax);
+        const float offsetX = -(ax + bx) / (bx - ax);
+        const float scaleY = 2.0f / (by - ay);
+        const float offsetY = -(ay + by) / (by - ay);
+        region.region.clipMin[0] = ax;
+        region.region.clipMin[1] = ay;
+        region.region.clipMax[0] = bx;
+        region.region.clipMax[1] = by;
+        region.region.viewProj = m_shadowCascadeViewProj[cascade];
+        for (int row = 0; row < 4; ++row)
+        {
+            region.region.viewProj.m[row * 4 + 0] = scaleX * m[row * 4 + 0] + offsetX * m[row * 4 + 3];
+            region.region.viewProj.m[row * 4 + 1] = scaleY * m[row * 4 + 1] + offsetY * m[row * 4 + 3];
+        }
+        regions.push_back(region);
+        return true;
+    };
+    // The edges the shift uncovered (the contents moved by it; what was past the far edge is gone).
+    if (shiftX > 0 && !addRegion(0.0f, 0.0f, static_cast<float>(shiftX), resolution))
+        return false;
+    if (shiftX < 0 && !addRegion(resolution + static_cast<float>(shiftX), 0.0f, resolution, resolution))
+        return false;
+    if (shiftY > 0 && !addRegion(0.0f, 0.0f, resolution, static_cast<float>(shiftY)))
+        return false;
+    if (shiftY < 0 && !addRegion(0.0f, resolution + static_cast<float>(shiftY), resolution, resolution))
+        return false;
+    if (!casters.staticLeft)
+        return true;
+    for (const StaticCasterBounds& bounds : *casters.staticLeft)
+    {
+        // The box's texels in the layer (clip x, y to texels as the viewport maps them), a texel
+        // past each side for its rasterized edge.
+        float minX = std::numeric_limits<float>::max();
+        float minY = std::numeric_limits<float>::max();
+        float maxX = std::numeric_limits<float>::lowest();
+        float maxY = std::numeric_limits<float>::lowest();
+        for (int corner = 0; corner < 8; ++corner)
+        {
+            const float x = (corner & 1) ? bounds.max.x : bounds.min.x;
+            const float y = (corner & 2) ? bounds.max.y : bounds.min.y;
+            const float z = (corner & 4) ? bounds.max.z : bounds.min.z;
+            const float clipW = x * m[3] + y * m[7] + z * m[11] + m[15];
+            const float w = std::abs(clipW) > 1e-6f ? clipW : 1.0f;
+            const float ndcX = (x * m[0] + y * m[4] + z * m[8] + m[12]) / w;
+            const float ndcY = (x * m[1] + y * m[5] + z * m[9] + m[13]) / w;
+            minX = std::min(minX, (ndcX + 1.0f) * 0.5f * resolution);
+            maxX = std::max(maxX, (ndcX + 1.0f) * 0.5f * resolution);
+            minY = std::min(minY, (ndcY + 1.0f) * 0.5f * resolution);
+            maxY = std::max(maxY, (ndcY + 1.0f) * 0.5f * resolution);
+        }
+        const float x0 = std::clamp(std::floor(minX) - 1.0f, 0.0f, resolution);
+        const float x1 = std::clamp(std::ceil(maxX) + 1.0f, 0.0f, resolution);
+        const float y0 = std::clamp(std::floor(minY) - 1.0f, 0.0f, resolution);
+        const float y1 = std::clamp(std::ceil(maxY) + 1.0f, 0.0f, resolution);
+        if (x1 <= x0 || y1 <= y0)
+            continue;  // not over this cascade
+        if (!addRegion(x0, y0, x1, y1))
+            return false;
+    }
+    return true;
+}
+
+bool TerrainRenderer::EnsureStaticShadowCache(ixrhi::IXRHICommandList& cmd)
+{
+    if (m_staticShadowTexture)
+        return true;
+    if (m_staticShadowCacheFailed || !m_rhi || !m_shadowTexture)
+        return false;
+    m_staticShadowCacheFailed = true;  // until made
+    ixrhi::IXRHITextureDesc desc;
+    desc.width = kShadowResolution;
+    desc.height = kShadowResolution;
+    desc.mipLevels = 1;
+    desc.arrayLayers = kShadowCascadeCount;
+    desc.format = ixrhi::IXRHIFormat::D32Float;
+    desc.usage = ixrhi::IXRHITextureUsage::DepthStencilAttachment | ixrhi::IXRHITextureUsage::TransferSrc |
+        ixrhi::IXRHITextureUsage::TransferDst;  // (moved: copied back in at its new place)
+    desc.debugName = "Terrain:ShadowCascadesStatic";
+    std::shared_ptr<ixrhi::IXRHITexture> texture = m_rhi->CreateTexture(desc, nullptr, 0);
+    if (!texture)
+        return false;
+    std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> staticTargets;
+    std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> staticLoadTargets;
+    std::array<std::unique_ptr<ixrhi::IXRHIRenderTarget>, kShadowCascadeCount> overlayTargets;
+    for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+    {
+        ixrhi::IXRHIRenderTargetDesc targetDesc;
+        targetDesc.color = nullptr;
+        targetDesc.depth = texture;
+        targetDesc.depthLayer = cascade;
+        targetDesc.depthLoad = ixrhi::IXRHILoadOp::Clear;
+        targetDesc.depthStore = ixrhi::IXRHIStoreOp::Store;
+        targetDesc.clearDepth = 1.0f;
+        targetDesc.debugName = "Terrain:ShadowCascadeStatic" + std::to_string(cascade);
+        staticTargets[cascade] = m_rhi->CreateRenderTarget(targetDesc);
+        targetDesc.depthLoad = ixrhi::IXRHILoadOp::Load;
+        targetDesc.debugName = "Terrain:ShadowCascadeStaticKept" + std::to_string(cascade);
+        staticLoadTargets[cascade] = m_rhi->CreateRenderTarget(targetDesc);
+        targetDesc.depth = m_shadowTexture;
+        targetDesc.debugName = "Terrain:ShadowCascadeOverlay" + std::to_string(cascade);
+        overlayTargets[cascade] = m_rhi->CreateRenderTarget(targetDesc);
+        if (!staticTargets[cascade] || !staticLoadTargets[cascade] || !overlayTargets[cascade])
+            return false;
+    }
+    // Every layer cleared once: each is then a depth attachment, the layout the copies start from.
+    for (const std::unique_ptr<ixrhi::IXRHIRenderTarget>& target : staticTargets)
+    {
+        target->Begin(cmd);
+        target->End(cmd);
+    }
+    m_staticShadowTexture = std::move(texture);
+    m_staticShadowTargets = std::move(staticTargets);
+    m_staticShadowLoadTargets = std::move(staticLoadTargets);
+    m_shadowOverlayTargets = std::move(overlayTargets);
+    for (std::optional<ShadowCascadeInputs>& inputs : m_staticShadowInputs)
+        inputs.reset();
+    m_staticShadowCacheFailed = false;
+    Tracen("[SHADOW] static caster cache: 4 x 2048x2048 D32_SFLOAT (moving casters drawn over a copy)");
+    return true;
+}
+
+void TerrainRenderer::RenderSunShadowMap(ixrhi::IXRHICommandList& cmd,
+                                          const ixrhi::IXRHIFrameInfo& frame,
+                                          const WorldCamera& camera,
+                                          const ShadowCasters& casters)
+{
+    // The terrain casts when there is one; the meshes (the casters) cast with or without it.
+    const bool drawTerrain = m_sceneTerrainActive && !m_sceneTerrain.editorHidden && m_vertexBuffer &&
+        m_indexBuffer && m_indexCount > 0;
+    if (!m_lightingState.sunShadowsEnabled || !m_shadowPipeline || !m_shadowTexture || !frame.frameActive ||
+        !m_shadowMapReadable || (!drawTerrain && !casters.drawStatic && !casters.drawDynamic))
     {
         for (PassDrawStats& cascadeStats : m_frameDrawStats.shadowCascades)
             cascadeStats.skipped = true;
+        for (std::optional<ShadowCascadeInputs>& inputs : m_shadowCascadeInputs)
+            inputs.reset();
         return;
     }
 
     UpdateShadowCascades(camera);
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
-    TransitionDepthArrayLayout(cmd, m_shadowImage, kShadowCascadeCount, m_shadowLayout,
-        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
-    m_shadowLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(kShadowResolution);
-    viewport.height = static_cast<float>(kShadowResolution);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    VkRect2D scissor{{0, 0}, {kShadowResolution, kShadowResolution}};
-    VkClearValue clear{};
-    clear.depthStencil = {1.0f, 0};
-    VkDeviceSize offset = 0;
+    // Only the cascades whose contents may have changed are drawn; the others are kept as they are.
+    // With the static cache, a redrawn cascade is composed: its static cache layer (the terrain and the
+    // static casters) copied in, the moving casters over it. A static layer that only lacks the frame's
+    // static caster change takes just that; it is drawn whole when anything else changed (the cascade
+    // moved, the terrain) or the change is not known.
+    enum class StaticLayerUpdate : std::uint8_t { Kept, Whole, Delta };
+    std::array<bool, kShadowCascadeCount> redraw{};
+    std::array<bool, kShadowCascadeCount> compose{};
+    std::array<StaticLayerUpdate, kShadowCascadeCount> staticUpdate{};
+    // (A delta layer's shift, in texels: the cascade moved across its texel grid.)
+    std::array<std::int32_t, kShadowCascadeCount> shiftX{};
+    std::array<std::int32_t, kShadowCascadeCount> shiftY{};
+    bool anyShift = false;
+    bool anyRedraw = false;
+    bool anyCompose = false;
+    const bool staticCache = casters.drawStatic && EnsureStaticShadowCache(cmd);
+    for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+    {
+        ShadowCascadeInputs inputs;
+        std::memcpy(inputs.viewProj.data(), m_shadowCascadeViewProj[cascade].m, sizeof(inputs.viewProj));
+        inputs.vertexBuffer = drawTerrain ? m_vertexBuffer.get() : nullptr;
+        inputs.indexBuffer = drawTerrain ? m_indexBuffer.get() : nullptr;
+        inputs.shadowTexture = m_shadowTexture.get();
+        inputs.indexCount = drawTerrain ? m_indexCount : 0u;
+        inputs.geometryRevision = m_terrainGeometryRevision;
+        inputs.castersRevision = casters.staticRevisions[cascade];
+        inputs.dynamicRevision = casters.dynamicRevisions[cascade];
+        redraw[cascade] = !m_shadowCascadeInputs[cascade] || !(*m_shadowCascadeInputs[cascade] == inputs);
+        if (!redraw[cascade])
+        {
+            m_frameDrawStats.shadowCascades[cascade].skipped = true;
+            continue;
+        }
+        m_shadowCascadeInputs[cascade] = inputs;
+        anyRedraw = true;
+        if (!staticCache)
+            continue;
+        compose[cascade] = true;
+        anyCompose = true;
+        ShadowCascadeInputs staticInputs = inputs;
+        staticInputs.dynamicRevision = 0;
+        staticInputs.shadowTexture = m_staticShadowTexture.get();
+        const std::optional<ShadowCascadeInputs>& held = m_staticShadowInputs[cascade];
+        if (held && *held == staticInputs)
+            continue;  // kept
+        // What the held layer needs to become this one: moved (the cascade moved across its texels),
+        // the frame's static caster change, or both; anything else and it is drawn whole.
+        bool delta = false;
+        if (held)
+        {
+            ShadowCascadeInputs advanced = *held;
+            // (IX_SHADOW_SHIFT=0: a moved cascade is drawn whole, as before; for comparing.)
+            static const bool shiftLayers = ixjobs::FeatureEnabled("IX_SHADOW_SHIFT");
+            if (shiftLayers && advanced.viewProj != staticInputs.viewProj &&
+                StaticShadowShift(advanced.viewProj, staticInputs.viewProj, shiftX[cascade], shiftY[cascade]))
+                advanced.viewProj = staticInputs.viewProj;
+            if (advanced.castersRevision != staticInputs.castersRevision && casters.staticDeltaFrom != 0 &&
+                held->castersRevision == casters.staticDeltaFrom)
+                advanced.castersRevision = staticInputs.castersRevision;
+            delta = advanced == staticInputs;
+        }
+        if (!delta)
+        {
+            shiftX[cascade] = 0;
+            shiftY[cascade] = 0;
+        }
+        anyShift = anyShift || shiftX[cascade] != 0 || shiftY[cascade] != 0;
+        staticUpdate[cascade] = delta ? StaticLayerUpdate::Delta : StaticLayerUpdate::Whole;
+        m_staticShadowInputs[cascade] = staticInputs;
+    }
+    if (!anyRedraw)
+    {
+        m_shadowDrawnFrame = frame.frameNumber;
+        return;
+    }
+    // The kept layers must keep their depth: the whole array goes back to an attachment from the
+    // readable layout (contents kept), and each redrawn layer clears in its own pass.
+    cmd.TransitionTexture(*m_shadowTexture,
+        ixrhi::IXRHIImageLayout::ShaderReadOnly,
+        ixrhi::IXRHIImageLayout::DepthStencilAttachment);
 
     if (m_sceneTerrain.triplanarEnabled && !m_triPerfShadowPassLogged)
     {
@@ -2351,8 +2443,180 @@ void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera
         m_triPerfShadowPassLogged = true;
     }
 
+    // The casters (and the terrain) bake their pipelines against the first cascade's pass; the other
+    // targets' passes are compatible with it (same depth format, only the load differs).
+    const ixrhi::IXRHIRenderPass* casterPass = m_shadowTargets[0] ? m_shadowTargets[0]->GetPass() : nullptr;
+    // (cullViewProj: what picks the chunks, the cascade's or a region's of it.)
+    const auto drawTerrainInto = [&](uint32_t cascade, PassDrawStats& cascadeStats, const WorldMat4& cullViewProj) {
+        if (drawTerrain)
+        {
+            cmd.SetGraphicsPipeline(*m_shadowPipeline);
+            cmd.PushConstants(&m_shadowCascadeViewProj[cascade], sizeof(WorldMat4));
+            cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+            cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
+            if (m_terrainChunks.empty())
+            {
+                cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
+                cascadeStats.drawCalls = 1;
+                cascadeStats.chunksDrawn = 1;
+            }
+            else
+            {
+                // Only the chunks under the cascade's footprint: the near cascades cover a small part of
+                // the terrain, and every drawn chunk is vertex/index traffic. Chunks adjacent in the index
+                // buffer are merged into one draw.
+                uint32_t runOffset = 0;
+                uint32_t runCount = 0;
+                auto flushRun = [&]() {
+                    if (runCount == 0)
+                        return;
+                    cmd.DrawIndexed(runCount, 1, runOffset, 0, 0);
+                    ++cascadeStats.drawCalls;
+                    runCount = 0;
+                };
+                for (const TerrainChunkDraw& chunk : m_terrainChunks)
+                {
+                    if (TerrainAabbOutsideCascadeFootprint(cullViewProj, chunk.worldMin, chunk.worldMax))
+                    {
+                        ++cascadeStats.chunksCulled;
+                        continue;
+                    }
+                    ++cascadeStats.chunksDrawn;
+                    if (runCount != 0 && runOffset + runCount == chunk.indexOffset)
+                    {
+                        runCount += chunk.indexCount;
+                        continue;
+                    }
+                    flushRun();
+                    runOffset = chunk.indexOffset;
+                    runCount = chunk.indexCount;
+                }
+                flushRun();
+            }
+        }
+    };
+    const auto beginCascadeStats = [&](uint32_t cascade) -> PassDrawStats& {
+        PassDrawStats& cascadeStats = m_frameDrawStats.shadowCascades[cascade];
+        cascadeStats.executed = true;
+        cascadeStats.drawCalls = 0;
+        cascadeStats.chunksDrawn = 0;
+        cascadeStats.chunksCulled = 0;
+        return cascadeStats;
+    };
+    const auto setShadowViewport = [&]() {
+        cmd.SetViewport(0.0f, 0.0f, static_cast<float>(kShadowResolution), static_cast<float>(kShadowResolution));
+        cmd.SetScissor(0, 0, kShadowResolution, kShadowResolution);
+    };
+
+    // The moved static layers: their contents moved by the shift, through the cascade's own layer of
+    // the map (drawn into after this anyway): the layer copied there, then back in its new place.
+    // The edges this uncovers are drawn below with the caster change.
+    if (anyShift)
+    {
+        cmd.TransitionTexture(*m_staticShadowTexture,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment,
+            ixrhi::IXRHIImageLayout::TransferSrc);
+        cmd.TransitionTexture(*m_shadowTexture,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment,
+            ixrhi::IXRHIImageLayout::TransferDst);
+        for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+        {
+            if (shiftX[cascade] != 0 || shiftY[cascade] != 0)
+                cmd.CopyTextureLayer(*m_staticShadowTexture, cascade, *m_shadowTexture, cascade);
+        }
+        cmd.TransitionTexture(*m_shadowTexture,
+            ixrhi::IXRHIImageLayout::TransferDst,
+            ixrhi::IXRHIImageLayout::TransferSrc);
+        cmd.TransitionTexture(*m_staticShadowTexture,
+            ixrhi::IXRHIImageLayout::TransferSrc,
+            ixrhi::IXRHIImageLayout::TransferDst);
+        for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+        {
+            const std::int32_t dx = shiftX[cascade];
+            const std::int32_t dy = shiftY[cascade];
+            if (dx == 0 && dy == 0)
+                continue;
+            const std::uint32_t width = kShadowResolution - static_cast<std::uint32_t>(std::abs(dx));
+            const std::uint32_t height = kShadowResolution - static_cast<std::uint32_t>(std::abs(dy));
+            cmd.CopyTextureLayerRegion(*m_shadowTexture, cascade,
+                dx < 0 ? static_cast<std::uint32_t>(-dx) : 0u, dy < 0 ? static_cast<std::uint32_t>(-dy) : 0u,
+                *m_staticShadowTexture, cascade,
+                dx > 0 ? static_cast<std::uint32_t>(dx) : 0u, dy > 0 ? static_cast<std::uint32_t>(dy) : 0u,
+                width, height);
+        }
+        cmd.TransitionTexture(*m_staticShadowTexture,
+            ixrhi::IXRHIImageLayout::TransferDst,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment);
+        cmd.TransitionTexture(*m_shadowTexture,
+            ixrhi::IXRHIImageLayout::TransferSrc,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment);
+    }
+
+    // The static layers that changed: drawn whole, or the frame's change drawn over them (the edges a
+    // shift uncovered and where the casters that left were, cleared and drawn again; then the casters
+    // that joined).
+    std::vector<StaticShadowRegion> regions;
     for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
     {
+        if (staticUpdate[cascade] == StaticLayerUpdate::Kept)
+            continue;
+        PassDrawStats& cascadeStats = beginCascadeStats(cascade);
+        if (staticUpdate[cascade] == StaticLayerUpdate::Delta &&
+            !StaticShadowRegions(cascade, casters, shiftX[cascade], shiftY[cascade], regions))
+            staticUpdate[cascade] = StaticLayerUpdate::Whole;
+        if (staticUpdate[cascade] == StaticLayerUpdate::Whole)
+        {
+            m_staticShadowTargets[cascade]->Begin(cmd);
+            setShadowViewport();
+            drawTerrainInto(cascade, cascadeStats, m_shadowCascadeViewProj[cascade]);
+            casters.drawStatic(cascade, m_shadowCascadeViewProj[cascade], casterPass);
+            m_staticShadowTargets[cascade]->End(cmd);
+            continue;
+        }
+        const bool joined = casters.staticJoined > 0 && casters.drawStaticJoined;
+        if (regions.empty() && !joined)
+            continue;
+        m_staticShadowLoadTargets[cascade]->Begin(cmd);
+        setShadowViewport();
+        for (const StaticShadowRegion& region : regions)
+        {
+            cmd.SetScissor(region.x, region.y, region.width, region.height);
+            cmd.ClearDepth(1.0f, region.x, region.y, region.width, region.height);
+            drawTerrainInto(cascade, cascadeStats, region.region.viewProj);
+            if (casters.drawStaticRegion)
+                casters.drawStaticRegion(cascade, m_shadowCascadeViewProj[cascade], region.region, casterPass);
+        }
+        cmd.SetScissor(0, 0, kShadowResolution, kShadowResolution);
+        if (joined)
+            casters.drawStaticJoined(cascade, m_shadowCascadeViewProj[cascade], casterPass);
+        m_staticShadowLoadTargets[cascade]->End(cmd);
+    }
+    // ...copied into their cascades,
+    if (anyCompose)
+    {
+        cmd.TransitionTexture(*m_staticShadowTexture,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment,
+            ixrhi::IXRHIImageLayout::TransferSrc);
+        cmd.TransitionTexture(*m_shadowTexture,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment,
+            ixrhi::IXRHIImageLayout::TransferDst);
+        for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+        {
+            if (compose[cascade])
+                cmd.CopyTextureLayer(*m_staticShadowTexture, cascade, *m_shadowTexture, cascade);
+        }
+        cmd.TransitionTexture(*m_shadowTexture,
+            ixrhi::IXRHIImageLayout::TransferDst,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment);
+        cmd.TransitionTexture(*m_staticShadowTexture,
+            ixrhi::IXRHIImageLayout::TransferSrc,
+            ixrhi::IXRHIImageLayout::DepthStencilAttachment);
+    }
+
+    for (uint32_t cascade = 0; cascade < kShadowCascadeCount; ++cascade)
+    {
+        if (!redraw[cascade])
+            continue;
         // Cascade timestamp pairs are sequential in IXRHITimestampPoint
         // (CascadeNBegin + 1 == CascadeNEnd); routed through the backend so
         // the legacy timestamp API could be deleted (Phase 3C).
@@ -2363,53 +2627,65 @@ void TerrainRenderer::RenderSunShadowMap(VulkanDevice& device, const WorldCamera
             static_cast<std::uint32_t>(cascadeBegin) + 1u);
         if (m_rhi)
             m_rhi->WriteTimestamp(cascadeBegin);
-        VkRenderPassBeginInfo pass{};
-        pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-        pass.renderPass = m_shadowRenderPass;
-        pass.framebuffer = m_shadowFramebuffers[cascade];
-        pass.renderArea.offset = {0, 0};
-        pass.renderArea.extent = {kShadowResolution, kShadowResolution};
-        pass.clearValueCount = 1;
-        pass.pClearValues = &clear;
-        vkCmdBeginRenderPass(cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
-        vkCmdSetViewport(cmd, 0, 1, &viewport);
-        vkCmdSetScissor(cmd, 0, 1, &scissor);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_shadowPipeline);
-        vkCmdPushConstants(cmd, m_shadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
-            0, sizeof(WorldMat4), &m_shadowCascadeViewProj[cascade]);
-        vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
-        vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
-        PassDrawStats& cascadeStats = m_frameDrawStats.shadowCascades[cascade];
-        cascadeStats.executed = true;
-        cascadeStats.drawCalls = 1;
-        cascadeStats.chunksDrawn = m_terrainChunks.empty()
-            ? (m_indexCount > 0 ? 1u : 0u)
-            : static_cast<uint32_t>(m_terrainChunks.size());
-        cascadeStats.chunksCulled = 0;
-        vkCmdEndRenderPass(cmd);
+        if (compose[cascade])
+        {
+            // ...and the moving casters over them.
+            if (staticUpdate[cascade] == StaticLayerUpdate::Kept)
+                beginCascadeStats(cascade);
+            if (m_shadowCascadeInputs[cascade]->dynamicRevision != 0 && casters.drawDynamic)
+            {
+                m_shadowOverlayTargets[cascade]->Begin(cmd);
+                setShadowViewport();
+                casters.drawDynamic(cascade, m_shadowCascadeViewProj[cascade], casterPass);
+                m_shadowOverlayTargets[cascade]->End(cmd);
+            }
+        }
+        else if (m_shadowTargets[cascade])
+        {
+            // Everything into the cascade (the meshes bind their own pipelines; viewport and scissor stay).
+            PassDrawStats& cascadeStats = beginCascadeStats(cascade);
+            m_shadowTargets[cascade]->Begin(cmd);
+            setShadowViewport();
+            drawTerrainInto(cascade, cascadeStats, m_shadowCascadeViewProj[cascade]);
+            if (casters.drawStatic)
+                casters.drawStatic(cascade, m_shadowCascadeViewProj[cascade], casterPass);
+            if (casters.drawDynamic)
+                casters.drawDynamic(cascade, m_shadowCascadeViewProj[cascade], casterPass);
+            m_shadowTargets[cascade]->End(cmd);
+        }
         if (m_rhi)
             m_rhi->WriteTimestamp(cascadeEnd);
     }
 
-    TransitionDepthArrayLayout(cmd, m_shadowImage, kShadowCascadeCount,
-        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
-    m_shadowLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    // Depth-attachment -> sampled transition (all layers, drawn or kept) for the terrain main pass
+    // (binding 9), the meshes and the volumetric light.
+    cmd.TransitionTexture(*m_shadowTexture,
+        ixrhi::IXRHIImageLayout::DepthStencilAttachment,
+        ixrhi::IXRHIImageLayout::ShaderReadOnly);
+    m_shadowDrawnFrame = frame.frameNumber;
+    m_shadowMapReadable = true;
 }
 
-WorldCamera TerrainRenderer::ComputeMirrorCamera(const WorldCamera& camera, VkExtent2D extent, float waterLevelY) const
+WorldCamera TerrainRenderer::ComputeMirrorCamera(const WorldCamera& camera,
+                                                  std::uint32_t targetWidth,
+                                                  std::uint32_t targetHeight,
+                                                  float waterLevelY) const
 {
+    // A true planar mirror: the scene reflected across the water plane, seen through the camera's
+    // OWN view-projection. A point on the water then lands on the same screen position in both
+    // images, so the water samples the reflection at its own screen coordinate. (Before, a separate
+    // 45-degree look-up camera from below the water produced a mismatched, vertically flipped image.)
+    // The geometry is mirrored, so its winding flips: the reflection pipelines draw both faces.
+    (void)targetWidth;
+    (void)targetHeight;
     const float waterY = waterLevelY;
-    WorldCamera mirror{};
-    mirror.eye = {camera.eye.x, 2.0f * waterY - camera.eye.y, camera.eye.z};
+    const WorldMat4 reflectAcrossWater = WorldMultiply(
+        WorldMultiply(WorldTranslation(0.0f, -waterY, 0.0f), xm::Scale({1.0f, -1.0f, 1.0f})),
+        WorldTranslation(0.0f, waterY, 0.0f));
+    WorldCamera mirror = camera;
+    mirror.eye = {camera.eye.x, 2.0f * waterY - camera.eye.y, camera.eye.z};  // lighting: the mirrored viewer
     mirror.target = {camera.target.x, 2.0f * waterY - camera.target.y, camera.target.z};
-    const float aspect = extent.height != 0 ? static_cast<float>(extent.width) / static_cast<float>(extent.height) : 1.0f;
-    const WorldMat4 view = WorldLookAt(mirror.eye, mirror.target, {0.0f, 1.0f, 0.0f});
-    mirror.nearPlane = camera.nearPlane;
-    mirror.farPlane = camera.farPlane;
-    const WorldMat4 projection = WorldPerspective(xm::DegreesToRadians(45.0f), aspect, mirror.nearPlane, mirror.farPlane);
-    mirror.viewProjection = WorldMultiply(view, projection);
+    mirror.viewProjection = WorldMultiply(reflectAcrossWater, camera.viewProjection);
     return mirror;
 }
 
@@ -2420,7 +2696,8 @@ const TerrainRenderer::WaterBodyGpu* TerrainRenderer::FindClosestWaterBody(const
     float closestDistanceSq = std::numeric_limits<float>::max();
     for (const WaterBodyGpu& waterBody : m_waterBodies)
     {
-        if (!ResolveWaterConfig(waterBody.body).enabled || waterBody.indexCount == 0)
+        if (!ResolveWaterConfig(waterBody.body).enabled || waterBody.indexCount == 0 ||
+            !WaterBodyInView(waterBody, camera))
             continue;
 
         const float centerX = (waterBody.body.bboxMin[0] + waterBody.body.bboxMax[0]) * 0.5f;
@@ -2440,10 +2717,125 @@ const TerrainRenderer::WaterBodyGpu* TerrainRenderer::FindClosestWaterBody(const
     return closest;
 }
 
-void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
-    const WorldCamera& camera,
-    double timeSeconds,
-    const std::function<void(const WorldCamera&, VkExtent2D, VkRenderPass, float)>& renderEntities)
+bool TerrainRenderer::WaterBodyInView(const WaterBodyGpu& waterBody, const WorldCamera& camera) const
+{
+    // A little height around the flat surface for the wave normals' look; the mesh itself is flat.
+    const WorldVec3 margin{0.5f, 0.5f, 0.5f};
+    return !TerrainAabbOutsideCameraFrustum(camera, waterBody.boundsMin - margin, waterBody.boundsMax + margin);
+}
+
+bool TerrainRenderer::AnyWaterBodyInView(const WorldCamera& camera) const
+{
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden)
+        return false;
+    for (const WaterBodyGpu& waterBody : m_waterBodies)
+    {
+        if (ResolveWaterConfig(waterBody.body).enabled && waterBody.indexCount != 0 &&
+            WaterBodyInView(waterBody, camera))
+            return true;
+    }
+    return false;
+}
+
+void TerrainRenderer::BeginWaterVisibility(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
+{
+    if (!m_rhi || !frame.frameActive || !m_waterOcclusionPipeline)
+        return;
+    if (!m_waterQueries)
+        m_waterQueries = m_rhi->CreateOcclusionQueries(kFramesInFlight);
+    if (!m_waterQueries)
+        return;
+    const std::uint32_t slot = frame.frameIndex % kFramesInFlight;
+    // This slot's query from its last frame has finished: that frame's fence was waited for. A result
+    // that is somehow not there counts as seen.
+    if (m_waterQueryIssued[slot])
+    {
+        std::uint64_t samples = 0;
+        if (!m_waterQueries->TryGetResult(slot, samples) || samples > 0)
+        {
+            m_waterSeenFrame = frame.frameNumber;
+            m_waterSeen = true;
+        }
+        m_waterQueryIssued[slot] = false;
+    }
+    m_waterQueries->Reset(cmd, slot, 1);
+}
+
+void TerrainRenderer::QueryWaterVisibility(ixrhi::IXRHICommandList& cmd,
+                                           const ixrhi::IXRHIFrameInfo& frame,
+                                           const WorldCamera& camera,
+                                           std::uint32_t viewWidth,
+                                           std::uint32_t viewHeight)
+{
+    if (!m_waterQueries || !m_waterOcclusionPipeline || !frame.frameActive || viewWidth == 0 || viewHeight == 0 ||
+        !m_sceneTerrainActive || m_sceneTerrain.editorHidden)
+        return;
+    const std::uint32_t slot = frame.frameIndex % kFramesInFlight;
+    bool begun = false;
+    for (const WaterBodyGpu& waterBody : m_waterBodies)
+    {
+        if (!ResolveWaterConfig(waterBody.body).enabled || waterBody.indexCount == 0 || !waterBody.vertexBuffer ||
+            !waterBody.indexBuffer || !WaterBodyInView(waterBody, camera))
+            continue;
+        if (!begun)
+        {
+            m_waterQueries->Begin(cmd, slot);
+            cmd.SetGraphicsPipeline(*m_waterOcclusionPipeline);
+            cmd.SetViewport(0.0f, 0.0f, static_cast<float>(viewWidth), static_cast<float>(viewHeight));
+            cmd.SetScissor(0, 0, viewWidth, viewHeight);
+            cmd.PushConstants(&camera.viewProjection, sizeof(WorldMat4));
+            begun = true;
+        }
+        cmd.SetVertexBuffer(0, *waterBody.vertexBuffer, 0);
+        cmd.SetIndexBuffer(*waterBody.indexBuffer, 0, /*thirtyTwoBit=*/true);
+        cmd.DrawIndexed(waterBody.indexCount, 1, 0, 0, 0);
+    }
+    if (begun)
+    {
+        m_waterQueries->End(cmd, slot);
+        m_waterQueryIssued[slot] = true;
+    }
+}
+
+bool TerrainRenderer::WaterMayBeVisible(std::uint64_t frameNumber) const
+{
+    // Kept this many frames after the query last saw it: a camera turning back and forth over a
+    // hilltop does not make it flicker in and out.
+    constexpr std::uint64_t kKeepFrames = 8;
+    if (!m_waterQueries || !m_waterOcclusionPipeline)
+        return true;  // no queries: always drawn when in view
+    return m_waterSeen && frameNumber <= m_waterSeenFrame + kKeepFrames;
+}
+
+bool TerrainRenderer::BoxUnderWater(WorldVec3 boundsMin, WorldVec3 boundsMax) const
+{
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden)
+        return false;
+    const float centerX = 0.5f * (boundsMin.x + boundsMax.x);
+    const float centerZ = 0.5f * (boundsMin.z + boundsMax.z);
+    for (const WaterBodyGpu& waterBody : m_waterBodies)
+    {
+        if (!ResolveWaterConfig(waterBody.body).enabled || waterBody.indexCount == 0)
+            continue;
+        if (centerX >= waterBody.boundsMin.x && centerX <= waterBody.boundsMax.x &&
+            centerZ >= waterBody.boundsMin.z && centerZ <= waterBody.boundsMax.z &&
+            boundsMax.y <= waterBody.body.waterLevelY)
+            return true;
+    }
+    return false;
+}
+
+void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
+                                              const ixrhi::IXRHIFrameInfo& frame,
+                                              const WorldCamera& camera,
+                                              std::uint32_t viewWidth,
+                                              std::uint32_t viewHeight,
+                                              double timeSeconds,
+                                              const std::function<void(const WorldCamera&,
+                                                                       std::uint32_t,
+                                                                       std::uint32_t,
+                                                                       const ixrhi::IXRHIRenderPass*,
+                                                                       float)>& renderEntities)
 {
     PassDrawStats& reflectionStats = m_frameDrawStats.waterReflection;
     auto skipReflection = [&]() {
@@ -2482,67 +2874,50 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
 
     const WaterConfig& reflectionConfig = ResolveWaterConfig(reflectionBody->body);
     const float reflectionWaterLevelY = reflectionBody->body.waterLevelY;
-    if (!reflectionConfig.enabled || !reflectionConfig.reflectionEnabled || !m_waterReflectionPipeline ||
-        !m_waterReflection.framebuffer || !m_indexCount || !device.IsFrameActive())
+    if (!m_rhi || !reflectionConfig.enabled || !reflectionConfig.reflectionEnabled || !m_reflectionPipeline ||
+        !m_bindGroup || !m_waterReflection.target || !m_indexBuffer || !m_vertexBuffer || m_indexCount == 0 ||
+        !frame.frameActive)
     {
         skipReflection();
         return;
     }
 
-    const VkExtent2D swapExtent = device.GetSwapchainExtent();
-    if (swapExtent.width == 0 || swapExtent.height == 0)
+    const std::uint32_t baseWidth = viewWidth > 0 ? viewWidth : m_rhi->GetMainSwapchain().Width();
+    const std::uint32_t baseHeight = viewHeight > 0 ? viewHeight : m_rhi->GetMainSwapchain().Height();
+    if (baseWidth == 0 || baseHeight == 0)
     {
         skipReflection();
         return;
     }
 
+    // The reflection is a fraction of the view it is seen in (the water samples it at its own
+    // screen position), so it follows that view's size.
+    const std::uint32_t reflectionDivisor = WaterReflectionDivisor(reflectionConfig.reflectionQuality);
+    const std::uint32_t wantedWidth = std::max(1u, baseWidth / reflectionDivisor);
+    const std::uint32_t wantedHeight = std::max(1u, baseHeight / reflectionDivisor);
     if (m_waterReflection.quality != reflectionConfig.reflectionQuality ||
-        m_waterReflection.width == 0 || m_waterReflection.height == 0 ||
-        m_waterReflection.width > swapExtent.width || m_waterReflection.height > swapExtent.height)
+        m_waterReflection.width != wantedWidth || m_waterReflection.height != wantedHeight)
     {
-        CreateOrRecreateWaterReflectionResources(device, true, reflectionConfig.reflectionQuality);
-        CreateWaterReflectionPipeline(device);
-        UpdateWaterDescriptors();
+        CreateOrRecreateWaterReflectionResources(*m_rhi, true, reflectionConfig.reflectionQuality, baseWidth, baseHeight);
+        CreateWaterReflectionPipeline(*m_rhi);
+        UpdateWaterBindGroup();
     }
 
-    if (!m_waterReflection.framebuffer || !m_waterReflectionPipeline)
+    if (!m_waterReflection.target || !m_reflectionPipeline)
     {
         skipReflection();
         return;
     }
 
-    const uint32_t frameIndex = device.GetFrameIndex();
-    const WorldCamera mirror = ComputeMirrorCamera(camera, {m_waterReflection.width, m_waterReflection.height}, reflectionWaterLevelY);
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    const WorldCamera mirror = ComputeMirrorCamera(camera, m_waterReflection.width, m_waterReflection.height, reflectionWaterLevelY);
     m_reflectionClipWaterLevelY = reflectionWaterLevelY;
-    UpdateUniform(frameIndex, mirror, true);
+    UpdateUniform(frameIndex, mirror, true, kReflectionUniformView);
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
-    std::array<VkClearValue, 2> clears{};
-    clears[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
-    clears[1].depthStencil = {1.0f, 0};
-
-    VkRenderPassBeginInfo pass{};
-    pass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    pass.renderPass = m_waterReflection.renderPass;
-    pass.framebuffer = m_waterReflection.framebuffer;
-    pass.renderArea.offset = {0, 0};
-    pass.renderArea.extent = {m_waterReflection.width, m_waterReflection.height};
-    pass.clearValueCount = static_cast<uint32_t>(clears.size());
-    pass.pClearValues = clears.data();
-
-    vkCmdBeginRenderPass(cmd, &pass, VK_SUBPASS_CONTENTS_INLINE);
-
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(m_waterReflection.width);
-    viewport.height = static_cast<float>(m_waterReflection.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-    VkRect2D scissor{{0, 0}, {m_waterReflection.width, m_waterReflection.height}};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterReflectionPipeline);
+    m_waterReflection.target->Begin(cmd);
+    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(m_waterReflection.width), static_cast<float>(m_waterReflection.height));
+    cmd.SetScissor(0, 0, m_waterReflection.width, m_waterReflection.height);
+    cmd.SetGraphicsPipeline(*m_reflectionPipeline);
     if (m_sceneTerrain.triplanarEnabled && !m_triPerfReflectionPassLogged)
     {
         TraceDiagf("[TRI-PERF] terrain pipeline bound in pass=water-reflection triplanar=yes extent=%ux%u shader=terrain_ps",
@@ -2551,9 +2926,8 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
         m_triPerfReflectionPassLogged = true;
     }
 
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
-    vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+    cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
 
     struct TerrainPushConstants
     {
@@ -2561,35 +2935,80 @@ void TerrainRenderer::RenderWaterReflection(VulkanDevice& device,
     };
 
     TerrainPushConstants push{{1.0f, 1.0f, 0.0f, 0.0f}};
-    vkCmdPushConstants(cmd, m_waterReflectionPipelineLayout,
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        0, sizeof(push), &push);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterReflectionPipelineLayout,
-        0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
-    vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
-    ++reflectionStats.drawCalls;
-
-    reflectionStats.executed = reflectionStats.drawCalls > 0;
-    reflectionStats.chunksDrawn = m_terrainChunks.empty()
-        ? (m_indexCount > 0 ? 1u : 0u)
-        : static_cast<uint32_t>(m_terrainChunks.size());
-    reflectionStats.chunksCulled = 0;
+    cmd.PushConstants(&push, sizeof(push));
+    cmd.BindGroup(0, *m_bindGroup, kReflectionUniformView * kFramesInFlight + frameIndex);
+    if (m_terrainChunks.empty())
+    {
+        cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
+        ++reflectionStats.drawCalls;
+        reflectionStats.chunksDrawn = 1;
+    }
+    else
+    {
+        // Only the chunks the mirror camera sees that reach above the water (the reflection shader
+        // clips everything under it). Chunks adjacent in the index buffer share one draw.
+        uint32_t runOffset = 0;
+        uint32_t runCount = 0;
+        auto flushRun = [&]() {
+            if (runCount == 0)
+                return;
+            cmd.DrawIndexed(runCount, 1, runOffset, 0, 0);
+            ++reflectionStats.drawCalls;
+            runCount = 0;
+        };
+        for (const TerrainChunkDraw& chunk : m_terrainChunks)
+        {
+            if (chunk.worldMax.y < reflectionWaterLevelY ||
+                TerrainAabbOutsideCameraFrustum(mirror, chunk.worldMin, chunk.worldMax))
+            {
+                ++reflectionStats.chunksCulled;
+                continue;
+            }
+            ++reflectionStats.chunksDrawn;
+            if (runCount != 0 && runOffset + runCount == chunk.indexOffset)
+            {
+                runCount += chunk.indexCount;
+                continue;
+            }
+            flushRun();
+            runOffset = chunk.indexOffset;
+            runCount = chunk.indexCount;
+        }
+        flushRun();
+    }
+    reflectionStats.executed = true;
 
     if (renderEntities)
-        renderEntities(mirror, {m_waterReflection.width, m_waterReflection.height}, m_waterReflection.renderPass, reflectionWaterLevelY);
+        renderEntities(mirror,
+            m_waterReflection.width,
+            m_waterReflection.height,
+            m_waterReflection.target->GetPass(),
+            reflectionWaterLevelY);
 
-    vkCmdEndRenderPass(cmd);
+    m_waterReflection.target->End(cmd);
+    if (!m_waterReflection.readable)
+    {
+        m_waterReflection.readable = true;
+        UpdateWaterBindGroup();
+    }
 
     m_reflectionClipWaterLevelY = std::numeric_limits<float>::quiet_NaN();
 }
 
-void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent, uint32_t viewIndex)
+void TerrainRenderer::Render(ixrhi::IXRHICommandList& cmd,
+                             const ixrhi::IXRHIFrameInfo& frame,
+                             const WorldCamera& camera,
+                             std::uint32_t targetWidth,
+                             std::uint32_t targetHeight,
+                             uint32_t viewIndex,
+                             bool clearDepth)
 {
     static bool loggedDraw = false;
     static bool loggedSkip = false;
     PassDrawStats& terrainStats = m_frameDrawStats.terrainMain;
 
-    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_pipeline || m_indexCount == 0 || !device.IsFrameActive())
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_pipeline || !m_bindGroup || !m_vertexBuffer ||
+        !m_indexBuffer || m_indexCount == 0 || !frame.frameActive)
     {
         terrainStats.skipped = true;
         if (!loggedSkip)
@@ -2600,56 +3019,38 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
         return;
     }
 
-    const VkExtent2D extent = (targetExtent.width > 0 && targetExtent.height > 0)
-        ? targetExtent
-        : device.GetSwapchainExtent();
-    if (extent.width == 0 || extent.height == 0)
+    const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
+    const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
+    if (extentWidth == 0 || extentHeight == 0)
     {
         terrainStats.skipped = true;
         return;
     }
 
-    const uint32_t frameIndex = device.GetFrameIndex();
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     UpdateUniform(frameIndex, camera, false, viewIndex);
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
+    // Depth-only clear over the draw area (parity with the pre-migration
+    // native depth clear inside the outer pass).
+    if (clearDepth)
+        cmd.ClearDepth(1.0f, 0, 0, extentWidth, extentHeight);
 
-    VkClearAttachment depthClear{};
-    depthClear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    depthClear.clearValue.depthStencil.depth = 1.0f;
-
-    VkClearRect depthRect{};
-    depthRect.rect = {{0, 0}, extent};
-    depthRect.baseArrayLayer = 0;
-    depthRect.layerCount = 1;
-    vkCmdClearAttachments(cmd, 1, &depthClear, 1, &depthRect);
-
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
+    cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    cmd.SetGraphicsPipeline(*m_pipeline);
     if (m_sceneTerrain.triplanarEnabled && !m_triPerfMainPassLogged)
     {
         TraceDiagf("[TRI-PERF] terrain pipeline bound in pass=main triplanar=yes extent=%ux%u shader=terrain_ps",
-            extent.width,
-            extent.height);
+            extentWidth,
+            extentHeight);
         TraceDiagf("[TRI-PERF] offscreen target extent=%ux%u fragment-bound-cost-scales-with-pixels",
-            extent.width,
-            extent.height);
+            extentWidth,
+            extentHeight);
         m_triPerfMainPassLogged = true;
     }
 
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
-    vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+    cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
     struct TerrainPushConstants
     {
         float layerParams[4];
@@ -2676,14 +3077,14 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
     auto drawVisibleTerrainChunks = [&]() {
         if (m_terrainChunks.empty())
         {
-            vkCmdDrawIndexed(cmd, m_indexCount, 1, 0, 0, 0);
+            cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
             ++terrainStats.drawCalls;
             return;
         }
         for (uint32_t chunkIndex : m_visibleTerrainChunksScratch)
         {
             const TerrainChunkDraw& chunk = m_terrainChunks[chunkIndex];
-            vkCmdDrawIndexed(cmd, chunk.indexCount, 1, chunk.indexOffset, 0, 0);
+            cmd.DrawIndexed(chunk.indexCount, 1, chunk.indexOffset, 0, 0);
             ++terrainStats.drawCalls;
         }
     };
@@ -2694,13 +3095,11 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
     terrainStats.chunksCulled = m_terrainChunks.empty() ? 0u : culledChunks;
 
     TerrainPushConstants push{{1.0f, 1.0f, 0.0f, 0.0f}};
-    vkCmdPushConstants(cmd, m_pipelineLayout,
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        0, sizeof(push), &push);
-    VkDescriptorSet terrainDescriptorSet =
-        (viewIndex == 0) ? m_descriptorSets[frameIndex] : m_descriptorSetsSecondary[frameIndex];
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-        0, 1, &terrainDescriptorSet, 0, nullptr);
+    cmd.PushConstants(&push, sizeof(push));
+    // Slot = viewIndex * kFramesInFlight + frameIndex (primary + secondary
+    // camera-uniform paths).
+    const std::uint32_t terrainSlot = viewIndex * kFramesInFlight + frameIndex;
+    cmd.BindGroup(0, *m_bindGroup, terrainSlot);
     const uint32_t baseDrawCallsBefore = terrainStats.drawCalls;
     drawVisibleTerrainChunks();
     const uint32_t baseDrawCalls = terrainStats.drawCalls - baseDrawCallsBefore;
@@ -2708,7 +3107,7 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
     if (!m_terrainShaderOptimDiagLogged)
     {
         const uint32_t activeLayerCount =
-            EstimateActiveSplatLayerSpan(m_splatABytes, m_splatBBytes, m_splatWidth, m_splatHeight);
+            ActiveSplatLayerSpan();
         const uint32_t samplesPerLayer = m_sceneTerrain.triplanarEnabled ? 16u : 5u;
         Tracenf("[TERRAIN-SHADER-DIAG] active_layer_count=%u total_layer_count=8 triplanar_enabled=%s samples_per_pixel_estimate=%u render_pass_count=1 draw_calls_per_frame=%u",
             activeLayerCount,
@@ -2724,13 +3123,10 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
                                         m_editorBrushLocalZ,
                                         6.0f,
                                         m_editorBrushRadiusMeters}};
-        vkCmdPushConstants(cmd, m_pipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(brushPush), &brushPush);
-        vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
-        vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-            0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
+        cmd.PushConstants(&brushPush, sizeof(brushPush));
+        cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+        cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
+        cmd.BindGroup(0, *m_bindGroup, frameIndex);
         drawVisibleTerrainChunks();
     }
 
@@ -2740,13 +3136,10 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
                                         m_waterSculptBrushWorldZ,
                                         m_waterSculptBrushAddMode ? 8.0f : 9.0f,
                                         m_waterSculptBrushRadiusMeters}};
-        vkCmdPushConstants(cmd, m_pipelineLayout,
-            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-            0, sizeof(brushPush), &brushPush);
-        vkCmdBindVertexBuffers(cmd, 0, 1, &m_vertexBuffer.buffer, &offset);
-        vkCmdBindIndexBuffer(cmd, m_indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-            0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
+        cmd.PushConstants(&brushPush, sizeof(brushPush));
+        cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+        cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
+        cmd.BindGroup(0, *m_bindGroup, frameIndex);
         drawVisibleTerrainChunks();
     }
 
@@ -2776,8 +3169,8 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
 
     if (!loggedDraw)
     {
-        const size_t paletteLayers = m_baseTexture.view && m_normalTexture.view &&
-            m_aoTexture.view && m_roughnessTexture.view && m_metallicTexture.view && m_heightTexture.view
+        const size_t paletteLayers = m_baseTexture.image && m_normalTexture.image &&
+            m_aoTexture.image && m_roughnessTexture.image && m_metallicTexture.image && m_heightTexture.image
                 ? m_paletteSlots.size()
                 : 0u;
         Tracenf("[TERRAIN] Render: %s indexCount=%u debugIndexCount=%u layers=%zu camera eye=(%.2f,%.2f,%.2f) target=(%.2f,%.2f,%.2f)",
@@ -2795,68 +3188,63 @@ void TerrainRenderer::Render(VulkanDevice& device, const WorldCamera& camera, Vk
     }
 }
 
-void TerrainRenderer::RenderSelectedWaterBodyHighlight(VulkanDevice& device, const WorldCamera& camera, VkExtent2D targetExtent)
+void TerrainRenderer::RenderSelectedWaterBodyHighlight(ixrhi::IXRHICommandList& cmd,
+                                                        const ixrhi::IXRHIFrameInfo& frame,
+                                                        const WorldCamera& camera,
+                                                        std::uint32_t targetWidth,
+                                                        std::uint32_t targetHeight)
 {
-    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_mapEditorOpen || !m_pipeline || !m_selectedWaterBodyIndexCount ||
-        !m_selectedWaterBodyVertexBuffer.buffer || !m_selectedWaterBodyIndexBuffer.buffer ||
-        !device.IsFrameActive())
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || !m_mapEditorOpen || !m_pipeline || !m_bindGroup ||
+        !m_selectedWaterBodyIndexCount || !m_selectedWaterBodyVertexBuffer || !m_selectedWaterBodyIndexBuffer ||
+        !frame.frameActive)
     {
         return;
     }
 
-    const VkExtent2D extent = (targetExtent.width > 0 && targetExtent.height > 0)
-        ? targetExtent
-        : device.GetSwapchainExtent();
-    if (extent.width == 0 || extent.height == 0)
+    const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
+    const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
+    if (extentWidth == 0 || extentHeight == 0)
         return;
 
-    const uint32_t frameIndex = device.GetFrameIndex();
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     UpdateUniform(frameIndex, camera);
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipeline);
+    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
+    cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    cmd.SetGraphicsPipeline(*m_pipeline);
 
     struct TerrainPushConstants
     {
         float layerParams[4];
     };
     TerrainPushConstants push{{1.0f, 1.0f, 7.0f, 0.0f}};
-    vkCmdPushConstants(cmd, m_pipelineLayout,
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-        0, sizeof(push), &push);
+    cmd.PushConstants(&push, sizeof(push));
 
-    VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(cmd, 0, 1, &m_selectedWaterBodyVertexBuffer.buffer, &offset);
-    vkCmdBindIndexBuffer(cmd, m_selectedWaterBodyIndexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
-        0, 1, &m_descriptorSets[frameIndex], 0, nullptr);
-    vkCmdDrawIndexed(cmd, m_selectedWaterBodyIndexCount, 1, 0, 0, 0);
+    cmd.SetVertexBuffer(0, *m_selectedWaterBodyVertexBuffer, 0);
+    cmd.SetIndexBuffer(*m_selectedWaterBodyIndexBuffer, 0, /*thirtyTwoBit=*/true);
+    cmd.BindGroup(0, *m_bindGroup, frameIndex);
+    cmd.DrawIndexed(m_selectedWaterBodyIndexCount, 1, 0, 0, 0);
 }
 
-void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camera, double timeSeconds, VkExtent2D targetExtent, uint32_t viewIndex)
+void TerrainRenderer::RenderWater(ixrhi::IXRHICommandList& cmd,
+                                   const ixrhi::IXRHIFrameInfo& frame,
+                                   const WorldCamera& camera,
+                                   double timeSeconds,
+                                   std::uint32_t targetWidth,
+                                   std::uint32_t targetHeight,
+                                   uint32_t viewIndex)
 {
     m_latestWaterTimeSeconds = timeSeconds;
-    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || m_waterBodies.empty() || !m_waterPipeline || !device.IsFrameActive())
+    if (!m_sceneTerrainActive || m_sceneTerrain.editorHidden || m_waterBodies.empty() || !m_waterPipeline ||
+        !m_waterBindGroup || !frame.frameActive)
         return;
 
-    const VkExtent2D extent = (targetExtent.width > 0 && targetExtent.height > 0)
-        ? targetExtent
-        : device.GetSwapchainExtent();
-    if (extent.width == 0 || extent.height == 0)
+    const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
+    const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
+    if (extentWidth == 0 || extentHeight == 0)
         return;
 
-    const uint32_t frameIndex = device.GetFrameIndex();
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     float reflectionTargetDistance = 0.0f;
     const WaterBodyGpu* reflectionTarget = FindClosestWaterBody(camera, &reflectionTargetDistance);
     if (timeSeconds - m_lastWaterDiagTimeSeconds >= 1.0)
@@ -2877,39 +3265,27 @@ void TerrainRenderer::RenderWater(VulkanDevice& device, const WorldCamera& camer
         m_lastWaterDiagTimeSeconds = timeSeconds;
     }
 
-    VkCommandBuffer cmd = device.GetCommandBuffer();
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(extent.width);
-    viewport.height = static_cast<float>(extent.height);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
+    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
+    cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    cmd.SetGraphicsPipeline(*m_waterPipeline);
 
-    VkRect2D scissor{{0, 0}, extent};
-    vkCmdSetViewport(cmd, 0, 1, &viewport);
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterPipeline);
-
-    VkDeviceSize offset = 0;
-    for (WaterBodyGpu& waterBody : m_waterBodies)
+    for (std::uint32_t bodyIndex = 0; bodyIndex < static_cast<std::uint32_t>(m_waterBodies.size()); ++bodyIndex)
     {
-        VkDescriptorSet waterDescriptorSet = (viewIndex == 0)
-            ? waterBody.descriptorSets[frameIndex]
-            : waterBody.descriptorSetsSecondary[frameIndex];
+        WaterBodyGpu& waterBody = m_waterBodies[bodyIndex];
         if (!ResolveWaterConfig(waterBody.body).enabled || !waterBody.indexCount ||
-            !waterBody.vertexBuffer.buffer || !waterBody.indexBuffer.buffer ||
-            !waterDescriptorSet)
+            !waterBody.vertexBuffer || !waterBody.indexBuffer || !WaterBodyInView(waterBody, camera))
         {
             continue;
         }
         const bool isReflectionTarget = (&waterBody == reflectionTarget);
         UpdateWaterBodyUniform(frameIndex, camera, timeSeconds, waterBody, isReflectionTarget, viewIndex);
-        vkCmdBindVertexBuffers(cmd, 0, 1, &waterBody.vertexBuffer.buffer, &offset);
-        vkCmdBindIndexBuffer(cmd, waterBody.indexBuffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_waterPipelineLayout,
-            0, 1, &waterDescriptorSet, 0, nullptr);
-        vkCmdDrawIndexed(cmd, waterBody.indexCount, 1, 0, 0, 0);
+        cmd.SetVertexBuffer(0, *waterBody.vertexBuffer, 0);
+        cmd.SetIndexBuffer(*waterBody.indexBuffer, 0, /*thirtyTwoBit=*/true);
+        // Slot = (bodyIndex * 2 + viewIndex) * kFramesInFlight + frameIndex.
+        cmd.BindGroup(0,
+            *m_waterBindGroup,
+            (bodyIndex * 2u + (viewIndex == 0 ? 0u : 1u)) * kFramesInFlight + frameIndex);
+        cmd.DrawIndexed(waterBody.indexCount, 1, 0, 0, 0);
     }
 }
 
@@ -2991,9 +3367,10 @@ std::vector<WaterBody> TerrainRenderer::GetWaterBodies() const
     return bodies;
 }
 
-bool TerrainRenderer::SetWaterBodies(VulkanDevice& device, const std::vector<WaterBody>& bodies)
+bool TerrainRenderer::SetWaterBodies(ixrhi::IXRHIDevice& rhi, const std::vector<WaterBody>& bodies)
 {
-    device.WaitIdle();
+    m_rhi = &rhi;
+    rhi.WaitIdle();
     DestroyWaterBodyResources();
     if (!m_sceneTerrainActive)
         return bodies.empty();
@@ -3010,7 +3387,7 @@ bool TerrainRenderer::SetWaterBodies(VulkanDevice& device, const std::vector<Wat
     {
         WaterBodyGpu gpu;
         gpu.body = std::move(body);
-        if (!CreateWaterBodyUniformBuffers(device, gpu) || !CreateWaterBodyMesh(device, gpu))
+        if (!CreateWaterBodyUniformBuffers(rhi, gpu) || !CreateWaterBodyMesh(rhi, gpu))
         {
             DestroyWaterBodyResources(gpu);
             Tracen("[WATER-OBJ] skipped invalid editor water body");
@@ -3019,9 +3396,9 @@ bool TerrainRenderer::SetWaterBodies(VulkanDevice& device, const std::vector<Wat
         m_waterBodies.push_back(std::move(gpu));
     }
 
-    if (m_waterDescriptorPool)
-        CreateWaterDescriptors();
-    SetSelectedWaterBodyHighlight(device, m_selectedWaterBodyId);
+    if (m_waterBindGroup)
+        CreateWaterBindGroup(rhi);
+    SetSelectedWaterBodyHighlight(rhi, m_selectedWaterBodyId);
     Tracenf("[WATER-OBJ] editor water bodies applied: %zu", m_waterBodies.size());
     return m_waterBodies.size() == limited.size();
 }
@@ -3057,25 +3434,25 @@ void TerrainRenderer::SetWaterMaterials(const std::vector<std::pair<std::string,
         edgeSignature += part;
         edgeSignature.push_back('\n');
     }
-    if (textureSignature != m_waterMaterialTextureSignature && m_deviceOwner && m_assets)
+    if (textureSignature != m_waterMaterialTextureSignature && m_rhi && m_assets)
     {
-        m_deviceOwner->WaitIdle();
+        m_rhi->WaitIdle();
         DestroyWaterMaterialTextureCache();
         m_waterMaterialTextureSignature = textureSignature;
         for (const auto& [id, material] : m_waterMaterials)
         {
             WaterMaterialTextureSet textureSet{};
-            if (LoadWaterMaterialTextureSet(*m_deviceOwner, id, material, textureSet))
+            if (LoadWaterMaterialTextureSet(*m_rhi, id, material, textureSet))
                 m_waterMaterialTextures[id] = std::move(textureSet);
         }
-        UpdateWaterDescriptors();
+        UpdateWaterBindGroup();
     }
-    if (edgeSignature != m_waterMaterialEdgeSignature && m_deviceOwner)
+    if (edgeSignature != m_waterMaterialEdgeSignature && m_rhi)
     {
-        m_deviceOwner->WaitIdle();
+        m_rhi->WaitIdle();
         m_waterMaterialEdgeSignature = edgeSignature;
         for (WaterBodyGpu& waterBody : m_waterBodies)
-            CreateWaterBodyMesh(*m_deviceOwner, waterBody);
+            CreateWaterBodyMesh(*m_rhi, waterBody);
         Tracenf("[WATER-OBJ-6] Material edge fade updated: %zu water bodies rebuilt", m_waterBodies.size());
     }
     static bool logged = false;
@@ -3088,18 +3465,11 @@ void TerrainRenderer::SetWaterMaterials(const std::vector<std::pair<std::string,
 
 void TerrainRenderer::DestroyWaterMaterialTextureCache()
 {
-    for (auto& [id, textureSet] : m_waterMaterialTextures)
-    {
-        (void)id;
-        DestroyTexture(textureSet.normalA);
-        DestroyTexture(textureSet.normalB);
-        DestroyTexture(textureSet.diffuse);
-    }
     m_waterMaterialTextures.clear();
     m_waterMaterialTextureSignature.clear();
 }
 
-bool TerrainRenderer::LoadWaterMaterialTextureSet(VulkanDevice& device,
+bool TerrainRenderer::LoadWaterMaterialTextureSet(ixrhi::IXRHIDevice& rhi,
                                                   const std::string& id,
                                                   const WaterMaterialData& material,
                                                   WaterMaterialTextureSet& out)
@@ -3113,11 +3483,11 @@ bool TerrainRenderer::LoadWaterMaterialTextureSet(VulkanDevice& device,
     if (normalAPath.empty() && normalBPath.empty() && diffusePath.empty())
         return false;
 
-    auto loadTexture = [&](const std::string& path, const std::string& label, Texture& texture, VkFormat format) -> bool {
+    auto loadTexture = [&](const std::string& path, const std::string& label, Texture& texture, ixrhi::IXRHIFormat format) -> bool {
         if (path.empty())
             return false;
         RgbaImage image{};
-        if (!LoadAnyTerrainImage(*m_assets, path, image, &m_additionalAssetRoots))
+        if (!LoadAnyTerrainImage(*m_assets, path, image, &m_additionalAssetRoots, format == ixrhi::IXRHIFormat::R8G8B8A8Srgb))
         {
             Tracenf("[WATER-MAT] failed to load %s texture for %s: %s",
                 label.c_str(),
@@ -3125,25 +3495,21 @@ bool TerrainRenderer::LoadWaterMaterialTextureSet(VulkanDevice& device,
                 path.c_str());
             return false;
         }
-        return UploadRgbaTexture2D(device, "watermat_" + id + "_" + label, image.width, image.height, image.pixels,
-            VK_SAMPLER_ADDRESS_MODE_REPEAT, texture, format);
+        if (label.rfind("normal", 0) == 0)
+            ConvertTangentNormalMapToYUp(image.pixels);
+        return UploadRgbaTexture2D(rhi, "watermat_" + id + "_" + label, image.width, image.height, image.pixels,
+            ixrhi::IXRHISamplerAddress::Repeat, texture, format, /*generateMips=*/true);
     };
 
-    const bool loadedA = loadTexture(normalAPath, "normal_a", out.normalA, VK_FORMAT_R8G8B8A8_UNORM);
-    const bool loadedB = loadTexture(normalBPath, "normal_b", out.normalB, VK_FORMAT_R8G8B8A8_UNORM);
-    const bool loadedDiffuse = loadTexture(diffusePath, "diffuse", out.diffuse, VK_FORMAT_R8G8B8A8_SRGB);
+    const bool loadedA = loadTexture(normalAPath, "normal_a", out.normalA, ixrhi::IXRHIFormat::R8G8B8A8Unorm);
+    const bool loadedB = loadTexture(normalBPath, "normal_b", out.normalB, ixrhi::IXRHIFormat::R8G8B8A8Unorm);
+    const bool loadedDiffuse = loadTexture(diffusePath, "diffuse", out.diffuse, ixrhi::IXRHIFormat::R8G8B8A8Srgb);
     if (!loadedA && !loadedB && !loadedDiffuse)
         return false;
     if (!loadedA)
-    {
-        DestroyTexture(out.normalA);
         out.normalA = {};
-    }
     if (!loadedB)
-    {
-        DestroyTexture(out.normalB);
         out.normalB = {};
-    }
     out.normalAPath = loadedA ? normalAPath : std::string{};
     out.normalBPath = loadedB ? normalBPath : std::string{};
     out.diffusePath = loadedDiffuse ? diffusePath : std::string{};
@@ -3166,7 +3532,7 @@ const TerrainRenderer::WaterMaterialTextureSet* TerrainRenderer::ResolveWaterMat
     return nullptr;
 }
 
-bool TerrainRenderer::SetSelectedWaterBodyHighlight(VulkanDevice& device, std::uint32_t selectedWaterBodyId)
+bool TerrainRenderer::SetSelectedWaterBodyHighlight(ixrhi::IXRHIDevice& rhi, std::uint32_t selectedWaterBodyId)
 {
     const WaterBody* selectedBody = nullptr;
     for (const WaterBodyGpu& waterBody : m_waterBodies)
@@ -3184,7 +3550,7 @@ bool TerrainRenderer::SetSelectedWaterBodyHighlight(VulkanDevice& device, std::u
             return true;
         m_selectedWaterBodyId = 0;
         std::fill(std::begin(m_selectedWaterBodySignature), std::end(m_selectedWaterBodySignature), 0.0f);
-        return RebuildSelectedWaterBodyHighlight(device, nullptr);
+        return RebuildSelectedWaterBodyHighlight(rhi, nullptr);
     }
 
     const float signature[5] = {
@@ -3203,14 +3569,14 @@ bool TerrainRenderer::SetSelectedWaterBodyHighlight(VulkanDevice& device, std::u
 
     m_selectedWaterBodyId = selectedBody->id;
     std::copy(std::begin(signature), std::end(signature), std::begin(m_selectedWaterBodySignature));
-    return RebuildSelectedWaterBodyHighlight(device, selectedBody);
+    return RebuildSelectedWaterBodyHighlight(rhi, selectedBody);
 }
 
-bool TerrainRenderer::RebuildSelectedWaterBodyHighlight(VulkanDevice& device, const WaterBody* body)
+bool TerrainRenderer::RebuildSelectedWaterBodyHighlight(ixrhi::IXRHIDevice& rhi, const WaterBody* body)
 {
-    device.WaitIdle();
-    DestroyBuffer(m_selectedWaterBodyVertexBuffer);
-    DestroyBuffer(m_selectedWaterBodyIndexBuffer);
+    rhi.WaitIdle();
+    m_selectedWaterBodyVertexBuffer.reset();
+    m_selectedWaterBodyIndexBuffer.reset();
     m_selectedWaterBodyIndexCount = 0;
 
     if (!body)
@@ -3254,12 +3620,18 @@ bool TerrainRenderer::RebuildSelectedWaterBodyHighlight(VulkanDevice& device, co
     addQuad(minX - kLineThickness * 0.5f, minZ, minX + kLineThickness * 0.5f, maxZ);
     addQuad(maxX - kLineThickness * 0.5f, minZ, maxX + kLineThickness * 0.5f, maxZ);
 
-    CreateHostVisibleBuffer(device, m_device, sizeof(Vertex) * vertices.size(),
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertices.data(), m_selectedWaterBodyVertexBuffer);
-    CreateHostVisibleBuffer(device, m_device, sizeof(uint32_t) * indices.size(),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indices.data(), m_selectedWaterBodyIndexBuffer);
+    m_selectedWaterBodyVertexBuffer = CreateRhiBuffer(rhi,
+        sizeof(Vertex) * vertices.size(),
+        ixrhi::IXRHIBufferUsage::Vertex,
+        vertices.data(),
+        "Terrain:SelectedWaterVB");
+    m_selectedWaterBodyIndexBuffer = CreateRhiBuffer(rhi,
+        sizeof(uint32_t) * indices.size(),
+        ixrhi::IXRHIBufferUsage::Index,
+        indices.data(),
+        "Terrain:SelectedWaterIB");
     m_selectedWaterBodyIndexCount = static_cast<uint32_t>(indices.size());
-    return m_selectedWaterBodyVertexBuffer.buffer && m_selectedWaterBodyIndexBuffer.buffer;
+    return m_selectedWaterBodyVertexBuffer != nullptr && m_selectedWaterBodyIndexBuffer != nullptr;
 }
 
 void TerrainRenderer::SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots)
@@ -3268,22 +3640,22 @@ void TerrainRenderer::SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>&
     m_materialParamsDirty = true;
 }
 
-bool TerrainRenderer::ApplyPaletteSlotChange(VulkanDevice& device, const MapEditorPaletteSlot& slot)
+bool TerrainRenderer::ApplyPaletteSlotChange(ixrhi::IXRHIDevice& rhi, const MapEditorPaletteSlot& slot)
 {
     if (slot.slot >= m_paletteSlots.size() || slot.texturePath.empty())
         return false;
 
     auto next = m_paletteSlots;
     next[slot.slot] = slot;
-    if (!LoadTerrainPaletteFromPaths(device, next))
+    if (!LoadTerrainPaletteFromPaths(rhi, next))
         return false;
     m_paletteSlots = next;
     return true;
 }
 
-bool TerrainRenderer::ApplyPaletteSlots(VulkanDevice& device, const std::array<MapEditorPaletteSlot, 8>& slots)
+bool TerrainRenderer::ApplyPaletteSlots(ixrhi::IXRHIDevice& rhi, const std::array<MapEditorPaletteSlot, 8>& slots)
 {
-    return LoadTerrainPaletteFromPaths(device, slots);
+    return LoadTerrainPaletteFromPaths(rhi, slots);
 }
 
 bool TerrainRenderer::ApplyPaletteSlotParams(const MapEditorPaletteSlot& slot)
@@ -3377,7 +3749,7 @@ bool TerrainRenderer::HandleEditorInput(const InputEvent& event)
     {
         m_editorCursorX = event.x;
         m_editorCursorY = event.y;
-        if (m_mapEditorOpen && m_editorTerrainToolActive && m_editorLmbHeld)
+        if (m_mapEditorOpen && m_editorTerrainToolActive && m_editorLmbHeld && BrushDiagLogs())
         {
             Tracenf("[TEDIT-DIAG] brush input tool=%s mouse=(%d,%d) activeTerrain=%p",
                 TeditToolModeName(m_editorToolMode),
@@ -3399,6 +3771,7 @@ bool TerrainRenderer::HandleEditorInput(const InputEvent& event)
             if (event.type == InputEvent::MouseDown)
             {
                 m_editorLmbHeld = true;
+                m_brushDiagApplications = 0;
                 if (m_editorTerrainToolActive)
                 {
                     Tracenf("[TEDIT-DIAG] brush input tool=%s mouse=(%d,%d) activeTerrain=%p",
@@ -3484,12 +3857,13 @@ bool TerrainRenderer::HandleEditorInput(const InputEvent& event)
     }
 }
 
-void TerrainRenderer::UpdateEditor(VulkanDevice& device,
+void TerrainRenderer::UpdateEditor(ixrhi::IXRHIDevice& rhi,
                                    double deltaSeconds,
                                    const WorldCamera& camera,
                                    uint32_t viewportWidth,
                                    uint32_t viewportHeight)
 {
+    m_rhi = &rhi;
     const bool editorBrushActive = m_walkabilityDebug || m_editorTerrainToolActive;
     if (m_mapEditorOpen && editorBrushActive && m_mapLoaded)
         RaycastEditorBrush(camera, viewportWidth, viewportHeight);
@@ -3503,7 +3877,7 @@ void TerrainRenderer::UpdateEditor(VulkanDevice& device,
     if (m_editorReloadRequested)
     {
         m_editorReloadRequested = false;
-        ReloadCurrentMap(device);
+        ReloadCurrentMap(rhi);
         return;
     }
 
@@ -3518,7 +3892,7 @@ void TerrainRenderer::UpdateEditor(VulkanDevice& device,
     if (m_editorUndoRequested)
     {
         m_editorUndoRequested = false;
-        UndoLastEditorStroke(device);
+        UndoLastEditorStroke(rhi);
     }
 
     if (!editorBrushActive || !m_mapLoaded)
@@ -3527,16 +3901,18 @@ void TerrainRenderer::UpdateEditor(VulkanDevice& device,
     if (m_mapEditorOpen)
     {
         if (m_editorLmbHeld && m_editorBrushVisible)
-            ApplyEditorBrush(device, deltaSeconds);
-        if (m_editorSplatGpuDirty)
-            RefreshSplatTextures(device);
+            ApplyEditorBrush(rhi, deltaSeconds);
+        // Painted texels upload in the frame (UploadEditedTerrain); this synchronous whole-texture path
+        // is only for a change without a dirty rectangle.
+        if (m_editorSplatGpuDirty && !m_splatDirtyRect.Valid())
+            RefreshSplatTextures(rhi);
         return;
     }
 
     if (m_editorRaiseHeld)
-        ApplyLegacyHeightBrush(device, 1.0f, deltaSeconds);
+        ApplyLegacyHeightBrush(1.0f, deltaSeconds);
     if (m_editorLowerHeld)
-        ApplyLegacyHeightBrush(device, -1.0f, deltaSeconds);
+        ApplyLegacyHeightBrush(-1.0f, deltaSeconds);
 }
 
 float TerrainRenderer::SampleHeightAt(float localX, float localZ) const
@@ -3546,7 +3922,7 @@ float TerrainRenderer::SampleHeightAt(float localX, float localZ) const
 
     const float localXcm = m_spawnLocalXcm + localX * 100.0f;
     const float localYcm = m_spawnLocalYcm - localZ * 100.0f;
-    const float heightCm = BilinearHeightCm(m_heightCmGrid, m_heightGridWidth, m_heightGridHeight,
+    const float heightCm = SampleTerrainCollisionHeightCm(m_heightCmGrid, m_heightGridWidth, m_heightGridHeight,
         localXcm, localYcm, m_cellScaleMeters * 100.0f);
     return heightCm * 0.01f;
 }
@@ -3576,53 +3952,66 @@ float TerrainRenderer::SampleHeight(WorldVec3 position) const
 
 void TerrainRenderer::Destroy()
 {
-    if (!m_device)
+    if (!m_rhi)
         return;
+
+    // Teardown drain: in-flight frames may still reference terrain buffers
+    // and textures being released here (parity with the old device wait).
+    m_rhi->WaitIdle();
+
+    m_waterQueries.reset();
+    m_waterQueryIssued = {};
+    m_waterSeen = false;
 
     DestroyPipeline();
     DestroyShadowResources();
     DestroyWaterResources();
 
-    if (m_descriptorPool)
-        vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
-    m_descriptorPool = VK_NULL_HANDLE;
+    m_bindGroup.reset();
+    m_bindLayout.reset();
+    m_waterBindGroup.reset();
+    m_waterBindLayout.reset();
 
-    if (m_descriptorSetLayout)
-        vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
-    m_descriptorSetLayout = VK_NULL_HANDLE;
+    // Refraction inputs share ownership with OffscreenSceneRenderer. Release
+    // our copies during explicit teardown while the device is still alive;
+    // leaving them for member destruction would outlive device shutdown.
+    m_waterSceneColor.reset();
+    m_waterSceneDepth.reset();
+    m_waterSceneSampler.reset();
+    m_waterSceneWidth = 0;
+    m_waterSceneHeight = 0;
 
-    DestroyBuffer(m_vertexBuffer);
-    DestroyBuffer(m_indexBuffer);
-    DestroyBuffer(m_debugVertexBuffer);
-    DestroyBuffer(m_debugIndexBuffer);
-    DestroyBuffer(m_logicVertexBuffer);
-    DestroyBuffer(m_logicIndexBuffer);
-    DestroyBuffer(m_selectedWaterBodyVertexBuffer);
-    DestroyBuffer(m_selectedWaterBodyIndexBuffer);
-    for (Buffer& buffer : m_uniformBuffers)
-        DestroyBuffer(buffer);
-    for (Buffer& buffer : m_uniformBuffersSecondary)
-        DestroyBuffer(buffer);
-    for (Buffer& buffer : m_waterUniformBuffers)
-        DestroyBuffer(buffer);
+    m_vertexBuffer.reset();
+    m_vertexEditBuffer.reset();
+    for (std::shared_ptr<ixrhi::IXRHIBuffer>& staging : m_splatStaging)
+        staging.reset();
+    m_indexBuffer.reset();
+    m_debugVertexBuffer.reset();
+    m_debugIndexBuffer.reset();
+    m_logicVertexBuffer.reset();
+    m_logicIndexBuffer.reset();
+    m_selectedWaterBodyVertexBuffer.reset();
+    m_selectedWaterBodyIndexBuffer.reset();
+    for (auto& buffer : m_uniformBuffers)
+        buffer.reset();
+    for (auto& buffer : m_uniformBuffersSecondary)
+        buffer.reset();
+    for (auto& buffer : m_uniformBuffersReflection)
+        buffer.reset();
     DestroyTerrainLayers();
-    DestroyTexture(m_baseTexture);
-    DestroyTexture(m_normalTexture);
-    DestroyTexture(m_aoTexture);
-    DestroyTexture(m_roughnessTexture);
-    DestroyTexture(m_metallicTexture);
-    DestroyTexture(m_heightTexture);
-    DestroyTexture(m_fallbackMask);
-    DestroyTexture(m_splatA);
-    DestroyTexture(m_splatB);
+    m_baseTexture = {};
+    m_normalTexture = {};
+    m_aoTexture = {};
+    m_roughnessTexture = {};
+    m_metallicTexture = {};
+    m_heightTexture = {};
+    m_fallbackMask = {};
+    m_splatA = {};
+    m_splatB = {};
     DestroyWaterMaterialTextureCache();
-    DestroyTexture(m_waterNormalSmall);
-    DestroyTexture(m_waterNormalLarge);
+    m_waterNormalSmall = {};
+    m_waterNormalLarge = {};
 
-    m_layerDescriptorSets.clear();
-    m_tileIndices.clear();
-    m_tileGridWidth = 0;
-    m_tileGridHeight = 0;
     m_indexCount = 0;
     m_debugIndexCount = 0;
     m_spawnDebugIndexOffset = 0;
@@ -3661,6 +4050,7 @@ void TerrainRenderer::Destroy()
     m_editorStrokeActive = false;
     m_editorBrushVisible = false;
     m_editorSplatGpuDirty = false;
+    m_splatDirtyRect = {};
     m_loadedMapDirectory.clear();
     m_loadedServerX = 0;
     m_loadedServerY = 0;
@@ -3668,6 +4058,7 @@ void TerrainRenderer::Destroy()
     m_attributes.clear();
     m_splatABytes.clear();
     m_splatBBytes.clear();
+    m_activeSplatLayerSpan = -1;
     m_dirtyChunkTexels.clear();
     m_terrainChunks.clear();
     m_visibleTerrainChunksScratch.clear();
@@ -3675,53 +4066,83 @@ void TerrainRenderer::Destroy()
     m_splatUndoRecorded.clear();
     m_currentUndo = {};
     m_undoStack.clear();
-    m_device = VK_NULL_HANDLE;
-    m_deviceOwner = nullptr;
+    m_targetPass = nullptr;
+    m_rhi = nullptr;
     m_assets = nullptr;
 }
 
-bool TerrainRenderer::CreateBuffers(VulkanDevice& device)
+bool TerrainRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
 {
     m_mapSizeX = 100;
     m_mapSizeY = 100;
     m_cellScaleMeters = 1.0f;
     m_heightCmGrid.assign(static_cast<size_t>(m_mapSizeX + 1u) * (m_mapSizeY + 1u), 0.0f);
-    return CreateFlatBuffers(device);
+    return CreateFlatBuffers(rhi);
 }
 
-bool TerrainRenderer::EnsureUniformBuffers(VulkanDevice& device)
+bool TerrainRenderer::EnsureUniformBuffers(ixrhi::IXRHIDevice& rhi)
 {
-    auto ensure = [&](std::array<Buffer, kFramesInFlight>& buffers) {
-        for (Buffer& buffer : buffers)
+    auto ensure = [&](std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight>& buffers,
+                      const char* debugName) {
+        for (auto& buffer : buffers)
         {
-            if (buffer.buffer && buffer.memory)
+            if (buffer)
                 continue;
 
-            DestroyBuffer(buffer);
-            CreateHostVisibleBuffer(device, m_device, sizeof(UniformBlock),
-                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
+            buffer = CreateRhiBuffer(rhi, sizeof(UniformBlock), ixrhi::IXRHIBufferUsage::Uniform, nullptr, debugName);
         }
     };
-    ensure(m_uniformBuffers);
-    ensure(m_uniformBuffersSecondary);
+    ensure(m_uniformBuffers, "Terrain:UBO");
+    ensure(m_uniformBuffersSecondary, "Terrain:UBO secondary");
+    ensure(m_uniformBuffersReflection, "Terrain:UBO reflection");
 
-    for (const Buffer& buffer : m_uniformBuffers)
+    for (const auto& buffer : m_uniformBuffers)
     {
-        if (!buffer.buffer || !buffer.memory)
+        if (!buffer)
         {
             Tracen("[TERRAIN] uniform buffer creation failed");
             return false;
         }
     }
-    for (const Buffer& buffer : m_uniformBuffersSecondary)
+    for (const auto& buffer : m_uniformBuffersSecondary)
     {
-        if (!buffer.buffer || !buffer.memory)
+        if (!buffer)
         {
             Tracen("[TERRAIN] secondary uniform buffer creation failed");
             return false;
         }
     }
+    for (const auto& buffer : m_uniformBuffersReflection)
+    {
+        if (!buffer)
+        {
+            Tracen("[TERRAIN] reflection uniform buffer creation failed");
+            return false;
+        }
+    }
     return true;
+}
+
+void TerrainRenderer::ExpandTerrainChunkBounds(const Vertex* vertices, std::size_t count)
+{
+    if (m_terrainChunks.empty() || vertices == nullptr || count == 0)
+        return;
+    WorldVec3 lo{vertices[0].position[0], vertices[0].position[1], vertices[0].position[2]};
+    WorldVec3 hi = lo;
+    for (std::size_t i = 1; i < count; ++i)
+    {
+        const float* p = vertices[i].position;
+        lo = {std::min(lo.x, p[0]), std::min(lo.y, p[1]), std::min(lo.z, p[2])};
+        hi = {std::max(hi.x, p[0]), std::max(hi.y, p[1]), std::max(hi.z, p[2])};
+    }
+    // Grow only (never shrink): conservative for the main-pass and shadow-cascade culling.
+    for (TerrainChunkDraw& chunk : m_terrainChunks)
+    {
+        if (chunk.worldMax.x < lo.x || chunk.worldMin.x > hi.x || chunk.worldMax.z < lo.z || chunk.worldMin.z > hi.z)
+            continue;
+        chunk.worldMin.y = std::min(chunk.worldMin.y, lo.y);
+        chunk.worldMax.y = std::max(chunk.worldMax.y, hi.y);
+    }
 }
 
 void TerrainRenderer::BuildTerrainChunkDraws(const std::vector<Vertex>& vertices, std::vector<uint32_t>& indices)
@@ -3788,8 +4209,8 @@ void TerrainRenderer::BuildTerrainChunkDraws(const std::vector<Vertex>& vertices
                     const uint32_t i3 = i0 + m_heightGridWidth;
                     indices.push_back(i0);
                     indices.push_back(i1);
-                    indices.push_back(i2);
-                    indices.push_back(i0);
+                    indices.push_back(i3);
+                    indices.push_back(i1);
                     indices.push_back(i2);
                     indices.push_back(i3);
                 }
@@ -3809,7 +4230,7 @@ void TerrainRenderer::BuildTerrainChunkDraws(const std::vector<Vertex>& vertices
     }
 }
 
-bool TerrainRenderer::CreateFlatBuffers(VulkanDevice& device)
+bool TerrainRenderer::CreateFlatBuffers(ixrhi::IXRHIDevice& rhi)
 {
     const uint32_t cellsX = std::max(1u, m_mapSizeX == 0 ? 100u : m_mapSizeX);
     const uint32_t cellsZ = std::max(1u, m_mapSizeY == 0 ? 100u : m_mapSizeY);
@@ -3844,195 +4265,161 @@ bool TerrainRenderer::CreateFlatBuffers(VulkanDevice& device)
     BuildTerrainChunkDraws(vertices, indices);
     m_indexCount = static_cast<uint32_t>(indices.size());
 
-    CreateHostVisibleBuffer(device, m_device, sizeof(Vertex) * vertices.size(),
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertices.data(), m_vertexBuffer);
-    CreateHostVisibleBuffer(device, m_device, sizeof(uint32_t) * indices.size(),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indices.data(), m_indexBuffer);
+    // Drawn from video memory (main pass + every shadow cascade); edited (sculpt) through a
+    // host-visible copy that UploadEditedTerrain() copies over.
+    m_vertexBuffer = CreateStaticRhiBuffer(rhi,
+        sizeof(Vertex) * vertices.size(),
+        ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferDst,
+        vertices.data(),
+        "Terrain:VB");
+    m_vertexEditBuffer = CreateRhiBuffer(rhi,
+        sizeof(Vertex) * vertices.size(),
+        ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferSrc,
+        vertices.data(),
+        "Terrain:VB(edit)");
+    m_vertexBufferUploadPending = false;
+    m_indexBuffer = CreateStaticRhiBuffer(rhi,
+        sizeof(uint32_t) * indices.size(),
+        ixrhi::IXRHIBufferUsage::Index,
+        indices.data(),
+        "Terrain:IB");
+    if (!m_vertexBuffer || !m_vertexEditBuffer || !m_indexBuffer)
+        return false;
 
-    return EnsureUniformBuffers(device);
+    return EnsureUniformBuffers(rhi);
 }
 
-bool TerrainRenderer::UploadRgbaTexture2D(VulkanDevice& device,
+bool TerrainRenderer::UploadRgbaTexture2D(ixrhi::IXRHIDevice& rhi,
     const std::string& name,
     uint32_t width,
     uint32_t height,
     const std::vector<std::uint8_t>& pixels,
-    VkSamplerAddressMode addressMode,
+    ixrhi::IXRHISamplerAddress addressMode,
     Texture& out,
-    VkFormat format)
+    ixrhi::IXRHIFormat format,
+    bool generateMips)
 {
     if (width == 0 || height == 0 || pixels.size() != static_cast<size_t>(width) * height * 4u)
         return false;
 
-    DestroyTexture(out);
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
+    out = {};
+    // A texture tiled across a surface needs its mip chain (and trilinear filtering): without it
+    // the distant, grazing-angle part of the surface aliases into shimmering stripes.
+    ArrayMipUpload mipUpload{};
+    if (generateMips)
+    {
+        mipUpload = BuildRgbaArrayMipUpload(width, height, 1, pixels,
+            format == ixrhi::IXRHIFormat::R8G8B8A8Srgb, name.find("normal") != std::string::npos ||
+                name.find("wave") != std::string::npos);
+    }
+    const std::uint32_t mipLevels = generateMips ? mipUpload.mipLevels : 1u;
+    ixrhi::IXRHITextureDesc imageDesc;
+    imageDesc.width = width;
+    imageDesc.height = height;
+    imageDesc.mipLevels = mipLevels;
+    imageDesc.format = format;
+    imageDesc.usage = ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
+    imageDesc.debugName = "Terrain:" + name;
+    out.image = generateMips
+        ? rhi.CreateTexture(imageDesc, mipUpload.pixels.data(), mipUpload.pixels.size())
+        : rhi.CreateTexture(imageDesc, pixels.data(), pixels.size());
+    if (!out.image)
+        return false;
 
-    CreateDeviceLocalImage(device, m_device, width, height, 1, format, out.image, out.memory);
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, pixels.data(), staging);
-
-    VkBufferImageCopy region{};
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {width, height, 1};
-
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayout(cmd, out.image, 1, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(cmd, staging.buffer, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    TransitionImageLayout(cmd, out.image, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-    DestroyBuffer(staging);
+    out.sampler = CreateRhiSampler(rhi, addressMode, /*trilinear=*/generateMips,
+        /*maxLod=*/generateMips ? static_cast<float>(mipLevels - 1u) : 1.0f, /*mipLodBias=*/0.0f,
+        ("Terrain:" + name + ":Sampler").c_str());
+    if (!out.sampler)
+    {
+        out = {};
+        return false;
+    }
 
     out.format = format;
     out.width = width;
     out.height = height;
-    out.mipLevels = 1;
+    out.mipLevels = mipLevels;
+    out.arrayLayers = 1;
     out.name = name;
-
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = out.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = out.format;
-    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.levelCount = 1;
-    view.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &out.view));
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler.addressModeU = addressMode;
-    sampler.addressModeV = addressMode;
-    sampler.addressModeW = addressMode;
-    if (addressMode == VK_SAMPLER_ADDRESS_MODE_REPEAT && device.SupportsSamplerAnisotropy())
-    {
-        sampler.anisotropyEnable = VK_TRUE;
-        sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
-    }
-    sampler.maxLod = 1.0f;
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &out.sampler));
     return true;
 }
 
-bool TerrainRenderer::UpdateRgbaTexture2D(VulkanDevice& device,
-                                          Texture& texture,
-                                          const std::vector<std::uint8_t>& pixels)
+bool TerrainRenderer::UpdateRgbaTexture2D(ixrhi::IXRHIDevice& rhi,
+                                           Texture& texture,
+                                           const std::vector<std::uint8_t>& pixels)
 {
     if (!texture.image || texture.width == 0 || texture.height == 0 ||
         pixels.size() != static_cast<size_t>(texture.width) * texture.height * 4u)
         return false;
 
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
-
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, pixels.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, pixels.data(), staging);
-
-    VkBufferImageCopy region{};
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {texture.width, texture.height, 1};
-
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayout(cmd, texture.image, 1, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(cmd, staging.buffer, texture.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    TransitionImageLayout(cmd, texture.image, 1, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-    DestroyBuffer(staging);
-    return true;
+    // Full base-level in-place rewrite (splat paint parity); the image,
+    // sampler and bind-group entries stay valid, so no descriptor update.
+    return rhi.UpdateTexture(*texture.image, pixels.data(), pixels.size());
 }
 
-bool TerrainRenderer::UploadRgbaTextureArray(VulkanDevice& device,
+bool TerrainRenderer::UploadRgbaTextureArray(ixrhi::IXRHIDevice& rhi,
     const std::string& name,
     uint32_t width,
     uint32_t height,
     uint32_t layers,
     const std::vector<std::uint8_t>& pixels,
-    VkFormat format,
+    ixrhi::IXRHIFormat format,
     Texture& out)
 {
     if (width == 0 || height == 0 || layers == 0 ||
         pixels.size() != static_cast<size_t>(width) * height * layers * 4u)
         return false;
 
-    DestroyTexture(out);
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
-
-    const bool srgbColor = format == VK_FORMAT_R8G8B8A8_SRGB;
+    out = {};
+    const bool srgbColor = format == ixrhi::IXRHIFormat::R8G8B8A8Srgb;
     const bool normalMap = name.find("normal") != std::string::npos;
     const ArrayMipUpload mipUpload = BuildRgbaArrayMipUpload(width, height, layers, pixels, srgbColor, normalMap);
-    CreateDeviceLocalImageArray(device, m_device, width, height, mipUpload.mipLevels, layers,
-        format, out.image, out.memory);
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, mipUpload.pixels.size(),
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, mipUpload.pixels.data(), staging);
 
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayoutArray(cmd, out.image, mipUpload.mipLevels, layers, VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(cmd, staging.buffer, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        static_cast<uint32_t>(mipUpload.regions.size()), mipUpload.regions.data());
-    TransitionImageLayoutArray(cmd, out.image, mipUpload.mipLevels, layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-    DestroyBuffer(staging);
+    ixrhi::IXRHITextureDesc imageDesc;
+    imageDesc.width = width;
+    imageDesc.height = height;
+    imageDesc.mipLevels = mipUpload.mipLevels;
+    imageDesc.arrayLayers = layers;
+    imageDesc.format = format;
+    imageDesc.usage = ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
+    imageDesc.debugName = "Terrain:" + name;
+    out.image = rhi.CreateTexture(imageDesc, mipUpload.pixels.data(), mipUpload.pixels.size());
+    if (!out.image)
+        return false;
+
+    const bool trilinear = mipUpload.mipLevels > 1;
+    out.sampler = CreateRhiSampler(rhi,
+        ixrhi::IXRHISamplerAddress::Repeat,
+        trilinear,
+        static_cast<float>(mipUpload.mipLevels > 0 ? mipUpload.mipLevels - 1u : 0u),
+        /*mipLodBias=*/0.0f,
+        ("Terrain:" + name + ":Sampler").c_str());
+    if (!out.sampler)
+    {
+        out = {};
+        return false;
+    }
 
     out.format = format;
     out.width = width;
     out.height = height;
     out.mipLevels = mipUpload.mipLevels;
+    out.arrayLayers = layers;
     out.name = name;
-
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = out.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    view.format = out.format;
-    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.levelCount = out.mipLevels;
-    view.subresourceRange.layerCount = layers;
-    VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &out.view));
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = out.mipLevels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    if (device.SupportsSamplerAnisotropy())
-    {
-        sampler.anisotropyEnable = VK_TRUE;
-        sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
-    }
-    sampler.mipLodBias = 0.0f;
-    sampler.maxLod = static_cast<float>(out.mipLevels > 0 ? out.mipLevels - 1u : 0u);
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &out.sampler));
+    const bool aniso = rhi.GetCapabilities().supportsAnisotropy;
     Tracenf("[TERRAIN-MIPS] generated array=%s size=%ux%u layers=%u mips=%u format=%s normalRenorm=%s sampler=trilinear aniso=%s",
         name.c_str(),
         width,
         height,
         layers,
         out.mipLevels,
-        VkFormatName(format),
+        RhiFormatName(format),
         normalMap ? "yes" : "no",
-        sampler.anisotropyEnable ? "yes" : "no");
+        aniso ? "yes" : "no");
     return true;
 }
 
-bool TerrainRenderer::UploadR8TextureArray(VulkanDevice& device,
+bool TerrainRenderer::UploadR8TextureArray(ixrhi::IXRHIDevice& rhi,
     const std::string& name,
     uint32_t width,
     uint32_t height,
@@ -4044,72 +4431,53 @@ bool TerrainRenderer::UploadR8TextureArray(VulkanDevice& device,
         pixels.size() != static_cast<size_t>(width) * height * layers)
         return false;
 
-    DestroyTexture(out);
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
-
+    out = {};
     const ArrayMipUpload mipUpload = BuildR8ArrayMipUpload(width, height, layers, pixels);
-    CreateDeviceLocalImageArray(device, m_device, width, height, mipUpload.mipLevels, layers,
-        VK_FORMAT_R8_UNORM, out.image, out.memory);
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, mipUpload.pixels.size(),
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, mipUpload.pixels.data(), staging);
 
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayoutArray(cmd, out.image, mipUpload.mipLevels, layers, VK_IMAGE_LAYOUT_UNDEFINED,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(cmd, staging.buffer, out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        static_cast<uint32_t>(mipUpload.regions.size()), mipUpload.regions.data());
-    TransitionImageLayoutArray(cmd, out.image, mipUpload.mipLevels, layers, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-    DestroyBuffer(staging);
+    ixrhi::IXRHITextureDesc imageDesc;
+    imageDesc.width = width;
+    imageDesc.height = height;
+    imageDesc.mipLevels = mipUpload.mipLevels;
+    imageDesc.arrayLayers = layers;
+    imageDesc.format = ixrhi::IXRHIFormat::R8Unorm;
+    imageDesc.usage = ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
+    imageDesc.debugName = "Terrain:" + name;
+    out.image = rhi.CreateTexture(imageDesc, mipUpload.pixels.data(), mipUpload.pixels.size());
+    if (!out.image)
+        return false;
 
-    out.format = VK_FORMAT_R8_UNORM;
+    const bool trilinear = mipUpload.mipLevels > 1;
+    out.sampler = CreateRhiSampler(rhi,
+        ixrhi::IXRHISamplerAddress::Repeat,
+        trilinear,
+        static_cast<float>(mipUpload.mipLevels > 0 ? mipUpload.mipLevels - 1u : 0u),
+        /*mipLodBias=*/0.0f,
+        ("Terrain:" + name + ":Sampler").c_str());
+    if (!out.sampler)
+    {
+        out = {};
+        return false;
+    }
+
+    out.format = ixrhi::IXRHIFormat::R8Unorm;
     out.width = width;
     out.height = height;
     out.mipLevels = mipUpload.mipLevels;
+    out.arrayLayers = layers;
     out.name = name;
-
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = out.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    view.format = out.format;
-    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.levelCount = out.mipLevels;
-    view.subresourceRange.layerCount = layers;
-    VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &out.view));
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = out.mipLevels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    if (device.SupportsSamplerAnisotropy())
-    {
-        sampler.anisotropyEnable = VK_TRUE;
-        sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
-    }
-    sampler.mipLodBias = 0.0f;
-    sampler.maxLod = static_cast<float>(out.mipLevels > 0 ? out.mipLevels - 1u : 0u);
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &out.sampler));
+    const bool aniso = rhi.GetCapabilities().supportsAnisotropy;
     Tracenf("[TERRAIN-MIPS] generated array=%s size=%ux%u layers=%u mips=%u format=%s data=linear sampler=trilinear aniso=%s",
         name.c_str(),
         width,
         height,
         layers,
         out.mipLevels,
-        VkFormatName(out.format),
-        sampler.anisotropyEnable ? "yes" : "no");
+        RhiFormatName(out.format),
+        aniso ? "yes" : "no");
     return true;
 }
 
-bool TerrainRenderer::CreateMapBuffers(VulkanDevice& device, const std::string& mapDirectory, int32_t serverX, int32_t serverY)
+bool TerrainRenderer::CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::string& mapDirectory, int32_t serverX, int32_t serverY)
 {
     if (!m_assets) {
         return false;
@@ -4150,18 +4518,20 @@ bool TerrainRenderer::CreateMapBuffers(VulkanDevice& device, const std::string& 
     m_chunkSplatHeight = chunksY > 0 ? m_splatHeight / chunksY : 0;
     m_splatABytes = field->splat_a_rgba8;
     m_splatBBytes = field->splat_b_rgba8;
+    m_activeSplatLayerSpan = -1;
     m_heightUndoRecorded.assign(m_heightCmGrid.size(), 0);
     m_splatUndoRecorded.assign(static_cast<size_t>(m_splatWidth) * m_splatHeight, 0);
     m_currentUndo = {};
     m_undoStack.clear();
     m_editorSplatGpuDirty = false;
+    m_splatDirtyRect = {};
     if (!field->splat_a_rgba8.empty() && !field->splat_b_rgba8.empty())
     {
-        UploadRgbaTexture2D(device, "splat_a", field->splat_width, field->splat_height,
-            field->splat_a_rgba8, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, m_splatA);
-        UploadRgbaTexture2D(device, "splat_b", field->splat_width, field->splat_height,
-            field->splat_b_rgba8, VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, m_splatB);
-        if (!LoadTerrainPalette(device, field->manifest, mapDirectory))
+        UploadRgbaTexture2D(rhi, "splat_a", field->splat_width, field->splat_height,
+            field->splat_a_rgba8, ixrhi::IXRHISamplerAddress::ClampToEdge, m_splatA);
+        UploadRgbaTexture2D(rhi, "splat_b", field->splat_width, field->splat_height,
+            field->splat_b_rgba8, ixrhi::IXRHISamplerAddress::ClampToEdge, m_splatB);
+        if (!LoadTerrainPalette(rhi, field->manifest, mapDirectory))
             Tracen("[TERRAIN-PALETTE] configured palette load failed; using generated fallback palette");
         Tracenf("[TERRAIN-SPLAT] loaded atlas %ux%u from mxchunk RGBA8 sections",
             field->splat_width,
@@ -4175,7 +4545,7 @@ bool TerrainRenderer::CreateMapBuffers(VulkanDevice& device, const std::string& 
         maxHeightCm = std::max(maxHeightCm, m_heightCmGrid[i]);
     }
 
-    m_spawnHeightCm = BilinearHeightCm(m_heightCmGrid, m_heightGridWidth, m_heightGridHeight,
+    m_spawnHeightCm = SampleTerrainCollisionHeightCm(m_heightCmGrid, m_heightGridWidth, m_heightGridHeight,
         m_spawnLocalXcm, m_spawnLocalYcm, m_cellScaleMeters * 100.0f);
 
     std::vector<Vertex> vertices;
@@ -4241,8 +4611,8 @@ bool TerrainRenderer::CreateMapBuffers(VulkanDevice& device, const std::string& 
                 }
                 debugIndices.push_back(base + 0);
                 debugIndices.push_back(base + 1);
-                debugIndices.push_back(base + 2);
-                debugIndices.push_back(base + 0);
+                debugIndices.push_back(base + 3);
+                debugIndices.push_back(base + 1);
                 debugIndices.push_back(base + 2);
                 debugIndices.push_back(base + 3);
             }
@@ -4261,7 +4631,7 @@ bool TerrainRenderer::CreateMapBuffers(VulkanDevice& device, const std::string& 
         for (const auto& [worldX, worldY] : corners) {
             const float localXcm = worldX * 100.0f;
             const float localYcm = worldY * 100.0f;
-            const float heightCm = BilinearHeightCm(m_heightCmGrid,
+            const float heightCm = SampleTerrainCollisionHeightCm(m_heightCmGrid,
                                       m_heightGridWidth,
                                       m_heightGridHeight,
                                       localXcm,
@@ -4424,26 +4794,58 @@ bool TerrainRenderer::CreateMapBuffers(VulkanDevice& device, const std::string& 
     }
 
     m_indexCount = static_cast<uint32_t>(indices.size());
-    CreateHostVisibleBuffer(device, m_device, sizeof(Vertex) * vertices.size(),
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertices.data(), m_vertexBuffer);
-    CreateHostVisibleBuffer(device, m_device, sizeof(uint32_t) * indices.size(),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indices.data(), m_indexBuffer);
+    // Drawn from video memory (main pass + every shadow cascade); edited (sculpt) through a
+    // host-visible copy that UploadEditedTerrain() copies over.
+    m_vertexBuffer = CreateStaticRhiBuffer(rhi,
+        sizeof(Vertex) * vertices.size(),
+        ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferDst,
+        vertices.data(),
+        "Terrain:VB");
+    m_vertexEditBuffer = CreateRhiBuffer(rhi,
+        sizeof(Vertex) * vertices.size(),
+        ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferSrc,
+        vertices.data(),
+        "Terrain:VB(edit)");
+    m_vertexBufferUploadPending = false;
+    m_indexBuffer = CreateStaticRhiBuffer(rhi,
+        sizeof(uint32_t) * indices.size(),
+        ixrhi::IXRHIBufferUsage::Index,
+        indices.data(),
+        "Terrain:IB");
+    if (!m_vertexBuffer || !m_vertexEditBuffer || !m_indexBuffer)
+        return false;
     m_debugIndexCount = static_cast<uint32_t>(debugIndices.size());
     if (!debugVertices.empty() && !debugIndices.empty())
     {
-        CreateHostVisibleBuffer(device, m_device, sizeof(Vertex) * debugVertices.size(),
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, debugVertices.data(), m_debugVertexBuffer);
-        CreateHostVisibleBuffer(device, m_device, sizeof(uint32_t) * debugIndices.size(),
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, debugIndices.data(), m_debugIndexBuffer);
+        m_debugVertexBuffer = CreateRhiBuffer(rhi,
+            sizeof(Vertex) * debugVertices.size(),
+            ixrhi::IXRHIBufferUsage::Vertex,
+            debugVertices.data(),
+            "Terrain:DebugVB");
+        m_debugIndexBuffer = CreateRhiBuffer(rhi,
+            sizeof(uint32_t) * debugIndices.size(),
+            ixrhi::IXRHIBufferUsage::Index,
+            debugIndices.data(),
+            "Terrain:DebugIB");
+        if (!m_debugVertexBuffer || !m_debugIndexBuffer)
+            return false;
     }
     if (!logicVertices.empty() && !logicIndices.empty())
     {
-        CreateHostVisibleBuffer(device, m_device, sizeof(Vertex) * logicVertices.size(),
-            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, logicVertices.data(), m_logicVertexBuffer);
-        CreateHostVisibleBuffer(device, m_device, sizeof(uint32_t) * logicIndices.size(),
-            VK_BUFFER_USAGE_INDEX_BUFFER_BIT, logicIndices.data(), m_logicIndexBuffer);
+        m_logicVertexBuffer = CreateRhiBuffer(rhi,
+            sizeof(Vertex) * logicVertices.size(),
+            ixrhi::IXRHIBufferUsage::Vertex,
+            logicVertices.data(),
+            "Terrain:LogicVB");
+        m_logicIndexBuffer = CreateRhiBuffer(rhi,
+            sizeof(uint32_t) * logicIndices.size(),
+            ixrhi::IXRHIBufferUsage::Index,
+            logicIndices.data(),
+            "Terrain:LogicIB");
+        if (!m_logicVertexBuffer || !m_logicIndexBuffer)
+            return false;
     }
-    if (!EnsureUniformBuffers(device)) {
+    if (!EnsureUniformBuffers(rhi)) {
         return false;
     }
 
@@ -4502,10 +4904,9 @@ void TerrainRenderer::LoadEditorConfig()
     m_editorBrushStrength = std::clamp(m_editorBrushStrength, 0.05f, 10.0f);
 }
 
-void TerrainRenderer::ApplyLegacyHeightBrush(VulkanDevice& device, float sign, double deltaSeconds)
+void TerrainRenderer::ApplyLegacyHeightBrush(float sign, double deltaSeconds)
 {
-    (void)device;
-    if (!m_mapLoaded || m_heightCmGrid.empty() || !m_vertexBuffer.memory ||
+    if (!m_mapLoaded || m_heightCmGrid.empty() || !m_vertexBuffer ||
         m_heightGridWidth < 2 || m_heightGridHeight < 2 || m_chunkSizeCells == 0)
         return;
 
@@ -4538,10 +4939,14 @@ void TerrainRenderer::ApplyLegacyHeightBrush(VulkanDevice& device, float sign, d
     if (xm::Abs(deltaCenterCm) < 0.0001f)
         return;
 
-    void* mapped = nullptr;
-    const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(m_heightGridWidth) * m_heightGridHeight * sizeof(Vertex);
-    VK_CHECK(vkMapMemory(m_device, m_vertexBuffer.memory, 0, vertexBytes, 0, &mapped));
-    auto* vertices = reinterpret_cast<Vertex*>(mapped);
+    // Mapped-write parity via Read-modify-Write: the touched index span is
+    // read back, patched on the CPU and written once (same bytes the old
+    // in-place mapped writes produced, same in-flight hazard profile).
+    const std::uint64_t spanFirst = static_cast<std::uint64_t>(minY) * m_heightGridWidth + minX;
+    const std::uint64_t spanLast = static_cast<std::uint64_t>(maxY) * m_heightGridWidth + maxX;
+    const std::uint64_t spanCount = spanLast - spanFirst + 1u;
+    std::vector<Vertex> span(static_cast<std::size_t>(spanCount));
+    m_vertexEditBuffer->Read(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
 
     uint32_t changed = 0;
     for (uint32_t gy = minY; gy <= maxY; ++gy)
@@ -4561,11 +4966,17 @@ void TerrainRenderer::ApplyLegacyHeightBrush(VulkanDevice& device, float sign, d
                                                -32768.0f,
                                                32767.0f);
             m_heightCmGrid[index] = newHeight;
-            vertices[index].position[1] = newHeight * 0.01f;
+            span[static_cast<std::size_t>(index) - static_cast<std::size_t>(spanFirst)].position[1] =
+                newHeight * 0.01f;
             ++changed;
         }
     }
-    vkUnmapMemory(m_device, m_vertexBuffer.memory);
+    if (changed > 0)
+    {
+        ExpandTerrainChunkBounds(span.data(), span.size());
+        m_vertexEditBuffer->Write(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+        m_vertexBufferUploadPending = true;
+    }
 
     if (changed > 0)
     {
@@ -4634,7 +5045,7 @@ bool TerrainRenderer::RaycastEditorBrush(const WorldCamera& camera,
             m_editorBrushLocalX = std::clamp(hit.x, bounds.minX, bounds.maxX);
             m_editorBrushLocalZ = std::clamp(hit.z, bounds.minZ, bounds.maxZ);
             m_editorBrushVisible = true;
-            if (m_editorLmbHeld && m_editorTerrainToolActive)
+            if (m_editorLmbHeld && m_editorTerrainToolActive && BrushDiagLogs())
             {
                 const float cellXf = (m_spawnLocalXcm + m_editorBrushLocalX * 100.0f) /
                     std::max(m_cellScaleMeters * 100.0f, 0.001f);
@@ -4740,8 +5151,45 @@ void TerrainRenderer::MarkHeightDirty(size_t heightIndex)
         ++m_dirtyChunkTexels[dirtyIndex];
 }
 
+uint32_t TerrainRenderer::ActiveSplatLayerSpan()
+{
+    if (m_activeSplatLayerSpan < 0)
+    {
+        m_activeSplatLayerSpan = static_cast<std::int32_t>(
+            EstimateActiveSplatLayerSpan(m_splatABytes, m_splatBBytes, m_splatWidth, m_splatHeight));
+    }
+    return static_cast<uint32_t>(m_activeSplatLayerSpan);
+}
+
 void TerrainRenderer::MarkSplatDirty(size_t splatIndex)
 {
+    // Every per-texel splat write (paint, undo) comes through here, after the write. Grow the cached
+    // active layer span by this texel's layers instead of dropping it: a span that only grows stays
+    // correct (the shader skips zero weights), and a full rescan per painted frame cost ~1 ms.
+    const size_t splatByte = splatIndex * 4u;
+    if (m_activeSplatLayerSpan >= 0 && splatByte + 3u < m_splatABytes.size() && splatByte + 3u < m_splatBBytes.size())
+    {
+        for (int layer = 0; layer < 4; ++layer)
+        {
+            if (m_splatABytes[splatByte + static_cast<size_t>(layer)] > 0)
+                m_activeSplatLayerSpan = std::max(m_activeSplatLayerSpan, layer + 1);
+            if (m_splatBBytes[splatByte + static_cast<size_t>(layer)] > 0)
+                m_activeSplatLayerSpan = std::max(m_activeSplatLayerSpan, layer + 5);
+        }
+    }
+    else
+    {
+        m_activeSplatLayerSpan = -1;
+    }
+    if (m_splatWidth > 0)
+    {
+        const uint32_t texelX = static_cast<uint32_t>(splatIndex % m_splatWidth);
+        const uint32_t texelY = static_cast<uint32_t>(splatIndex / m_splatWidth);
+        m_splatDirtyRect.minX = std::min(m_splatDirtyRect.minX, texelX);
+        m_splatDirtyRect.minY = std::min(m_splatDirtyRect.minY, texelY);
+        m_splatDirtyRect.maxX = std::max(m_splatDirtyRect.maxX, texelX);
+        m_splatDirtyRect.maxY = std::max(m_splatDirtyRect.maxY, texelY);
+    }
     if (m_chunkSplatWidth == 0 || m_chunkSplatHeight == 0 || m_dirtyChunkTexels.empty() || m_splatWidth == 0)
         return;
     const uint32_t sx = static_cast<uint32_t>(splatIndex % m_splatWidth);
@@ -4757,20 +5205,19 @@ void TerrainRenderer::MarkSplatDirty(size_t splatIndex)
         ++m_dirtyChunkTexels[dirtyIndex];
 }
 
-void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds)
+void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeconds)
 {
-    (void)device;
-    if (!m_editorBrushVisible || m_heightCmGrid.empty() || !m_vertexBuffer.memory ||
+    m_rhi = &rhi;
+    if (!m_editorBrushVisible || m_heightCmGrid.empty() || !m_vertexBuffer ||
         m_heightGridWidth < 2 || m_heightGridHeight < 2 || m_chunkSizeCells == 0)
     {
         if (m_editorLmbHeld && m_editorTerrainToolActive)
         {
-            Tracenf("[TEDIT-DIAG] %s apply skipped terrainId=%p brushVisible=%d heightBuffer=%p vertexBuffer=%p heightGrid=%ux%u chunkCells=%u",
+            Tracenf("[TEDIT-DIAG] %s apply skipped terrainId=%p brushVisible=%d vertexBuffer=%p heightGrid=%ux%u chunkCells=%u",
                 m_editorTool == MapEditorTool::Paint ? "splat" : "sculpt",
                 m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
                 m_editorBrushVisible ? 1 : 0,
-                m_heightCmGrid.empty() ? nullptr : static_cast<void*>(m_heightCmGrid.data()),
-                m_vertexBuffer.memory,
+                m_vertexBuffer ? static_cast<const void*>(m_vertexBuffer.get()) : nullptr,
                 m_heightGridWidth,
                 m_heightGridHeight,
                 m_chunkSizeCells);
@@ -4905,32 +5352,36 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
             }
         }
         m_editorSplatGpuDirty = m_editorSplatGpuDirty || changed;
-        Tracenf("[TEDIT-DIAG] splat apply terrainId=%p splatTarget=%p/%p layer=%u cellRange=(%u,%u)-(%u,%u) maskUpdated=%s changedCells=%u gpuUpload=%s",
-            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
-            m_splatABytes.empty() ? nullptr : static_cast<void*>(m_splatABytes.data()),
-            m_splatBBytes.empty() ? nullptr : static_cast<void*>(m_splatBBytes.data()),
-            m_editorTextureSlot,
-            minX,
-            minY,
-            maxX,
-            maxY,
-            changed ? "yes" : "no",
-            changedCells,
-            m_editorSplatGpuDirty ? "pending" : "no");
-        std::ostringstream chunksText;
-        bool firstChunk = true;
-        for (std::uint32_t packed : touchedChunks)
+        if (BrushDiagLogs())
         {
-            if (!firstChunk)
-                chunksText << ";";
-            firstChunk = false;
-            chunksText << (packed & 0xffffu) << "," << (packed >> 16u);
+            Tracenf("[TEDIT-DIAG] splat apply terrainId=%p splatTarget=%p/%p layer=%u cellRange=(%u,%u)-(%u,%u) maskUpdated=%s changedCells=%u gpuUpload=%s",
+                m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+                m_splatABytes.empty() ? nullptr : static_cast<void*>(m_splatABytes.data()),
+                m_splatBBytes.empty() ? nullptr : static_cast<void*>(m_splatBBytes.data()),
+                m_editorTextureSlot,
+                minX,
+                minY,
+                maxX,
+                maxY,
+                changed ? "yes" : "no",
+                changedCells,
+                m_editorSplatGpuDirty ? "pending" : "no");
+            std::ostringstream chunksText;
+            bool firstChunk = true;
+            for (std::uint32_t packed : touchedChunks)
+            {
+                if (!firstChunk)
+                    chunksText << ";";
+                firstChunk = false;
+                chunksText << (packed & 0xffffu) << "," << (packed >> 16u);
+            }
+            Tracenf("[TCHUNK] splat stroke chunksTouched=[%s] dirty=%zu gpuUpload=%s remesh=%s",
+                chunksText.str().c_str(),
+                touchedChunks.size(),
+                changed ? "yes" : "no",
+                changed ? "yes" : "no");
         }
-        Tracenf("[TCHUNK] splat stroke chunksTouched=[%s] dirty=%zu gpuUpload=%s remesh=%s",
-            chunksText.str().c_str(),
-            touchedChunks.size(),
-            changed ? "yes" : "no",
-            changed ? "yes" : "no");
+        ++m_brushDiagApplications;
         return;
     }
 
@@ -4953,10 +5404,13 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
     float maxHeightDeltaCm = 0.0f;
     std::unordered_set<std::uint32_t> touchedChunks;
 
-    void* mapped = nullptr;
-    const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(m_heightGridWidth) * m_heightGridHeight * sizeof(Vertex);
-    VK_CHECK(vkMapMemory(m_device, m_vertexBuffer.memory, 0, vertexBytes, 0, &mapped));
-    auto* vertices = reinterpret_cast<Vertex*>(mapped);
+    // Mapped-write parity via Read-modify-Write over the touched index span
+    // (see ApplyLegacyHeightBrush): same GPU bytes, one Write per stroke.
+    const std::uint64_t spanFirst = static_cast<std::uint64_t>(minY) * m_heightGridWidth + minX;
+    const std::uint64_t spanLast = static_cast<std::uint64_t>(maxY) * m_heightGridWidth + maxX;
+    const std::uint64_t spanCount = spanLast - spanFirst + 1u;
+    std::vector<Vertex> span(static_cast<std::size_t>(spanCount));
+    m_vertexEditBuffer->Read(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
 
     for (uint32_t gy = minY; gy <= maxY; ++gy)
     {
@@ -5013,7 +5467,8 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
                 maxHeightDeltaCm = heightDeltaCm;
             RecordHeightUndo(index);
             m_heightCmGrid[index] = newHeight;
-            vertices[index].position[1] = newHeight * 0.01f;
+            span[static_cast<std::size_t>(index) - static_cast<std::size_t>(spanFirst)].position[1] =
+                newHeight * 0.01f;
             MarkHeightDirty(index);
             const std::uint32_t cx = m_chunkSizeCells > 0 ? std::min(gx / m_chunkSizeCells, chunksX - 1u) : 0;
             const std::uint32_t cy = m_chunkSizeCells > 0 ? std::min(gy / m_chunkSizeCells, chunksY - 1u) : 0;
@@ -5021,79 +5476,90 @@ void TerrainRenderer::ApplyEditorBrush(VulkanDevice& device, double deltaSeconds
             ++changedHeights;
         }
     }
-    vkUnmapMemory(m_device, m_vertexBuffer.memory);
-    Tracenf("[TEDIT-DIAG] sculpt apply terrainId=%p tool=%s heightBuffer=%p vertexBuffer=%p cellRange=(%u,%u)-(%u,%u) changedCells=%u gpuUpload=%s remesh=no",
-        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
-        TeditToolName(m_editorTool),
-        m_heightCmGrid.empty() ? nullptr : static_cast<void*>(m_heightCmGrid.data()),
-        m_vertexBuffer.memory,
-        minX,
-        minY,
-        maxX,
-        maxY,
-        changedHeights,
-        changedHeights > 0 ? "mapped-buffer-write" : "no");
-    const uint32_t brushCellX = static_cast<uint32_t>(std::clamp(
-        centerGridX,
-        0.0f,
-        static_cast<float>(m_heightGridWidth > 0 ? m_heightGridWidth - 1u : 0u)));
-    const uint32_t brushCellY = static_cast<uint32_t>(std::clamp(
-        centerGridY,
-        0.0f,
-        static_cast<float>(m_heightGridHeight > 0 ? m_heightGridHeight - 1u : 0u)));
-    Tracenf("[SCULPT-DIAG] sculpt APPLY terrainId=%p worldPos=(%.2f,%.2f,%.2f) cell=(%u,%u) radius=%.2f strength=%.2f dir=%s cellsModified=%u heightDelta=%.4f gpuUpload=%s remesh=%s",
-        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
-        m_editorBrushLocalX,
-        SampleHeightAt(m_editorBrushLocalX, m_editorBrushLocalZ),
-        m_editorBrushLocalZ,
-        brushCellX,
-        brushCellY,
-        m_editorBrushRadiusMeters,
-        m_editorBrushStrength,
-        TeditToolName(m_editorTool),
-        changedHeights,
-        maxHeightDeltaCm * 0.01f,
-        changedHeights > 0 ? "yes" : "no",
-        changedHeights > 0 ? "yes" : "no");
-    std::ostringstream chunksText;
-    bool firstChunk = true;
-    for (std::uint32_t packed : touchedChunks)
+    if (changedHeights > 0)
     {
-        if (!firstChunk)
-            chunksText << ";";
-        firstChunk = false;
-        chunksText << (packed & 0xffffu) << "," << (packed >> 16u);
+        ExpandTerrainChunkBounds(span.data(), span.size());
+        m_vertexEditBuffer->Write(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+        m_vertexBufferUploadPending = true;
     }
-    Tracenf("[TCHUNK] sculpt stroke chunksTouched=[%s] dirty=%zu gpuUpload=%s remesh=%s",
-        chunksText.str().c_str(),
-        touchedChunks.size(),
-        changedHeights > 0 ? "yes" : "no",
-        changedHeights > 0 ? "yes" : "no");
+    if (BrushDiagLogs())
+    {
+        Tracenf("[TEDIT-DIAG] sculpt apply terrainId=%p tool=%s cellRange=(%u,%u)-(%u,%u) changedCells=%u gpuUpload=%s remesh=no",
+            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+            TeditToolName(m_editorTool),
+            minX,
+            minY,
+            maxX,
+            maxY,
+            changedHeights,
+            changedHeights > 0 ? "read-modify-write" : "no");
+        const uint32_t brushCellX = static_cast<uint32_t>(std::clamp(
+            centerGridX,
+            0.0f,
+            static_cast<float>(m_heightGridWidth > 0 ? m_heightGridWidth - 1u : 0u)));
+        const uint32_t brushCellY = static_cast<uint32_t>(std::clamp(
+            centerGridY,
+            0.0f,
+            static_cast<float>(m_heightGridHeight > 0 ? m_heightGridHeight - 1u : 0u)));
+        Tracenf("[SCULPT-DIAG] sculpt APPLY terrainId=%p worldPos=(%.2f,%.2f,%.2f) cell=(%u,%u) radius=%.2f strength=%.2f dir=%s cellsModified=%u heightDelta=%.4f gpuUpload=%s remesh=%s",
+            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+            m_editorBrushLocalX,
+            SampleHeightAt(m_editorBrushLocalX, m_editorBrushLocalZ),
+            m_editorBrushLocalZ,
+            brushCellX,
+            brushCellY,
+            m_editorBrushRadiusMeters,
+            m_editorBrushStrength,
+            TeditToolName(m_editorTool),
+            changedHeights,
+            maxHeightDeltaCm * 0.01f,
+            changedHeights > 0 ? "yes" : "no",
+            changedHeights > 0 ? "yes" : "no");
+        std::ostringstream chunksText;
+        bool firstChunk = true;
+        for (std::uint32_t packed : touchedChunks)
+        {
+            if (!firstChunk)
+                chunksText << ";";
+            firstChunk = false;
+            chunksText << (packed & 0xffffu) << "," << (packed >> 16u);
+        }
+        Tracenf("[TCHUNK] sculpt stroke chunksTouched=[%s] dirty=%zu gpuUpload=%s remesh=%s",
+            chunksText.str().c_str(),
+            touchedChunks.size(),
+            changedHeights > 0 ? "yes" : "no",
+            changedHeights > 0 ? "yes" : "no");
+    }
+    ++m_brushDiagApplications;
 }
 
-bool TerrainRenderer::RefreshSplatTextures(VulkanDevice& device)
+bool TerrainRenderer::RefreshSplatTextures(ixrhi::IXRHIDevice& rhi)
 {
     if (m_splatABytes.empty() || m_splatBBytes.empty())
         return false;
-    const bool okA = UpdateRgbaTexture2D(device, m_splatA, m_splatABytes);
-    const bool okB = UpdateRgbaTexture2D(device, m_splatB, m_splatBBytes);
+    const bool okA = UpdateRgbaTexture2D(rhi, m_splatA, m_splatABytes);
+    const bool okB = UpdateRgbaTexture2D(rhi, m_splatB, m_splatBBytes);
     m_editorSplatGpuDirty = !(okA && okB);
-    Tracenf("[TEDIT-DIAG] splat gpu upload terrainId=%p targetImages=%p/%p textureSize=%ux%u cpuSize=%ux%u okA=%d okB=%d gpuUpload=%s",
-        m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
-        m_splatA.image,
-        m_splatB.image,
-        m_splatA.width,
-        m_splatA.height,
-        m_splatWidth,
-        m_splatHeight,
-        okA ? 1 : 0,
-        okB ? 1 : 0,
-        (okA && okB) ? "yes" : "no");
+    if (okA && okB)
+        m_splatDirtyRect = {};
+    if (BrushDiagLogs() || !(okA && okB))  // every frame while painting: only a stroke's first few
+        Tracenf("[TEDIT-DIAG] splat gpu upload terrainId=%p targets=%p/%p textureSize=%ux%u cpuSize=%ux%u okA=%d okB=%d gpuUpload=%s",
+            m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
+            m_splatA.image ? static_cast<const void*>(m_splatA.image.get()) : nullptr,
+            m_splatB.image ? static_cast<const void*>(m_splatB.image.get()) : nullptr,
+            m_splatA.width,
+            m_splatA.height,
+            m_splatWidth,
+            m_splatHeight,
+            okA ? 1 : 0,
+            okB ? 1 : 0,
+            (okA && okB) ? "yes" : "no");
     return okA && okB;
 }
 
-void TerrainRenderer::UndoLastEditorStroke(VulkanDevice& device)
+void TerrainRenderer::UndoLastEditorStroke(ixrhi::IXRHIDevice& rhi)
 {
+    m_rhi = &rhi;
     EndEditorStroke();
     if (m_undoStack.empty())
     {
@@ -5104,21 +5570,37 @@ void TerrainRenderer::UndoLastEditorStroke(VulkanDevice& device)
     EditorUndoEntry entry = std::move(m_undoStack.back());
     m_undoStack.pop_back();
 
-    if (!entry.heights.empty() && m_vertexBuffer.memory)
+    if (!entry.heights.empty() && m_vertexBuffer)
     {
-        void* mapped = nullptr;
-        const VkDeviceSize vertexBytes = static_cast<VkDeviceSize>(m_heightGridWidth) * m_heightGridHeight * sizeof(Vertex);
-        VK_CHECK(vkMapMemory(m_device, m_vertexBuffer.memory, 0, vertexBytes, 0, &mapped));
-        auto* vertices = reinterpret_cast<Vertex*>(mapped);
+        // Read-modify-Write over the undo span (same bytes the old mapped
+        // writes produced).
+        std::uint64_t spanFirst = std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t spanLast = 0;
         for (const HeightUndo& undo : entry.heights)
         {
             if (undo.index >= m_heightCmGrid.size())
                 continue;
-            m_heightCmGrid[undo.index] = undo.oldCm;
-            vertices[undo.index].position[1] = undo.oldCm * 0.01f;
-            MarkHeightDirty(undo.index);
+            spanFirst = std::min(spanFirst, static_cast<std::uint64_t>(undo.index));
+            spanLast = std::max(spanLast, static_cast<std::uint64_t>(undo.index));
         }
-        vkUnmapMemory(m_device, m_vertexBuffer.memory);
+        if (spanLast >= spanFirst)
+        {
+            const std::uint64_t spanCount = spanLast - spanFirst + 1u;
+            std::vector<Vertex> span(static_cast<std::size_t>(spanCount));
+            m_vertexEditBuffer->Read(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+            for (const HeightUndo& undo : entry.heights)
+            {
+                if (undo.index >= m_heightCmGrid.size())
+                    continue;
+                m_heightCmGrid[undo.index] = undo.oldCm;
+                span[static_cast<std::size_t>(undo.index) - static_cast<std::size_t>(spanFirst)].position[1] =
+                    undo.oldCm * 0.01f;
+                MarkHeightDirty(undo.index);
+            }
+            ExpandTerrainChunkBounds(span.data(), span.size());
+            m_vertexEditBuffer->Write(spanFirst * sizeof(Vertex), span.data(), spanCount * sizeof(Vertex));
+            m_vertexBufferUploadPending = true;
+        }
     }
 
     if (!entry.splats.empty())
@@ -5134,8 +5616,7 @@ void TerrainRenderer::UndoLastEditorStroke(VulkanDevice& device)
                 m_splatBBytes[byte + i] = undo.oldWeights[4 + i];
             MarkSplatDirty(undo.index);
         }
-        m_editorSplatGpuDirty = true;
-        RefreshSplatTextures(device);
+        m_editorSplatGpuDirty = true;  // uploaded in the frame (MarkSplatDirty grew the rectangle)
     }
     Tracenf("[TERRAIN-EDITOR] undo applied heights=%zu splats=%zu",
         entry.heights.size(),
@@ -5396,15 +5877,15 @@ bool TerrainRenderer::SaveChunkHeights(uint32_t chunkX, uint32_t chunkY, uint32_
     return true;
 }
 
-bool TerrainRenderer::ReloadCurrentMap(VulkanDevice& device)
+bool TerrainRenderer::ReloadCurrentMap(ixrhi::IXRHIDevice& rhi)
 {
     if (m_loadedMapDirectory.empty())
         return false;
     Tracen("[TERRAIN-EDITOR] reload heightmap from disk");
-    return LoadMap(device, m_loadedMapDirectory, m_loadedServerX, m_loadedServerY);
+    return LoadMap(rhi, m_loadedMapDirectory, m_loadedServerX, m_loadedServerY);
 }
 
-bool TerrainRenderer::CreateFallbackTexture(VulkanDevice& device)
+bool TerrainRenderer::CreateFallbackTexture(ixrhi::IXRHIDevice& rhi)
 {
     constexpr uint32_t kSize = 4;
     constexpr uint32_t kLayers = 8;
@@ -5443,88 +5924,69 @@ bool TerrainRenderer::CreateFallbackTexture(VulkanDevice& device)
     std::vector<uint8_t> roughness(static_cast<size_t>(kSize) * kSize * kLayers, 128);
     std::vector<uint8_t> metallic(static_cast<size_t>(kSize) * kSize * kLayers, 0);
     std::vector<uint8_t> height(static_cast<size_t>(kSize) * kSize * kLayers, 0);
-    return UploadRgbaTextureArray(device, "terrain_palette_fallback", kSize, kSize, kLayers, pixels,
-               VK_FORMAT_R8G8B8A8_SRGB, m_baseTexture) &&
-           UploadRgbaTextureArray(device, "terrain_normal_fallback", kSize, kSize, kLayers, normals,
-               VK_FORMAT_R8G8B8A8_UNORM, m_normalTexture) &&
-           UploadR8TextureArray(device, "terrain_ao_fallback", kSize, kSize, kLayers, ao, m_aoTexture) &&
-           UploadR8TextureArray(device, "terrain_roughness_fallback", kSize, kSize, kLayers, roughness, m_roughnessTexture) &&
-           UploadR8TextureArray(device, "terrain_metallic_fallback", kSize, kSize, kLayers, metallic, m_metallicTexture) &&
-           UploadR8TextureArray(device, "terrain_height_fallback", kSize, kSize, kLayers, height, m_heightTexture);
-}
-
-bool TerrainRenderer::CreateFallbackMask(VulkanDevice& device)
-{
-    DestroyTexture(m_fallbackMask);
-
-    const uint8_t pixel = 255;
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
-
-    CreateDeviceLocalImage(device, m_device, 1, 1, 1,
-        VK_FORMAT_R8_UNORM, m_fallbackMask.image, m_fallbackMask.memory);
-
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, sizeof(pixel),
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &pixel, staging);
-
-    VkBufferImageCopy region{};
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {1, 1, 1};
-
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayout(cmd, m_fallbackMask.image, 1,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(cmd, staging.buffer, m_fallbackMask.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    TransitionImageLayout(cmd, m_fallbackMask.image, 1,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-    DestroyBuffer(staging);
-
-    m_fallbackMask.format = VK_FORMAT_R8_UNORM;
-    m_fallbackMask.width = 1;
-    m_fallbackMask.height = 1;
-    m_fallbackMask.mipLevels = 1;
-    m_fallbackMask.name = "terrain_full_mask";
-
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = m_fallbackMask.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = m_fallbackMask.format;
-    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.levelCount = 1;
-    view.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &m_fallbackMask.view));
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.maxLod = 1.0f;
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &m_fallbackMask.sampler));
+    if (!UploadRgbaTextureArray(rhi, "terrain_palette_fallback", kSize, kSize, kLayers, pixels,
+            ixrhi::IXRHIFormat::R8G8B8A8Srgb, m_baseTexture) ||
+        !UploadRgbaTextureArray(rhi, "terrain_normal_fallback", kSize, kSize, kLayers, normals,
+            ixrhi::IXRHIFormat::R8G8B8A8Unorm, m_normalTexture) ||
+        !UploadRgbaTextureArray(rhi, "terrain_orm_fallback", kSize, kSize, kLayers,
+            PackOcclusionRoughnessMetallic(ao, roughness, metallic), ixrhi::IXRHIFormat::R8G8B8A8Unorm, m_aoTexture) ||
+        !UploadR8TextureArray(rhi, "terrain_height_fallback", kSize, kSize, kLayers, height, m_heightTexture))
+    {
+        return false;
+    }
+    m_roughnessTexture = m_aoTexture;  // the packed array serves all three slots
+    m_metallicTexture = m_aoTexture;
     return true;
 }
 
-bool TerrainRenderer::CreateFallbackSplatTextures(VulkanDevice& device)
+bool TerrainRenderer::CreateFallbackMask(ixrhi::IXRHIDevice& rhi)
+{
+    // 1x1 white R8 mask (created but currently unbound — parity with the
+    // pre-migration resource set; trivially cheap).
+    m_fallbackMask = {};
+    const std::uint8_t pixel = 255;
+    ixrhi::IXRHITextureDesc imageDesc;
+    imageDesc.width = 1;
+    imageDesc.height = 1;
+    imageDesc.format = ixrhi::IXRHIFormat::R8Unorm;
+    imageDesc.usage = ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
+    imageDesc.debugName = "Terrain:terrain_full_mask";
+    m_fallbackMask.image = rhi.CreateTexture(imageDesc, &pixel, sizeof(pixel));
+    if (!m_fallbackMask.image)
+        return false;
+    m_fallbackMask.sampler = CreateRhiSampler(rhi,
+        ixrhi::IXRHISamplerAddress::ClampToEdge,
+        /*trilinear=*/false,
+        /*maxLod=*/1.0f,
+        /*mipLodBias=*/0.0f,
+        "Terrain:terrain_full_mask:Sampler");
+    if (!m_fallbackMask.sampler)
+    {
+        m_fallbackMask = {};
+        return false;
+    }
+
+    m_fallbackMask.format = ixrhi::IXRHIFormat::R8Unorm;
+    m_fallbackMask.width = 1;
+    m_fallbackMask.height = 1;
+    m_fallbackMask.mipLevels = 1;
+    m_fallbackMask.arrayLayers = 1;
+    m_fallbackMask.name = "terrain_full_mask";
+    return true;
+}
+
+bool TerrainRenderer::CreateFallbackSplatTextures(ixrhi::IXRHIDevice& rhi)
 {
     std::vector<uint8_t> splatA(4, 0);
     std::vector<uint8_t> splatB(4, 0);
     splatA[2] = 255; // fallback grass.
-    return UploadRgbaTexture2D(device, "splat_a_fallback", 1, 1, splatA,
-               VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, m_splatA) &&
-           UploadRgbaTexture2D(device, "splat_b_fallback", 1, 1, splatB,
-               VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, m_splatB);
+    return UploadRgbaTexture2D(rhi, "splat_a_fallback", 1, 1, splatA,
+               ixrhi::IXRHISamplerAddress::ClampToEdge, m_splatA) &&
+            UploadRgbaTexture2D(rhi, "splat_b_fallback", 1, 1, splatB,
+                ixrhi::IXRHISamplerAddress::ClampToEdge, m_splatB);
 }
 
-bool TerrainRenderer::CreateSceneSplatTextures(VulkanDevice& device)
+bool TerrainRenderer::CreateSceneSplatTextures(ixrhi::IXRHIDevice& rhi)
 {
     if (m_splatWidth == 0 || m_splatHeight == 0 ||
         m_splatABytes.size() != static_cast<size_t>(m_splatWidth) * m_splatHeight * 4u ||
@@ -5533,10 +5995,10 @@ bool TerrainRenderer::CreateSceneSplatTextures(VulkanDevice& device)
         return false;
     }
 
-    const bool okA = UploadRgbaTexture2D(device, "splat_a_scene", m_splatWidth, m_splatHeight, m_splatABytes,
-        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, m_splatA);
-    const bool okB = UploadRgbaTexture2D(device, "splat_b_scene", m_splatWidth, m_splatHeight, m_splatBBytes,
-        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, m_splatB);
+    const bool okA = UploadRgbaTexture2D(rhi, "splat_a_scene", m_splatWidth, m_splatHeight, m_splatABytes,
+        ixrhi::IXRHISamplerAddress::ClampToEdge, m_splatA);
+    const bool okB = UploadRgbaTexture2D(rhi, "splat_b_scene", m_splatWidth, m_splatHeight, m_splatBBytes,
+        ixrhi::IXRHISamplerAddress::ClampToEdge, m_splatB);
     Tracenf("[TERRAIN-SPLAT] scene splat textures created size=%ux%u okA=%d okB=%d",
         m_splatWidth,
         m_splatHeight,
@@ -5545,7 +6007,7 @@ bool TerrainRenderer::CreateSceneSplatTextures(VulkanDevice& device)
     return okA && okB;
 }
 
-bool TerrainRenderer::LoadTerrainPalette(VulkanDevice& device,
+bool TerrainRenderer::LoadTerrainPalette(ixrhi::IXRHIDevice& rhi,
     const mx::map::Manifest& manifest,
     const std::string& mapDirectory)
 {
@@ -5585,10 +6047,10 @@ bool TerrainRenderer::LoadTerrainPalette(VulkanDevice& device,
             slots[i].uvRotationDegrees = manifest.texture_palette_uv_rotation_degrees[i];
     }
 
-    return LoadTerrainPaletteFromPaths(device, slots);
+    return LoadTerrainPaletteFromPaths(rhi, slots);
 }
 
-bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const std::array<MapEditorPaletteSlot, 8>& slots)
+bool TerrainRenderer::LoadTerrainPaletteFromPaths(ixrhi::IXRHIDevice& rhi, const std::array<MapEditorPaletteSlot, 8>& slots)
 {
     if (!m_assets)
         return false;
@@ -5601,10 +6063,40 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
     std::array<RgbaImage, 8> heightImages{};
     uint32_t width = 0;
     uint32_t height = 0;
+    // Every layer's images read and decoded at once, in parallel on the shared pool (each into its
+    // own image); a failed or missing one takes its default below.
+    struct ImageLoad
+    {
+        const std::string* path = nullptr;
+        RgbaImage* image = nullptr;
+        bool loaded = false;
+        bool srgbColor = false;
+    };
+    std::array<std::array<ImageLoad, 6>, 8> loads{};
+    std::vector<ImageLoad*> pending;
     for (uint32_t i = 0; i < images.size(); ++i)
     {
-        if (slots[i].texturePath.empty() || !LoadAnyTerrainImage(*m_assets, slots[i].texturePath, images[i], &m_additionalAssetRoots))
+        const std::string* paths[6] = {&slots[i].texturePath, &slots[i].normalTexturePath, &slots[i].aoTexturePath,
+            &slots[i].roughnessTexturePath, &slots[i].metallicTexturePath, &slots[i].heightTexturePath};
+        RgbaImage* targets[6] = {&images[i], &normalImages[i], &aoImages[i], &roughnessImages[i], &metallicImages[i],
+            &heightImages[i]};
+        for (uint32_t kind = 0; kind < 6; ++kind)
         {
+            loads[i][kind] = {paths[kind], targets[kind], false, kind == 0};
+            if (!paths[kind]->empty())
+                pending.push_back(&loads[i][kind]);
+        }
+    }
+    ixjobs::JobSystem::Instance().ParallelFor(static_cast<uint32_t>(pending.size()), 1,
+        [&](uint32_t begin, uint32_t end, uint32_t) {
+            for (uint32_t k = begin; k < end; ++k)
+                pending[k]->loaded = LoadAnyTerrainImage(*m_assets, *pending[k]->path, *pending[k]->image, &m_additionalAssetRoots, pending[k]->srgbColor);
+        });
+    for (uint32_t i = 0; i < images.size(); ++i)
+    {
+        if (!loads[i][0].loaded)
+        {
+            images[i] = {};
             Tracenf("[TERRAIN-PALETTE] using default diffuse for layer %u path=%s", i, slots[i].texturePath.c_str());
         }
     }
@@ -5650,8 +6142,7 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
 
     for (uint32_t i = 0; i < normalImages.size(); ++i)
     {
-        if (!slots[i].normalTexturePath.empty() &&
-            LoadAnyTerrainImage(*m_assets, slots[i].normalTexturePath, normalImages[i], &m_additionalAssetRoots))
+        if (loads[i][1].loaded)
         {
             normalImages[i] = ResizeNearest(normalImages[i], width, height);
             continue;
@@ -5667,8 +6158,8 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
             normalImages[i].pixels[p + 3] = 255;
         }
     }
-    auto loadSingleChannelOrDefault = [&](const std::string& path, RgbaImage& image, uint8_t defaultValue) {
-        if (!path.empty() && LoadAnyTerrainImage(*m_assets, path, image, &m_additionalAssetRoots))
+    auto loadedSingleChannelOrDefault = [&](const ImageLoad& load, RgbaImage& image, uint8_t defaultValue) {
+        if (load.loaded)
         {
             image = ResizeNearest(image, width, height);
             return;
@@ -5678,10 +6169,10 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
 
     for (uint32_t i = 0; i < images.size(); ++i)
     {
-        loadSingleChannelOrDefault(slots[i].aoTexturePath, aoImages[i], 255);
-        loadSingleChannelOrDefault(slots[i].roughnessTexturePath, roughnessImages[i], 128);
-        loadSingleChannelOrDefault(slots[i].metallicTexturePath, metallicImages[i], 0);
-        loadSingleChannelOrDefault(slots[i].heightTexturePath, heightImages[i], 0);
+        loadedSingleChannelOrDefault(loads[i][2], aoImages[i], 255);
+        loadedSingleChannelOrDefault(loads[i][3], roughnessImages[i], 128);
+        loadedSingleChannelOrDefault(loads[i][4], metallicImages[i], 0);
+        loadedSingleChannelOrDefault(loads[i][5], heightImages[i], 0);
     }
 
     std::vector<uint8_t> pixels;
@@ -5712,60 +6203,47 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
 
     Texture palette{};
     Texture normals{};
-    Texture ao{};
-    Texture roughness{};
-    Texture metallic{};
+    Texture orm{};
     Texture heightTex{};
-    if (!UploadRgbaTextureArray(device, "terrain_palette", width, height, static_cast<uint32_t>(images.size()), pixels,
-            VK_FORMAT_R8G8B8A8_SRGB, palette) ||
-        !UploadRgbaTextureArray(device, "terrain_normals", width, height, static_cast<uint32_t>(images.size()), normalPixels,
-            VK_FORMAT_R8G8B8A8_UNORM, normals) ||
-        !UploadR8TextureArray(device, "terrain_ao", width, height, static_cast<uint32_t>(images.size()), aoPixels, ao) ||
-        !UploadR8TextureArray(device, "terrain_roughness", width, height, static_cast<uint32_t>(images.size()), roughnessPixels, roughness) ||
-        !UploadR8TextureArray(device, "terrain_metallic", width, height, static_cast<uint32_t>(images.size()), metallicPixels, metallic) ||
-        !UploadR8TextureArray(device, "terrain_height", width, height, static_cast<uint32_t>(images.size()), heightPixels, heightTex))
+    if (!UploadRgbaTextureArray(rhi, "terrain_palette", width, height, static_cast<uint32_t>(images.size()), pixels,
+            ixrhi::IXRHIFormat::R8G8B8A8Srgb, palette) ||
+        !UploadRgbaTextureArray(rhi, "terrain_normals", width, height, static_cast<uint32_t>(images.size()), normalPixels,
+            ixrhi::IXRHIFormat::R8G8B8A8Unorm, normals) ||
+        !UploadRgbaTextureArray(rhi, "terrain_orm", width, height, static_cast<uint32_t>(images.size()),
+            PackOcclusionRoughnessMetallic(aoPixels, roughnessPixels, metallicPixels),
+            ixrhi::IXRHIFormat::R8G8B8A8Unorm, orm) ||
+        !UploadR8TextureArray(rhi, "terrain_height", width, height, static_cast<uint32_t>(images.size()), heightPixels, heightTex))
     {
-        DestroyTexture(palette);
-        DestroyTexture(normals);
-        DestroyTexture(ao);
-        DestroyTexture(roughness);
-        DestroyTexture(metallic);
-        DestroyTexture(heightTex);
         return false;
     }
 
-    DestroyTexture(m_baseTexture);
-    DestroyTexture(m_normalTexture);
-    DestroyTexture(m_aoTexture);
-    DestroyTexture(m_roughnessTexture);
-    DestroyTexture(m_metallicTexture);
-    DestroyTexture(m_heightTexture);
-    m_baseTexture = palette;
-    m_normalTexture = normals;
-    m_aoTexture = ao;
-    m_roughnessTexture = roughness;
-    m_metallicTexture = metallic;
-    m_heightTexture = heightTex;
+    m_baseTexture = std::move(palette);
+    m_normalTexture = std::move(normals);
+    // One array for the three (the shader takes them in one fetch); it stays bound to all three slots.
+    m_aoTexture = orm;
+    m_roughnessTexture = orm;
+    m_metallicTexture = std::move(orm);
+    m_heightTexture = std::move(heightTex);
     m_paletteSlots = slots;
     m_materialParamsDirty = true;
-    UpdateDescriptors();
+    UpdateBindGroup();
     Tracenf("[TERRAIN-PALETTE] loaded 8-layer PBR palette size=%ux%u diffuse=%s normal=%s orm_height=R8",
         m_baseTexture.width,
         m_baseTexture.height,
-        VkFormatName(m_baseTexture.format),
-        VkFormatName(m_normalTexture.format));
+        RhiFormatName(m_baseTexture.format),
+        RhiFormatName(m_normalTexture.format));
     if (!m_triPerfPaletteLogged)
     {
         TraceDiagf("[TRI-PERF] palette size=%ux%u layers=%zu format(diffuse=%s normal=%s ao=%s roughness=%s metallic=%s height=%s) mips(diffuse=%u normal=%u ao=%u roughness=%u metallic=%u height=%u)",
             m_baseTexture.width,
             m_baseTexture.height,
             images.size(),
-            VkFormatName(m_baseTexture.format),
-            VkFormatName(m_normalTexture.format),
-            VkFormatName(m_aoTexture.format),
-            VkFormatName(m_roughnessTexture.format),
-            VkFormatName(m_metallicTexture.format),
-            VkFormatName(m_heightTexture.format),
+            RhiFormatName(m_baseTexture.format),
+            RhiFormatName(m_normalTexture.format),
+            RhiFormatName(m_aoTexture.format),
+            RhiFormatName(m_roughnessTexture.format),
+            RhiFormatName(m_metallicTexture.format),
+            RhiFormatName(m_heightTexture.format),
             m_baseTexture.mipLevels,
             m_normalTexture.mipLevels,
             m_aoTexture.mipLevels,
@@ -5777,813 +6255,185 @@ bool TerrainRenderer::LoadTerrainPaletteFromPaths(VulkanDevice& device, const st
     return true;
 }
 
-bool TerrainRenderer::LoadDominantTerrainTexture(VulkanDevice& device, const std::string& mapDirectory)
+
+bool TerrainRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
 {
-    const std::vector<std::string> texturePaths =
-        m_assets ? LoadTextureSetPaths(*m_assets, ReadTextureSetPathFromSetting(*m_assets, mapDirectory + "/setting.txt"))
-                 : std::vector<std::string>{};
-    uint8_t index = m_assets ? DominantTileIndex(*m_assets, mapDirectory, m_mapSizeX, m_mapSizeY) : 0;
-    if (index == 0 || index >= texturePaths.size() || texturePaths[index].empty())
-        index = texturePaths.size() > 5 && !texturePaths[5].empty() ? 5 : 1;
-    if (index >= texturePaths.size() || texturePaths[index].empty())
-        return false;
-
-    std::string ext = std::filesystem::path(texturePaths[index]).extension().string();
-    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    if (ext != ".dds")
+    for (const auto& buffer : m_uniformBuffers)
     {
-        RgbaImage image{};
-        if (!m_assets || !LoadAnyTerrainImage(*m_assets, texturePaths[index], image, &m_additionalAssetRoots))
-            return false;
-
-        Texture newTexture{};
-        if (!UploadRgbaTexture2D(device, texturePaths[index], image.width, image.height, image.pixels,
-                VK_SAMPLER_ADDRESS_MODE_REPEAT, newTexture, VK_FORMAT_R8G8B8A8_SRGB))
+        if (!buffer)
         {
+            Tracen("[TERRAIN] CreateBindGroup skipped: uniform buffer is not ready");
             return false;
         }
-
-        DestroyTexture(m_baseTexture);
-        m_baseTexture = newTexture;
-        UpdateDescriptors();
-        Tracenf("[TERRAIN-TEX] loaded textureset index=%u file=%s size=%ux%u mips=%u format=%s",
-            index,
-            texturePaths[index].c_str(),
-            m_baseTexture.width,
-            m_baseTexture.height,
-            m_baseTexture.mipLevels,
-            VkFormatName(m_baseTexture.format));
-        return true;
     }
-
-    DdsImage dds{};
-    if (!m_assets || !LoadDdsImage(*m_assets, texturePaths[index], dds))
-        return false;
-
-    VkFormatProperties props{};
-    vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), dds.format, &props);
-    const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    if ((props.optimalTilingFeatures & required) != required)
+    for (const auto& buffer : m_uniformBuffersSecondary)
     {
-        Tracenf("[TERRAIN-TEX] unsupported format features for %s", texturePaths[index].c_str());
-        return false;
-    }
-
-    Texture newTexture{};
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
-    CreateDeviceLocalImage(device, m_device, dds.width, dds.height, dds.mipLevels,
-        dds.format, newTexture.image, newTexture.memory);
-
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, dds.pixels.size(),
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, dds.pixels.data(), staging);
-
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayout(cmd, newTexture.image, dds.mipLevels,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(cmd, staging.buffer, newTexture.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-        static_cast<uint32_t>(dds.regions.size()),
-        dds.regions.data());
-    TransitionImageLayout(cmd, newTexture.image, dds.mipLevels,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-    DestroyBuffer(staging);
-
-    newTexture.format = dds.format;
-    newTexture.width = dds.width;
-    newTexture.height = dds.height;
-    newTexture.mipLevels = dds.mipLevels;
-    newTexture.name = dds.filename;
-
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = newTexture.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = newTexture.format;
-    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.levelCount = newTexture.mipLevels;
-    view.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &newTexture.view));
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = newTexture.mipLevels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    if (device.SupportsSamplerAnisotropy())
-    {
-        sampler.anisotropyEnable = VK_TRUE;
-        sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
-    }
-    sampler.mipLodBias = -0.5f;
-    sampler.maxLod = static_cast<float>(newTexture.mipLevels);
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &newTexture.sampler));
-
-    DestroyTexture(m_baseTexture);
-    m_baseTexture = newTexture;
-    UpdateDescriptors();
-    Tracenf("[TERRAIN-TEX] loaded textureset index=%u file=%s size=%ux%u mips=%u format=%s",
-        index,
-        texturePaths[index].c_str(),
-        m_baseTexture.width,
-        m_baseTexture.height,
-        m_baseTexture.mipLevels,
-        VkFormatName(m_baseTexture.format));
-    return true;
-}
-
-bool TerrainRenderer::LoadTileIndices(const std::string& mapDirectory)
-{
-    if (m_mapSizeX == 0 || m_mapSizeY == 0)
-        return false;
-
-    constexpr uint32_t kTileSize = 256;
-    m_tileGridWidth = m_mapSizeX * kTileSize;
-    m_tileGridHeight = m_mapSizeY * kTileSize;
-    m_tileIndices.assign(static_cast<size_t>(m_tileGridWidth) * m_tileGridHeight, 0);
-
-    uint32_t loadedCells = 0;
-    for (uint32_t cellX = 0; cellX < m_mapSizeX; ++cellX)
-    {
-        for (uint32_t cellY = 0; cellY < m_mapSizeY; ++cellY)
+        if (!buffer)
         {
-            const uint32_t cellId = cellX * 1000u + cellY;
-            char folder[16]{};
-            std::snprintf(folder, sizeof(folder), "%06u", cellId);
-
-            std::vector<uint8_t> interior;
-            const std::string tilePath = mapDirectory + "/" + folder + "/tile.raw";
-            if (!m_assets || !ReadTileRaw(*m_assets, tilePath, interior))
-            {
-                Tracenf("[TERRAIN-TILE] failed tile.raw: %s", tilePath.c_str());
-                m_tileIndices.clear();
-                m_tileGridWidth = 0;
-                m_tileGridHeight = 0;
-                return false;
-            }
-
-            ++loadedCells;
-            for (uint32_t y = 0; y < kTileSize; ++y)
-            {
-                const size_t srcOffset = static_cast<size_t>(y) * kTileSize;
-                const size_t dstOffset =
-                    (static_cast<size_t>(cellY) * kTileSize + y) * m_tileGridWidth +
-                    static_cast<size_t>(cellX) * kTileSize;
-                std::memcpy(m_tileIndices.data() + dstOffset, interior.data() + srcOffset, kTileSize);
-            }
+            Tracen("[TERRAIN] CreateBindGroup skipped: secondary uniform buffer is not ready");
+            return false;
         }
     }
-
-    Tracenf("[TERRAIN-TILE] loaded cells=%u tileGrid=%ux%u",
-        loadedCells,
-        m_tileGridWidth,
-        m_tileGridHeight);
-    return true;
-}
-
-bool TerrainRenderer::BuildTerrainLayers(VulkanDevice& device, const std::string& mapDirectory)
-{
-    DestroyTerrainLayers();
-    if (m_tileIndices.empty())
-        return false;
-
-    std::array<uint32_t, 256> coverage{};
-    for (uint8_t index : m_tileIndices)
+    for (const auto& buffer : m_uniformBuffersReflection)
     {
-        if (index != 0)
-            ++coverage[index];
-    }
-
-    std::vector<uint32_t> textureIndices;
-    for (uint32_t index = 1; index < coverage.size(); ++index)
-    {
-        if (coverage[index] > 0)
-            textureIndices.push_back(index);
-    }
-
-    if (textureIndices.empty())
-        return false;
-
-    std::sort(textureIndices.begin(), textureIndices.end(),
-        [&coverage](uint32_t a, uint32_t b)
+        if (!buffer)
         {
-            if (coverage[a] == coverage[b])
-                return a < b;
-            return coverage[a] > coverage[b];
-        });
-
-    const std::string textureSetPath = m_assets
-        ? ReadTextureSetPathFromSetting(*m_assets, mapDirectory + "/setting.txt")
-        : std::string();
-    const std::vector<TextureSetEntry> textureSet = m_assets
-        ? LoadTextureSetEntries(*m_assets, textureSetPath)
-        : std::vector<TextureSetEntry>{};
-    if (textureSet.empty())
-    {
-        Tracenf("[TERRAIN-SPLAT] failed textureset: %s", textureSetPath.c_str());
-        return false;
-    }
-
-    std::vector<TerrainLayer> newLayers;
-    newLayers.reserve(textureIndices.size());
-
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
-
-    for (uint32_t textureIndex : textureIndices)
-    {
-        if (textureIndex >= textureSet.size() || textureSet[textureIndex].path.empty())
-        {
-            Tracenf("[TERRAIN-SPLAT] missing textureset index=%u", textureIndex);
-            continue;
-        }
-
-        DdsImage dds{};
-        if (!m_assets || !LoadDdsImage(*m_assets, textureSet[textureIndex].path, dds))
-        {
-            Tracenf("[TERRAIN-SPLAT] failed DDS index=%u path=%s",
-                textureIndex,
-                textureSet[textureIndex].path.c_str());
-            continue;
-        }
-
-        VkFormatProperties props{};
-        vkGetPhysicalDeviceFormatProperties(device.GetPhysicalDevice(), dds.format, &props);
-        const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-        if ((props.optimalTilingFeatures & required) != required)
-        {
-            Tracenf("[TERRAIN-SPLAT] unsupported format features for %s", textureSet[textureIndex].path.c_str());
-            continue;
-        }
-
-        TerrainLayer layer{};
-        layer.textureIndex = textureIndex;
-        layer.tilingU = textureSet[textureIndex].scaleU;
-        layer.tilingV = textureSet[textureIndex].scaleV;
-        layer.coverage = coverage[textureIndex];
-
-        CreateDeviceLocalImage(device, m_device, dds.width, dds.height, dds.mipLevels,
-            dds.format, layer.diffuse.image, layer.diffuse.memory);
-
-        Buffer staging{};
-        CreateHostVisibleBuffer(device, m_device, dds.pixels.size(),
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT, dds.pixels.data(), staging);
-
-        VkCommandPool uploadPool = VK_NULL_HANDLE;
-        VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-        TransitionImageLayout(cmd, layer.diffuse.image, dds.mipLevels,
-            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        vkCmdCopyBufferToImage(cmd, staging.buffer, layer.diffuse.image,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-            static_cast<uint32_t>(dds.regions.size()),
-            dds.regions.data());
-        TransitionImageLayout(cmd, layer.diffuse.image, dds.mipLevels,
-            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-        DestroyBuffer(staging);
-
-        layer.diffuse.format = dds.format;
-        layer.diffuse.width = dds.width;
-        layer.diffuse.height = dds.height;
-        layer.diffuse.mipLevels = dds.mipLevels;
-        layer.diffuse.name = dds.filename;
-
-        VkImageViewCreateInfo view{};
-        view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        view.image = layer.diffuse.image;
-        view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        view.format = layer.diffuse.format;
-        view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        view.subresourceRange.levelCount = layer.diffuse.mipLevels;
-        view.subresourceRange.layerCount = 1;
-        VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &layer.diffuse.view));
-
-        VkSamplerCreateInfo sampler{};
-        sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        sampler.magFilter = VK_FILTER_LINEAR;
-        sampler.minFilter = VK_FILTER_LINEAR;
-        sampler.mipmapMode = layer.diffuse.mipLevels > 1 ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-        if (device.SupportsSamplerAnisotropy())
-        {
-            sampler.anisotropyEnable = VK_TRUE;
-            sampler.maxAnisotropy = device.GetMaxSamplerAnisotropy();
-        }
-        sampler.mipLodBias = -0.5f;
-        sampler.maxLod = static_cast<float>(layer.diffuse.mipLevels);
-        VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &layer.diffuse.sampler));
-
-        newLayers.push_back(layer);
-        Tracenf("[TERRAIN-SPLAT] layer index=%u coverage=%u file=%s tiling=(%.3f,%.3f)",
-            textureIndex,
-            coverage[textureIndex],
-            textureSet[textureIndex].path.c_str(),
-            textureSet[textureIndex].scaleU,
-            textureSet[textureIndex].scaleV);
-    }
-
-    if (newLayers.empty())
-        return false;
-
-    m_layers = std::move(newLayers);
-    for (TerrainLayer& layer : m_layers)
-    {
-        if (!GenerateLayerMask(device, layer))
-        {
-            DestroyTerrainLayers();
+            Tracen("[TERRAIN] CreateBindGroup skipped: reflection uniform buffer is not ready");
             return false;
         }
     }
 
-    return true;
-}
-
-bool TerrainRenderer::GenerateLayerMask(VulkanDevice& device, TerrainLayer& layer)
-{
-    if (m_tileIndices.empty() || m_tileGridWidth == 0 || m_tileGridHeight == 0)
-        return false;
-
-    DestroyTexture(layer.mask);
-
-    std::vector<uint8_t> pixels(m_tileIndices.size(), 0);
-    const bool baseLayer = !m_layers.empty() && layer.textureIndex == m_layers.front().textureIndex;
-    if (baseLayer)
+    if (!m_bindLayout)
     {
-        // The most common texture is drawn as the base carpet; later binary masks blend over it.
-        std::fill(pixels.begin(), pixels.end(), 255);
-    }
-    else
-    {
-        for (size_t i = 0; i < m_tileIndices.size(); ++i)
-            pixels[i] = m_tileIndices[i] == layer.textureIndex ? 255 : 0;
-    }
-
-    VkQueue graphicsQueue = VK_NULL_HANDLE;
-    vkGetDeviceQueue(m_device, device.GetGraphicsQueueFamily(), 0, &graphicsQueue);
-
-    CreateDeviceLocalImage(device, m_device, m_tileGridWidth, m_tileGridHeight, 1,
-        VK_FORMAT_R8_UNORM, layer.mask.image, layer.mask.memory);
-
-    Buffer staging{};
-    CreateHostVisibleBuffer(device, m_device, pixels.size(),
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, pixels.data(), staging);
-
-    VkBufferImageCopy region{};
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent = {m_tileGridWidth, m_tileGridHeight, 1};
-
-    VkCommandPool uploadPool = VK_NULL_HANDLE;
-    VkCommandBuffer cmd = BeginOneTimeCommands(m_device, device.GetGraphicsQueueFamily(), uploadPool);
-    TransitionImageLayout(cmd, layer.mask.image, 1,
-        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(cmd, staging.buffer, layer.mask.image,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-    TransitionImageLayout(cmd, layer.mask.image, 1,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    EndOneTimeCommands(m_device, graphicsQueue, uploadPool, cmd);
-    DestroyBuffer(staging);
-
-    layer.mask.format = VK_FORMAT_R8_UNORM;
-    layer.mask.width = m_tileGridWidth;
-    layer.mask.height = m_tileGridHeight;
-    layer.mask.mipLevels = 1;
-    layer.mask.name = "terrain_mask_" + std::to_string(layer.textureIndex);
-
-    VkImageViewCreateInfo view{};
-    view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    view.image = layer.mask.image;
-    view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    view.format = layer.mask.format;
-    view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    view.subresourceRange.levelCount = 1;
-    view.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(m_device, &view, nullptr, &layer.mask.view));
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.maxLod = 1.0f;
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &layer.mask.sampler));
-
-    return true;
-}
-
-bool TerrainRenderer::CreateDescriptors()
-{
-    for (const Buffer& buffer : m_uniformBuffers)
-    {
-        if (!buffer.buffer || !buffer.memory)
-        {
-            Tracen("[TERRAIN] CreateDescriptors skipped: uniform buffer is not ready");
-            return false;
-        }
-    }
-    for (const Buffer& buffer : m_uniformBuffersSecondary)
-    {
-        if (!buffer.buffer || !buffer.memory)
-        {
-            Tracen("[TERRAIN] CreateDescriptors skipped: secondary uniform buffer is not ready");
-            return false;
-        }
-    }
-
-    if (!m_descriptorSetLayout)
-    {
-        VkDescriptorSetLayoutBinding ubo{};
-        ubo.binding = 0;
-        ubo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        ubo.descriptorCount = 1;
-        ubo.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding palette{};
-        palette.binding = 1;
-        palette.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        palette.descriptorCount = 1;
-        palette.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding splatA{};
-        splatA.binding = 2;
-        splatA.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        splatA.descriptorCount = 1;
-        splatA.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding splatB{};
-        splatB.binding = 3;
-        splatB.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        splatB.descriptorCount = 1;
-        splatB.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding normals{};
-        normals.binding = 4;
-        normals.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        normals.descriptorCount = 1;
-        normals.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding ao{};
-        ao.binding = 5;
-        ao.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        ao.descriptorCount = 1;
-        ao.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding roughness{};
-        roughness.binding = 6;
-        roughness.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        roughness.descriptorCount = 1;
-        roughness.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding metallic{};
-        metallic.binding = 7;
-        metallic.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        metallic.descriptorCount = 1;
-        metallic.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding height{};
-        height.binding = 8;
-        height.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        height.descriptorCount = 1;
-        height.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding shadow{};
-        shadow.binding = 9;
-        shadow.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        shadow.descriptorCount = 1;
-        shadow.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutCreateInfo layout{};
-        layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        std::array<VkDescriptorSetLayoutBinding, 10> bindings = {
-            ubo, palette, splatA, splatB, normals, ao, roughness, metallic, height, shadow
+        // Binding 0 = per-view UBO (vertex+fragment); bindings 1..9 =
+        // combined image samplers (fragment): palette array, splat A/B,
+        // normal/ao/roughness/metallic/height arrays, shadow depth array.
+        const ixrhi::IXRHIShaderStage allStages =
+            ixrhi::IXRHIShaderStage::Vertex | ixrhi::IXRHIShaderStage::Fragment;
+        const std::vector<ixrhi::IXRHIBinding> bindings = {
+            {0, ixrhi::IXRHIBindingType::UniformBuffer, allStages},
+            {1, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {2, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {3, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {4, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {5, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {6, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {7, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {8, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {9, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
         };
-        layout.bindingCount = static_cast<uint32_t>(bindings.size());
-        layout.pBindings = bindings.data();
-        VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layout, nullptr, &m_descriptorSetLayout));
+        m_bindLayout = rhi.CreateBindGroupLayout(bindings);
+        if (!m_bindLayout)
+            return false;
     }
 
-    if (m_descriptorPool)
-        vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
-    m_descriptorPool = VK_NULL_HANDLE;
-    m_descriptorSets.fill(VK_NULL_HANDLE);
-    m_descriptorSetsSecondary.fill(VK_NULL_HANDLE);
-    m_layerDescriptorSets.clear();
+    // Two camera views (primary = Scene View / free-fly, secondary = Game view
+    // / Main Camera), plus the water reflection's mirrored camera, each with one slot per
+    // frame-in-flight. Recreating the group retires the old sets (RAII); in-flight frames keep
+    // theirs alive through the group's shared keeps.
+    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kFramesInFlight * (kReflectionUniformView + 1u));
+    if (!m_bindGroup)
+        return false;
 
-    // Two camera views (primary = Scene View / free-fly, secondary = Game view / Main
-    // Camera), each with one descriptor set per frame-in-flight.
-    const uint32_t descriptorSetCount = kFramesInFlight * 2u;
-
-    std::array<VkDescriptorPoolSize, 2> poolSizes{};
-    poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = descriptorSetCount;
-    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = descriptorSetCount * 9u;
-
-    VkDescriptorPoolCreateInfo pool{};
-    pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool.maxSets = descriptorSetCount;
-    pool.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    pool.pPoolSizes = poolSizes.data();
-    VK_CHECK(vkCreateDescriptorPool(m_device, &pool, nullptr, &m_descriptorPool));
-
-    std::vector<VkDescriptorSetLayout> layouts(descriptorSetCount, m_descriptorSetLayout);
-    std::vector<VkDescriptorSet> allocated(descriptorSetCount, VK_NULL_HANDLE);
-
-    VkDescriptorSetAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc.descriptorPool = m_descriptorPool;
-    alloc.descriptorSetCount = descriptorSetCount;
-    alloc.pSetLayouts = layouts.data();
-    VK_CHECK(vkAllocateDescriptorSets(m_device, &alloc, allocated.data()));
-
-    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
-    {
-        m_descriptorSets[frame] = allocated[frame];
-        m_descriptorSetsSecondary[frame] = allocated[kFramesInFlight + frame];
-    }
-
-    UpdateDescriptors();
-
+    UpdateBindGroup();
     return true;
 }
 
-bool TerrainRenderer::CreateShadowResources(VulkanDevice& device)
+bool TerrainRenderer::CreateShadowResources(ixrhi::IXRHIDevice& rhi)
 {
-    if (m_shadowImage)
+    if (m_shadowTexture)
         return true;
 
-    constexpr VkFormat kShadowFormat = VK_FORMAT_D32_SFLOAT;
-    CreateDepthImageArray(device, m_device, kShadowResolution, kShadowResolution,
-        kShadowCascadeCount, kShadowFormat, m_shadowImage, m_shadowMemory);
-
-    VkImageViewCreateInfo arrayView{};
-    arrayView.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    arrayView.image = m_shadowImage;
-    arrayView.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    arrayView.format = kShadowFormat;
-    arrayView.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    arrayView.subresourceRange.levelCount = 1;
-    arrayView.subresourceRange.layerCount = kShadowCascadeCount;
-    VK_CHECK(vkCreateImageView(m_device, &arrayView, nullptr, &m_shadowArrayView));
-
-    for (uint32_t i = 0; i < kShadowCascadeCount; ++i)
-    {
-        VkImageViewCreateInfo layerView = arrayView;
-        layerView.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        layerView.subresourceRange.baseArrayLayer = i;
-        layerView.subresourceRange.layerCount = 1;
-        VK_CHECK(vkCreateImageView(m_device, &layerView, nullptr, &m_shadowLayerViews[i]));
-    }
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    sampler.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
-    sampler.compareEnable = VK_TRUE;
-    sampler.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    sampler.minLod = 0.0f;
-    sampler.maxLod = 0.0f;
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &m_shadowSampler));
-
-    VkAttachmentDescription depthAttachment{};
-    depthAttachment.format = kShadowFormat;
-    depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkAttachmentReference depthRef{};
-    depthRef.attachment = 0;
-    depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.pDepthStencilAttachment = &depthRef;
-
-    VkRenderPassCreateInfo renderPass{};
-    renderPass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    renderPass.attachmentCount = 1;
-    renderPass.pAttachments = &depthAttachment;
-    renderPass.subpassCount = 1;
-    renderPass.pSubpasses = &subpass;
-    VK_CHECK(vkCreateRenderPass(m_device, &renderPass, nullptr, &m_shadowRenderPass));
-
-    for (uint32_t i = 0; i < kShadowCascadeCount; ++i)
-    {
-        VkFramebufferCreateInfo fb{};
-        fb.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        fb.renderPass = m_shadowRenderPass;
-        fb.attachmentCount = 1;
-        fb.pAttachments = &m_shadowLayerViews[i];
-        fb.width = kShadowResolution;
-        fb.height = kShadowResolution;
-        fb.layers = 1;
-        VK_CHECK(vkCreateFramebuffer(m_device, &fb, nullptr, &m_shadowFramebuffers[i]));
-    }
-
-    if (!CreateShadowPipeline())
+    // 4-cascade depth array sampled by the main pass (binding 9) with a
+    // comparison sampler; one depth-only target per cascade slice.
+    ixrhi::IXRHITextureDesc shadowDesc;
+    shadowDesc.width = kShadowResolution;
+    shadowDesc.height = kShadowResolution;
+    shadowDesc.mipLevels = 1;
+    shadowDesc.arrayLayers = kShadowCascadeCount;
+    shadowDesc.format = ixrhi::IXRHIFormat::D32Float;
+    // (The static cache's layers are copied in; a moved cache layer goes through its cascade's layer.)
+    shadowDesc.usage = ixrhi::IXRHITextureUsage::DepthStencilAttachment | ixrhi::IXRHITextureUsage::Sampled |
+        ixrhi::IXRHITextureUsage::TransferDst | ixrhi::IXRHITextureUsage::TransferSrc;
+    shadowDesc.debugName = "Terrain:ShadowCascades";
+    m_shadowTexture = rhi.CreateTexture(shadowDesc, nullptr, 0);
+    if (!m_shadowTexture)
         return false;
+
+    ixrhi::IXRHISamplerDesc samplerDesc;
+    samplerDesc.minFilter = ixrhi::IXRHISamplerFilter::Linear;
+    samplerDesc.magFilter = ixrhi::IXRHISamplerFilter::Linear;
+    samplerDesc.mipmapFilter = ixrhi::IXRHISamplerFilter::Nearest;
+    samplerDesc.addressU = ixrhi::IXRHISamplerAddress::ClampToBorder;
+    samplerDesc.addressV = ixrhi::IXRHISamplerAddress::ClampToBorder;
+    samplerDesc.addressW = ixrhi::IXRHISamplerAddress::ClampToBorder;
+    samplerDesc.compareEnable = true;
+    samplerDesc.compareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    samplerDesc.maxLod = 0.0f;
+    samplerDesc.debugName = "Terrain:ShadowSampler";
+    m_shadowSampler = rhi.CreateSampler(samplerDesc);
+    if (!m_shadowSampler)
+    {
+        m_shadowTexture.reset();
+        return false;
+    }
+
+    for (uint32_t i = 0; i < kShadowCascadeCount; ++i)
+    {
+        ixrhi::IXRHIRenderTargetDesc targetDesc;
+        targetDesc.color = nullptr;
+        targetDesc.depth = m_shadowTexture;
+        targetDesc.depthLayer = i;
+        targetDesc.depthLoad = ixrhi::IXRHILoadOp::Clear;
+        targetDesc.depthStore = ixrhi::IXRHIStoreOp::Store;
+        targetDesc.clearDepth = 1.0f;
+        targetDesc.debugName = "Terrain:ShadowCascade" + std::to_string(i);
+        m_shadowTargets[i] = rhi.CreateRenderTarget(targetDesc);
+        if (!m_shadowTargets[i])
+        {
+            DestroyShadowResources();
+            return false;
+        }
+    }
+
+    if (!CreateShadowPipeline(rhi))
+    {
+        DestroyShadowResources();
+        return false;
+    }
 
     Tracen("[SHADOW] Cascade Shadow Maps: 4 cascades x 2048x2048 D32_SFLOAT, PCF 5x5");
     return true;
 }
 
-void TerrainRenderer::UpdateDescriptors()
+void TerrainRenderer::UpdateBindGroup()
 {
-    if (!m_descriptorPool)
+    if (!m_bindGroup)
         return;
 
-    auto writeSet = [this](VkDescriptorSet descriptorSet, const Buffer& uniformBuffer)
-    {
-        if (!descriptorSet || !m_baseTexture.view || !m_baseTexture.sampler ||
-            !m_normalTexture.view || !m_normalTexture.sampler ||
-            !m_aoTexture.view || !m_aoTexture.sampler ||
-            !m_roughnessTexture.view || !m_roughnessTexture.sampler ||
-            !m_metallicTexture.view || !m_metallicTexture.sampler ||
-            !m_heightTexture.view || !m_heightTexture.sampler ||
-            !m_shadowArrayView || !m_shadowSampler ||
-            !m_splatA.view || !m_splatA.sampler || !m_splatB.view || !m_splatB.sampler)
+    auto writeSlot = [this](std::uint32_t slot, const std::shared_ptr<ixrhi::IXRHIBuffer>& uniformBuffer) {
+        if (!uniformBuffer || !m_baseTexture.image || !m_baseTexture.sampler ||
+            !m_normalTexture.image || !m_normalTexture.sampler ||
+            !m_aoTexture.image || !m_aoTexture.sampler ||
+            !m_roughnessTexture.image || !m_roughnessTexture.sampler ||
+            !m_metallicTexture.image || !m_metallicTexture.sampler ||
+            !m_heightTexture.image || !m_heightTexture.sampler ||
+            !m_shadowTexture || !m_shadowSampler ||
+            !m_splatA.image || !m_splatA.sampler || !m_splatB.image || !m_splatB.sampler)
             return;
-        if (!uniformBuffer.buffer || !uniformBuffer.memory)
-        {
-            Tracen("[TERRAIN] descriptor update skipped: uniform buffer is not ready");
-            return;
-        }
 
-        VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = uniformBuffer.buffer;
-        bufferInfo.offset = 0;
-        bufferInfo.range = sizeof(UniformBlock);
-
-        VkDescriptorImageInfo paletteInfo{};
-        paletteInfo.sampler = m_baseTexture.sampler;
-        paletteInfo.imageView = m_baseTexture.view;
-        paletteInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo splatAInfo{};
-        splatAInfo.sampler = m_splatA.sampler;
-        splatAInfo.imageView = m_splatA.view;
-        splatAInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo splatBInfo{};
-        splatBInfo.sampler = m_splatB.sampler;
-        splatBInfo.imageView = m_splatB.view;
-        splatBInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo normalInfo{};
-        normalInfo.sampler = m_normalTexture.sampler;
-        normalInfo.imageView = m_normalTexture.view;
-        normalInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo aoInfo{};
-        aoInfo.sampler = m_aoTexture.sampler;
-        aoInfo.imageView = m_aoTexture.view;
-        aoInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo roughnessInfo{};
-        roughnessInfo.sampler = m_roughnessTexture.sampler;
-        roughnessInfo.imageView = m_roughnessTexture.view;
-        roughnessInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo metallicInfo{};
-        metallicInfo.sampler = m_metallicTexture.sampler;
-        metallicInfo.imageView = m_metallicTexture.view;
-        metallicInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo heightInfo{};
-        heightInfo.sampler = m_heightTexture.sampler;
-        heightInfo.imageView = m_heightTexture.view;
-        heightInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo shadowInfo{};
-        shadowInfo.sampler = m_shadowSampler;
-        shadowInfo.imageView = m_shadowArrayView;
-        shadowInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-
-        std::array<VkWriteDescriptorSet, 10> writes{};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = descriptorSet;
-        writes[0].dstBinding = 0;
-        writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[0].pBufferInfo = &bufferInfo;
-
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = descriptorSet;
-        writes[1].dstBinding = 1;
-        writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[1].pImageInfo = &paletteInfo;
-
-        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[2].dstSet = descriptorSet;
-        writes[2].dstBinding = 2;
-        writes[2].descriptorCount = 1;
-        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[2].pImageInfo = &splatAInfo;
-
-        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[3].dstSet = descriptorSet;
-        writes[3].dstBinding = 3;
-        writes[3].descriptorCount = 1;
-        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[3].pImageInfo = &splatBInfo;
-
-        writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[4].dstSet = descriptorSet;
-        writes[4].dstBinding = 4;
-        writes[4].descriptorCount = 1;
-        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[4].pImageInfo = &normalInfo;
-
-        writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[5].dstSet = descriptorSet;
-        writes[5].dstBinding = 5;
-        writes[5].descriptorCount = 1;
-        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[5].pImageInfo = &aoInfo;
-
-        writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[6].dstSet = descriptorSet;
-        writes[6].dstBinding = 6;
-        writes[6].descriptorCount = 1;
-        writes[6].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[6].pImageInfo = &roughnessInfo;
-
-        writes[7].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[7].dstSet = descriptorSet;
-        writes[7].dstBinding = 7;
-        writes[7].descriptorCount = 1;
-        writes[7].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[7].pImageInfo = &metallicInfo;
-
-        writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[8].dstSet = descriptorSet;
-        writes[8].dstBinding = 8;
-        writes[8].descriptorCount = 1;
-        writes[8].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[8].pImageInfo = &heightInfo;
-
-        writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[9].dstSet = descriptorSet;
-        writes[9].dstBinding = 9;
-        writes[9].descriptorCount = 1;
-        writes[9].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[9].pImageInfo = &shadowInfo;
-
-        vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        m_bindGroup->UpdateBuffer(slot, 0, uniformBuffer, 0, sizeof(UniformBlock));
+        m_bindGroup->UpdateTexture(slot, 1, m_baseTexture.image, m_baseTexture.sampler);
+        m_bindGroup->UpdateTexture(slot, 2, m_splatA.image, m_splatA.sampler);
+        m_bindGroup->UpdateTexture(slot, 3, m_splatB.image, m_splatB.sampler);
+        m_bindGroup->UpdateTexture(slot, 4, m_normalTexture.image, m_normalTexture.sampler);
+        m_bindGroup->UpdateTexture(slot, 5, m_aoTexture.image, m_aoTexture.sampler);
+        m_bindGroup->UpdateTexture(slot, 6, m_roughnessTexture.image, m_roughnessTexture.sampler);
+        m_bindGroup->UpdateTexture(slot, 7, m_metallicTexture.image, m_metallicTexture.sampler);
+        m_bindGroup->UpdateTexture(slot, 8, m_heightTexture.image, m_heightTexture.sampler);
+        m_bindGroup->UpdateTexture(slot, 9, m_shadowTexture, m_shadowSampler);
     };
 
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
-        writeSet(m_descriptorSets[frame], m_uniformBuffers[frame]);
-        writeSet(m_descriptorSetsSecondary[frame], m_uniformBuffersSecondary[frame]);
+        writeSlot(frame, m_uniformBuffers[frame]);
+        writeSlot(kFramesInFlight + frame, m_uniformBuffersSecondary[frame]);
+        writeSlot(kReflectionUniformView * kFramesInFlight + frame, m_uniformBuffersReflection[frame]);
     }
 }
 
-bool TerrainRenderer::CreateWaterResources(VulkanDevice& device)
+bool TerrainRenderer::CreateWaterResources(ixrhi::IXRHIDevice& rhi)
 {
-    for (Buffer& buffer : m_waterUniformBuffers)
-    {
-        if (!buffer.buffer || !buffer.memory)
-        {
-            DestroyBuffer(buffer);
-            CreateHostVisibleBuffer(device, m_device, sizeof(WaterUniformBlock),
-                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
-        }
-    }
-
-    const bool normals = CreateWaterNormalTextures(device);
-    const bool reflectionResources = normals ? CreateOrRecreateWaterReflectionResources(device, true) : false;
-    const bool descriptors = reflectionResources ? CreateWaterDescriptors() : false;
-    const bool reflectionPipeline = descriptors ? CreateWaterReflectionPipeline(device) : false;
-    const bool pipeline = reflectionPipeline ? CreateWaterPipeline(device) : false;
+    const bool normals = CreateWaterNormalTextures(rhi);
+    const bool reflectionResources = normals ? CreateOrRecreateWaterReflectionResources(rhi, true) : false;
+    const bool descriptors = reflectionResources ? CreateWaterBindGroup(rhi) : false;
+    const bool reflectionPipeline = descriptors ? CreateWaterReflectionPipeline(rhi) : false;
+    const bool pipeline = reflectionPipeline ? CreateWaterPipeline(rhi) : false;
     Tracen("[WATER-OBJ] Water body renderer resources ready");
     return normals && reflectionResources && descriptors && reflectionPipeline && pipeline;
 }
 
-bool TerrainRenderer::LoadWaterBodies(VulkanDevice& device, const std::string& mapDirectory)
+bool TerrainRenderer::LoadWaterBodies(ixrhi::IXRHIDevice& rhi, const std::string& mapDirectory)
 {
     DestroyWaterBodyResources();
 
@@ -6599,8 +6449,8 @@ bool TerrainRenderer::LoadWaterBodies(VulkanDevice& device, const std::string& m
     if (!bytes)
     {
         Tracen("[WATER-OBJ] no water body file; map starts without water bodies");
-        if (m_waterDescriptorPool)
-            CreateWaterDescriptors();
+        if (m_waterBindGroup)
+            CreateWaterBindGroup(rhi);
         return true;
     }
 
@@ -6609,8 +6459,8 @@ bool TerrainRenderer::LoadWaterBodies(VulkanDevice& device, const std::string& m
     if (!client::render::LoadWaterBodiesBinary(*bytes, bodies, &error))
     {
         Tracenf("[WATER-OBJ] failed to parse %s: %s", waterPath.c_str(), error.c_str());
-        if (m_waterDescriptorPool)
-            CreateWaterDescriptors();
+        if (m_waterBindGroup)
+            CreateWaterBindGroup(rhi);
         return false;
     }
 
@@ -6625,7 +6475,7 @@ bool TerrainRenderer::LoadWaterBodies(VulkanDevice& device, const std::string& m
     {
         WaterBodyGpu gpu;
         gpu.body = std::move(body);
-        if (!CreateWaterBodyUniformBuffers(device, gpu) || !CreateWaterBodyMesh(device, gpu))
+        if (!CreateWaterBodyUniformBuffers(rhi, gpu) || !CreateWaterBodyMesh(rhi, gpu))
         {
             DestroyWaterBodyResources(gpu);
             Tracen("[WATER-OBJ] skipped invalid water body");
@@ -6639,33 +6489,33 @@ bool TerrainRenderer::LoadWaterBodies(VulkanDevice& device, const std::string& m
         m_waterBodies.push_back(std::move(gpu));
     }
 
-    if (m_waterDescriptorPool)
-        CreateWaterDescriptors();
+    if (m_waterBindGroup)
+        CreateWaterBindGroup(rhi);
 
     Tracenf("[WATER-OBJ] active water bodies: %zu", m_waterBodies.size());
     return true;
 }
 
-bool TerrainRenderer::CreateWaterBodyUniformBuffers(VulkanDevice& device, WaterBodyGpu& waterBody)
+bool TerrainRenderer::CreateWaterBodyUniformBuffers(ixrhi::IXRHIDevice& rhi, WaterBodyGpu& waterBody)
 {
-    auto createSet = [&](std::array<Buffer, kFramesInFlight>& buffers) -> bool {
-        for (Buffer& buffer : buffers)
+    auto createSet = [&](std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight>& buffers,
+                         const char* debugName) -> bool {
+        for (auto& buffer : buffers)
         {
-            DestroyBuffer(buffer);
-            CreateHostVisibleBuffer(device, m_device, sizeof(WaterUniformBlock),
-                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, nullptr, buffer);
-            if (!buffer.buffer || !buffer.memory)
+            buffer = CreateRhiBuffer(rhi, sizeof(WaterUniformBlock), ixrhi::IXRHIBufferUsage::Uniform, nullptr, debugName);
+            if (!buffer)
                 return false;
         }
         return true;
     };
-    return createSet(waterBody.uniformBuffers) && createSet(waterBody.uniformBuffersSecondary);
+    return createSet(waterBody.uniformBuffers, "Terrain:WaterUBO") &&
+        createSet(waterBody.uniformBuffersSecondary, "Terrain:WaterUBO secondary");
 }
 
-bool TerrainRenderer::CreateWaterBodyMesh(VulkanDevice& device, WaterBodyGpu& waterBody)
+bool TerrainRenderer::CreateWaterBodyMesh(ixrhi::IXRHIDevice& rhi, WaterBodyGpu& waterBody)
 {
-    DestroyBuffer(waterBody.vertexBuffer);
-    DestroyBuffer(waterBody.indexBuffer);
+    waterBody.vertexBuffer.reset();
+    waterBody.indexBuffer.reset();
     waterBody.indexCount = 0;
 
     const WaterBody& body = waterBody.body;
@@ -6734,265 +6584,173 @@ bool TerrainRenderer::CreateWaterBodyMesh(VulkanDevice& device, WaterBodyGpu& wa
     if (indices.empty())
         return false;
 
-    CreateHostVisibleBuffer(device, m_device, sizeof(WaterVertex) * vertices.size(),
-        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, vertices.data(), waterBody.vertexBuffer);
-    CreateHostVisibleBuffer(device, m_device, sizeof(uint32_t) * indices.size(),
-        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, indices.data(), waterBody.indexBuffer);
+    waterBody.boundsMin = {vertices[0].position[0], vertices[0].position[1], vertices[0].position[2]};
+    waterBody.boundsMax = waterBody.boundsMin;
+    for (const WaterVertex& vertex : vertices)
+    {
+        waterBody.boundsMin.x = std::min(waterBody.boundsMin.x, vertex.position[0]);
+        waterBody.boundsMin.y = std::min(waterBody.boundsMin.y, vertex.position[1]);
+        waterBody.boundsMin.z = std::min(waterBody.boundsMin.z, vertex.position[2]);
+        waterBody.boundsMax.x = std::max(waterBody.boundsMax.x, vertex.position[0]);
+        waterBody.boundsMax.y = std::max(waterBody.boundsMax.y, vertex.position[1]);
+        waterBody.boundsMax.z = std::max(waterBody.boundsMax.z, vertex.position[2]);
+    }
+
+    // Device-local: the GPU reads the (often large) water mesh in every pass that draws it.
+    waterBody.vertexBuffer = CreateStaticRhiBuffer(rhi,
+        sizeof(WaterVertex) * vertices.size(),
+        ixrhi::IXRHIBufferUsage::Vertex,
+        vertices.data(),
+        "Terrain:WaterVB");
+    waterBody.indexBuffer = CreateStaticRhiBuffer(rhi,
+        sizeof(uint32_t) * indices.size(),
+        ixrhi::IXRHIBufferUsage::Index,
+        indices.data(),
+        "Terrain:WaterIB");
     waterBody.indexCount = static_cast<uint32_t>(indices.size());
     Tracenf("[WATER-OBJ-6] Vertex alpha computed: body_id=%u fade_zone_vertices=%u fully_water_vertices=%u",
         body.id, fadeZoneVertices, fullyWaterVertices);
-    return waterBody.vertexBuffer.buffer && waterBody.indexBuffer.buffer;
+    return waterBody.vertexBuffer != nullptr && waterBody.indexBuffer != nullptr;
 }
 
-bool TerrainRenderer::CreateWaterNormalTextures(VulkanDevice& device)
+bool TerrainRenderer::CreateWaterNormalTextures(ixrhi::IXRHIDevice& rhi)
 {
-    constexpr uint32_t kSize = 128;
-    const std::vector<std::uint8_t> small = GenerateWaterNormalPixels(kSize, kSize, 18.0f, 29.0f, 0.020f);
-    const std::vector<std::uint8_t> large = GenerateWaterNormalPixels(kSize, kSize, 5.0f, 8.0f, 0.045f);
-    return UploadRgbaTexture2D(device, "water_wave_small", kSize, kSize, small,
-               VK_SAMPLER_ADDRESS_MODE_REPEAT, m_waterNormalSmall) &&
-           UploadRgbaTexture2D(device, "water_wave_large", kSize, kSize, large,
-               VK_SAMPLER_ADDRESS_MODE_REPEAT, m_waterNormalLarge);
+    // Fine ripples and broad swells, each a different random wave set, with full mip chains.
+    constexpr uint32_t kSize = 256;
+    const std::vector<std::uint8_t> small = GenerateWaterNormalPixels(kSize, kSize, 0x5157u, 5.0f, 28.0f, 0.30f);
+    const std::vector<std::uint8_t> large = GenerateWaterNormalPixels(kSize, kSize, 0xB16Bu, 2.0f, 10.0f, 0.24f);
+    return UploadRgbaTexture2D(rhi, "water_wave_small", kSize, kSize, small,
+               ixrhi::IXRHISamplerAddress::Repeat, m_waterNormalSmall, ixrhi::IXRHIFormat::R8G8B8A8Unorm, true) &&
+            UploadRgbaTexture2D(rhi, "water_wave_large", kSize, kSize, large,
+                ixrhi::IXRHISamplerAddress::Repeat, m_waterNormalLarge, ixrhi::IXRHIFormat::R8G8B8A8Unorm, true);
 }
 
-bool TerrainRenderer::CreateWaterDescriptors()
+bool TerrainRenderer::CreateWaterBindGroup(ixrhi::IXRHIDevice& rhi)
 {
-    if (!m_waterDescriptorSetLayout)
+    if (!m_waterBindLayout)
     {
-        VkDescriptorSetLayoutBinding ubo{};
-        ubo.binding = 0;
-        ubo.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        ubo.descriptorCount = 1;
-        ubo.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding normalSmall{};
-        normalSmall.binding = 1;
-        normalSmall.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        normalSmall.descriptorCount = 1;
-        normalSmall.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
-
-        VkDescriptorSetLayoutBinding normalLarge = normalSmall;
-        normalLarge.binding = 2;
-
-        VkDescriptorSetLayoutBinding reflection = normalSmall;
-        reflection.binding = 3;
-
-        VkDescriptorSetLayoutBinding sceneColor = normalSmall;
-        sceneColor.binding = 4;
-
-        VkDescriptorSetLayoutBinding sceneDepth = normalSmall;
-        sceneDepth.binding = 5;
-
-        VkDescriptorSetLayoutBinding diffuse = normalSmall;
-        diffuse.binding = 6;
-
-        std::array<VkDescriptorSetLayoutBinding, 7> bindings = {ubo, normalSmall, normalLarge, reflection, sceneColor, sceneDepth, diffuse};
-        VkDescriptorSetLayoutCreateInfo layout{};
-        layout.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layout.bindingCount = static_cast<uint32_t>(bindings.size());
-        layout.pBindings = bindings.data();
-        VK_CHECK(vkCreateDescriptorSetLayout(m_device, &layout, nullptr, &m_waterDescriptorSetLayout));
+        // Binding 0 = per-body UBO (vertex+fragment); bindings 1..6 =
+        // combined image samplers (fragment): small/large wave normals,
+        // reflection color, scene color/depth refraction inputs, material
+        // diffuse.
+        const ixrhi::IXRHIShaderStage allStages =
+            ixrhi::IXRHIShaderStage::Vertex | ixrhi::IXRHIShaderStage::Fragment;
+        const std::vector<ixrhi::IXRHIBinding> bindings = {
+            {0, ixrhi::IXRHIBindingType::UniformBuffer, allStages},
+            {1, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {2, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {3, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {4, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {5, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+            {6, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+        };
+        m_waterBindLayout = rhi.CreateBindGroupLayout(bindings);
+        if (!m_waterBindLayout)
+            return false;
     }
 
-    if (m_waterDescriptorPool)
-        vkDestroyDescriptorPool(m_device, m_waterDescriptorPool, nullptr);
-    m_waterDescriptorPool = VK_NULL_HANDLE;
-    m_waterDescriptorSets.fill(VK_NULL_HANDLE);
-    for (WaterBodyGpu& waterBody : m_waterBodies)
-    {
-        waterBody.descriptorSets.fill(VK_NULL_HANDLE);
-        waterBody.descriptorSetsSecondary.fill(VK_NULL_HANDLE);
-    }
-
-    std::array<VkDescriptorPoolSize, 2> poolSizes{};
-    // Each water body needs primary + secondary descriptor sets (Scene + Game view).
-    const uint32_t maxWaterSets = kFramesInFlight * (1u + kMaxWaterBodyDraws * 2u);
-    poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSizes[0].descriptorCount = maxWaterSets;
-    poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = maxWaterSets * 6u;
-
-    VkDescriptorPoolCreateInfo pool{};
-    pool.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    pool.maxSets = maxWaterSets;
-    pool.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
-    pool.pPoolSizes = poolSizes.data();
-    VK_CHECK(vkCreateDescriptorPool(m_device, &pool, nullptr, &m_waterDescriptorPool));
-
-    if (!AllocateWaterDescriptorSets(m_waterUniformBuffers, m_waterDescriptorSets))
+    // One slot per (body, view, frame); bodies are capped at
+    // kMaxWaterBodyDraws. Recreating the group retires the old sets (RAII).
+    m_waterBindGroup = rhi.CreateBindGroup(*m_waterBindLayout,
+        kMaxWaterBodyDraws * 2u * kFramesInFlight);
+    if (!m_waterBindGroup)
         return false;
-    for (WaterBodyGpu& waterBody : m_waterBodies)
-    {
-        if (!AllocateWaterDescriptorSets(waterBody.uniformBuffers, waterBody.descriptorSets))
-            return false;
-        if (!AllocateWaterDescriptorSets(waterBody.uniformBuffersSecondary, waterBody.descriptorSetsSecondary))
-            return false;
-    }
-    UpdateWaterDescriptors();
+
+    UpdateWaterBindGroup();
     return true;
 }
 
-bool TerrainRenderer::AllocateWaterDescriptorSets(const std::array<Buffer, kFramesInFlight>&,
-                                                  std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets)
+void TerrainRenderer::WriteWaterBindGroupSets(std::uint32_t bodyIndex,
+                                                uint32_t viewIndex,
+                                                uint32_t frameIndex,
+                                                const WaterMaterialTextureSet* materialTextures)
 {
-    if (!m_waterDescriptorPool || !m_waterDescriptorSetLayout)
-        return false;
-
-    std::vector<VkDescriptorSetLayout> layouts(kFramesInFlight, m_waterDescriptorSetLayout);
-    VkDescriptorSetAllocateInfo alloc{};
-    alloc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    alloc.descriptorPool = m_waterDescriptorPool;
-    alloc.descriptorSetCount = kFramesInFlight;
-    alloc.pSetLayouts = layouts.data();
-    return vkAllocateDescriptorSets(m_device, &alloc, descriptorSets.data()) == VK_SUCCESS;
-}
-
-void TerrainRenderer::WriteWaterDescriptorSets(const std::array<Buffer, kFramesInFlight>& uniformBuffers,
-                                               const std::array<VkDescriptorSet, kFramesInFlight>& descriptorSets,
-                                               const WaterMaterialTextureSet* materialTextures)
-{
-    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
-    {
-        if (!descriptorSets[frame] || !uniformBuffers[frame].buffer)
-            continue;
-        VkDescriptorBufferInfo bufferInfo{};
-        bufferInfo.buffer = uniformBuffers[frame].buffer;
-        bufferInfo.range = sizeof(WaterUniformBlock);
-
-        VkDescriptorImageInfo smallInfo{};
-        const Texture* normalA = materialTextures && materialTextures->normalA.view ? &materialTextures->normalA : &m_waterNormalSmall;
-        const Texture* normalB = materialTextures && materialTextures->normalB.view ? &materialTextures->normalB : normalA;
-        smallInfo.sampler = normalA->sampler;
-        smallInfo.imageView = normalA->view;
-        smallInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo largeInfo{};
-        largeInfo.sampler = normalB->sampler ? normalB->sampler : m_waterNormalLarge.sampler;
-        largeInfo.imageView = normalB->view ? normalB->view : m_waterNormalLarge.view;
-        largeInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo reflectionInfo{};
-        reflectionInfo.sampler = m_waterReflection.sampler;
-        reflectionInfo.imageView = m_waterReflection.colorView;
-        reflectionInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        // Backend-local native resolution (transition-only): the textures stay
-        // IXRHI-owned; views/samplers resolve here at write time, with the
-        // same normal-map fallback as before when unbound or unresolvable.
-        const VkImageView resolvedColorView =
-            m_waterSceneColor ? ixvulkan::NativeViewOf(*m_waterSceneColor) : VK_NULL_HANDLE;
-        const VkImageView resolvedDepthView =
-            m_waterSceneDepth ? ixvulkan::NativeViewOf(*m_waterSceneDepth) : VK_NULL_HANDLE;
-        const VkSampler resolvedSampler =
-            m_waterSceneSampler ? ixvulkan::NativeSamplerOf(*m_waterSceneSampler) : VK_NULL_HANDLE;
-        VkDescriptorImageInfo sceneColorInfo{};
-        sceneColorInfo.sampler =
-            resolvedSampler ? resolvedSampler : m_waterNormalSmall.sampler;
-        sceneColorInfo.imageView =
-            resolvedColorView ? resolvedColorView : m_waterNormalSmall.view;
-        sceneColorInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo sceneDepthInfo{};
-        sceneDepthInfo.sampler =
-            resolvedSampler ? resolvedSampler : m_waterNormalLarge.sampler;
-        sceneDepthInfo.imageView =
-            resolvedDepthView ? resolvedDepthView : m_waterNormalLarge.view;
-        sceneDepthInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        VkDescriptorImageInfo diffuseInfo{};
-        const Texture* diffuse = materialTextures && materialTextures->diffuse.view ? &materialTextures->diffuse : &m_waterNormalSmall;
-        diffuseInfo.sampler = diffuse->sampler;
-        diffuseInfo.imageView = diffuse->view;
-        diffuseInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-        std::array<VkWriteDescriptorSet, 7> writes{};
-        writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet = descriptorSets[frame];
-        writes[0].dstBinding = 0;
-        writes[0].descriptorCount = 1;
-        writes[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[0].pBufferInfo = &bufferInfo;
-        writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet = descriptorSets[frame];
-        writes[1].dstBinding = 1;
-        writes[1].descriptorCount = 1;
-        writes[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[1].pImageInfo = &smallInfo;
-        writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[2].dstSet = descriptorSets[frame];
-        writes[2].dstBinding = 2;
-        writes[2].descriptorCount = 1;
-        writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[2].pImageInfo = &largeInfo;
-        writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[3].dstSet = descriptorSets[frame];
-        writes[3].dstBinding = 3;
-        writes[3].descriptorCount = 1;
-        writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[3].pImageInfo = &reflectionInfo;
-        writes[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[4].dstSet = descriptorSets[frame];
-        writes[4].dstBinding = 4;
-        writes[4].descriptorCount = 1;
-        writes[4].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[4].pImageInfo = &sceneColorInfo;
-        writes[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[5].dstSet = descriptorSets[frame];
-        writes[5].dstBinding = 5;
-        writes[5].descriptorCount = 1;
-        writes[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[5].pImageInfo = &sceneDepthInfo;
-        writes[6].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[6].dstSet = descriptorSets[frame];
-        writes[6].dstBinding = 6;
-        writes[6].descriptorCount = 1;
-        writes[6].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[6].pImageInfo = &diffuseInfo;
-        vkUpdateDescriptorSets(m_device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
-    }
-}
-
-void TerrainRenderer::UpdateWaterDescriptors()
-{
-    if (!m_waterDescriptorPool || !m_waterNormalSmall.view || !m_waterNormalLarge.view || !m_waterReflection.colorView)
+    if (!m_waterBindGroup || bodyIndex >= m_waterBodies.size() || frameIndex >= kFramesInFlight)
+        return;
+    const WaterBodyGpu& waterBody = m_waterBodies[bodyIndex];
+    const std::shared_ptr<ixrhi::IXRHIBuffer>& uniformBuffer =
+        viewIndex == 0 ? waterBody.uniformBuffers[frameIndex] : waterBody.uniformBuffersSecondary[frameIndex];
+    if (!uniformBuffer)
         return;
 
-    WriteWaterDescriptorSets(m_waterUniformBuffers, m_waterDescriptorSets);
-    for (WaterBodyGpu& waterBody : m_waterBodies)
+    // Fallback chain preserved exactly: material textures, else wave normals,
+    // else refraction snapshots fall back to the wave normals as well.
+    const Texture* normalA = materialTextures && materialTextures->normalA.image ? &materialTextures->normalA : &m_waterNormalSmall;
+    const Texture* normalB = materialTextures && materialTextures->normalB.image ? &materialTextures->normalB : normalA;
+    const Texture* diffuse = materialTextures && materialTextures->diffuse.image ? &materialTextures->diffuse : &m_waterNormalSmall;
+    const Texture* normalBSafe = (normalB->image && normalB->sampler) ? normalB : &m_waterNormalLarge;
+    if (!normalA->image || !normalA->sampler || !normalBSafe->image || !normalBSafe->sampler ||
+        !m_waterReflection.color || !m_waterReflection.sampler || !diffuse->image || !diffuse->sampler)
+        return;
+
+    const std::uint32_t slot = (bodyIndex * 2u + (viewIndex == 0 ? 0u : 1u)) * kFramesInFlight + frameIndex;
+    m_waterBindGroup->UpdateBuffer(slot, 0, uniformBuffer, 0, sizeof(WaterUniformBlock));
+    m_waterBindGroup->UpdateTexture(slot, 1, normalA->image, normalA->sampler);
+    m_waterBindGroup->UpdateTexture(slot, 2, normalBSafe->image, normalBSafe->sampler);
+    // Even a shader branch that skips reflection needs valid descriptor layouts.
+    // A newly created target becomes readable only after its first completed pass.
+    m_waterBindGroup->UpdateTexture(slot, 3,
+        m_waterReflection.readable ? m_waterReflection.color : m_waterNormalSmall.image,
+        m_waterReflection.readable ? m_waterReflection.sampler : m_waterNormalSmall.sampler);
+    // Refraction snapshots are IXRHI-owned (shared lifetime); sampler and
+    // view resolve independently with wave-normal fallbacks, exactly like
+    // the old null-view path.
+    m_waterBindGroup->UpdateTexture(slot,
+        4,
+        m_waterSceneColor ? m_waterSceneColor : m_waterNormalSmall.image,
+        m_waterSceneSampler ? m_waterSceneSampler : m_waterNormalSmall.sampler);
+    m_waterBindGroup->UpdateTexture(slot,
+        5,
+        m_waterSceneDepth ? m_waterSceneDepth : m_waterNormalLarge.image,
+        m_waterSceneSampler ? m_waterSceneSampler : m_waterNormalLarge.sampler);
+    m_waterBindGroup->UpdateTexture(slot, 6, diffuse->image, diffuse->sampler);
+}
+
+void TerrainRenderer::UpdateWaterBindGroup()
+{
+    if (!m_waterBindGroup || !m_waterNormalSmall.image || !m_waterNormalLarge.image || !m_waterReflection.color)
+        return;
+    // Every frame slot's sets are rewritten: the GPU must be done with the frames still using them
+    // (rare: refraction inputs or reflection target replaced, water materials changed).
+    if (m_rhi)
+        m_rhi->WaitIdle();
+
+    for (std::uint32_t bodyIndex = 0; bodyIndex < static_cast<std::uint32_t>(m_waterBodies.size()); ++bodyIndex)
     {
-        const WaterMaterialTextureSet* textures = ResolveWaterMaterialTextures(waterBody.body);
-        WriteWaterDescriptorSets(waterBody.uniformBuffers, waterBody.descriptorSets, textures);
-        WriteWaterDescriptorSets(waterBody.uniformBuffersSecondary, waterBody.descriptorSetsSecondary, textures);
+        const WaterMaterialTextureSet* textures = ResolveWaterMaterialTextures(m_waterBodies[bodyIndex].body);
+        for (uint32_t viewIndex = 0; viewIndex < 2u; ++viewIndex)
+        {
+            for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
+                WriteWaterBindGroupSets(bodyIndex, viewIndex, frame, textures);
+        }
     }
 }
 
-bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(VulkanDevice& device, bool force)
+bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevice& rhi, bool force)
 {
-    return CreateOrRecreateWaterReflectionResources(device, force, WaterConfig::ReflectionQuality::Half);
+    return CreateOrRecreateWaterReflectionResources(rhi, force, WaterConfig::ReflectionQuality::Half);
 }
 
-bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(VulkanDevice& device,
+bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevice& rhi,
                                                                bool force,
-                                                               WaterConfig::ReflectionQuality quality)
+                                                               WaterConfig::ReflectionQuality quality,
+                                                               std::uint32_t viewWidth,
+                                                               std::uint32_t viewHeight)
 {
-    const VkExtent2D swapExtent = device.GetSwapchainExtent();
-    if (swapExtent.width == 0 || swapExtent.height == 0)
+    m_rhi = &rhi;
+    const std::uint32_t baseWidth = viewWidth > 0 ? viewWidth : rhi.GetMainSwapchain().Width();
+    const std::uint32_t baseHeight = viewHeight > 0 ? viewHeight : rhi.GetMainSwapchain().Height();
+    if (baseWidth == 0 || baseHeight == 0)
         return false;
 
-    uint32_t divisor = 2;
-    switch (quality)
-    {
-    case WaterConfig::ReflectionQuality::Quarter: divisor = 4; break;
-    case WaterConfig::ReflectionQuality::Half: divisor = 2; break;
-    case WaterConfig::ReflectionQuality::Full: divisor = 1; break;
-    }
+    const uint32_t divisor = WaterReflectionDivisor(quality);
+    const uint32_t width = std::max(1u, baseWidth / divisor);
+    const uint32_t height = std::max(1u, baseHeight / divisor);
+    // Floating point like the views it is mirrored into: a bright sky or sun stays bright in the water.
+    const ixrhi::IXRHIFormat colorFormat = ixrhi::IXRHIFormat::R16G16B16A16Float;
+    const ixrhi::IXRHIFormat depthFormat = rhi.GetMainSwapchain().DepthFormat();
 
-    const uint32_t width = std::max(1u, swapExtent.width / divisor);
-    const uint32_t height = std::max(1u, swapExtent.height / divisor);
-    const VkFormat colorFormat = device.GetSwapchainFormat();
-    const VkFormat depthFormat = device.GetDepthStencilFormat();
-
-    if (!force && m_waterReflection.colorView && m_waterReflection.depthView &&
+    if (!force && m_waterReflection.color && m_waterReflection.depth &&
         m_waterReflection.width == width && m_waterReflection.height == height &&
         m_waterReflection.quality == quality &&
         m_waterReflection.colorFormat == colorFormat && m_waterReflection.depthFormat == depthFormat)
@@ -7000,12 +6758,11 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(VulkanDevice& dev
         return true;
     }
 
-    const bool hadResources = m_waterReflection.colorImage != VK_NULL_HANDLE ||
-        m_waterReflection.depthImage != VK_NULL_HANDLE ||
-        m_waterReflection.framebuffer != VK_NULL_HANDLE;
+    const bool hadResources = m_waterReflection.color != nullptr || m_waterReflection.depth != nullptr ||
+        m_waterReflection.target != nullptr;
     if (hadResources)
     {
-        device.WaitIdle();
+        rhi.WaitIdle();
         Tracen("[WATER-2] Re-creating reflection resources");
     }
     DestroyWaterReflectionPipeline();
@@ -7016,116 +6773,71 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(VulkanDevice& dev
     m_waterReflection.quality = quality;
     m_waterReflection.colorFormat = colorFormat;
     m_waterReflection.depthFormat = depthFormat;
-    m_waterReflection.colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    CreateDeviceLocalAttachmentImage(device, m_device, width, height, colorFormat,
-        VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-        m_waterReflection.colorImage, m_waterReflection.colorMemory);
-    CreateDeviceLocalAttachmentImage(device, m_device, width, height, depthFormat,
-        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
-        m_waterReflection.depthImage, m_waterReflection.depthMemory);
+    ixrhi::IXRHITextureDesc colorDesc;
+    colorDesc.width = width;
+    colorDesc.height = height;
+    colorDesc.format = colorFormat;
+    colorDesc.usage = ixrhi::IXRHITextureUsage::ColorAttachment | ixrhi::IXRHITextureUsage::Sampled;
+    colorDesc.debugName = "Terrain:ReflectionColor";
+    m_waterReflection.color = rhi.CreateTexture(colorDesc, nullptr, 0);
+    if (!m_waterReflection.color)
+    {
+        DestroyWaterReflectionResources();
+        return false;
+    }
 
-    VkImageViewCreateInfo colorView{};
-    colorView.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    colorView.image = m_waterReflection.colorImage;
-    colorView.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    colorView.format = colorFormat;
-    colorView.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    colorView.subresourceRange.levelCount = 1;
-    colorView.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(m_device, &colorView, nullptr, &m_waterReflection.colorView));
+    ixrhi::IXRHITextureDesc depthDesc;
+    depthDesc.width = width;
+    depthDesc.height = height;
+    depthDesc.format = depthFormat;
+    depthDesc.usage = ixrhi::IXRHITextureUsage::DepthStencilAttachment;
+    depthDesc.debugName = "Terrain:ReflectionDepth";
+    m_waterReflection.depth = rhi.CreateTexture(depthDesc, nullptr, 0);
+    if (!m_waterReflection.depth)
+    {
+        DestroyWaterReflectionResources();
+        return false;
+    }
 
-    VkImageViewCreateInfo depthView{};
-    depthView.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    depthView.image = m_waterReflection.depthImage;
-    depthView.viewType = VK_IMAGE_VIEW_TYPE_2D;
-    depthView.format = depthFormat;
-    depthView.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    if (HasStencilAspect(depthFormat))
-        depthView.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
-    depthView.subresourceRange.levelCount = 1;
-    depthView.subresourceRange.layerCount = 1;
-    VK_CHECK(vkCreateImageView(m_device, &depthView, nullptr, &m_waterReflection.depthView));
+    // Color clears to the scene's own backdrop (what the reflected "sky" must show: black made the
+    // water dark at every grazing view), depth to 1.0; depth is not stored (DONT_CARE) since only
+    // the color is sampled afterwards.
+    ixrhi::IXRHIRenderTargetDesc targetDesc;
+    targetDesc.color = m_waterReflection.color;
+    targetDesc.depth = m_waterReflection.depth;
+    targetDesc.colorLoad = ixrhi::IXRHILoadOp::Clear;
+    targetDesc.colorStore = ixrhi::IXRHIStoreOp::Store;
+    targetDesc.depthLoad = ixrhi::IXRHILoadOp::Clear;
+    targetDesc.depthStore = ixrhi::IXRHIStoreOp::DontCare;
+    targetDesc.clearColor[0] = kSceneClearColor[0];
+    targetDesc.clearColor[1] = kSceneClearColor[1];
+    targetDesc.clearColor[2] = kSceneClearColor[2];
+    targetDesc.clearColor[3] = kSceneClearColor[3];
+    targetDesc.clearDepth = 1.0f;
+    targetDesc.debugName = "Terrain:Reflection";
+    m_waterReflection.target = rhi.CreateRenderTarget(targetDesc);
+    if (!m_waterReflection.target)
+    {
+        DestroyWaterReflectionResources();
+        return false;
+    }
 
-    VkAttachmentDescription colorAttachment{};
-    colorAttachment.format = colorFormat;
-    colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    colorAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    VkAttachmentDescription depthAttachment{};
-    depthAttachment.format = depthFormat;
-    depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-    depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    std::array<VkAttachmentDescription, 2> attachments = {colorAttachment, depthAttachment};
-    VkAttachmentReference colorRef{};
-    colorRef.attachment = 0;
-    colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    VkAttachmentReference depthRef{};
-    depthRef.attachment = 1;
-    depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &colorRef;
-    subpass.pDepthStencilAttachment = &depthRef;
-
-    std::array<VkSubpassDependency, 2> dependencies{};
-    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-    dependencies[0].dstSubpass = 0;
-    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[1].srcSubpass = 0;
-    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-    VkRenderPassCreateInfo renderPass{};
-    renderPass.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    renderPass.attachmentCount = static_cast<uint32_t>(attachments.size());
-    renderPass.pAttachments = attachments.data();
-    renderPass.subpassCount = 1;
-    renderPass.pSubpasses = &subpass;
-    renderPass.dependencyCount = static_cast<uint32_t>(dependencies.size());
-    renderPass.pDependencies = dependencies.data();
-    VK_CHECK(vkCreateRenderPass(m_device, &renderPass, nullptr, &m_waterReflection.renderPass));
-
-    std::array<VkImageView, 2> framebufferAttachments = {m_waterReflection.colorView, m_waterReflection.depthView};
-    VkFramebufferCreateInfo framebuffer{};
-    framebuffer.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    framebuffer.renderPass = m_waterReflection.renderPass;
-    framebuffer.attachmentCount = static_cast<uint32_t>(framebufferAttachments.size());
-    framebuffer.pAttachments = framebufferAttachments.data();
-    framebuffer.width = width;
-    framebuffer.height = height;
-    framebuffer.layers = 1;
-    VK_CHECK(vkCreateFramebuffer(m_device, &framebuffer, nullptr, &m_waterReflection.framebuffer));
-
-    VkSamplerCreateInfo sampler{};
-    sampler.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    sampler.magFilter = VK_FILTER_LINEAR;
-    sampler.minFilter = VK_FILTER_LINEAR;
-    sampler.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    sampler.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    sampler.maxLod = 1.0f;
-    VK_CHECK(vkCreateSampler(m_device, &sampler, nullptr, &m_waterReflection.sampler));
+    ixrhi::IXRHISamplerDesc samplerDesc;
+    samplerDesc.minFilter = ixrhi::IXRHISamplerFilter::Linear;
+    samplerDesc.magFilter = ixrhi::IXRHISamplerFilter::Linear;
+    samplerDesc.mipmapFilter = ixrhi::IXRHISamplerFilter::Linear;
+    samplerDesc.addressU = ixrhi::IXRHISamplerAddress::ClampToEdge;
+    samplerDesc.addressV = ixrhi::IXRHISamplerAddress::ClampToEdge;
+    samplerDesc.addressW = ixrhi::IXRHISamplerAddress::ClampToEdge;
+    samplerDesc.maxLod = 1.0f;
+    samplerDesc.debugName = "Terrain:ReflectionSampler";
+    m_waterReflection.sampler = rhi.CreateSampler(samplerDesc);
+    if (!m_waterReflection.sampler)
+    {
+        DestroyWaterReflectionResources();
+        return false;
+    }
 
     const char* qualityName = "Half";
     if (quality == WaterConfig::ReflectionQuality::Quarter)
@@ -7136,527 +6848,233 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(VulkanDevice& dev
     return true;
 }
 
-bool TerrainRenderer::CreatePipeline(VulkanDevice& device)
+bool TerrainRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
 {
-    if (!m_assets)
+    if (!m_assets || !m_bindLayout)
         return false;
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/terrain_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/terrain_ps.spv");
+    auto vs = LoadShader(rhi, *m_assets, "assets/shaders/terrain_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex, "VSMain");
+    auto ps = LoadShader(rhi, *m_assets, "assets/shaders/terrain_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    if (!vs || !ps)
+        return false;
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vs;
-    stages[0].pName = "VSMain";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = ps;
-    stages[1].pName = "PSMain";
-
-    VkVertexInputBindingDescription binding{};
-    binding.binding = 0;
-    binding.stride = sizeof(Vertex);
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-    VkVertexInputAttributeDescription attributes[3]{};
-    attributes[0].location = 0;
-    attributes[0].binding = 0;
-    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[0].offset = offsetof(Vertex, position);
-    attributes[1].location = 1;
-    attributes[1].binding = 0;
-    attributes[1].format = VK_FORMAT_R32G32_SFLOAT;
-    attributes[1].offset = offsetof(Vertex, texUv);
-    attributes[2].location = 2;
-    attributes[2].binding = 0;
-    attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
-    attributes[2].offset = offsetof(Vertex, maskUv);
-
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = 3;
-    vertexInput.pVertexAttributeDescriptions = attributes;
-
-    VkPipelineInputAssemblyStateCreateInfo assembly{};
-    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport{};
-    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth{};
-    depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = VK_TRUE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    blendAttachment.blendEnable = VK_TRUE;
-    blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-    blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
-    blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-    blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
-
-    VkPipelineColorBlendStateCreateInfo blend{};
-    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blend.attachmentCount = 1;
-    blend.pAttachments = &blendAttachment;
-
-    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamicStates;
-
-    VkPipelineLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layout.setLayoutCount = 1;
-    layout.pSetLayouts = &m_descriptorSetLayout;
-    VkPushConstantRange pushConstant{};
-    pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    pushConstant.offset = 0;
-    pushConstant.size = sizeof(float) * 4u;
-    layout.pushConstantRangeCount = 1;
-    layout.pPushConstantRanges = &pushConstant;
-    VK_CHECK(vkCreatePipelineLayout(m_device, &layout, nullptr, &m_pipelineLayout));
-
-    VkGraphicsPipelineCreateInfo pipeline{};
-    pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline.stageCount = 2;
-    pipeline.pStages = stages;
-    pipeline.pVertexInputState = &vertexInput;
-    pipeline.pInputAssemblyState = &assembly;
-    pipeline.pViewportState = &viewport;
-    pipeline.pRasterizationState = &raster;
-    pipeline.pMultisampleState = &multisample;
-    pipeline.pDepthStencilState = &depth;
-    pipeline.pColorBlendState = &blend;
-    pipeline.pDynamicState = &dynamic;
-    pipeline.layout = m_pipelineLayout;
-    pipeline.renderPass = m_mainRenderPass ? m_mainRenderPass : device.GetRenderPass();
-    pipeline.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_pipeline));
-
-    vkDestroyShaderModule(m_device, ps, nullptr);
-    vkDestroyShaderModule(m_device, vs, nullptr);
-    return true;
+    // Parity with the pre-migration state: triangle list, fill, cull-none,
+    // depth test+write LEQUAL, standard alpha blend, push-constant
+    // layerParams (vertex+fragment, 16 bytes), dynamic viewport/scissor.
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = ps;
+    desc.bindGroupLayouts = {m_bindLayout.get()};
+    desc.pushRanges = {{ixrhi::IXRHIShaderStage::Vertex | ixrhi::IXRHIShaderStage::Fragment, 0, sizeof(float) * 4u}};
+    desc.vertexBindings = {{0, sizeof(Vertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, position)},
+        {1, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, texUv)},
+        {2, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, maskUv)},
+    };
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = true;
+    desc.depthWriteEnable = true;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.blendAttachments = {{true,
+        ixrhi::IXRHIBlendFactor::SrcAlpha,
+        ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+        ixrhi::IXRHIBlendOp::Add,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+        ixrhi::IXRHIBlendOp::Add}};
+    desc.sampleCount = 1;
+    desc.targetRenderPass = m_targetPass;
+    desc.debugName = "Terrain:Main";
+    m_pipeline = rhi.CreateGraphicsPipeline(desc);
+    return m_pipeline != nullptr;
 }
 
-bool TerrainRenderer::CreateWaterReflectionPipeline(VulkanDevice& device)
+bool TerrainRenderer::CreateWaterReflectionPipeline(ixrhi::IXRHIDevice& rhi)
 {
-    if (!m_assets || !m_waterReflection.renderPass)
+    if (!m_assets || !m_bindLayout || !m_waterReflection.target)
         return false;
 
     DestroyWaterReflectionPipeline();
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/terrain_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/terrain_ps.spv");
+    auto vs = LoadShader(rhi, *m_assets, "assets/shaders/terrain_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex, "VSMain");
+    auto ps = LoadShader(rhi, *m_assets, "assets/shaders/terrain_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    if (!vs || !ps)
+        return false;
 
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vs;
-    stages[0].pName = "VSMain";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = ps;
-    stages[1].pName = "PSMain";
-
-    VkVertexInputBindingDescription binding{};
-    binding.binding = 0;
-    binding.stride = sizeof(Vertex);
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-    VkVertexInputAttributeDescription attributes[3]{};
-    attributes[0].location = 0;
-    attributes[0].binding = 0;
-    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[0].offset = offsetof(Vertex, position);
-    attributes[1].location = 1;
-    attributes[1].binding = 0;
-    attributes[1].format = VK_FORMAT_R32G32_SFLOAT;
-    attributes[1].offset = offsetof(Vertex, texUv);
-    attributes[2].location = 2;
-    attributes[2].binding = 0;
-    attributes[2].format = VK_FORMAT_R32G32_SFLOAT;
-    attributes[2].offset = offsetof(Vertex, maskUv);
-
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(std::size(attributes));
-    vertexInput.pVertexAttributeDescriptions = attributes;
-
-    VkPipelineInputAssemblyStateCreateInfo assembly{};
-    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport{};
-    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_FRONT_BIT;
-    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth{};
-    depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = VK_TRUE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    blendAttachment.blendEnable = VK_FALSE;
-
-    VkPipelineColorBlendStateCreateInfo blend{};
-    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blend.attachmentCount = 1;
-    blend.pAttachments = &blendAttachment;
-
-    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamicStates;
-
-    VkPushConstantRange pushConstant{};
-    pushConstant.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    pushConstant.offset = 0;
-    pushConstant.size = sizeof(float) * 4u;
-
-    VkPipelineLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layout.setLayoutCount = 1;
-    layout.pSetLayouts = &m_descriptorSetLayout;
-    layout.pushConstantRangeCount = 1;
-    layout.pPushConstantRanges = &pushConstant;
-    VK_CHECK(vkCreatePipelineLayout(m_device, &layout, nullptr, &m_waterReflectionPipelineLayout));
-
-    VkGraphicsPipelineCreateInfo pipeline{};
-    pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline.stageCount = 2;
-    pipeline.pStages = stages;
-    pipeline.pVertexInputState = &vertexInput;
-    pipeline.pInputAssemblyState = &assembly;
-    pipeline.pViewportState = &viewport;
-    pipeline.pRasterizationState = &raster;
-    pipeline.pMultisampleState = &multisample;
-    pipeline.pDepthStencilState = &depth;
-    pipeline.pColorBlendState = &blend;
-    pipeline.pDynamicState = &dynamic;
-    pipeline.layout = m_waterReflectionPipelineLayout;
-    pipeline.renderPass = m_waterReflection.renderPass;
-    pipeline.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_waterReflectionPipeline));
-
-    vkDestroyShaderModule(m_device, ps, nullptr);
-    vkDestroyShaderModule(m_device, vs, nullptr);
-    return true;
+    // Same terrain shaders as the main pipeline with blending off. The reflection draws the scene
+    // mirrored across the water plane (ComputeMirrorCamera), which flips its winding: both faces
+    // are drawn, depth sorts them.
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = ps;
+    desc.bindGroupLayouts = {m_bindLayout.get()};
+    desc.pushRanges = {{ixrhi::IXRHIShaderStage::Vertex | ixrhi::IXRHIShaderStage::Fragment, 0, sizeof(float) * 4u}};
+    desc.vertexBindings = {{0, sizeof(Vertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, position)},
+        {1, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, texUv)},
+        {2, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, maskUv)},
+    };
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = true;
+    desc.depthWriteEnable = true;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.blendAttachments = {{false,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::Zero,
+        ixrhi::IXRHIBlendOp::Add,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::Zero,
+        ixrhi::IXRHIBlendOp::Add}};
+    desc.sampleCount = 1;
+    desc.targetRenderPass = m_waterReflection.target->GetPass();
+    desc.debugName = "Terrain:Reflection";
+    m_reflectionPipeline = rhi.CreateGraphicsPipeline(desc);
+    return m_reflectionPipeline != nullptr;
 }
 
-bool TerrainRenderer::CreateWaterPipeline(VulkanDevice& device)
+bool TerrainRenderer::CreateWaterPipeline(ixrhi::IXRHIDevice& rhi)
 {
-    if (!m_assets || !m_waterDescriptorSetLayout)
+    if (!m_assets || !m_waterBindLayout)
         return false;
 
     DestroyWaterPipeline();
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/water_vs.spv");
-    VkShaderModule ps = CreateShaderModule(m_device, *m_assets, "assets/shaders/water_ps.spv");
-
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vs;
-    stages[0].pName = "VSMain";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = ps;
-    stages[1].pName = "PSMain";
-
-    VkVertexInputBindingDescription binding{};
-    binding.binding = 0;
-    binding.stride = sizeof(WaterVertex);
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-    VkVertexInputAttributeDescription attributes[3]{};
-    attributes[0].location = 0;
-    attributes[0].binding = 0;
-    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[0].offset = offsetof(WaterVertex, position);
-    attributes[1].location = 1;
-    attributes[1].binding = 0;
-    attributes[1].format = VK_FORMAT_R32G32_SFLOAT;
-    attributes[1].offset = offsetof(WaterVertex, uv);
-    attributes[2].location = 2;
-    attributes[2].binding = 0;
-    attributes[2].format = VK_FORMAT_R32_SFLOAT;
-    attributes[2].offset = offsetof(WaterVertex, edgeAlpha);
-
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(std::size(attributes));
-    vertexInput.pVertexAttributeDescriptions = attributes;
-
-    VkPipelineInputAssemblyStateCreateInfo assembly{};
-    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport{};
-    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth{};
-    depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = VK_FALSE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkPipelineColorBlendAttachmentState blendAttachment{};
-    blendAttachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-        VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-    blendAttachment.blendEnable = VK_TRUE;
-    blendAttachment.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
-    blendAttachment.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blendAttachment.colorBlendOp = VK_BLEND_OP_ADD;
-    blendAttachment.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-    blendAttachment.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blendAttachment.alphaBlendOp = VK_BLEND_OP_ADD;
-
-    VkPipelineColorBlendStateCreateInfo blend{};
-    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blend.attachmentCount = 1;
-    blend.pAttachments = &blendAttachment;
-
-    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamicStates;
-
-    VkPipelineLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layout.setLayoutCount = 1;
-    layout.pSetLayouts = &m_waterDescriptorSetLayout;
-    VK_CHECK(vkCreatePipelineLayout(m_device, &layout, nullptr, &m_waterPipelineLayout));
-
-    VkGraphicsPipelineCreateInfo pipeline{};
-    pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline.stageCount = 2;
-    pipeline.pStages = stages;
-    pipeline.pVertexInputState = &vertexInput;
-    pipeline.pInputAssemblyState = &assembly;
-    pipeline.pViewportState = &viewport;
-    pipeline.pRasterizationState = &raster;
-    pipeline.pMultisampleState = &multisample;
-    pipeline.pDepthStencilState = &depth;
-    pipeline.pColorBlendState = &blend;
-    pipeline.pDynamicState = &dynamic;
-    pipeline.layout = m_waterPipelineLayout;
-    pipeline.renderPass = m_mainRenderPass ? m_mainRenderPass : device.GetRenderPass();
-    pipeline.subpass = 0;
-    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_waterPipeline));
-
-    vkDestroyShaderModule(m_device, ps, nullptr);
-    vkDestroyShaderModule(m_device, vs, nullptr);
-    return true;
-}
-
-bool TerrainRenderer::CreateShadowPipeline()
-{
-    if (!m_assets || !m_shadowRenderPass)
+    auto vs = LoadShader(rhi, *m_assets, "assets/shaders/water_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex, "VSMain");
+    auto ps = LoadShader(rhi, *m_assets, "assets/shaders/water_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    if (!vs || !ps)
         return false;
 
-    VkShaderModule vs = CreateShaderModule(m_device, *m_assets, "assets/shaders/shadow_depth_vs.spv");
+    // Parity: triangle list, fill, cull-none, depth test LEQUAL without
+    // write (translucent water over terrain), standard alpha blend, no push
+    // constants.
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = ps;
+    desc.bindGroupLayouts = {m_waterBindLayout.get()};
+    desc.vertexBindings = {{0, sizeof(WaterVertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(WaterVertex, position)},
+        {1, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(WaterVertex, uv)},
+        {2, 0, ixrhi::IXRHIFormat::R32Float, offsetof(WaterVertex, edgeAlpha)},
+    };
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = true;
+    desc.depthWriteEnable = false;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.blendAttachments = {{true,
+        ixrhi::IXRHIBlendFactor::SrcAlpha,
+        ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+        ixrhi::IXRHIBlendOp::Add,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+        ixrhi::IXRHIBlendOp::Add}};
+    desc.sampleCount = 1;
+    desc.targetRenderPass = m_targetPass;
+    desc.debugName = "Terrain:Water";
+    m_waterPipeline = rhi.CreateGraphicsPipeline(desc);
 
-    VkPipelineShaderStageCreateInfo stage{};
-    stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stage.stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stage.module = vs;
-    stage.pName = "VSMain";
+    // The visibility query's draw (QueryWaterVisibility): the same surface, depth-tested only. The
+    // shadow depth shader takes the position and a view-projection push constant; no fragment shader,
+    // no colour written. Without it the water is simply always drawn when in view.
+    if (auto occlusionVs = LoadShader(rhi, *m_assets, "assets/shaders/shadow_depth_vs.spv",
+            ixrhi::IXRHIShaderStage::Vertex, "VSMain"))
+    {
+        ixrhi::IXRHIGraphicsPipelineDesc occlusion;
+        occlusion.vertexShader = occlusionVs;
+        occlusion.fragmentShader = nullptr;
+        occlusion.pushRanges = {{ixrhi::IXRHIShaderStage::Vertex, 0, sizeof(WorldMat4)}};
+        occlusion.vertexBindings = {{0, sizeof(WaterVertex)}};
+        occlusion.vertexAttributes = {
+            {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(WaterVertex, position)},
+        };
+        occlusion.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+        occlusion.cullMode = ixrhi::IXRHICullMode::None;
+        occlusion.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+        occlusion.depthTestEnable = true;
+        occlusion.depthWriteEnable = false;
+        occlusion.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+        ixrhi::IXRHIBlendAttachment noColor{};
+        noColor.writeColor = false;
+        occlusion.blendAttachments = {noColor};
+        occlusion.sampleCount = 1;
+        occlusion.targetRenderPass = m_targetPass;
+        occlusion.debugName = "Terrain:WaterOcclusion";
+        m_waterOcclusionPipeline = rhi.CreateGraphicsPipeline(occlusion);
+    }
+    return m_waterPipeline != nullptr;
+}
 
-    VkVertexInputBindingDescription binding{};
-    binding.binding = 0;
-    binding.stride = sizeof(Vertex);
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+bool TerrainRenderer::CreateShadowPipeline(ixrhi::IXRHIDevice& rhi)
+{
+    if (!m_assets || !m_shadowTargets[0])
+        return false;
 
-    VkVertexInputAttributeDescription attributes[1]{};
-    attributes[0].location = 0;
-    attributes[0].binding = 0;
-    attributes[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-    attributes[0].offset = offsetof(Vertex, position);
+    auto vs = LoadShader(rhi, *m_assets, "assets/shaders/shadow_depth_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex, "VSMain");
+    if (!vs)
+        return false;
 
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = static_cast<uint32_t>(std::size(attributes));
-    vertexInput.pVertexAttributeDescriptions = attributes;
-
-    VkPipelineInputAssemblyStateCreateInfo assembly{};
-    assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport{};
-    viewport.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport.viewportCount = 1;
-    viewport.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_FRONT_BIT;
-    raster.frontFace = VK_FRONT_FACE_CLOCKWISE;
-    raster.depthBiasEnable = VK_TRUE;
-    raster.depthBiasConstantFactor = 1.25f;
-    raster.depthBiasSlopeFactor = 1.75f;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineDepthStencilStateCreateInfo depth{};
-    depth.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depth.depthTestEnable = VK_TRUE;
-    depth.depthWriteEnable = VK_TRUE;
-    depth.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-
-    VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamicStates;
-
-    VkPushConstantRange push{};
-    push.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-    push.offset = 0;
-    push.size = sizeof(WorldMat4);
-
-    VkPipelineLayoutCreateInfo layout{};
-    layout.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    layout.pushConstantRangeCount = 1;
-    layout.pPushConstantRanges = &push;
-    VK_CHECK(vkCreatePipelineLayout(m_device, &layout, nullptr, &m_shadowPipelineLayout));
-
-    VkGraphicsPipelineCreateInfo pipeline{};
-    pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline.stageCount = 1;
-    pipeline.pStages = &stage;
-    pipeline.pVertexInputState = &vertexInput;
-    pipeline.pInputAssemblyState = &assembly;
-    pipeline.pViewportState = &viewport;
-    pipeline.pRasterizationState = &raster;
-    pipeline.pMultisampleState = &multisample;
-    pipeline.pDepthStencilState = &depth;
-    pipeline.pDynamicState = &dynamic;
-    pipeline.layout = m_shadowPipelineLayout;
-    pipeline.renderPass = m_shadowRenderPass;
-    VK_CHECK(vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &pipeline, nullptr, &m_shadowPipeline));
-
-    vkDestroyShaderModule(m_device, vs, nullptr);
-    return true;
+    // Depth-only pipeline (no fragment shader, no color attachments):
+    // position-only vertex input, front cull, fixed depth bias, push-constant
+    // light view-projection (vertex stage, 64 bytes).
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = nullptr;
+    desc.pushRanges = {{ixrhi::IXRHIShaderStage::Vertex, 0, sizeof(WorldMat4)}};
+    desc.vertexBindings = {{0, sizeof(Vertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, position)},
+    };
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::Front;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = true;
+    desc.depthWriteEnable = true;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.depthBias.enable = true;
+    desc.depthBias.constantFactor = 1.25f;
+    desc.depthBias.slopeFactor = 1.75f;
+    desc.sampleCount = 1;
+    desc.targetRenderPass = m_shadowTargets[0]->GetPass();
+    desc.debugName = "Terrain:Shadow";
+    m_shadowPipeline = rhi.CreateGraphicsPipeline(desc);
+    return m_shadowPipeline != nullptr;
 }
 
 void TerrainRenderer::DestroyPipeline()
 {
     DestroyWaterPipeline();
     DestroyWaterReflectionPipeline();
-
-    if (m_pipeline)
-        vkDestroyPipeline(m_device, m_pipeline, nullptr);
-    m_pipeline = VK_NULL_HANDLE;
-
-    if (m_pipelineLayout)
-        vkDestroyPipelineLayout(m_device, m_pipelineLayout, nullptr);
-    m_pipelineLayout = VK_NULL_HANDLE;
+    m_pipeline.reset();
 }
 
 void TerrainRenderer::DestroyWaterPipeline()
 {
-    if (m_waterPipeline)
-        vkDestroyPipeline(m_device, m_waterPipeline, nullptr);
-    m_waterPipeline = VK_NULL_HANDLE;
-    if (m_waterPipelineLayout)
-        vkDestroyPipelineLayout(m_device, m_waterPipelineLayout, nullptr);
-    m_waterPipelineLayout = VK_NULL_HANDLE;
+    m_waterPipeline.reset();
+    m_waterOcclusionPipeline.reset();
 }
 
 void TerrainRenderer::DestroyWaterReflectionPipeline()
 {
-    if (m_waterReflectionPipeline)
-        vkDestroyPipeline(m_device, m_waterReflectionPipeline, nullptr);
-    m_waterReflectionPipeline = VK_NULL_HANDLE;
-    if (m_waterReflectionPipelineLayout)
-        vkDestroyPipelineLayout(m_device, m_waterReflectionPipelineLayout, nullptr);
-    m_waterReflectionPipelineLayout = VK_NULL_HANDLE;
+    m_reflectionPipeline.reset();
 }
 
 void TerrainRenderer::DestroyWaterReflectionResources()
 {
-    if (m_waterReflection.sampler)
-        vkDestroySampler(m_device, m_waterReflection.sampler, nullptr);
-    if (m_waterReflection.framebuffer)
-        vkDestroyFramebuffer(m_device, m_waterReflection.framebuffer, nullptr);
-    if (m_waterReflection.renderPass)
-        vkDestroyRenderPass(m_device, m_waterReflection.renderPass, nullptr);
-    if (m_waterReflection.colorView)
-        vkDestroyImageView(m_device, m_waterReflection.colorView, nullptr);
-    if (m_waterReflection.depthView)
-        vkDestroyImageView(m_device, m_waterReflection.depthView, nullptr);
-    if (m_waterReflection.colorImage)
-        vkDestroyImage(m_device, m_waterReflection.colorImage, nullptr);
-    if (m_waterReflection.depthImage)
-        vkDestroyImage(m_device, m_waterReflection.depthImage, nullptr);
-    if (m_waterReflection.colorMemory)
-        vkFreeMemory(m_device, m_waterReflection.colorMemory, nullptr);
-    if (m_waterReflection.depthMemory)
-        vkFreeMemory(m_device, m_waterReflection.depthMemory, nullptr);
     m_waterReflection = {};
 }
 
@@ -7665,18 +7083,11 @@ void TerrainRenderer::DestroyWaterResources()
     DestroyWaterPipeline();
     DestroyWaterReflectionPipeline();
     DestroyWaterReflectionResources();
-    if (m_waterDescriptorPool)
-        vkDestroyDescriptorPool(m_device, m_waterDescriptorPool, nullptr);
-    m_waterDescriptorPool = VK_NULL_HANDLE;
-    if (m_waterDescriptorSetLayout)
-        vkDestroyDescriptorSetLayout(m_device, m_waterDescriptorSetLayout, nullptr);
-    m_waterDescriptorSetLayout = VK_NULL_HANDLE;
-    m_waterDescriptorSets.fill(VK_NULL_HANDLE);
+    m_waterBindGroup.reset();
+    m_waterBindLayout.reset();
     DestroyWaterBodyResources();
-    for (Buffer& buffer : m_waterUniformBuffers)
-        DestroyBuffer(buffer);
-    DestroyTexture(m_waterNormalSmall);
-    DestroyTexture(m_waterNormalLarge);
+    m_waterNormalSmall = {};
+    m_waterNormalLarge = {};
 }
 
 void TerrainRenderer::DestroyWaterBodyResources()
@@ -7688,98 +7099,51 @@ void TerrainRenderer::DestroyWaterBodyResources()
 
 void TerrainRenderer::DestroyWaterBodyResources(WaterBodyGpu& waterBody)
 {
-    DestroyBuffer(waterBody.vertexBuffer);
-    DestroyBuffer(waterBody.indexBuffer);
-    for (Buffer& buffer : waterBody.uniformBuffers)
-        DestroyBuffer(buffer);
-    for (Buffer& buffer : waterBody.uniformBuffersSecondary)
-        DestroyBuffer(buffer);
-    waterBody.descriptorSets.fill(VK_NULL_HANDLE);
-    waterBody.descriptorSetsSecondary.fill(VK_NULL_HANDLE);
+    waterBody.vertexBuffer.reset();
+    waterBody.indexBuffer.reset();
+    for (auto& buffer : waterBody.uniformBuffers)
+        buffer.reset();
+    for (auto& buffer : waterBody.uniformBuffersSecondary)
+        buffer.reset();
     waterBody.indexCount = 0;
 }
 
 void TerrainRenderer::DestroyShadowPipeline()
 {
-    if (m_shadowPipeline)
-        vkDestroyPipeline(m_device, m_shadowPipeline, nullptr);
-    m_shadowPipeline = VK_NULL_HANDLE;
-    if (m_shadowPipelineLayout)
-        vkDestroyPipelineLayout(m_device, m_shadowPipelineLayout, nullptr);
-    m_shadowPipelineLayout = VK_NULL_HANDLE;
+    m_shadowPipeline.reset();
 }
 
 void TerrainRenderer::DestroyShadowResources()
 {
     DestroyShadowPipeline();
-    for (VkFramebuffer& fb : m_shadowFramebuffers)
-    {
-        if (fb)
-            vkDestroyFramebuffer(m_device, fb, nullptr);
-        fb = VK_NULL_HANDLE;
-    }
-    if (m_shadowRenderPass)
-        vkDestroyRenderPass(m_device, m_shadowRenderPass, nullptr);
-    m_shadowRenderPass = VK_NULL_HANDLE;
-    if (m_shadowSampler)
-        vkDestroySampler(m_device, m_shadowSampler, nullptr);
-    m_shadowSampler = VK_NULL_HANDLE;
-    for (VkImageView& view : m_shadowLayerViews)
-    {
-        if (view)
-            vkDestroyImageView(m_device, view, nullptr);
-        view = VK_NULL_HANDLE;
-    }
-    if (m_shadowArrayView)
-        vkDestroyImageView(m_device, m_shadowArrayView, nullptr);
-    m_shadowArrayView = VK_NULL_HANDLE;
-    if (m_shadowImage)
-        vkDestroyImage(m_device, m_shadowImage, nullptr);
-    m_shadowImage = VK_NULL_HANDLE;
-    if (m_shadowMemory)
-        vkFreeMemory(m_device, m_shadowMemory, nullptr);
-    m_shadowMemory = VK_NULL_HANDLE;
-    m_shadowLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-}
-
-void TerrainRenderer::DestroyBuffer(Buffer& buffer)
-{
-    if (buffer.buffer)
-        vkDestroyBuffer(m_device, buffer.buffer, nullptr);
-    if (buffer.memory)
-        vkFreeMemory(m_device, buffer.memory, nullptr);
-    buffer = {};
-}
-
-void TerrainRenderer::DestroyTexture(Texture& texture)
-{
-    if (texture.sampler)
-        vkDestroySampler(m_device, texture.sampler, nullptr);
-    if (texture.view)
-        vkDestroyImageView(m_device, texture.view, nullptr);
-    if (texture.image)
-        vkDestroyImage(m_device, texture.image, nullptr);
-    if (texture.memory)
-        vkFreeMemory(m_device, texture.memory, nullptr);
-    texture = {};
+    for (auto& target : m_shadowTargets)
+        target.reset();
+    for (auto& target : m_staticShadowTargets)
+        target.reset();
+    for (auto& target : m_staticShadowLoadTargets)
+        target.reset();
+    for (auto& target : m_shadowOverlayTargets)
+        target.reset();
+    m_staticShadowTexture.reset();
+    m_staticShadowCacheFailed = false;
+    for (std::optional<ShadowCascadeInputs>& inputs : m_staticShadowInputs)
+        inputs.reset();
+    m_shadowTexture.reset();
+    m_shadowSampler.reset();
 }
 
 void TerrainRenderer::DestroyTerrainLayers()
 {
-    for (TerrainLayer& layer : m_layers)
-    {
-        DestroyTexture(layer.diffuse);
-        DestroyTexture(layer.mask);
-    }
     m_layers.clear();
-    m_layerDescriptorSets.clear();
 }
 
 void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& camera, bool reflectionPass, uint32_t viewIndex)
 {
-    std::array<Buffer, kFramesInFlight>& targetBuffers =
-        (viewIndex == 0) ? m_uniformBuffers : m_uniformBuffersSecondary;
-    if (frameIndex >= kFramesInFlight || !targetBuffers[frameIndex].memory)
+    const std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight>& targetBuffers =
+        viewIndex == kReflectionUniformView ? m_uniformBuffersReflection
+        : viewIndex == 0                    ? m_uniformBuffers
+                                            : m_uniformBuffersSecondary;
+    if (frameIndex >= kFramesInFlight || !targetBuffers[frameIndex])
     {
         Tracen("[TERRAIN] UpdateUniform skipped: uniform buffer is not ready");
         return;
@@ -7807,7 +7171,7 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     uniform.terrainMaterialParams[2] = std::clamp(m_sceneTerrain.triplanarSlopeThreshold, 0.0f, 1.0f);
     uniform.terrainMaterialParams[3] = std::clamp(m_sceneTerrain.triplanarSlopeTransition, 0.001f, 1.0f);
     uniform.activeLayerCount = static_cast<std::int32_t>(
-        EstimateActiveSplatLayerSpan(m_splatABytes, m_splatBBytes, m_splatWidth, m_splatHeight));
+        ActiveSplatLayerSpan());
     uniform.cameraPos[0] = camera.eye.x;
     uniform.cameraPos[1] = camera.eye.y;
     uniform.cameraPos[2] = camera.eye.z;
@@ -7838,10 +7202,13 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
         uniform.cascadeSplits[i] = m_shadowCascadeSplits[i];
     }
     uniform.shadowParams[0] = (!reflectionPass && m_lightingState.sunShadowsEnabled &&
-        m_shadowLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) ? 1.0f : 0.0f;
+        m_shadowTexture != nullptr) ? 1.0f : 0.0f;
     uniform.shadowParams[1] = static_cast<float>(kShadowResolution);
+    // The compare bias: 0.0015 of a cascade's depth range as it was before the range took on the
+    // step's padding (Terrain.hlsl takes that padding's share back out, in metres), so the terrain's
+    // shadows start where they did.
     uniform.shadowParams[2] = 0.0015f;
-    uniform.shadowParams[3] = 0.0f;
+    uniform.shadowParams[3] = 0.0015f * 2.0f * kShadowDepthStepMeters;
     if (reflectionPass)
     {
         uniform.numPointLights = 0;
@@ -7910,10 +7277,7 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
         Tracen("[TERRAIN] lighting now reads LightingState");
         loggedLighting = true;
     }
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device, targetBuffers[frameIndex].memory, 0, sizeof(uniform), 0, &mapped));
-    std::memcpy(mapped, &uniform, sizeof(uniform));
-    vkUnmapMemory(m_device, targetBuffers[frameIndex].memory);
+    targetBuffers[frameIndex]->Write(0, &uniform, sizeof(uniform));
     if (m_materialParamsDirty)
     {
         Tracen("[TMAT] params buffer updated (live, no reload, no remesh)");
@@ -8025,7 +7389,7 @@ TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const Worl
     uniform.levelTimeEnabled[1] = static_cast<float>(timeSeconds);
     uniform.levelTimeEnabled[2] = water.enabled ? 1.0f : 0.0f;
     uniform.levelTimeEnabled[3] = 0.0f;
-    uniform.reflectionParams[0] = (reflectionTarget && water.reflectionEnabled && m_waterReflection.colorView) ? 1.0f : 0.0f;
+    uniform.reflectionParams[0] = (reflectionTarget && water.reflectionEnabled && m_waterReflection.readable) ? 1.0f : 0.0f;
     uniform.reflectionParams[1] = std::clamp(water.reflectionDistortionStrength, 0.0f, 0.2f);
     uniform.reflectionParams[2] = m_waterReflection.width > 0 ? static_cast<float>(m_waterReflection.width) : 1.0f;
     uniform.reflectionParams[3] = m_waterReflection.height > 0 ? static_cast<float>(m_waterReflection.height) : 1.0f;
@@ -8072,14 +7436,11 @@ TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const Worl
     return uniform;
 }
 
-void TerrainRenderer::UploadWaterUniform(Buffer& buffer, const WaterUniformBlock& uniform)
+void TerrainRenderer::UploadWaterUniform(const std::shared_ptr<ixrhi::IXRHIBuffer>& buffer, const WaterUniformBlock& uniform)
 {
-    if (!buffer.memory)
+    if (!buffer)
         return;
-    void* mapped = nullptr;
-    VK_CHECK(vkMapMemory(m_device, buffer.memory, 0, sizeof(uniform), 0, &mapped));
-    std::memcpy(mapped, &uniform, sizeof(uniform));
-    vkUnmapMemory(m_device, buffer.memory);
+    buffer->Write(0, &uniform, sizeof(uniform));
 }
 
 const WaterConfig& TerrainRenderer::ResolveWaterConfig(const WaterBody& body) const
@@ -8120,9 +7481,9 @@ void TerrainRenderer::UpdateWaterBodyUniform(uint32_t frameIndex,
     }
     if (textures)
     {
-        uniform.textureParams[0] = textures->normalA.view ? 1.0f : 0.0f;
-        uniform.textureParams[1] = textures->normalB.view ? 1.0f : 0.0f;
-        uniform.textureParams[2] = textures->diffuse.view ? 1.0f : 0.0f;
+        uniform.textureParams[0] = textures->normalA.image ? 1.0f : 0.0f;
+        uniform.textureParams[1] = textures->normalB.image ? 1.0f : 0.0f;
+        uniform.textureParams[2] = textures->diffuse.image ? 1.0f : 0.0f;
     }
     if (material)
     {

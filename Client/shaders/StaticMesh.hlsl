@@ -22,7 +22,7 @@ struct SpotLightUbo
     float4 u_materialParams; // metallic, roughness, normal strength, AO strength
     float4 u_materialEmissive; // rgb, intensity
     float4 u_materialUv; // tiling.xy, offset.xy
-    float4 u_materialAlpha; // mode: 0 opaque, 1 mask, 2 blend; cutoff
+    float4 u_materialAlpha; // mode: 0 opaque, 1 mask, 2 blend; cutoff; coverage min/max
     float4 u_cameraPosition;
     float4 u_sunDir;
     float4 u_sunColor;
@@ -34,6 +34,10 @@ struct SpotLightUbo
     float2 u_lightPadding;
     PointLightUbo u_pointLights[16];
     SpotLightUbo u_spotLights[16];
+    float4x4 u_shadowCascadeViewProj[4];
+    float4 u_shadowParams;
+    float4 u_shadowDepthBias;
+    float4 u_shadowNormalOffset;
 };
 
 [[vk::combinedImageSampler]] [[vk::binding(1, 0)]] Texture2D u_diffuse : register(t0);
@@ -56,6 +60,11 @@ struct StaticMeshInstanceData
 };
 
 [[vk::binding(4, 0)]] StructuredBuffer<StaticMeshInstanceData> u_instances : register(t3);
+
+[[vk::combinedImageSampler]] [[vk::binding(5, 0)]] Texture2DArray<float> u_sunShadowMap : register(t4);
+[[vk::combinedImageSampler]] [[vk::binding(5, 0)]] SamplerComparisonState u_sunShadowSampler : register(s4);
+
+#include "SunShadow.hlsli"
 
 struct VSInput
 {
@@ -97,7 +106,31 @@ VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
     output.materialParams = instance.materialParams;
     output.materialEmissive = instance.materialEmissive;
     output.materialAlpha = instance.materialAlpha;
+#if defined(STATIC_MESH_SHADOW)
+    // Into a sun shadow cascade (mvp = model x light view-projection, orthographic): a caster
+    // between the sun and the cascade's depth range is flattened onto its near plane, not clipped.
+    output.position.z = max(output.position.z, 0.0);
+#endif
     return output;
+}
+
+// The sun shadow pass of alpha-tested (mask) materials: their cut-out parts cast no shadow.
+void ApplyLodCoverage(VSOutput input)
+{
+    if (input.materialAlpha.z > 0.0 || input.materialAlpha.w < 1.0)
+    {
+        // Complementary intervals keep mesh/view transitions stable without blending or sorting.
+        float noise = frac(52.9829189 * frac(dot(floor(input.position.xy), float2(0.06711056, 0.00583715))));
+        if (noise < input.materialAlpha.z || noise >= input.materialAlpha.w) discard;
+    }
+}
+
+void ShadowMaskPS(VSOutput input)
+{
+    ApplyLodCoverage(input);
+    const float alpha = u_diffuse.Sample(u_sampler, input.uv).a * input.materialBaseColor.a * input.tint.a;
+    if (input.materialAlpha.x > 0.5 && alpha < input.materialAlpha.y)
+        discard;
 }
 
 float SpecularTerm(float3 normal, float3 lightDir, float3 viewDir, float roughness, float metallic)
@@ -121,7 +154,8 @@ float3 ApplyNormalMap(float3 vertexNormal, float3 worldPos, float2 uv, float str
     float2 duv1 = ddx(uv);
     float2 duv2 = ddy(uv);
     float3 tangent = dp1 * duv2.y - dp2 * duv1.y;
-    if (dot(tangent, tangent) < 0.000001)
+    // Atlas UVs are small: retain their tangent basis at distant-tree screen sizes.
+    if (dot(tangent, tangent) < 0.000000000001)
         return n;
     tangent = normalize(tangent);
     float3 bitangent = normalize(cross(n, tangent));
@@ -133,13 +167,20 @@ float4 PSMain(VSOutput input) : SV_Target0
 #if defined(STATIC_MESH_OUTLINE)
     return float4(1.0, 0.78, 0.18, 1.0);
 #else
+    // The opaque draws' variant (STATIC_MESH_OPAQUE) has no discard at all: a shader that can discard
+    // keeps the hardware from testing depth before shading, so every hidden layer was shaded.
+#if !defined(STATIC_MESH_OPAQUE)
+    ApplyLodCoverage(input);
     if (u_lightPadding.x > 0.5 && input.worldPos.y < u_lightPadding.y)
         discard;
+#endif
 
     float4 texSample = u_diffuse.Sample(u_sampler, input.uv);
     const float alpha = texSample.a * input.materialBaseColor.a * input.tint.a;
+#if !defined(STATIC_MESH_OPAQUE)
     if (input.materialAlpha.x > 0.5 && input.materialAlpha.x < 1.5 && alpha < input.materialAlpha.y)
         discard;
+#endif
 
     float3 texColor = texSample.rgb;
     float3 albedo = texColor * input.materialBaseColor.rgb * input.tint.rgb;
@@ -157,8 +198,9 @@ float4 PSMain(VSOutput input) : SV_Target0
     const float metallic = saturate(input.materialParams.x * orm.b);
     const float roughness = saturate(input.materialParams.y * max(orm.g, 0.04));
     const float ao = saturate(input.materialParams.w * orm.r);
-    float3 lighting = u_ambientColor.rgb * ao + u_sunColor.rgb * ndotl;
-    float3 specular = u_sunColor.rgb * SpecularTerm(normal, lightDir, viewDir, roughness, metallic);
+    const float sunShadow = SunShadow(input.worldPos, normalize(input.normal));
+    float3 lighting = u_ambientColor.rgb * ao + u_sunColor.rgb * ndotl * sunShadow;
+    float3 specular = u_sunColor.rgb * SpecularTerm(normal, lightDir, viewDir, roughness, metallic) * sunShadow;
 
     [loop]
     for (int p = 0; p < u_numPointLights; ++p)

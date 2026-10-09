@@ -1,8 +1,11 @@
+#include "asset/ExrImage.h"
 #include "StaticMeshRenderer.h"
 
 #include "AssimpImporter.h"
+#include "import_export/tree/TreeImpostor.h"
 #include "Debug.h"
 #include "IXRHIShader.h"
+#include "JobSystem.h"
 #include "MaterialAssetManager.h"
 #include "ProjectManager.h"
 #include "asset/IAssetReader.h"
@@ -29,6 +32,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
@@ -77,7 +81,7 @@ struct UniformBlock
     float materialParams[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // metallic, roughness, normal strength, AO strength
     float materialEmissive[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float materialUv[4] = {1.0f, 1.0f, 0.0f, 0.0f}; // tiling.xy, offset.xy
-    float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 0.0f}; // mode: 0 opaque, 1 mask, 2 blend; cutoff
+    float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 1.0f}; // mode, cutoff, coverage interval
     float cameraPosition[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float sunDir[4];
     float sunColor[4];
@@ -89,7 +93,15 @@ struct UniformBlock
     float lightPadding[2] = {0.0f, 0.0f};
     PointLightUniform pointLights[kMaxDynamicPointLights]{};
     SpotLightUniform spotLights[kMaxDynamicSpotLights]{};
+    float shadowCascadeViewProj[SunShadowReceive::kCascades][16]{};
+    float shadowParams[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float shadowDepthBias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float shadowNormalOffset[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
+
+// Bind sets' UniformBlocks share a page's buffer this far apart: a multiple of 256 bytes, the most
+// any device asks uniform buffer offsets to be aligned to.
+constexpr std::uint64_t kUniformStride = (sizeof(UniformBlock) + 255u) & ~std::uint64_t{255u};
 
 struct InstancedDrawCommand
 {
@@ -329,6 +341,10 @@ StaticMeshRenderer::MaterialDefaults MaterialDefaultsFromAsset(const MaterialAss
         (material.alphaMode == MaterialAsset::AlphaMode::Blend ? "blend" : "opaque");
     defaults.alphaCutoff = material.alphaCutoff;
     defaults.unlit = material.shadingMode == MaterialAsset::ShadingMode::Unlit;
+    defaults.uvTiling[0] = material.uvTiling[0];
+    defaults.uvTiling[1] = material.uvTiling[1];
+    defaults.uvOffset[0] = material.uvOffset[0];
+    defaults.uvOffset[1] = material.uvOffset[1];
     return defaults;
 }
 
@@ -352,12 +368,14 @@ void LogPinkFallbackOnce(std::uint32_t entityId,
 StaticMeshRenderer::MaterialDefaults ResolveMaterialSlotDefaults(
     const StaticMeshRenderer::Instance& instance,
     uint32_t materialSlot,
-    const std::vector<StaticMeshRenderer::MaterialDefaults>& bakedDefaults)
+    const std::vector<StaticMeshRenderer::MaterialDefaults>& bakedDefaults,
+    bool internalBakedMaterial = false)
 {
     const StaticMeshRenderer::MaterialDefaults bakedFallback{};
     StaticMeshRenderer::MaterialDefaults defaults = bakedDefaults.empty()
         ? bakedFallback
         : (materialSlot < bakedDefaults.size() ? bakedDefaults[materialSlot] : bakedDefaults.front());
+    if (internalBakedMaterial) return defaults;
 
     if (materialSlot >= instance.materialSlots.size() || instance.materialSlots[materialSlot].empty())
     {
@@ -386,22 +404,23 @@ StaticMeshRenderer::MaterialDefaults ResolveMaterialSlotDefaults(
     return defaults;
 }
 
-void FillStaticMeshInstanceBlock(const WorldCamera& camera,
+void FillStaticMeshInstanceBlock(const Mat4& viewProjection,
     const StaticMeshRenderer::Instance& instance,
     uint32_t materialSlot,
     const std::vector<StaticMeshRenderer::MaterialDefaults>& materialDefaults,
-    StaticMeshRenderer::InstanceBlock& out)
+    StaticMeshRenderer::InstanceBlock& out,
+    bool internalBakedMaterial = false)
 {
     out = {};
     out.model = BuildStaticMeshModelMatrix(instance);
-    out.mvp = Multiply(out.model, ToLocalMat4(camera.viewProjection));
+    out.mvp = Multiply(out.model, viewProjection);
     out.tint[0] = instance.tint[0];
     out.tint[1] = instance.tint[1];
     out.tint[2] = instance.tint[2];
     out.tint[3] = instance.tint[3];
 
     const StaticMeshRenderer::MaterialDefaults defaults =
-        ResolveMaterialSlotDefaults(instance, materialSlot, materialDefaults);
+        ResolveMaterialSlotDefaults(instance, materialSlot, materialDefaults, internalBakedMaterial);
     std::memcpy(out.materialBaseColor, defaults.baseColor, sizeof(out.materialBaseColor));
     out.materialParams[0] = defaults.metallic;
     out.materialParams[1] = defaults.roughness;
@@ -411,14 +430,14 @@ void FillStaticMeshInstanceBlock(const WorldCamera& camera,
     out.materialEmissive[1] = defaults.emissive[1];
     out.materialEmissive[2] = defaults.emissive[2];
     out.materialEmissive[3] = 1.0f;
-    out.materialUv[0] = 1.0f;
-    out.materialUv[1] = 1.0f;
-    out.materialUv[2] = 0.0f;
-    out.materialUv[3] = 0.0f;
+    out.materialUv[0] = defaults.uvTiling[0];
+    out.materialUv[1] = defaults.uvTiling[1];
+    out.materialUv[2] = defaults.uvOffset[0];
+    out.materialUv[3] = defaults.uvOffset[1];
     out.materialAlpha[0] = AlphaModeCode(defaults.alphaMode);
     out.materialAlpha[1] = std::clamp(defaults.alphaCutoff, 0.0f, 1.0f);
-    out.materialAlpha[2] = defaults.unlit ? 1.0f : 0.0f;
-    out.materialAlpha[3] = 0.0f;
+    out.materialAlpha[2] = instance.coverageMin;
+    out.materialAlpha[3] = instance.coverageMax;
 
     for (const MeshSceneEntity::MaterialOverride& overrideSlot : instance.materialOverrides)
     {
@@ -500,6 +519,9 @@ std::optional<fastgltf::Asset> ParseGltf(client::asset::IAssetReader& assets,
 {
     const size_t slash = modelPath.find_last_of("\\/");
     const std::string dir = slash == std::string::npos ? std::string(".") : modelPath.substr(0, slash);
+    auto gltfDirectory = std::filesystem::path(dir);
+    if (!gltfDirectory.is_absolute())
+        if (auto root = assets.RootPath()) gltfDirectory = *root / gltfDirectory;
     auto modelBytes = assets.ReadAll(modelPath);
     if (!modelBytes)
     {
@@ -523,7 +545,7 @@ std::optional<fastgltf::Asset> ParseGltf(client::asset::IAssetReader& assets,
         options |= fastgltf::Options::LoadExternalImages;
 
     fastgltf::Parser parser;
-    auto assetResult = parser.loadGltf(data.get(), std::filesystem::path(dir),
+    auto assetResult = parser.loadGltf(data.get(), gltfDirectory,
         options);
     if (assetResult.error() != fastgltf::Error::None)
     {
@@ -658,8 +680,20 @@ const char* AlphaFragmentPath(const std::string& alphaMode)
     if (alphaMode == "mask" || alphaMode == "MASK")
         return "discard";
     if (alphaMode == "blend" || alphaMode == "BLEND")
-        return "blend-fallback-opaque";
+        return "blend";
     return "none";
+}
+
+// Whether the material in an instance's slot is alpha-blended (only a material asset sets that).
+bool IsBlendMaterialSlot(const StaticMeshRenderer::Instance& instance, std::uint32_t materialSlot)
+{
+    if (materialSlot >= instance.materialSlots.size())
+        return false;
+    const std::optional<Guid> guid = Guid::fromString(instance.materialSlots[materialSlot]);
+    if (!guid)
+        return false;
+    const MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(*guid);
+    return material && material->alphaMode == MaterialAsset::AlphaMode::Blend;
 }
 
 std::string SanitizedStem(std::string value)
@@ -758,11 +792,27 @@ std::vector<Guid> GenerateMaterialAssetsForGltf(const fastgltf::Asset& asset, co
         ? modelFsPath.parent_path()
         : std::filesystem::current_path();
     const std::string meshName = SanitizedStem(modelFsPath.stem().string());
-    const std::filesystem::path materialFolder = projects.AssetRootPath() / "materials" / meshName;
+    // The model's generated materials sit next to it, in <model>_materials/ (no per-type folder).
+    const std::filesystem::path materialFolder = modelDir / (meshName + "_materials");
 
     auto& manager = MaterialAssetManager::Instance();
     MaterialAssetManager::ImportSummary summary{};
     const std::size_t materialCount = asset.materials.empty() ? 1u : asset.materials.size();
+    // A model that has its materials already (its .meta's default materials, one per glTF material,
+    // all still there: the ones it was imported or saved with, or chosen for it) keeps them. Made
+    // again from the file on every load, any that differed from the saved one (a tree's, by its
+    // emissive strength) was saved again as <name>_v2 and replaced the model's own, a chosen one too.
+    {
+        const std::vector<Guid> existing = AssetDatabase::Instance().loadDefaultMaterials(modelFsPath);
+        const bool allThere = existing.size() == materialCount &&
+            std::all_of(existing.begin(), existing.end(), [](const Guid& guid) {
+                const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(guid);
+                std::error_code exists;
+                return path && std::filesystem::exists(*path, exists);
+            });
+        if (allThere)
+            return existing;
+    }
     summary.materials = static_cast<std::uint32_t>(materialCount);
     defaultMaterials.reserve(materialCount);
     for (std::size_t i = 0; i < materialCount; ++i)
@@ -858,6 +908,18 @@ bool DecodeGltfTexture(const fastgltf::Asset& asset,
     int width = 0;
     int height = 0;
     int channels = 0;
+    if (client::asset::IsExr(encoded))
+    {
+        std::string error;
+        auto exr = client::asset::DecodeExr(encoded, error);
+        if (!exr) { LogFormat("[EXR] %s", error.c_str()); return false; }
+        out.name = std::string(image.name.empty() ? label : image.name);
+        out.width = static_cast<std::uint32_t>(exr->width);
+        out.height = static_cast<std::uint32_t>(exr->height);
+        out.format = ixrhi::IXRHIFormat::R16G16B16A16Float;
+        out.pixels = client::asset::ExrHalfPixels(*exr);
+        return true;
+    }
     stbi_uc* decoded = stbi_load_from_memory(
         encoded.data(), static_cast<int>(encoded.size()), &width, &height, &channels, 4);
     if (!decoded || width <= 0 || height <= 0)
@@ -890,6 +952,19 @@ bool DecodeTextureFile(const std::filesystem::path& path,
     std::vector<uint8_t> encoded((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     if (encoded.empty())
         return false;
+
+    if (client::asset::IsExr(encoded) || client::asset::IsExrPath(path))
+    {
+        std::string error;
+        auto exr = client::asset::DecodeExr(encoded, error);
+        if (!exr) { LogFormat("[EXR] %s", error.c_str()); return false; }
+        out.name = path.filename().generic_string();
+        out.width = static_cast<std::uint32_t>(exr->width);
+        out.height = static_cast<std::uint32_t>(exr->height);
+        out.format = ixrhi::IXRHIFormat::R16G16B16A16Float;
+        out.pixels = client::asset::ExrHalfPixels(*exr);
+        return true;
+    }
 
     int width = 0;
     int height = 0;
@@ -946,7 +1021,55 @@ bool LoadGltfMaterialTextures(client::asset::IAssetReader& assets,
     return loadedAny;
 }
 
+// The material texture cache key's role (EnsureMaterialTexture): the decode differs per role.
+std::uint8_t MaterialTextureRoleIndex(const char* role)
+{
+    if (role == nullptr)
+        return 0;
+    if (std::strcmp(role, "baseColor") == 0)
+        return 1;
+    if (std::strcmp(role, "normal") == 0)
+        return 2;
+    if (std::strcmp(role, "metallicRoughness") == 0)
+        return 3;
+    return 4;
+}
+
 } // namespace
+
+struct StaticMeshRenderer::MaterialTextureLoad
+{
+    ixjobs::Counter decoded;  // the decode job
+    std::filesystem::path path;
+    ixrhi::IXRHIFormat format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
+    std::string role;
+    RgbaImage image;
+    bool ok = false;
+    ~MaterialTextureLoad() { ixjobs::JobSystem::Instance().Wait(decoded, /*runBackground=*/true); }
+};
+
+struct StaticMeshRenderer::PendingMaterialImport
+{
+    fastgltf::Asset asset;
+};
+
+struct StaticMeshRenderer::TreeImpostorState
+{
+    tree_tool::TreeImpostorData data;
+    std::unique_ptr<StaticMeshRenderer> renderer;
+    std::uint64_t checkedRevision = 0;
+    std::vector<std::filesystem::file_time_type> sourceTimes;
+    std::filesystem::file_time_type metadataTime{};
+    std::chrono::steady_clock::time_point checkedFiles{};
+    bool filesValid = true;
+    bool valid = true;
+    bool partitioning = false;
+    InstanceList nearInstances, farInstances;
+    std::vector<Instance> fading, billboards;
+    std::vector<PreparedInstance> billboardPrepared;
+};
+
+StaticMeshRenderer::StaticMeshRenderer() = default;
 
 StaticMeshRenderer::~StaticMeshRenderer()
 {
@@ -971,15 +1094,355 @@ bool StaticMeshRenderer::Create(ixrhi::IXRHIDevice& rhi,
     const std::string& modelPath)
 {
     Destroy();
-    m_rhi = &rhi;
+    return LoadCpu(assets, modelPath) && FinishGpu(rhi);
+}
+
+bool StaticMeshRenderer::LoadCpu(client::asset::IAssetReader& assets, const std::string& modelPath)
+{
     m_assets = &assets;
     m_modelPath = modelPath;
     m_status = LoadStatus::Failed;
-    bool loaded = false;
+    m_pendingMaterialImport.reset();
+    auto logLoadFailure = [&]() {
+        LogFormat("[MESH] Create: loaded=0 buffers=0 textures=0 descriptors=0 pipeline=0 verts=%zu indices=%zu drawcalls=%zu model=%s",
+            m_vertices.size(),
+            m_indices.size(),
+            m_draws.size(),
+            modelPath.c_str());
+    };
+
+    const bool builtinPrimitive = modelPath.rfind("builtin://primitive/", 0) == 0;
+    const std::string ext = LowercaseExtension(modelPath);
+    if (builtinPrimitive)
+    {
+        if (!LoadBuiltinPrimitiveMesh(modelPath))
+        {
+            logLoadFailure();
+            return false;
+        }
+    }
+    else if (ext == ".fbx")
+    {
+        if (!LoadStaticFbxMesh(modelPath))
+        {
+            logLoadFailure();
+            return false;
+        }
+    }
+    else
+    {
+        bool isSkinned = false;
+        std::string error;
+        if (!DetectSkinnedGltf(assets, modelPath, isSkinned, &error))
+        {
+            LogFormat("[STATIC-MESH] inspect failed: %s reason=%s", modelPath.c_str(), error.c_str());
+            logLoadFailure();
+            return false;
+        }
+        if (isSkinned)
+        {
+            m_status = LoadStatus::UnsupportedSkinned;
+            LogFormat("[STATIC-MESH] skinned glTF detected, static renderer will not load it: %s", modelPath.c_str());
+            logLoadFailure();
+            return false;
+        }
+
+        if (!LoadStaticGltfMesh(modelPath))
+        {
+            logLoadFailure();
+            return false;
+        }
+    }
+    BuildLods();
+    DecodeTextures(modelPath);
+    if (!builtinPrimitive) LoadTreeImpostorCpu();
+    m_status = LoadStatus::NotLoaded;  // on the CPU; FinishGpu makes it LoadedStatic
+    return true;
+}
+
+void StaticMeshRenderer::LoadTreeImpostorCpu()
+{
+    m_treeImpostor.reset();
+    if (!m_isTreeImpostor)
+    {
+        std::string impostorError;
+        if (auto data = tree_tool::LoadTreeImpostor(*m_assets, m_modelPath, impostorError))
+        {
+            auto state = std::make_unique<TreeImpostorState>();
+            state->data = std::move(*data);
+            if (auto root = m_assets->RootPath())
+            {
+                std::error_code metadataError;
+                state->metadataTime = std::filesystem::last_write_time(*root / (m_modelPath + ".impostor.json"), metadataError);
+                state->filesValid &= !metadataError;
+                for (const auto& source : state->data.sourcePaths)
+                {
+                    std::error_code error;
+                    state->sourceTimes.push_back(std::filesystem::last_write_time(*root / source, error));
+                    state->filesValid &= !error;
+                }
+            }
+            state->renderer = std::make_unique<StaticMeshRenderer>();
+            state->renderer->m_isTreeImpostor = true; // Never recursively load another impostor.
+            if (state->renderer->LoadCpu(*m_assets, state->data.billboardPath) &&
+                state->renderer->VertexCount() == 4 && state->renderer->IndexCount() == 6)
+                m_treeImpostor = std::move(state);
+        }
+        else if (!impostorError.empty()) LogFormat("[TREE-IMPOSTOR] fallback model=%s reason=%s", m_modelPath.c_str(), impostorError.c_str());
+    }
+}
+
+void StaticMeshRenderer::ReloadTreeImpostor()
+{
+    if (!m_rhi || !m_assets || !IsLoaded() || m_isTreeImpostor) return;
+    LoadTreeImpostorCpu();
+    if (m_treeImpostor)
+    {
+        m_treeImpostor->renderer->SetTargetPass(m_targetPass);
+        if (!m_treeImpostor->renderer->FinishGpu(*m_rhi)) m_treeImpostor.reset();
+    }
+    LogFormat("[TREE-IMPOSTOR] reloaded model=%s active=%u", m_modelPath.c_str(), m_treeImpostor ? 1u : 0u);
+}
+
+void StaticMeshRenderer::BuildLods()
+{
+    m_lodIndices.clear();
+    for (std::vector<MeshDraw>& draws : m_shadowLodDraws)
+        draws.clear();
+    for (std::vector<MeshDraw>& draws : m_viewLodDraws)
+        draws.clear();
+    m_modelRadius = 0.0f;
+    for (int corner = 0; corner < 8; ++corner)
+    {
+        const float x = (corner & 1) ? m_boundsMax[0] : m_boundsMin[0];
+        const float y = (corner & 2) ? m_boundsMax[1] : m_boundsMin[1];
+        const float z = (corner & 4) ? m_boundsMax[2] : m_boundsMin[2];
+        m_modelRadius = std::max(m_modelRadius, std::sqrt(x * x + y * y + z * z));
+    }
+    m_shadowCardVertices.clear();
+    m_shadowCardDraws.clear();
+    if (m_vertices.empty() || m_indices.empty())
+        return;
+    const auto masked = [&](const MeshDraw& draw) {
+        return draw.materialSlot < m_materialDefaults.size() &&
+            AlphaModeCode(m_materialDefaults[draw.materialSlot].alphaMode) >= 1.0f;
+    };
+    const auto started = std::chrono::steady_clock::now();
+    std::vector<std::uint32_t> welded(m_indices.size());
+    meshopt_generateShadowIndexBuffer(welded.data(), m_indices.data(), m_indices.size(),
+        &m_vertices.front().position[0], m_vertices.size(), sizeof(float) * 3u, sizeof(Vertex));
+
+    // Opaque submeshes, simplified (a model of a few hundred opaque triangles keeps its own).
+    std::size_t opaqueIndices = 0;
+    for (const MeshDraw& draw : m_draws)
+        opaqueIndices += masked(draw) ? 0u : draw.indexCount;
+    std::array<std::size_t, kLodLevels> levelIndices{};
+    std::array<std::size_t, kLodLevels> viewLevelIndices{};
+    // Each opaque draw's levels, from the given indices (welded for the shadow, as they are for the view).
+    const auto simplifyLevels = [&](const std::vector<std::uint32_t>& sourceIndices,
+                                    std::array<std::vector<MeshDraw>, kLodLevels>& out,
+                                    std::array<std::size_t, kLodLevels>& outIndices) {
+        for (std::vector<MeshDraw>& draws : out)
+            draws.assign(m_draws.size(), MeshDraw{});
+        std::vector<std::uint32_t> source;
+        std::vector<std::uint32_t> simplified;
+        for (std::size_t drawIndex = 0; drawIndex < m_draws.size(); ++drawIndex)
+        {
+            const MeshDraw& draw = m_draws[drawIndex];
+            if (draw.indexCount == 0 || masked(draw))
+                continue;
+            source.assign(sourceIndices.begin() + draw.firstIndex, sourceIndices.begin() + draw.firstIndex + draw.indexCount);
+            MeshDraw kept{};  // the coarsest level kept so far (indexCount 0: the draw's own)
+            float keptError = 0.0f;  // how far off the surface it is
+            for (std::size_t level = 0; level < kLodLevels; ++level)
+            {
+                simplified.resize(source.size());
+                float error = 0.0f;
+                const std::size_t count = meshopt_simplify(simplified.data(), source.data(), source.size(),
+                    &m_vertices.front().position[0], m_vertices.size(), sizeof(Vertex), 0,
+                    std::max(kLodErrors[level] - keptError, 0.0f),
+                    meshopt_SimplifySparse | meshopt_SimplifyErrorAbsolute, &error);
+                if (count >= 3u && count * 4u <= source.size() * 3u)
+                {
+                    kept.firstIndex = static_cast<std::uint32_t>(m_lodIndices.size());
+                    kept.indexCount = static_cast<std::uint32_t>(count);
+                    kept.materialSlot = draw.materialSlot;
+                    kept.vertexCount = draw.vertexCount;
+                    m_lodIndices.insert(m_lodIndices.end(), simplified.begin(), simplified.begin() + count);
+                    source.assign(simplified.begin(), simplified.begin() + count);
+                    keptError += error;
+                }
+                out[level][drawIndex] = kept;
+                outIndices[level] += kept.indexCount != 0 ? kept.indexCount : draw.indexCount;
+            }
+        }
+    };
+    if (opaqueIndices >= 3u * 256u)
+    {
+        simplifyLevels(welded, m_shadowLodDraws, levelIndices);
+        simplifyLevels(m_indices, m_viewLodDraws, viewLevelIndices);
+    }
+
+    // Alpha-masked submeshes of many small separate pieces (leaf cards). A simplifier cannot merge
+    // them; at the coarsest level a share of them is drawn instead, each grown about its centre to
+    // cover the area of those left out (a crown's shadow keeps its density; kShadowCardCover of it,
+    // as the grown pieces overlap each other less than the many small ones did).
+    constexpr std::uint32_t kNone = std::numeric_limits<std::uint32_t>::max();
+    constexpr float kFar = std::numeric_limits<float>::max();
+    std::size_t cardIndicesBefore = 0;
+    std::size_t cardIndicesAfter = 0;
+    std::vector<std::uint32_t> parent;
+    std::vector<std::uint32_t> pieceOfRoot;
+    std::vector<std::uint32_t> cardVertexOf;
+    for (std::size_t drawIndex = 0; drawIndex < m_draws.size(); ++drawIndex)
+    {
+        const MeshDraw& draw = m_draws[drawIndex];
+        const std::uint32_t triangles = draw.indexCount / 3u;
+        if (!masked(draw) || triangles < 256u)
+            continue;
+        if (parent.empty())
+        {
+            parent.resize(m_vertices.size());
+            pieceOfRoot.assign(m_vertices.size(), kNone);
+            cardVertexOf.assign(m_vertices.size(), kNone);
+        }
+        // The pieces: triangles joined through shared (welded) corners.
+        const std::uint32_t* corners = welded.data() + draw.firstIndex;
+        for (std::uint32_t i = 0; i < draw.indexCount; ++i)
+            parent[corners[i]] = corners[i];
+        const auto root = [&](std::uint32_t v) {
+            while (parent[v] != v)
+            {
+                parent[v] = parent[parent[v]];
+                v = parent[v];
+            }
+            return v;
+        };
+        for (std::uint32_t t = 0; t < triangles; ++t)
+        {
+            const std::uint32_t a = root(corners[t * 3u]);
+            parent[root(corners[t * 3u + 1u])] = a;
+            parent[root(corners[t * 3u + 2u])] = a;
+        }
+        std::vector<std::uint32_t> pieceOf(triangles);
+        std::vector<std::uint32_t> pieceTriangles;
+        std::vector<std::uint32_t> roots;
+        for (std::uint32_t t = 0; t < triangles; ++t)
+        {
+            const std::uint32_t r = root(corners[t * 3u]);
+            if (pieceOfRoot[r] == kNone)
+            {
+                pieceOfRoot[r] = static_cast<std::uint32_t>(pieceTriangles.size());
+                pieceTriangles.push_back(0);
+                roots.push_back(r);
+            }
+            pieceOf[t] = pieceOfRoot[r];
+            ++pieceTriangles[pieceOf[t]];
+        }
+        for (const std::uint32_t r : roots)
+            pieceOfRoot[r] = kNone;
+        const std::uint32_t pieces = static_cast<std::uint32_t>(pieceTriangles.size());
+        if (pieces < 64u || *std::max_element(pieceTriangles.begin(), pieceTriangles.end()) > 16u)
+            continue;  // not cards
+
+        // The kept pieces: an evenly mixed share (by a hash of their number, the same every load).
+        const std::uint32_t keep = std::max(1u, static_cast<std::uint32_t>(std::lround(pieces * kShadowCardKeep)));
+        std::vector<std::uint32_t> order(pieces);
+        for (std::uint32_t p = 0; p < pieces; ++p)
+            order[p] = p;
+        std::nth_element(order.begin(), order.begin() + keep, order.end(),
+            [](std::uint32_t a, std::uint32_t b) { return a * 0x9E3779B1u < b * 0x9E3779B1u; });
+        std::vector<std::uint8_t> kept(pieces, 0);
+        for (std::uint32_t k = 0; k < keep; ++k)
+            kept[order[k]] = 1;
+        const float grow = std::sqrt(kShadowCardCover * static_cast<float>(pieces) / static_cast<float>(keep));
+        // Each kept piece's centre: the middle of its bounds.
+        std::vector<std::array<float, 6>> bounds(pieces, {kFar, kFar, kFar, -kFar, -kFar, -kFar});
+        for (std::uint32_t t = 0; t < triangles; ++t)
+        {
+            if (!kept[pieceOf[t]])
+                continue;
+            std::array<float, 6>& box = bounds[pieceOf[t]];
+            for (std::uint32_t k = 0; k < 3u; ++k)
+            {
+                const float* p = m_vertices[m_indices[draw.firstIndex + t * 3u + k]].position;
+                for (int axis = 0; axis < 3; ++axis)
+                {
+                    box[axis] = std::min(box[axis], p[axis]);
+                    box[axis + 3] = std::max(box[axis + 3], p[axis]);
+                }
+            }
+        }
+        // Their triangles, on copies of their own vertices (uvs kept for the cut-out) moved out.
+        MeshDraw cards{};
+        cards.firstIndex = static_cast<std::uint32_t>(m_lodIndices.size());
+        cards.materialSlot = draw.materialSlot;
+        const std::size_t firstCardVertex = m_shadowCardVertices.size();
+        for (std::uint32_t t = 0; t < triangles; ++t)
+        {
+            if (!kept[pieceOf[t]])
+                continue;
+            const std::array<float, 6>& box = bounds[pieceOf[t]];
+            for (std::uint32_t k = 0; k < 3u; ++k)
+            {
+                const std::uint32_t source = m_indices[draw.firstIndex + t * 3u + k];
+                if (cardVertexOf[source] == kNone)
+                {
+                    Vertex vertex = m_vertices[source];
+                    for (int axis = 0; axis < 3; ++axis)
+                    {
+                        const float centre = 0.5f * (box[axis] + box[axis + 3]);
+                        vertex.position[axis] = centre + (vertex.position[axis] - centre) * grow;
+                    }
+                    cardVertexOf[source] = static_cast<std::uint32_t>(m_shadowCardVertices.size());
+                    m_shadowCardVertices.push_back(vertex);
+                }
+                m_lodIndices.push_back(cardVertexOf[source]);
+            }
+        }
+        for (std::uint32_t i = 0; i < draw.indexCount; ++i)
+            cardVertexOf[m_indices[draw.firstIndex + i]] = kNone;
+        cards.indexCount = static_cast<std::uint32_t>(m_lodIndices.size() - cards.firstIndex);
+        cards.vertexCount = static_cast<std::uint32_t>(m_shadowCardVertices.size() - firstCardVertex);
+        if (m_shadowCardDraws.empty())
+            m_shadowCardDraws.assign(m_draws.size(), MeshDraw{});
+        m_shadowCardDraws[drawIndex] = cards;
+        cardIndicesBefore += draw.indexCount;
+        cardIndicesAfter += cards.indexCount;
+    }
+
+    if (m_lodIndices.empty())
+    {
+        for (std::vector<MeshDraw>& draws : m_shadowLodDraws)
+            draws.clear();
+        for (std::vector<MeshDraw>& draws : m_viewLodDraws)
+            draws.clear();
+        return;
+    }
+    LogFormat("[STATIC-MESH] lods: %s opaque_tris=%zu shadow=%zu/%zu/%zu view=%zu/%zu/%zu cards_tris=%zu->%zu (%.2f ms)",
+        m_modelPath.c_str(), opaqueIndices / 3u, levelIndices[0] / 3u, levelIndices[1] / 3u, levelIndices[2] / 3u,
+        viewLevelIndices[0] / 3u, viewLevelIndices[1] / 3u, viewLevelIndices[2] / 3u,
+        cardIndicesBefore / 3u, cardIndicesAfter / 3u,
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+}
+
+bool StaticMeshRenderer::FinishGpu(ixrhi::IXRHIDevice& rhi, bool deferUploads)
+{
+    m_rhi = &rhi;
+    m_deferUploads = deferUploads;
+    m_pendingUploads = deferUploads ? std::make_unique<PendingUploads>() : nullptr;
+    if (m_pendingMaterialImport)
+    {
+        GenerateMaterialAssetsForGltf(m_pendingMaterialImport->asset, m_modelPath);
+        m_pendingMaterialImport.reset();
+    }
+    const std::string& modelPath = m_modelPath;
+    const bool loaded = !m_vertices.empty() && !m_indices.empty();
     bool buffers = false;
     bool textures = false;
     bool descriptors = false;
     bool pipeline = false;
+    m_status = LoadStatus::Failed;
     auto logCreateState = [&]() {
         LogFormat("[MESH] Create: loaded=%d buffers=%d textures=%d descriptors=%d pipeline=%d verts=%zu indices=%zu drawcalls=%zu texture=%s bbox_min=(%.3f,%.3f,%.3f) bbox_max=(%.3f,%.3f,%.3f)",
             loaded ? 1 : 0,
@@ -994,57 +1457,18 @@ bool StaticMeshRenderer::Create(ixrhi::IXRHIDevice& rhi,
             m_boundsMin[0], m_boundsMin[1], m_boundsMin[2],
             m_boundsMax[0], m_boundsMax[1], m_boundsMax[2]);
     };
-
-    const bool builtinPrimitive = modelPath.rfind("builtin://primitive/", 0) == 0;
-    const std::string ext = LowercaseExtension(modelPath);
-    if (builtinPrimitive)
+    if (!loaded)
     {
-        if (!LoadBuiltinPrimitiveMesh(modelPath))
-        {
-            logCreateState();
-            return false;
-        }
+        logCreateState();
+        return false;
     }
-    else if (ext == ".fbx")
-    {
-        if (!LoadStaticFbxMesh(modelPath))
-        {
-            logCreateState();
-            return false;
-        }
-    }
-    else
-    {
-        bool isSkinned = false;
-        std::string error;
-        if (!DetectSkinnedGltf(assets, modelPath, isSkinned, &error))
-        {
-            LogFormat("[STATIC-MESH] inspect failed: %s reason=%s", modelPath.c_str(), error.c_str());
-            logCreateState();
-            return false;
-        }
-        if (isSkinned)
-        {
-            m_status = LoadStatus::UnsupportedSkinned;
-            LogFormat("[STATIC-MESH] skinned glTF detected, static renderer will not load it: %s", modelPath.c_str());
-            logCreateState();
-            return false;
-        }
-
-        if (!LoadStaticGltfMesh(modelPath))
-        {
-            logCreateState();
-            return false;
-        }
-    }
-    loaded = true;
     if (!CreateBuffers(rhi))
     {
         logCreateState();
         return false;
     }
     buffers = HasVertexBuffer() && HasIndexBuffer();
-    if (!CreateTextures(rhi, modelPath))
+    if (!UploadDecodedTextures(rhi))
     {
         logCreateState();
         return false;
@@ -1063,6 +1487,13 @@ bool StaticMeshRenderer::Create(ixrhi::IXRHIDevice& rhi,
     }
     pipeline = HasPipeline();
 
+    if (m_treeImpostor)
+    {
+        m_treeImpostor->renderer->SetTargetPass(m_targetPass);
+        if (!m_treeImpostor->renderer->FinishGpu(rhi, deferUploads)) m_treeImpostor.reset();
+        else LogFormat("[TREE-IMPOSTOR] ready model=%s views=%d start=%.1f transition=%.1f",
+            modelPath.c_str(), m_treeImpostor->data.azimuths * 3, m_treeImpostor->data.distance, m_treeImpostor->data.transition);
+    }
     m_status = LoadStatus::LoadedStatic;
     logCreateState();
     LogFormat("[STATIC-MESH] loaded: %s verts=%zu indices=%zu draws=%zu",
@@ -1079,6 +1510,11 @@ bool StaticMeshRenderer::RecreatePipeline(ixrhi::IXRHIDevice& rhi)
     // Deferred-true while the target pass is torn down (parity); real failures
     // abort in the backend like the pre-migration VK_CHECK path.
     CreatePipeline(rhi);
+    if (m_treeImpostor)
+    {
+        m_treeImpostor->renderer->SetTargetPass(m_targetPass);
+        m_treeImpostor->renderer->RecreatePipeline(rhi);
+    }
     return true;
 }
 
@@ -1165,6 +1601,35 @@ bool StaticMeshRenderer::CopyPhysicsMesh(
 
     outIndices = m_indices;
     return !outVertices.empty() && outIndices.size() >= 3;
+}
+
+bool StaticMeshRenderer::BakeTreeImpostorAsset(client::asset::IAssetReader& assets,
+    const std::filesystem::path& modelPath, const tree_tool::TreeImpostorSettings& settings, std::string& error)
+{
+    const auto materials = AssetDatabase::Instance().loadDefaultMaterials(modelPath);
+    StaticMeshRenderer source;
+    source.m_isTreeImpostor = true; // Load just the original geometry, regardless of an earlier bake.
+    if (materials.size() != 2 || !source.LoadCpu(assets, modelPath.generic_string()) ||
+        source.m_draws.empty() || std::any_of(source.m_draws.begin(), source.m_draws.end(), [](const auto& draw) { return draw.materialSlot >= 2; }))
+    { error = "A static tree with two default materials (bark/leaves) is required"; return false; }
+    ixtreemetree::TreeMesh mesh;
+    mesh.bboxMin = {source.m_boundsMin[0], source.m_boundsMin[1], source.m_boundsMin[2]};
+    mesh.bboxMax = {source.m_boundsMax[0], source.m_boundsMax[1], source.m_boundsMax[2]};
+    for (const auto& vertex : source.m_vertices)
+    {
+        const ixtreemetree::Vertex treeVertex{{vertex.position[0], vertex.position[1], vertex.position[2]},
+            {vertex.normal[0], vertex.normal[1], vertex.normal[2]}, {vertex.uv[0], vertex.uv[1]}};
+        mesh.bark.vertices.push_back(treeVertex); mesh.leaves.vertices.push_back(treeVertex);
+    }
+    for (const auto& draw : source.m_draws)
+    {
+        auto& indices = draw.materialSlot == 0 ? mesh.bark.indices : mesh.leaves.indices;
+        indices.insert(indices.end(), source.m_indices.begin() + draw.firstIndex,
+            source.m_indices.begin() + draw.firstIndex + draw.indexCount);
+    }
+    auto dependencies = AssetDatabase::Instance().loadDependencies(modelPath);
+    if (!tree_tool::BakeTreeImpostor(mesh, modelPath, materials, settings, dependencies, error)) return false;
+    return AssetDatabase::Instance().writeDependencies(modelPath, dependencies);
 }
 
 void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instance& instance) const
@@ -1289,8 +1754,8 @@ void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instanc
             alphaCutoff = binding->alphaCutoff;
             if (binding->resolvedMaterial != "gltf_baked")
                 resolvedName = binding->resolvedMaterial;
-            if (binding->baseColorTextureGuid != "EMPTY")
-                baseColorTextureGuid = binding->baseColorTextureGuid;
+            if (binding->baseColorTextureGuid)
+                baseColorTextureGuid = binding->baseColorTextureGuid->toString();
         }
 
         LogFormat("[MATBIND-DIAG]   submesh=%zu materialSlot=%u", i, materialSlot);
@@ -1454,7 +1919,9 @@ bool StaticMeshRenderer::LoadStaticGltfMesh(const std::string& modelPath)
         m_boundsMax = {0.0f, 0.0f, 0.0f};
         return false;
     }
-    GenerateMaterialAssetsForGltf(asset, modelPath);
+    // Its materials are registered in FinishGpu (this may run on a loading thread); asset is not
+    // read past here.
+    m_pendingMaterialImport = std::make_unique<PendingMaterialImport>(PendingMaterialImport{std::move(*parsed)});
     LogFormat("[MPERF] mesh=%s verts=%zu submeshes=%zu materials=%u alpha=%s",
         modelPath.c_str(),
         m_vertices.size(),
@@ -1778,34 +2245,84 @@ bool StaticMeshRenderer::LoadStaticFbxMesh(const std::string& modelPath)
 
 bool StaticMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
 {
-    m_vertexBuffer = CreateRhiBuffer(rhi,
-        sizeof(Vertex) * m_vertices.size(),
-        ixrhi::IXRHIBufferUsage::Vertex,
-        ixrhi::IXRHICpuAccess::None,
-        m_vertices.data(),
-        ("StaticMesh:" + m_modelPath + ":VB").c_str());
-    m_indexBuffer = CreateRhiBuffer(rhi,
-        sizeof(uint32_t) * m_indices.size(),
-        ixrhi::IXRHIBufferUsage::Index,
-        ixrhi::IXRHICpuAccess::None,
-        m_indices.data(),
-        ("StaticMesh:" + m_modelPath + ":IB").c_str());
+    const std::uint64_t vertexBytes = sizeof(Vertex) * m_vertices.size();
+    const std::uint64_t indexBytes = sizeof(uint32_t) * m_indices.size();
+    if (m_deferUploads && m_pendingUploads)
+    {
+        // Made empty, the data staged (RecordPendingUploads copies it in).
+        m_vertexBuffer = CreateRhiBuffer(rhi,
+            vertexBytes,
+            ixrhi::IXRHIBufferUsage::Vertex | ixrhi::IXRHIBufferUsage::TransferDst,
+            ixrhi::IXRHICpuAccess::None,
+            nullptr,
+            ("StaticMesh:" + m_modelPath + ":VB").c_str());
+        m_indexBuffer = CreateRhiBuffer(rhi,
+            indexBytes,
+            ixrhi::IXRHIBufferUsage::Index | ixrhi::IXRHIBufferUsage::TransferDst,
+            ixrhi::IXRHICpuAccess::None,
+            nullptr,
+            ("StaticMesh:" + m_modelPath + ":IB").c_str());
+        m_pendingUploads->vertexStaging = CreateRhiBuffer(rhi,
+            vertexBytes,
+            ixrhi::IXRHIBufferUsage::TransferSrc,
+            ixrhi::IXRHICpuAccess::Write,
+            m_vertices.data(),
+            ("StaticMesh:" + m_modelPath + ":VBStaging").c_str());
+        m_pendingUploads->indexStaging = CreateRhiBuffer(rhi,
+            indexBytes,
+            ixrhi::IXRHIBufferUsage::TransferSrc,
+            ixrhi::IXRHICpuAccess::Write,
+            m_indices.data(),
+            ("StaticMesh:" + m_modelPath + ":IBStaging").c_str());
+        if (!m_pendingUploads->vertexStaging || !m_pendingUploads->indexStaging)
+            return false;
+    }
+    else
+    {
+        m_vertexBuffer = CreateRhiBuffer(rhi,
+            vertexBytes,
+            ixrhi::IXRHIBufferUsage::Vertex,
+            ixrhi::IXRHICpuAccess::None,
+            m_vertices.data(),
+            ("StaticMesh:" + m_modelPath + ":VB").c_str());
+        m_indexBuffer = CreateRhiBuffer(rhi,
+            indexBytes,
+            ixrhi::IXRHIBufferUsage::Index,
+            ixrhi::IXRHICpuAccess::None,
+            m_indices.data(),
+            ("StaticMesh:" + m_modelPath + ":IB").c_str());
+    }
     if (!m_vertexBuffer || !m_indexBuffer)
         return false;
-    for (auto& frameBuffers : m_uniformBuffers)
-    {
-        for (auto& buffer : frameBuffers)
+    // The shadow detail levels (none made: the model's own triangles in every cascade).
+    m_lodIndexBuffer.reset();
+    m_shadowCardVertexBuffer.reset();
+    const bool deferred = m_deferUploads && m_pendingUploads;
+    const auto makeShadowLodBuffer = [&](const void* data, std::uint64_t bytes, ixrhi::IXRHIBufferUsage usage,
+                                         std::shared_ptr<ixrhi::IXRHIBuffer>* staging, const char* name) {
+        std::shared_ptr<ixrhi::IXRHIBuffer> buffer = CreateRhiBuffer(rhi,
+            bytes,
+            deferred ? usage | ixrhi::IXRHIBufferUsage::TransferDst : usage,
+            ixrhi::IXRHICpuAccess::None,
+            deferred ? nullptr : data,
+            ("StaticMesh:" + m_modelPath + ":" + name).c_str());
+        if (buffer && deferred)
         {
-            buffer = CreateRhiBuffer(rhi,
-                sizeof(UniformBlock),
-                ixrhi::IXRHIBufferUsage::Uniform,
-                ixrhi::IXRHICpuAccess::Write,
-                nullptr,
-                ("StaticMesh:" + m_modelPath + ":UBO").c_str());
-            if (!buffer)
-                return false;
+            *staging = CreateRhiBuffer(rhi, bytes, ixrhi::IXRHIBufferUsage::TransferSrc, ixrhi::IXRHICpuAccess::Write,
+                data, ("StaticMesh:" + m_modelPath + ":" + name + "Staging").c_str());
+            if (!*staging)
+                buffer.reset();
         }
-    }
+        return buffer;
+    };
+    if (!m_lodIndices.empty())
+        m_lodIndexBuffer = makeShadowLodBuffer(m_lodIndices.data(),
+            sizeof(std::uint32_t) * m_lodIndices.size(), ixrhi::IXRHIBufferUsage::Index,
+            deferred ? &m_pendingUploads->lodIndexStaging : nullptr, "ShadowLodIB");
+    if (m_lodIndexBuffer && !m_shadowCardVertices.empty())
+        m_shadowCardVertexBuffer = makeShadowLodBuffer(m_shadowCardVertices.data(),
+            sizeof(Vertex) * m_shadowCardVertices.size(), ixrhi::IXRHIBufferUsage::Vertex,
+            deferred ? &m_pendingUploads->shadowCardVertexStaging : nullptr, "ShadowCardVB");
     for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
     {
         m_instanceBufferCapacity[frame] = kInitialInstanceCapacity;
@@ -1817,7 +2334,6 @@ bool StaticMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
             ("StaticMesh:" + m_modelPath + ":Instances").c_str());
         if (!m_instanceBuffers[frame])
             return false;
-        m_instanceMirror[frame].assign(m_instanceBufferCapacity[frame], InstanceBlock{});
     }
     return true;
 }
@@ -2380,25 +2896,134 @@ void StaticMeshRenderer::LodWorkerMain()
     }
 }
 
-bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture)
+void StaticMeshRenderer::RecordTextureUpload(ixrhi::IXRHICommandList& cmd, const Texture& texture,
+                                             const ixrhi::IXRHIBuffer& staging)
 {
-    RgbaImage image = source;
+    cmd.TransitionTexture(*texture.image, ixrhi::IXRHIImageLayout::Undefined, ixrhi::IXRHIImageLayout::TransferDst);
+    cmd.CopyBufferToTexture(staging, 0, texture.width, *texture.image, 0, 0, 0, 0, texture.width, texture.height);
+    cmd.TransitionTexture(*texture.image, ixrhi::IXRHIImageLayout::TransferDst, ixrhi::IXRHIImageLayout::ShaderReadOnly);
+}
+
+void StaticMeshRenderer::RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
+{
+    if (m_treeImpostor) m_treeImpostor->renderer->RecordPendingUploads(cmd, frame);
+    if (!m_rhi || !frame.frameActive)
+        return;
+    // The material textures decoded since: made, and copied in ahead of the frame's draws.
+    for (auto it = m_materialTextureLoads.begin(); it != m_materialTextureLoads.end();)
+    {
+        MaterialTextureLoad& load = *it->second;
+        if (!load.decoded.Done())
+        {
+            ++it;
+            continue;
+        }
+        Texture texture{};
+        std::shared_ptr<ixrhi::IXRHIBuffer> staging;
+        if (!load.ok || !UploadTexture(*m_rhi, load.image, texture, &staging) || !staging)
+        {
+            m_failedMaterialTextureKeys.insert(it->first);
+            LogFormat("[MATBIND-DIAG] texture %s failed role=%s path=%s", load.ok ? "upload" : "decode",
+                load.role.c_str(), load.path.generic_string().c_str());
+            it = m_materialTextureLoads.erase(it);
+            continue;
+        }
+        RecordTextureUpload(cmd, texture, *staging);
+        m_materialTextureStaging.push_back({std::move(staging), frame.frameNumber});
+        LogFormat("[MATBIND-DIAG] texture loaded role=%s image=%s path=%s", load.role.c_str(), texture.name.c_str(),
+            load.path.generic_string().c_str());
+        m_materialTextureCache.emplace(it->first, std::move(texture));
+        it = m_materialTextureLoads.erase(it);
+    }
+    // Staging whose copy's frame is done (its slot came round again).
+    m_materialTextureStaging.erase(std::remove_if(m_materialTextureStaging.begin(), m_materialTextureStaging.end(),
+                                       [&](const RetiredStaging& staging) {
+                                           return frame.frameNumber >= staging.frame + kFramesInFlight;
+                                       }),
+        m_materialTextureStaging.end());
+
+    if (!m_pendingUploads)
+        return;
+    PendingUploads& uploads = *m_pendingUploads;
+    if (uploads.recordedFrame != std::numeric_limits<std::uint64_t>::max())
+    {
+        if (frame.frameNumber >= uploads.recordedFrame + kFramesInFlight)
+            m_pendingUploads.reset();
+        return;
+    }
+    uploads.recordedFrame = frame.frameNumber;
+    if (uploads.vertexStaging && m_vertexBuffer)
+    {
+        cmd.CopyBuffer(*uploads.vertexStaging, *m_vertexBuffer, uploads.vertexStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::VertexRead);
+    }
+    if (uploads.indexStaging && m_indexBuffer)
+    {
+        cmd.CopyBuffer(*uploads.indexStaging, *m_indexBuffer, uploads.indexStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_indexBuffer, ixrhi::IXRHIBufferState::TransferDst, ixrhi::IXRHIBufferState::IndexRead);
+    }
+    if (uploads.lodIndexStaging && m_lodIndexBuffer)
+    {
+        cmd.CopyBuffer(*uploads.lodIndexStaging, *m_lodIndexBuffer, uploads.lodIndexStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_lodIndexBuffer, ixrhi::IXRHIBufferState::TransferDst,
+            ixrhi::IXRHIBufferState::IndexRead);
+    }
+    if (uploads.shadowCardVertexStaging && m_shadowCardVertexBuffer)
+    {
+        cmd.CopyBuffer(*uploads.shadowCardVertexStaging, *m_shadowCardVertexBuffer,
+            uploads.shadowCardVertexStaging->SizeBytes());
+        cmd.TransitionBuffer(*m_shadowCardVertexBuffer, ixrhi::IXRHIBufferState::TransferDst,
+            ixrhi::IXRHIBufferState::VertexRead);
+    }
+    const std::array<Texture*, 3> textures = {&m_texture, &m_normalTexture, &m_ormTexture};
+    for (std::size_t i = 0; i < textures.size(); ++i)
+    {
+        const std::shared_ptr<ixrhi::IXRHIBuffer>& staging = uploads.textureStaging[i];
+        if (staging && textures[i]->image)
+            RecordTextureUpload(cmd, *textures[i], *staging);
+    }
+}
+
+bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage& source, Texture& texture,
+                                       std::shared_ptr<ixrhi::IXRHIBuffer>* staging)
+{
+    const RgbaImage& image = source;
     const ixrhi::IXRHITextureUsage sampledUpload =
         ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
-    if (!rhi.IsTextureFormatSupported(image.format, sampledUpload))
+    ixrhi::IXRHIFormat format = image.format;
+    if (!rhi.IsTextureFormatSupported(format, sampledUpload))
     {
-        image.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
-        if (!rhi.IsTextureFormatSupported(image.format, sampledUpload))
+        // A half-float payload must never be reinterpreted as RGBA8.
+        if (format == ixrhi::IXRHIFormat::R16G16B16A16Float)
+            return false;
+        format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;  // the same RGBA8 texels
+        if (!rhi.IsTextureFormatSupported(format, sampledUpload))
             return false;
     }
 
     ixrhi::IXRHITextureDesc desc;
     desc.width = image.width;
     desc.height = image.height;
-    desc.format = image.format;
+    desc.format = format;
     desc.usage = sampledUpload;
     desc.debugName = "StaticMesh:" + image.name;
-    auto uploaded = rhi.CreateTexture(desc, image.pixels.data(), image.pixels.size());
+    std::shared_ptr<ixrhi::IXRHITexture> uploaded;
+    if (staging)
+    {
+        uploaded = rhi.CreateTexture(desc, nullptr, 0);
+        *staging = CreateRhiBuffer(rhi,
+            image.pixels.size(),
+            ixrhi::IXRHIBufferUsage::TransferSrc,
+            ixrhi::IXRHICpuAccess::Write,
+            image.pixels.data(),
+            ("StaticMesh:" + image.name + ":Staging").c_str());
+        if (!*staging)
+            return false;
+    }
+    else
+    {
+        uploaded = rhi.CreateTexture(desc, image.pixels.data(), image.pixels.size());
+    }
     if (!uploaded)
         return false;
 
@@ -2424,15 +3049,18 @@ bool StaticMeshRenderer::UploadTexture(ixrhi::IXRHIDevice& rhi, const RgbaImage&
     texture.width = image.width;
     texture.height = image.height;
     texture.mipLevels = 1;
-    texture.format = image.format;
+    texture.format = format;
     return true;
 }
 
-bool StaticMeshRenderer::CreateTextures(ixrhi::IXRHIDevice& rhi, const std::string& modelPath)
+void StaticMeshRenderer::DecodeTextures(const std::string& modelPath)
 {
-    RgbaImage diffuse{};
-    RgbaImage normal{};
-    RgbaImage orm{};
+    RgbaImage& diffuse = m_decodedTextures[0];
+    RgbaImage& normal = m_decodedTextures[1];
+    RgbaImage& orm = m_decodedTextures[2];
+    diffuse = {};
+    normal = {};
+    orm = {};
     if (!m_assets || !LoadGltfMaterialTextures(*m_assets, modelPath, diffuse, normal, orm))
     {
         LogFormat("[STATIC-MESH] using fallback PBR textures for %s", modelPath.c_str());
@@ -2443,10 +3071,18 @@ bool StaticMeshRenderer::CreateTextures(ixrhi::IXRHIDevice& rhi, const std::stri
         normal = CreateFallbackNormalImage(modelPath);
     if (orm.pixels.empty())
         orm = CreateFallbackOrmImage(modelPath);
+}
 
-    return UploadTexture(rhi, diffuse, m_texture) &&
-        UploadTexture(rhi, normal, m_normalTexture) &&
-        UploadTexture(rhi, orm, m_ormTexture);
+bool StaticMeshRenderer::UploadDecodedTextures(ixrhi::IXRHIDevice& rhi)
+{
+    const bool defer = m_deferUploads && m_pendingUploads;
+    const bool uploaded =
+        UploadTexture(rhi, m_decodedTextures[0], m_texture, defer ? &m_pendingUploads->textureStaging[0] : nullptr) &&
+        UploadTexture(rhi, m_decodedTextures[1], m_normalTexture, defer ? &m_pendingUploads->textureStaging[1] : nullptr) &&
+        UploadTexture(rhi, m_decodedTextures[2], m_ormTexture, defer ? &m_pendingUploads->textureStaging[2] : nullptr);
+    for (RgbaImage& image : m_decodedTextures)
+        image = {};
+    return uploaded;
 }
 
 const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(ixrhi::IXRHIDevice& rhi,
@@ -2457,12 +3093,12 @@ const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(ixr
     if (!guid)
         return nullptr;
 
-    const std::string guidText = guid->toString();
-    const std::string key = std::string(role ? role : "texture") + ":" + guidText;
+    const MaterialTextureKey key{MaterialTextureRoleIndex(role), *guid};
     if (const auto it = m_materialTextureCache.find(key); it != m_materialTextureCache.end())
         return it->second.image != nullptr ? &it->second : nullptr;
     if (m_failedMaterialTextureKeys.find(key) != m_failedMaterialTextureKeys.end())
         return nullptr;
+    const std::string guidText = guid->toString();
 
     const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*guid);
     if (!path)
@@ -2474,35 +3110,24 @@ const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(ixr
         return nullptr;
     }
 
-    RgbaImage image{};
-    if (!DecodeTextureFile(*path, format, role ? role : "texture", image))
-    {
-        m_failedMaterialTextureKeys.insert(key);
-        LogFormat("[MATBIND-DIAG] texture decode failed role=%s guid=%s path=%s",
-            role ? role : "texture",
-            guidText.c_str(),
-            path->generic_string().c_str());
-        return nullptr;
-    }
-
-    Texture texture{};
-    if (!UploadTexture(rhi, image, texture))
-    {
-        m_failedMaterialTextureKeys.insert(key);
-        LogFormat("[MATBIND-DIAG] texture upload failed role=%s guid=%s path=%s",
-            role ? role : "texture",
-            guidText.c_str(),
-            path->generic_string().c_str());
-        return nullptr;
-    }
-
-    auto [it, _] = m_materialTextureCache.emplace(key, std::move(texture));
-    LogFormat("[MATBIND-DIAG] texture loaded role=%s guid=%s image=%s path=%s",
-        role ? role : "texture",
-        guidText.c_str(),
-        it->second.name.c_str(),
-        path->generic_string().c_str());
-    return &it->second;
+    // Called while drawing (inside a render pass): the texture is decoded on a loading thread and
+    // made and copied in by RecordPendingUploads; until then the model's own texture stands in.
+    (void)rhi;
+    if (m_materialTextureLoads.find(key) != m_materialTextureLoads.end())
+        return nullptr;  // on its way
+    auto load = std::make_unique<MaterialTextureLoad>();
+    load->path = *path;
+    load->format = format;
+    load->role = role ? role : "texture";
+    MaterialTextureLoad* started = load.get();
+    m_materialTextureLoads.emplace(key, std::move(load));
+    ixjobs::JobSystem::Instance().SubmitBackground(
+        [](void* data, std::uint32_t) {
+            MaterialTextureLoad& texture = *static_cast<MaterialTextureLoad*>(data);
+            texture.ok = DecodeTextureFile(texture.path, texture.format, texture.role.c_str(), texture.image);
+        },
+        started, 0, &started->decoded);
+    return nullptr;
 }
 
 StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialTextureViews(ixrhi::IXRHIDevice& rhi,
@@ -2520,6 +3145,16 @@ StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialText
     views.baseColor = materialOf(m_texture);
     views.normal = materialOf(m_normalTexture);
     views.orm = materialOf(m_ormTexture);
+    if (m_isTreeImpostor && !m_materialDefaults.empty())
+    {
+        const auto& defaults = m_materialDefaults.front();
+        views.alphaMode = defaults.alphaMode;
+        views.alphaCutoff = defaults.alphaCutoff;
+        views.fragmentShaderAlphaPath = AlphaFragmentPath(views.alphaMode);
+        views.unlit = defaults.unlit;
+        views.resolvedMaterial = "tree_impostor";
+        return views;
+    }
 
     if (materialSlot >= instance.materialSlots.size())
         return views;
@@ -2539,9 +3174,7 @@ StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialText
     views.resolvedMaterial = material->name.empty()
         ? material->path.filename().generic_string()
         : material->name;
-    views.baseColorTextureGuid = material->baseColorTexture
-        ? material->baseColorTexture->toString()
-        : std::string("EMPTY");
+    views.baseColorTextureGuid = material->baseColorTexture;
     views.alphaMode = MaterialAlphaModeName(material->alphaMode);
     views.alphaCutoff = material->alphaCutoff;
     views.fragmentShaderAlphaPath = AlphaFragmentPath(views.alphaMode);
@@ -2566,25 +3199,27 @@ StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialText
     return views;
 }
 
-void StaticMeshRenderer::UpdateMaterialTextureDescriptors(uint32_t frameIndex,
-    uint32_t uniformSlot,
-    const MaterialTextureViews& textures)
+void StaticMeshRenderer::UpdateMaterialTextureDescriptors(const BindSlot& slot, const MaterialTextureViews& textures)
 {
-    if (!m_bindGroup || frameIndex >= kFramesInFlight || uniformSlot >= kUniformSlots)
+    if (!slot.page)
         return;
 
-    const uint32_t slot = frameIndex * kUniformSlots + uniformSlot;
-    if (textures.baseColor.texture && textures.baseColor.sampler)
-        m_bindGroup->UpdateTexture(slot, 1, textures.baseColor.texture, textures.baseColor.sampler);
-    if (textures.normal.texture && textures.normal.sampler)
-        m_bindGroup->UpdateTexture(slot, 2, textures.normal.texture, textures.normal.sampler);
-    if (textures.orm.texture && textures.orm.sampler)
-        m_bindGroup->UpdateTexture(slot, 3, textures.orm.texture, textures.orm.sampler);
+    std::array<BoundSlotTexture, 3>& bound = slot.page->textures[slot.set];
+    auto update = [&](std::uint32_t binding, const MaterialTexture& material, BoundSlotTexture& current) {
+        if (!material.texture || !material.sampler)
+            return;
+        if (current.texture == material.texture.get() && current.sampler == material.sampler.get())
+            return;  // already bound: skip the descriptor write
+        slot.page->group->UpdateTexture(slot.set, binding, material.texture, material.sampler);
+        current = {material.texture.get(), material.sampler.get()};
+    };
+    update(1, textures.baseColor, bound[0]);
+    update(2, textures.normal, bound[1]);
+    update(3, textures.orm, bound[2]);
 }
 
 bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
 {
-    constexpr uint32_t kBindSlots = kFramesInFlight * kUniformSlots;
     const ixrhi::IXRHIShaderStage allStages =
         ixrhi::IXRHIShaderStage::Vertex | ixrhi::IXRHIShaderStage::Fragment;
     const std::vector<ixrhi::IXRHIBinding> bindings = {
@@ -2593,49 +3228,115 @@ bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
         {2, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
         {3, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
         {4, ixrhi::IXRHIBindingType::StorageBuffer, allStages},
+        {5, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},  // sun shadow cascades
     };
     m_bindLayout = rhi.CreateBindGroupLayout(bindings);
     if (!m_bindLayout)
         return false;
-    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kBindSlots);
-    if (!m_bindGroup)
+    m_bindPages.clear();
+    m_loggedBindPagesFull = false;
+    if (!AddBindPage(rhi))
         return false;
-
-    for (uint32_t frame = 0; frame < kFramesInFlight; ++frame)
-    {
-        const std::uint64_t instanceBytes =
-            sizeof(InstanceBlock) * m_instanceBufferCapacity[frame];
-        for (uint32_t uniformSlot = 0; uniformSlot < kUniformSlots; ++uniformSlot)
-        {
-            const uint32_t slot = frame * kUniformSlots + uniformSlot;
-            m_bindGroup->UpdateBuffer(slot,
-                0,
-                m_uniformBuffers[frame][uniformSlot],
-                0,
-                sizeof(UniformBlock));
-            if (m_texture.image && m_texture.sampler)
-                m_bindGroup->UpdateTexture(slot, 1, m_texture.image, m_texture.sampler);
-            if (m_normalTexture.image && m_normalTexture.sampler)
-                m_bindGroup->UpdateTexture(slot, 2, m_normalTexture.image, m_normalTexture.sampler);
-            if (m_ormTexture.image && m_ormTexture.sampler)
-                m_bindGroup->UpdateTexture(slot, 3, m_ormTexture.image, m_ormTexture.sampler);
-            m_bindGroup->UpdateBuffer(slot, 4, m_instanceBuffers[frame], 0, instanceBytes);
-        }
-    }
+    m_boundSunShadowTexture = m_sunShadow.sampler ? m_sunShadow.texture.get() : nullptr;
     return true;
 }
-void StaticMeshRenderer::UpdateInstanceDescriptorSets(uint32_t frameIndex)
-{
-    if (!m_bindGroup || frameIndex >= kFramesInFlight || !m_instanceBuffers[frameIndex])
-        return;
 
-    const std::uint64_t instanceBytes =
-        sizeof(InstanceBlock) * m_instanceBufferCapacity[frameIndex];
-    for (uint32_t uniformSlot = 0; uniformSlot < kUniformSlots; ++uniformSlot)
+StaticMeshRenderer::BindPage* StaticMeshRenderer::AddBindPage(ixrhi::IXRHIDevice& rhi)
+{
+    if (!m_bindLayout || m_bindPages.size() >= kMaxBindPages)
+        return nullptr;
+    constexpr uint32_t kSets = kFramesInFlight * kUniformSlots;
+    auto page = std::make_unique<BindPage>();
+    page->group = rhi.CreateBindGroup(*m_bindLayout, kSets);
+    page->uniforms = CreateRhiBuffer(rhi,
+        kUniformStride * kSets,
+        ixrhi::IXRHIBufferUsage::Uniform,
+        ixrhi::IXRHICpuAccess::Write,
+        nullptr,
+        ("StaticMesh:" + m_modelPath + ":UBO").c_str());
+    if (!page->group || !page->uniforms)
+        return nullptr;
+    for (uint32_t set = 0; set < kSets; ++set)
     {
-        const uint32_t slot = frameIndex * kUniformSlots + uniformSlot;
-        m_bindGroup->UpdateBuffer(slot, 4, m_instanceBuffers[frameIndex], 0, instanceBytes);
+        const uint32_t frame = set / kUniformSlots;
+        page->group->UpdateBuffer(set, 0, page->uniforms, kUniformStride * set, sizeof(UniformBlock));
+        if (m_texture.image && m_texture.sampler)
+            page->group->UpdateTexture(set, 1, m_texture.image, m_texture.sampler);
+        if (m_normalTexture.image && m_normalTexture.sampler)
+            page->group->UpdateTexture(set, 2, m_normalTexture.image, m_normalTexture.sampler);
+        if (m_ormTexture.image && m_ormTexture.sampler)
+            page->group->UpdateTexture(set, 3, m_ormTexture.image, m_ormTexture.sampler);
+        page->textures[set] = {{{m_texture.image.get(), m_texture.sampler.get()},
+            {m_normalTexture.image.get(), m_normalTexture.sampler.get()},
+            {m_ormTexture.image.get(), m_ormTexture.sampler.get()}}};
+        page->group->UpdateBuffer(set, 4, m_instanceBuffers[frame], 0,
+            sizeof(InstanceBlock) * m_instanceBufferCapacity[frame]);
+        page->instances[set] = m_instanceBuffers[frame].get();
+        if (m_sunShadow.texture && m_sunShadow.sampler)
+            page->group->UpdateTexture(set, 5, m_sunShadow.texture, m_sunShadow.sampler);
     }
+    m_bindPages.push_back(std::move(page));
+    return m_bindPages.back().get();
+}
+
+void StaticMeshRenderer::BeginFrameSlots(const ixrhi::IXRHIFrameInfo& frame)
+{
+    if (m_worldRenderFrameNumber == frame.frameNumber)
+        return;
+    m_worldRenderFrameNumber = frame.frameNumber;
+    m_worldRenderFrameIndex = frame.frameIndex % kFramesInFlight;
+    m_worldUniformCursor = 0;
+    m_worldInstanceCursor = 0;
+}
+
+std::optional<StaticMeshRenderer::BindSlot> StaticMeshRenderer::NextBindSlot(uint32_t frameIndex)
+{
+    if (!m_rhi || frameIndex >= kFramesInFlight || !m_instanceBuffers[frameIndex])
+        return std::nullopt;
+    const uint32_t pageIndex = m_worldUniformCursor / kUniformSlots;
+    while (pageIndex >= m_bindPages.size())
+    {
+        if (!AddBindPage(*m_rhi))
+        {
+            if (!m_loggedBindPagesFull)
+            {
+                LogFormat("[MESH] static mesh draws skipped: more than %u draws in one frame model=%s",
+                    kMaxBindPages * kUniformSlots, m_modelPath.c_str());
+                m_loggedBindPagesFull = true;
+            }
+            return std::nullopt;
+        }
+    }
+    BindSlot slot;
+    slot.page = m_bindPages[pageIndex].get();
+    slot.set = frameIndex * kUniformSlots + m_worldUniformCursor % kUniformSlots;
+    slot.id = pageIndex * kFramesInFlight * kUniformSlots + slot.set;
+    ++m_worldUniformCursor;
+    // The frame grew the instance buffer since this set last pointed at it. The set is unbound: the
+    // frames that bound it have run (this frame index's fence), and this one takes each set once.
+    const ixrhi::IXRHIBuffer* instances = m_instanceBuffers[frameIndex].get();
+    if (slot.page->instances[slot.set] != instances)
+    {
+        slot.page->group->UpdateBuffer(slot.set, 4, m_instanceBuffers[frameIndex], 0,
+            sizeof(InstanceBlock) * m_instanceBufferCapacity[frameIndex]);
+        slot.page->instances[slot.set] = instances;
+    }
+    return slot;
+}
+
+void StaticMeshRenderer::SetSunShadow(const SunShadowReceive& shadow)
+{
+    m_sunShadow = shadow;
+    if (m_bindPages.empty() || !shadow.texture || !shadow.sampler || shadow.texture.get() == m_boundSunShadowTexture)
+        return;
+    // A new map (first one, or recreated): every set's binding 5. Not while a frame may still use
+    // the sets: the map is set up front and changes only with the device's resources.
+    for (const std::unique_ptr<BindPage>& page : m_bindPages)
+    {
+        for (uint32_t set = 0; set < kFramesInFlight * kUniformSlots; ++set)
+            page->group->UpdateTexture(set, 5, shadow.texture, shadow.sampler);
+    }
+    m_boundSunShadowTexture = shadow.texture.get();
 }
 
 bool StaticMeshRenderer::EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi,
@@ -2652,11 +3353,9 @@ bool StaticMeshRenderer::EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi,
     while (nextCapacity < requiredRecords)
         nextCapacity *= 2u;
 
-    // Preserve instance records already written this frame: growing mid-frame rebinds the
-    // bind groups to the new buffer, so earlier (recorded but not executed) draws must
-    // still find their transforms at the same offsets. The CPU mirror carries the
-    // prefix bytes (same content the old GPU map-copy preserved, without readback).
-    const std::uint32_t previousCapacity = m_instanceBufferCapacity[frameIndex];
+    // The frame's draws recorded so far read their records from the old buffer (their sets keep it
+    // alive); the sets taken from now on point at the new one (NextBindSlot), which gets the records
+    // appended from here on.
     m_instanceBuffers[frameIndex] = CreateRhiBuffer(rhi,
         sizeof(InstanceBlock) * nextCapacity,
         ixrhi::IXRHIBufferUsage::Storage,
@@ -2665,18 +3364,15 @@ bool StaticMeshRenderer::EnsureInstanceCapacity(ixrhi::IXRHIDevice& rhi,
         ("StaticMesh:" + m_modelPath + ":Instances").c_str());
     if (!m_instanceBuffers[frameIndex])
         return false;
-    m_instanceMirror[frameIndex].resize(nextCapacity);
-    if (previousCapacity > 0)
-    {
-        m_instanceBuffers[frameIndex]->Write(0,
-            m_instanceMirror[frameIndex].data(),
-            sizeof(InstanceBlock) * previousCapacity);
-    }
     m_instanceBufferCapacity[frameIndex] = nextCapacity;
-    UpdateInstanceDescriptorSets(frameIndex);
     m_lastInstanceBufferRebuilt = true;
     return true;
 }
+
+namespace
+{
+bool EnvironmentSwitchOn(const char* name);
+} // namespace
 
 bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
 {
@@ -2689,11 +3385,19 @@ bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
         ixrhi::IXRHIShaderStage::Fragment, "PSMain");
     auto unlitPs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_unlit_ps.spv",
         ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    // The opaque draws' fragment shaders: no discard, so the depth test runs before shading.
+    auto opaquePs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_opaque_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    auto unlitOpaquePs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_unlit_opaque_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
     auto outlineVs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_outline_vs.spv",
         ixrhi::IXRHIShaderStage::Vertex, "VSMain");
     auto outlinePs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_outline_ps.spv",
         ixrhi::IXRHIShaderStage::Fragment, "PSMain");
-    if (!vs || !ps || !unlitPs || !outlineVs || !outlinePs)
+    // (The shadow pass's alpha test: the same vertex output, so it pairs with the view's vertex shader.)
+    auto maskDepthPs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_shadow_mask_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "ShadowMaskPS");
+    if (!vs || !ps || !unlitPs || !opaquePs || !unlitOpaquePs || !outlineVs || !outlinePs || !maskDepthPs)
         return false;
 
     ixrhi::IXRHIGraphicsPipelineDesc desc;
@@ -2736,11 +3440,62 @@ bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
         return target != nullptr;
     };
     desc.debugName = "StaticMesh:Opaque";
-    if (!createVariant("StaticMesh:Opaque", ps, m_pipeline) ||
+    // (IX_OPAQUE_NO_DISCARD=0: the opaque draws with the shader that can discard, as before; for comparing.)
+    static const bool opaqueVariants = EnvironmentSwitchOn("IX_OPAQUE_NO_DISCARD");
+    if (!createVariant("StaticMesh:Opaque", opaqueVariants ? opaquePs : ps, m_pipeline) ||
         !createVariant("StaticMesh:Mask", ps, m_maskPipeline) ||
-        !createVariant("StaticMesh:Unlit", unlitPs, m_unlitPipeline) ||
+        !createVariant("StaticMesh:Unlit", opaqueVariants ? unlitOpaquePs : unlitPs, m_unlitPipeline) ||
         !createVariant("StaticMesh:UnlitMask", unlitPs, m_unlitMaskPipeline))
         return false;
+
+    // The masked draws' two steps: depth only (alpha-tested), then colour on that depth (less-or-equal,
+    // not written: equal for the nearest texel, which is the only one left).
+    ixrhi::IXRHIGraphicsPipelineDesc maskDepth = desc;
+    maskDepth.fragmentShader = maskDepthPs;
+    maskDepth.blendAttachments[0].writeColor = false;
+    maskDepth.debugName = "StaticMesh:MaskDepth";
+    m_maskDepthPipeline = rhi.CreateGraphicsPipeline(maskDepth);
+    ixrhi::IXRHIGraphicsPipelineDesc onDepth = desc;
+    onDepth.depthWriteEnable = false;
+    onDepth.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    onDepth.debugName = "StaticMesh:MaskOnDepth";
+    m_maskOnDepthPipeline = rhi.CreateGraphicsPipeline(onDepth);
+    onDepth.fragmentShader = unlitPs;
+    onDepth.debugName = "StaticMesh:UnlitMaskOnDepth";
+    m_unlitMaskOnDepthPipeline = rhi.CreateGraphicsPipeline(onDepth);
+    if (!m_maskDepthPipeline || !m_maskOnDepthPipeline || !m_unlitMaskOnDepthPipeline)
+        return false;
+
+    // Alpha-blended: over what is drawn, depth tested but not written. Each side of the faces in its
+    // own draw, back faces first (outward faces are the front ones, see the outline below), so a
+    // closed transparent shape blends its far side under its near side.
+    ixrhi::IXRHIGraphicsPipelineDesc blend = desc;
+    blend.depthWriteEnable = false;
+    blend.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    blend.blendAttachments = {{true,
+        ixrhi::IXRHIBlendFactor::SrcAlpha,
+        ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+        ixrhi::IXRHIBlendOp::Add,
+        ixrhi::IXRHIBlendFactor::One,
+        ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
+        ixrhi::IXRHIBlendOp::Add}};
+    const std::array<std::shared_ptr<ixrhi::IXRHIShader>, 2> blendFragments = {ps, unlitPs};
+    const std::array<std::array<const char*, 2>, 2> blendNames = {{
+        {"StaticMesh:BlendBack", "StaticMesh:BlendFront"},
+        {"StaticMesh:UnlitBlendBack", "StaticMesh:UnlitBlendFront"},
+    }};
+    for (std::size_t shading = 0; shading < 2; ++shading)
+    {
+        for (std::size_t side = 0; side < 2; ++side)
+        {
+            blend.fragmentShader = blendFragments[shading];
+            blend.cullMode = side == 0 ? ixrhi::IXRHICullMode::Front : ixrhi::IXRHICullMode::Back;
+            blend.debugName = blendNames[shading][side];
+            m_blendPipelines[shading][side] = rhi.CreateGraphicsPipeline(blend);
+            if (!m_blendPipelines[shading][side])
+                return false;
+        }
+    }
 
     desc.vertexShader = outlineVs;
     desc.fragmentShader = outlinePs;
@@ -2766,8 +3521,7 @@ void StaticMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     std::uint32_t targetWidth,
     std::uint32_t targetHeight)
 {
-    std::vector<Instance> instances;
-    instances.push_back(instance);
+    const InstanceList instances = {&instance};
     RenderBatchInWorld(cmd, frame, timeSeconds, camera, instances, targetWidth, targetHeight);
 }
 
@@ -2775,7 +3529,7 @@ void StaticMeshRenderer::RenderBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const ixrhi::IXRHIFrameInfo& frame,
     double timeSeconds,
     const WorldCamera& camera,
-    const std::vector<Instance>& instances,
+    const InstanceList& instances,
     std::uint32_t targetWidth,
     std::uint32_t targetHeight)
 {
@@ -2783,34 +3537,217 @@ void StaticMeshRenderer::RenderBatchInWorld(ixrhi::IXRHICommandList& cmd,
     RenderLodBatchInWorld(cmd, frame, timeSeconds, camera, instances, defaultLod, 0, 0, targetWidth, targetHeight);
 }
 
+namespace
+{
+// A comparison switch: on unless the environment sets it to 0 (IX_VIEW_LOD, IX_SHADOW_LOD).
+bool EnvironmentSwitchOn(const char* name)
+{
+    std::string value;
+#if defined(_WIN32)
+    char* text = nullptr;
+    std::size_t length = 0;
+    if (_dupenv_s(&text, &length, name) == 0 && text)
+    {
+        value = text;
+        std::free(text);
+    }
+#else
+    if (const char* text = std::getenv(name))
+        value = text;
+#endif
+    return value != "0";
+}
+} // namespace
+
+bool StaticMeshRenderer::HasTreeImpostor() const
+{
+    return m_treeImpostor && m_treeImpostor->valid && m_treeImpostor->filesValid && m_treeImpostor->renderer->IsLoaded();
+}
+
+bool StaticMeshRenderer::RenderTreeImpostors(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
+    double timeSeconds, const WorldCamera& camera, const InstanceList& instances,
+    const LodConfig& config, std::uint64_t configHash, std::uint32_t lodLevel,
+    std::uint32_t targetWidth, std::uint32_t targetHeight)
+{
+    static const bool enabled = EnvironmentSwitchOn("IX_TREE_IMPOSTORS");
+    auto* state = m_treeImpostor.get();
+    if (!enabled || !state || state->partitioning || !frame.frameActive || !state->renderer->IsLoaded() ||
+        !UploadsRecorded() || !state->renderer->UploadsRecorded() || !m_boundSunShadowTexture) return false;
+    const auto revision = MaterialAssetManager::Instance().Revision();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state->checkedFiles >= std::chrono::seconds(1) && !state->sourceTimes.empty())
+    {
+        state->checkedFiles = now;
+        if (auto root = m_assets->RootPath())
+        {
+            std::error_code metadataError;
+            const auto metadataStamp = std::filesystem::last_write_time(*root / (m_modelPath + ".impostor.json"), metadataError);
+            state->filesValid &= !metadataError && metadataStamp == state->metadataTime;
+            for (std::size_t i=0;i<state->sourceTimes.size();++i)
+            {
+                std::error_code error;
+                const auto stamp = std::filesystem::last_write_time(*root / state->data.sourcePaths[i], error);
+                state->filesValid &= !error && stamp == state->sourceTimes[i];
+            }
+        }
+    }
+    if (state->checkedRevision != revision)
+    {
+        bool valid = true;
+        for (std::size_t i=0;i<state->data.materials.size();++i)
+        {
+            const auto guid = Guid::fromString(state->data.materials[i]);
+            const auto* material = guid ? MaterialAssetManager::Instance().getOrLoad(*guid) : nullptr;
+            valid &= material && tree_tool::TreeImpostorMaterialSignature(*material) == state->data.materialSignatures[i];
+        }
+        if (state->valid && !valid) LogFormat("[TREE-IMPOSTOR] material/texture changed; using mesh until rebaked model=%s", m_modelPath.c_str());
+        state->valid = valid;
+        state->checkedRevision = revision;
+    }
+    if (!state->valid || !state->filesValid || instances.empty()) return false;
+    constexpr float pi = 3.14159265358979323846f;
+    state->nearInstances.clear(); state->farInstances.clear();
+    std::size_t faded = 0, sprites = 0;
+    std::uint32_t impostorTrees = 0;
+    // Grow arenas without clearing their per-instance vector capacities each frame.
+    if (state->fading.size() < instances.size()) state->fading.resize(instances.size());
+    if (state->billboards.size() < instances.size() * 2) state->billboards.resize(instances.size() * 2);
+    if (state->billboardPrepared.size() < instances.size() * 2) state->billboardPrepared.resize(instances.size() * 2);
+    for (const Instance* source : instances)
+    {
+        const float scale = source->scale[0];
+        bool eligible = !source->selectedForOutline && scale > 0 &&
+            std::abs(source->scale[1]-scale) <= scale*0.001f && std::abs(source->scale[2]-scale) <= scale*0.001f &&
+            std::abs(source->rotation[0]) < 0.001f && std::abs(source->rotation[2]) < 0.001f &&
+            source->materialSlots.size() == state->data.materials.size() &&
+            std::equal(source->materialSlots.begin(), source->materialSlots.end(), state->data.materials.begin()) &&
+            std::none_of(source->materialOverrides.begin(), source->materialOverrides.end(), [](const auto& entry) { return entry.enabled; });
+        const auto center = xm::TransformPoint(BuildStaticMeshModelMatrix(*source),
+            {state->data.center[0], state->data.center[1], state->data.center[2]});
+        const float dx = static_cast<float>(camera.eye.x) - center.x;
+        const float dy = static_cast<float>(camera.eye.y) - center.y;
+        const float dz = static_cast<float>(camera.eye.z) - center.z;
+        const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+        const float elevation = std::atan2(dy, std::sqrt(dx*dx + dz*dz));
+        // Outside the captured elevations, tilted/reflected trees and edited materials stay meshes.
+        eligible &= std::abs(elevation) <= pi/4;
+        const float weight = eligible ? tree_tool::TreeImpostorWeight(distance, state->data.distance * scale,
+            state->data.transition * scale) : 0.0f;
+        if (weight <= 0)
+        {
+            state->nearInstances.push_back(source);
+            continue;
+        }
+        ++impostorTrees;
+        if (weight < 1)
+        {
+            auto& copy = state->fading[faded++];
+            copy = *source;
+            copy.coverageMax = 1-weight;
+        }
+        const float yaw = std::atan2(dx,dz);
+        // Original tree yaw uses row-vector RotationY; positive yaw turns +Z toward -X.
+        const auto view = tree_tool::SelectTreeImpostorView(yaw + source->rotation[1], elevation, state->data.azimuths);
+        float coverage = 1-weight;
+        for (int image = 0; image < 2; ++image)
+        {
+            const float share = weight * (image == 0 ? 1-view.blend : view.blend);
+            if (share <= 0) continue;
+            const auto uv = tree_tool::TreeImpostorUv(image == 0 ? view.first : view.second,
+                view.row, state->data.azimuths, state->data.resolution);
+            auto& prepared = state->billboardPrepared[sprites];
+            auto& billboard = state->billboards[sprites++];
+            const bool changed = prepared.renderer != state->renderer.get() || prepared.materialRevision != revision ||
+                billboard.position.x != center.x || billboard.position.y != center.y || billboard.position.z != center.z ||
+                billboard.rotation[0] != elevation || billboard.rotation[1] != -yaw || billboard.scale[0] != scale ||
+                billboard.tint != source->tint || billboard.materialOverrides.empty() ||
+                billboard.materialOverrides[0].uvTiling[0] != uv[0] || billboard.materialOverrides[0].uvTiling[1] != uv[1] ||
+                billboard.materialOverrides[0].uvOffset[0] != uv[2] || billboard.materialOverrides[0].uvOffset[1] != uv[3];
+            billboard.entityId = source->entityId;
+            billboard.position = {center.x,center.y,center.z};
+            billboard.rotation[0] = elevation;
+            billboard.rotation[1] = -yaw;
+            billboard.rotation[2] = 0;
+            for (float& value : billboard.scale) value = scale;
+            billboard.tint = source->tint;
+            billboard.prepared = nullptr;
+            billboard.selectedForOutline = false;
+            billboard.coverageMin = coverage;
+            coverage += share;
+            billboard.coverageMax = image == 1 ? 1.0f : coverage;
+            billboard.materialOverrides.resize(1);
+            auto& material = billboard.materialOverrides.front();
+            material = {};
+            material.enabled = true;
+            material.uvTiling[0] = uv[0]; material.uvTiling[1] = uv[1];
+            material.uvOffset[0] = uv[2]; material.uvOffset[1] = uv[3];
+            if (changed) state->renderer->PrepareInstance(billboard, prepared);
+            billboard.prepared = &prepared;
+            state->farInstances.push_back(&billboard);
+        }
+    }
+    if (state->farInstances.empty()) return false;
+    for (std::size_t i = 0; i < faded; ++i) state->nearInstances.push_back(&state->fading[i]);
+    state->partitioning = true;
+    RenderLodBatchInWorld(cmd, frame, timeSeconds, camera, state->nearInstances, config, configHash, lodLevel, targetWidth, targetHeight);
+    state->partitioning = false;
+    auto& renderer = *state->renderer;
+    renderer.SetLightingState(m_lightingState);
+    renderer.SetSunShadow(m_sunShadow);
+    renderer.RenderBatchInWorld(cmd, frame, timeSeconds, camera, state->farInstances, targetWidth, targetHeight);
+    m_lastSubmittedDrawCalls += renderer.LastSubmittedDrawCalls();
+    m_lastSubmittedInstances += renderer.LastSubmittedInstances();
+    m_lastSubmittedIndexCount += renderer.LastSubmittedIndexCount();
+    m_lastSubmittedTriangles += renderer.LastSubmittedTriangles();
+    m_lastInstanceBufferBytes += renderer.LastInstanceBufferBytes();
+    m_lastInstanceBufferRebuilt |= renderer.LastInstanceBufferRebuilt();
+    m_lastMaterialUniformUpdates += renderer.LastMaterialUniformUpdates();
+    m_lastImpostorTrees = impostorTrees;
+    return true;
+}
+
 void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const ixrhi::IXRHIFrameInfo& frame,
     double timeSeconds,
     const WorldCamera& camera,
-    const std::vector<Instance>& instances,
+    const InstanceList& instancesIn,
     const LodConfig& lodConfig,
     std::uint64_t configHash,
     std::uint32_t lodLevel,
     std::uint32_t targetWidth,
     std::uint32_t targetHeight)
 {
+    if (RenderTreeImpostors(cmd, frame, timeSeconds, camera, instancesIn, lodConfig, configHash, lodLevel, targetWidth, targetHeight)) return;
+    if (!m_treeImpostor || !m_treeImpostor->partitioning) m_lastImpostorTrees = 0;
     m_lastSubmittedDrawCalls = 0;
     m_lastSubmittedInstances = 0;
     m_lastSubmittedIndexCount = 0;
+    m_lastSubmittedTriangles = 0;
     m_lastUsedFullResFallback = false;
     m_lastMaterialUniformUpdates = 0;
     m_lastOverrideActiveDraws = 0;
     m_lastInstanceBufferBytes = 0;
     m_lastInstanceBufferRebuilt = false;
-    if (!m_pipeline || !m_unlitPipeline || !m_bindGroup || m_indices.empty() || instances.empty() ||
-        !frame.frameActive)
+    if (!m_pipeline || !m_unlitPipeline || m_bindPages.empty() || m_indices.empty() || instancesIn.empty() ||
+        !frame.frameActive || !UploadsRecorded())
         return;
+    if (!m_boundSunShadowTexture)
+    {
+        // Every lit draw samples the sun shadow map: without one bound the descriptors are incomplete.
+        static bool loggedNoShadowMap = false;
+        if (!loggedNoShadowMap)
+        {
+            LogFormat("[MESH] static mesh draws skipped: no sun shadow map set (SetSunShadow) model=%s", m_modelPath.c_str());
+            loggedNoShadowMap = true;
+        }
+        return;
+    }
     const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
     const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
     if (extentWidth == 0 || extentHeight == 0)
         return;
 
-    const std::uint32_t diagnosticEntityId = instances.empty() ? 0u : instances.front().entityId;
+    const std::uint32_t diagnosticEntityId = instancesIn.empty() ? 0u : instancesIn.front()->entityId;
     const bool useLodBuffer = configHash != 0 && lodLevel > 0 &&
         EnsureLodBuffers(lodConfig, configHash, diagnosticEntityId);
     const LodIndexBuffer* lodSet = nullptr;
@@ -2858,13 +3795,73 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         lodLevel = 0;
     }
 
-    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
-    if (m_worldRenderFrameIndex != frameIndex)
+    // Each instance's view detail level (a model LOD config aside): how many of the levels' errors,
+    // at its scale and nearest depth, project under kViewLodMaxErrorPixels (the view's y scale and
+    // depth read from the view-projection: row vectors, clip w the depth). The instances are drawn
+    // grouped by level (keeping their order within it), so a level is one run.
+    static const bool viewLodsEnabled = EnvironmentSwitchOn("IX_VIEW_LOD");
+    InstanceList grouped;
+    std::vector<std::uint8_t> viewLevels;
+    const InstanceList* drawn = &instancesIn;
+    if (!lodSet && viewLodsEnabled && m_lodIndexBuffer && !m_viewLodDraws[0].empty())
     {
-        m_worldRenderFrameIndex = frameIndex;
-        m_worldUniformCursor = 0;
-        m_worldInstanceCursor = 0;
+        const float* vp = camera.viewProjection.m;
+        const float pixelsAtUnitDepth =
+            0.5f * static_cast<float>(extentHeight) * std::sqrt(vp[1] * vp[1] + vp[5] * vp[5] + vp[9] * vp[9]);
+        std::array<std::uint32_t, kLodLevels + 1> counts{};
+        viewLevels.resize(instancesIn.size());
+        for (std::size_t i = 0; i < instancesIn.size(); ++i)
+        {
+            const Instance& instance = *instancesIn[i];
+            const float scale = std::max({std::abs(instance.scale[0]), std::abs(instance.scale[1]), std::abs(instance.scale[2])});
+            const float depth = static_cast<float>(instance.position.x) * vp[3] + static_cast<float>(instance.position.y) * vp[7] +
+                static_cast<float>(instance.position.z) * vp[11] + vp[15] - m_modelRadius * scale;
+            std::uint8_t level = 0;
+            if (depth > camera.nearPlane)
+            {
+                const float pixelsPerModelUnit = pixelsAtUnitDepth * scale / depth;
+                while (level < kLodLevels && kLodErrors[level] * pixelsPerModelUnit <= kViewLodMaxErrorPixels)
+                    ++level;
+            }
+            viewLevels[i] = level;
+            ++counts[level];
+        }
+        if (counts[0] == instancesIn.size())
+        {
+            viewLevels.clear();
+        }
+        else
+        {
+            std::array<std::uint32_t, kLodLevels + 1> next{};
+            for (std::size_t level = 1; level < next.size(); ++level)
+                next[level] = next[level - 1] + counts[level - 1];
+            grouped.resize(instancesIn.size());
+            std::vector<std::uint8_t> groupedLevels(instancesIn.size());
+            for (std::size_t i = 0; i < instancesIn.size(); ++i)
+            {
+                const std::uint32_t at = next[viewLevels[i]]++;
+                grouped[at] = instancesIn[i];
+                groupedLevels[at] = viewLevels[i];
+            }
+            viewLevels = std::move(groupedLevels);
+            drawn = &grouped;
+        }
     }
+    const InstanceList& instances = *drawn;
+    // Whether a draw (submesh) has view levels: its runs are split by level then.
+    const auto levelled = [&](std::uint32_t submesh) {
+        if (viewLevels.empty() || submesh >= m_draws.size())
+            return false;
+        for (const std::vector<MeshDraw>& draws : m_viewLodDraws)
+        {
+            if (submesh < draws.size() && draws[submesh].indexCount != 0)
+                return true;
+        }
+        return false;
+    };
+
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    BeginFrameSlots(frame);
     const uint32_t instanceBase = m_worldInstanceCursor;
 
     std::vector<StaticMeshRenderer::InstanceBlock> instanceBlocks;
@@ -2876,6 +3873,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         : m_draws.size();
     instanceBlocks.reserve(instances.size() * std::max<std::size_t>(1u, drawCountForLevel));
     drawCommands.reserve(drawCountForLevel);
+    const Mat4 viewProjection = ToLocalMat4(camera.viewProjection);
     auto appendDraw = [&](std::uint32_t firstIndex, std::uint32_t indexCount, std::uint32_t materialSlot, std::uint32_t sourceSubmesh) {
         if (indexCount == 0)
             return;
@@ -2887,13 +3885,15 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             command.instanceCount = static_cast<uint32_t>(instances.size());
             command.materialSlot = materialSlot;
             command.sourceSubmesh = sourceSubmesh;
-            for (const Instance& instance : instances)
+            const std::size_t first = instanceBlocks.size();
+            instanceBlocks.resize(first + instances.size());
+            FillInstanceBlocks(viewProjection, instances, materialSlot, instanceBlocks.data() + first);
+            for (const Instance* instance : instances)
             {
-                StaticMeshRenderer::InstanceBlock block{};
-                FillStaticMeshInstanceBlock(camera, instance, materialSlot, m_materialDefaults, block);
-                instanceBlocks.push_back(block);
-                const bool overrideActive = std::any_of(instance.materialOverrides.begin(),
-                    instance.materialOverrides.end(),
+                if (instance->materialOverrides.empty())
+                    continue;
+                const bool overrideActive = std::any_of(instance->materialOverrides.begin(),
+                    instance->materialOverrides.end(),
                     [&](const MeshSceneEntity::MaterialOverride& material) {
                         return material.enabled && material.slot == materialSlot;
                     });
@@ -2923,23 +3923,9 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         }
     }
 
-    const std::uint32_t instanceCount = static_cast<std::uint32_t>(instanceBlocks.size());
-    if (instanceBlocks.empty() || !EnsureInstanceCapacity(*m_rhi, frameIndex, instanceBase + instanceCount))
+    if (!AppendInstanceBlocks(frameIndex, instanceBlocks))
         return;
-    const std::size_t blockBytes = sizeof(InstanceBlock);
-    m_lastInstanceBufferBytes = instanceCount * blockBytes;
-    // Append at the per-frame cursor offset (not offset 0) so multiple calls to this
-    // renderer in one frame don't clobber each other's instance transforms.
-    m_instanceBuffers[frameIndex]->Write(static_cast<std::uint64_t>(instanceBase) * blockBytes,
-        instanceBlocks.data(),
-        m_lastInstanceBufferBytes);
-    // Mirror the same bytes for growth preservation (no GPU readback).
-    if (m_instanceMirror[frameIndex].size() < static_cast<std::size_t>(instanceBase) + instanceCount)
-        m_instanceMirror[frameIndex].resize(static_cast<std::size_t>(instanceBase) + instanceCount);
-    std::memcpy(m_instanceMirror[frameIndex].data() + instanceBase,
-        instanceBlocks.data(),
-        m_lastInstanceBufferBytes);
-    m_worldInstanceCursor = instanceBase + instanceCount;
+    m_lastInstanceBufferBytes = instanceBlocks.size() * sizeof(InstanceBlock);
 
     cmd.SetViewport(0.0f,
         0.0f,
@@ -2950,10 +3936,11 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const std::shared_ptr<ixrhi::IXRHIBuffer>& boundIndexBuffer =
         lodSet && lodSet->buffer ? lodSet->buffer : m_indexBuffer;
     cmd.SetIndexBuffer(*boundIndexBuffer, 0, /*thirtyTwoBit=*/true);
+    const ixrhi::IXRHIBuffer* currentIndexBuffer = boundIndexBuffer.get();
     const auto findInstanceIndex = [&](std::uint32_t entityId) -> std::optional<std::size_t> {
         for (std::size_t i = 0; i < instances.size(); ++i)
         {
-            if (instances[i].entityId == entityId)
+            if (instances[i]->entityId == entityId)
                 return i;
         }
         return std::nullopt;
@@ -2965,7 +3952,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     {
         for (std::size_t i = 0; i < instances.size(); ++i)
         {
-            if (instances[i].entityId != 3u)
+            if (instances[i]->entityId != 3u)
             {
                 refInstanceIndex = i;
                 break;
@@ -2979,7 +3966,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                                  std::uint32_t entityId,
                                  const InstancedDrawCommand& draw,
                                  std::size_t instanceIndex,
-                                 uint32_t uniformSlot,
+                                 uint32_t bindSlot,
                                  const ixrhi::IXRHIGraphicsPipeline* pipelineForDraw) {
         const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + instanceIndex;
         const std::size_t instanceOffset = absoluteInstance * sizeof(InstanceBlock);
@@ -2998,7 +3985,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             instanceOffset,
             draw.instanceCount,
             draw.firstInstance,
-            frameIndex * kUniformSlots + uniformSlot);
+            bindSlot);
     };
     const auto logMaterialDiag = [&](const char* tag,
                                      const Instance& instance,
@@ -3074,32 +4061,79 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             materialSlots[1],
             materialSlots[2]);
     }
-    m_lastMaterialBindings.clear();
-    m_lastMaterialBindings.reserve(drawCommands.size());
+    // The bindings of this call are written over the previous call's records (reusing their strings'
+    // buffers): rebuilt every draw of every frame, fresh strings were allocations per draw.
+    std::size_t materialBindingCount = 0;
     const ixrhi::IXRHIGraphicsPipeline* boundPipeline = nullptr;
-    auto drawPass = [&](bool maskPass) {
-        for (const InstancedDrawCommand& draw : drawCommands)
+    // The texture descriptors and the world uniform are bound once per draw call, so one instanced
+    // draw may only cover instances that share this slot's material: split each command into runs of
+    // consecutive instances with the same material GUID (instances of one material stay one draw).
+    const auto fades = [](const Instance& instance) { return instance.coverageMin > 0.0f || instance.coverageMax < 1.0f; };
+    const auto materialKey = [](const Instance& instance, std::uint32_t slot) -> std::string_view {
+        return slot < instance.materialSlots.size() ? std::string_view(instance.materialSlots[slot]) : std::string_view();
+    };
+    // Resolved once per run, then drawn by the opaque or the mask pass (resolving inside each pass
+    // did the material/texture lookups twice per draw, every frame).
+    struct MaterialRun
+    {
+        const InstancedDrawCommand* command = nullptr;
+        InstancedDrawCommand draw;
+        const Instance* instance = nullptr;
+        MaterialTextureViews textures;
+        bool isMask = false;
+        bool isBlend = false;  // left to RenderTransparentInWorld
+        std::uint8_t level = 0;  // the view detail level its instances are drawn at
+    };
+    std::vector<MaterialRun> materialRuns;
+    materialRuns.reserve(drawCommands.size());
+    for (const InstancedDrawCommand& command : drawCommands)
+    for (std::uint32_t runStart = 0; runStart < command.instanceCount;)
+    {
+        const bool byLevel = levelled(command.sourceSubmesh);
+        std::uint32_t runEnd = runStart + 1;
+        while (runEnd < command.instanceCount &&
+               materialKey(*instances[runEnd], command.materialSlot) ==
+                   materialKey(*instances[runStart], command.materialSlot) &&
+               fades(*instances[runEnd]) == fades(*instances[runStart]) &&
+               (!byLevel || viewLevels[runEnd] == viewLevels[runStart]))
+            ++runEnd;
+        MaterialRun& run = materialRuns.emplace_back();
+        run.command = &command;
+        run.draw = command;
+        run.draw.firstInstance = command.firstInstance + runStart;
+        run.draw.instanceCount = runEnd - runStart;
+        run.instance = instances[runStart];
+        run.textures = ResolveMaterialTextureViews(*m_rhi, *run.instance, run.draw.materialSlot);
+        run.isMask = std::strcmp(run.textures.fragmentShaderAlphaPath, "discard") == 0 || fades(*run.instance);
+        run.isBlend = std::strcmp(run.textures.fragmentShaderAlphaPath, "blend") == 0;
+        run.level = byLevel ? viewLevels[runStart] : 0;
+        runStart = runEnd;
+    }
+    // The masked runs (leaves) in two steps, each run's set made in the first and bound again in the
+    // second (MaskStep). The lit shader can discard, which keeps the hardware from rejecting a hidden
+    // texel before shading it: a crown seen up close was shaded once for every layer of its leaves.
+    // (IX_MASK_PREPASS=0: in one step, as before; for comparing.)
+    enum class MaskStep { Single, Depth, Colour };
+    static const bool maskPrepass = EnvironmentSwitchOn("IX_MASK_PREPASS");
+    std::vector<std::optional<BindSlot>> maskRunSlots(materialRuns.size());
+    auto drawPass = [&](bool maskPass, MaskStep step) {
+        for (std::size_t runIndex = 0; runIndex < materialRuns.size(); ++runIndex)
         {
-            const MaterialTextureViews materialTextures =
-                ResolveMaterialTextureViews(*m_rhi, instances.front(), draw.materialSlot);
-            const bool isMask = std::strcmp(materialTextures.fragmentShaderAlphaPath, "discard") == 0;
-            if (isMask != maskPass)
+            const MaterialRun& run = materialRuns[runIndex];
+            if (run.isMask != maskPass || run.isBlend)
                 continue;
+            const InstancedDrawCommand& command = *run.command;
+            const InstancedDrawCommand& draw = run.draw;
+            const Instance& runInstance = *run.instance;
+            const MaterialTextureViews& materialTextures = run.textures;
 
             const ixrhi::IXRHIGraphicsPipeline* pipelineForDraw = materialTextures.unlit
-                ? (isMask ? m_unlitMaskPipeline.get() : m_unlitPipeline.get())
-                : (isMask ? m_maskPipeline.get() : m_pipeline.get());
-            if (std::strcmp(materialTextures.fragmentShaderAlphaPath, "blend-fallback-opaque") == 0)
-            {
-                static std::unordered_set<std::string> loggedBlendFallbacks;
-                const std::string key = m_modelPath + ":" + std::to_string(draw.materialSlot);
-                if (loggedBlendFallbacks.insert(key).second)
-                    LogFormat("[MATERIAL] BLEND mode not yet supported, falling back to OPAQUE material=%s slot=%u",
-                        materialTextures.resolvedMaterial.c_str(),
-                        draw.materialSlot);
-                pipelineForDraw =
-                    materialTextures.unlit ? m_unlitPipeline.get() : m_pipeline.get();
-            }
+                ? (run.isMask ? m_unlitMaskPipeline.get() : m_unlitPipeline.get())
+                : (run.isMask ? m_maskPipeline.get() : m_pipeline.get());
+            if (step == MaskStep::Depth)
+                pipelineForDraw = m_maskDepthPipeline.get();
+            else if (step == MaskStep::Colour)
+                pipelineForDraw = materialTextures.unlit ? m_unlitMaskOnDepthPipeline.get() : m_maskOnDepthPipeline.get();
 
             if (boundPipeline != pipelineForDraw)
             {
@@ -3107,96 +4141,150 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                 boundPipeline = pipelineForDraw;
             }
 
-            const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-            UpdateWorldUniform(frameIndex, uniformSlot, camera, instances.front(), timeSeconds, draw.materialSlot);
-            UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, materialTextures);
-            const uint32_t bindSlot = frameIndex * kUniformSlots + uniformSlot;
-            LastMaterialBinding binding{};
+            if (step == MaskStep::Colour)
+            {
+                // The set its depth step made.
+                const std::optional<BindSlot>& kept = maskRunSlots[runIndex];
+                if (!kept)
+                    continue;
+                if (currentIndexBuffer != boundIndexBuffer.get())
+                {
+                    cmd.SetIndexBuffer(*boundIndexBuffer, 0, /*thirtyTwoBit=*/true);
+                    currentIndexBuffer = boundIndexBuffer.get();
+                }
+                cmd.BindGroup(0, *kept->page->group, kept->set);
+                cmd.DrawIndexed(draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
+                ++m_lastSubmittedDrawCalls;
+                m_lastSubmittedIndexCount += draw.indexCount;
+                m_lastSubmittedTriangles += static_cast<std::uint64_t>(draw.indexCount/3) * draw.instanceCount;
+                continue;
+            }
+            const std::optional<BindSlot> slot = NextBindSlot(frameIndex);
+            if (!slot)
+                return;
+            UpdateWorldUniform(*slot, camera, runInstance, timeSeconds, draw.materialSlot);
+            UpdateMaterialTextureDescriptors(*slot, materialTextures);
+            if (step == MaskStep::Depth)
+                maskRunSlots[runIndex] = slot;
+            const uint32_t bindSlot = slot->id;
+            if (materialBindingCount == m_lastMaterialBindings.size())
+                m_lastMaterialBindings.emplace_back();
+            LastMaterialBinding& binding = m_lastMaterialBindings[materialBindingCount++];
             binding.sourceSubmesh = draw.sourceSubmesh;
             binding.materialSlot = draw.materialSlot;
             binding.bindSlot = bindSlot;
-            binding.baseColorTexture = materialTextures.baseColor.texture
-                ? materialTextures.baseColor.texture->DebugName()
-                : std::string();
-            binding.normalTexture = materialTextures.normal.texture
-                ? materialTextures.normal.texture->DebugName()
-                : std::string();
-            binding.ormTexture = materialTextures.orm.texture
-                ? materialTextures.orm.texture->DebugName()
-                : std::string();
+            auto assignName = [](std::string& target, const auto& resource) {
+                if (resource)
+                    target.assign(resource->DebugName());
+                else
+                    target.clear();
+            };
+            assignName(binding.baseColorTexture, materialTextures.baseColor.texture);
+            assignName(binding.normalTexture, materialTextures.normal.texture);
+            assignName(binding.ormTexture, materialTextures.orm.texture);
             binding.resolvedMaterial = materialTextures.resolvedMaterial;
             binding.baseColorTextureGuid = materialTextures.baseColorTextureGuid;
             binding.alphaMode = materialTextures.alphaMode;
             binding.alphaCutoff = materialTextures.alphaCutoff;
             binding.fragmentShaderAlphaPath = materialTextures.fragmentShaderAlphaPath;
             binding.unlit = materialTextures.unlit;
-            binding.pipelineName =
-                pipelineForDraw ? pipelineForDraw->DebugName() : std::string();
+            assignName(binding.pipelineName, pipelineForDraw);
             binding.boundBeforeDraw = true;
-            m_lastMaterialBindings.push_back(std::move(binding));
             ++m_lastMaterialUniformUpdates;
-            cmd.BindGroup(0, *m_bindGroup, bindSlot);
-            if (configHash != 0 && diagnosticInstanceIndex)
+            cmd.BindGroup(0, *slot->page->group, slot->set);
+            const auto inRun = [&](std::size_t index) {
+                const std::size_t first = draw.firstInstance - command.firstInstance;
+                return index >= first && index < first + draw.instanceCount;
+            };
+            if (configHash != 0 && diagnosticInstanceIndex && inRun(*diagnosticInstanceIndex))
             {
-                const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *diagnosticInstanceIndex;
+                const std::size_t absoluteInstance = static_cast<std::size_t>(command.firstInstance) + *diagnosticInstanceIndex;
                 if (absoluteInstance < instanceBlocks.size())
                 {
                     if (!loggedMaterialE3)
                     {
                         logMaterialDiag("[LOD-MAT-E3]",
-                            instances[*diagnosticInstanceIndex],
+                            *instances[*diagnosticInstanceIndex],
                             instanceBlocks[absoluteInstance],
                             draw.materialSlot,
                             absoluteInstance,
                             true);
                         loggedMaterialE3 = true;
                     }
-                    logDrawDiag("[LOD-DRAW-E3]", diagnosticEntityId, draw, *diagnosticInstanceIndex, uniformSlot, pipelineForDraw);
+                    logDrawDiag("[LOD-DRAW-E3]", diagnosticEntityId, command, *diagnosticInstanceIndex, bindSlot, pipelineForDraw);
                 }
             }
-            if (refInstanceIndex)
+            if (refInstanceIndex && inRun(*refInstanceIndex))
             {
-                const std::size_t absoluteInstance = static_cast<std::size_t>(draw.firstInstance) + *refInstanceIndex;
+                const std::size_t absoluteInstance = static_cast<std::size_t>(command.firstInstance) + *refInstanceIndex;
                 if (absoluteInstance < instanceBlocks.size())
                 {
                     if (!loggedMaterialRef)
                     {
                         logMaterialDiag("[LOD-MAT-REF]",
-                            instances[*refInstanceIndex],
+                            *instances[*refInstanceIndex],
                             instanceBlocks[absoluteInstance],
                             draw.materialSlot,
                             absoluteInstance,
                             false);
                         loggedMaterialRef = true;
                     }
-                    logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex].entityId, draw, *refInstanceIndex, uniformSlot, pipelineForDraw);
+                    logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex]->entityId, command, *refInstanceIndex, bindSlot, pipelineForDraw);
                 }
             }
-            cmd.DrawIndexed(draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
+            // An opaque run at its level's indices (a masked one keeps its own: its uvs).
+            const MeshDraw* lod = nullptr;
+            if (run.level > 0 && !run.isMask)
+            {
+                const MeshDraw& span = m_viewLodDraws[run.level - 1u][draw.sourceSubmesh];
+                if (span.indexCount != 0)
+                    lod = &span;
+            }
+            const ixrhi::IXRHIBuffer* indexBuffer = lod ? m_lodIndexBuffer.get() : boundIndexBuffer.get();
+            if (currentIndexBuffer != indexBuffer)
+            {
+                cmd.SetIndexBuffer(*indexBuffer, 0, /*thirtyTwoBit=*/true);
+                currentIndexBuffer = indexBuffer;
+            }
+            const std::uint32_t indexCount = lod ? lod->indexCount : draw.indexCount;
+            cmd.DrawIndexed(indexCount, draw.instanceCount, lod ? lod->firstIndex : draw.firstIndex, 0, draw.firstInstance);
             ++m_lastSubmittedDrawCalls;
-            m_lastSubmittedIndexCount += draw.indexCount;
+            m_lastSubmittedIndexCount += indexCount;
+            if (step != MaskStep::Depth)
+                m_lastSubmittedTriangles += static_cast<std::uint64_t>(indexCount/3) * draw.instanceCount;
         }
     };
-    drawPass(false);
-    drawPass(true);
+    drawPass(false, MaskStep::Single);
+    if (maskPrepass && m_maskDepthPipeline && m_maskOnDepthPipeline && m_unlitMaskOnDepthPipeline)
+    {
+        drawPass(true, MaskStep::Depth);
+        drawPass(true, MaskStep::Colour);
+    }
+    else
+    {
+        drawPass(true, MaskStep::Single);
+    }
+    m_lastMaterialBindings.resize(materialBindingCount);
     if (m_outlinePipeline)
     {
         std::vector<std::uint32_t> outlinedInstances;
         outlinedInstances.reserve(instances.size());
         for (std::uint32_t i = 0; i < instances.size(); ++i)
         {
-            if (instances[i].selectedForOutline)
+            if (instances[i]->selectedForOutline)
                 outlinedInstances.push_back(i);
         }
-        if (!outlinedInstances.empty())
+        const std::optional<BindSlot> slot = outlinedInstances.empty() ? std::nullopt : NextBindSlot(frameIndex);
+        if (slot)
         {
+            if (currentIndexBuffer != boundIndexBuffer.get())
+                cmd.SetIndexBuffer(*boundIndexBuffer, 0, /*thirtyTwoBit=*/true);
             cmd.SetGraphicsPipeline(*m_outlinePipeline);
             const MaterialTextureViews materialTextures =
-                ResolveMaterialTextureViews(*m_rhi, instances.front(), 0);
-            const uint32_t uniformSlot = std::min(m_worldUniformCursor++, kUniformSlots - 1);
-            UpdateWorldUniform(frameIndex, uniformSlot, camera, instances.front(), timeSeconds, 0);
-            UpdateMaterialTextureDescriptors(frameIndex, uniformSlot, materialTextures);
-            cmd.BindGroup(0, *m_bindGroup, frameIndex * kUniformSlots + uniformSlot);
+                ResolveMaterialTextureViews(*m_rhi, *instances.front(), 0);
+            UpdateWorldUniform(*slot, camera, *instances.front(), timeSeconds, 0);
+            UpdateMaterialTextureDescriptors(*slot, materialTextures);
+            cmd.BindGroup(0, *slot->page->group, slot->set);
 
             for (const InstancedDrawCommand& draw : drawCommands)
             {
@@ -3216,6 +4304,380 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     m_lastSubmittedInstances = static_cast<std::uint32_t>(instances.size());
 }
 
+bool StaticMeshRenderer::PrepareInstance(const Instance& instance, PreparedInstance& out) const
+{
+    const Mat4 identity = Identity();
+    const std::uint32_t slotCount = MaterialSlotCount();
+    bool changed = out.renderer != this || out.slots.size() != slotCount;
+    out.renderer = this;
+    out.slots.resize(slotCount);
+    for (std::uint32_t slot = 0; slot < slotCount; ++slot)
+    {
+        InstanceBlock block{};
+        FillStaticMeshInstanceBlock(identity, instance, slot, m_materialDefaults, block, m_isTreeImpostor);
+        changed = changed || std::memcmp(&block, &out.slots[slot], sizeof(InstanceBlock)) != 0;
+        out.slots[slot] = block;
+    }
+    bool hasTransparentDraws = false;
+    for (const MeshDraw& draw : m_draws)
+    {
+        if (draw.indexCount != 0 && IsBlendMaterialSlot(instance, draw.materialSlot))
+        {
+            hasTransparentDraws = true;
+            break;
+        }
+    }
+    changed = changed || hasTransparentDraws != out.hasTransparentDraws;
+    out.hasTransparentDraws = hasTransparentDraws;
+    out.materialRevision = MaterialAssetManager::Instance().Revision();
+    return changed;
+}
+
+void StaticMeshRenderer::FillInstanceBlock(const WorldMat4& viewProjection,
+    const Instance& instance,
+    std::uint32_t materialSlot,
+    InstanceBlock& out) const
+{
+    const PreparedInstance* prepared = instance.prepared;
+    if (prepared && prepared->renderer == this && materialSlot < prepared->slots.size() &&
+        prepared->materialRevision == MaterialAssetManager::Instance().Revision())
+    {
+        out = prepared->slots[materialSlot];
+        out.mvp = Multiply(out.model, viewProjection);
+        std::memcpy(out.tint, instance.tint.data(), sizeof(out.tint));
+        out.materialAlpha[2] = instance.coverageMin;
+        out.materialAlpha[3] = instance.coverageMax;
+        return;
+    }
+    FillStaticMeshInstanceBlock(viewProjection, instance, materialSlot, m_materialDefaults, out, m_isTreeImpostor);
+}
+
+bool StaticMeshRenderer::PreparedUsable(const Instance& instance) const
+{
+    const PreparedInstance* prepared = instance.prepared;
+    return prepared && prepared->renderer == this &&
+        prepared->materialRevision == MaterialAssetManager::Instance().Revision();
+}
+
+void StaticMeshRenderer::FillInstanceBlocks(const WorldMat4& viewProjection,
+    const InstanceList& instances,
+    std::uint32_t materialSlot,
+    InstanceBlock* out) const
+{
+    const std::uint32_t count = static_cast<std::uint32_t>(instances.size());
+    constexpr std::uint32_t kGrain = 1024;
+    static const bool parallel = ixjobs::FeatureEnabled("IX_PARALLEL_CULL");
+    if (!parallel || count < 2u * kGrain)
+    {
+        for (std::uint32_t i = 0; i < count; ++i)
+            FillInstanceBlock(viewProjection, *instances[i], materialSlot, out[i]);
+        return;
+    }
+    std::vector<std::uint8_t> left(count, 0);  // 1: not prepared, filled below
+    ixjobs::JobSystem::Instance().ParallelFor(count, kGrain, [&](std::uint32_t begin, std::uint32_t end, std::uint32_t) {
+        for (std::uint32_t i = begin; i < end; ++i)
+        {
+            if (PreparedUsable(*instances[i]) && materialSlot < instances[i]->prepared->slots.size())
+                FillInstanceBlock(viewProjection, *instances[i], materialSlot, out[i]);
+            else
+                left[i] = 1;
+        }
+    });
+    for (std::uint32_t i = 0; i < count; ++i)
+    {
+        if (left[i])
+            FillInstanceBlock(viewProjection, *instances[i], materialSlot, out[i]);
+    }
+}
+
+bool StaticMeshRenderer::HasTransparentDraws(const Instance& instance) const
+{
+    const PreparedInstance* prepared = instance.prepared;
+    if (prepared && prepared->renderer == this &&
+        prepared->materialRevision == MaterialAssetManager::Instance().Revision())
+        return prepared->hasTransparentDraws;
+    for (const MeshDraw& draw : m_draws)
+    {
+        if (draw.indexCount != 0 && IsBlendMaterialSlot(instance, draw.materialSlot))
+            return true;
+    }
+    return false;
+}
+
+void StaticMeshRenderer::RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
+    double timeSeconds,
+    const WorldCamera& camera,
+    const Instance& instance,
+    std::uint32_t targetWidth,
+    std::uint32_t targetHeight)
+{
+    if (!m_rhi || m_bindPages.empty() || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || !frame.frameActive ||
+        !m_boundSunShadowTexture || !m_blendPipelines[0][0] || !m_blendPipelines[1][1] || !UploadsRecorded())
+        return;
+    const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
+    const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
+    if (extentWidth == 0 || extentHeight == 0)
+        return;
+
+    std::vector<std::size_t> blendDraws;
+    for (std::size_t i = 0; i < m_draws.size(); ++i)
+    {
+        if (m_draws[i].indexCount != 0 && IsBlendMaterialSlot(instance, m_draws[i].materialSlot))
+            blendDraws.push_back(i);
+    }
+    if (blendDraws.empty())
+        return;
+
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    BeginFrameSlots(frame);
+    std::vector<InstanceBlock> blocks(blendDraws.size());
+    const Mat4 viewProjection = ToLocalMat4(camera.viewProjection);
+    for (std::size_t i = 0; i < blendDraws.size(); ++i)
+        FillInstanceBlock(viewProjection, instance, m_draws[blendDraws[i]].materialSlot, blocks[i]);
+    const std::optional<std::uint32_t> base = AppendInstanceBlocks(frameIndex, blocks);
+    if (!base)
+        return;
+
+    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
+    cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
+    for (std::size_t i = 0; i < blendDraws.size(); ++i)
+    {
+        const MeshDraw& draw = m_draws[blendDraws[i]];
+        const MaterialTextureViews textures = ResolveMaterialTextureViews(*m_rhi, instance, draw.materialSlot);
+        const std::optional<BindSlot> slot = NextBindSlot(frameIndex);
+        if (!slot)
+            return;
+        UpdateWorldUniform(*slot, camera, instance, timeSeconds, draw.materialSlot);
+        UpdateMaterialTextureDescriptors(*slot, textures);
+        // The set binds against the bound pipeline's layout: this renderer's first (the previous draw
+        // may be another renderer's); the second side shares the layout, so the set stays bound.
+        const auto& sides = m_blendPipelines[textures.unlit ? 1 : 0];
+        cmd.SetGraphicsPipeline(*sides[0]);  // back faces
+        cmd.BindGroup(0, *slot->page->group, slot->set);
+        cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, *base + static_cast<std::uint32_t>(i));
+        cmd.SetGraphicsPipeline(*sides[1]);  // front faces
+        cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, *base + static_cast<std::uint32_t>(i));
+    }
+}
+
+std::optional<std::uint32_t> StaticMeshRenderer::AppendInstanceBlocks(uint32_t frameIndex,
+    const std::vector<InstanceBlock>& blocks)
+{
+    const std::uint32_t base = m_worldInstanceCursor;
+    const std::uint32_t count = static_cast<std::uint32_t>(blocks.size());
+    if (blocks.empty() || !m_rhi || !EnsureInstanceCapacity(*m_rhi, frameIndex, base + count))
+        return std::nullopt;
+    const std::size_t bytes = blocks.size() * sizeof(InstanceBlock);
+    // Appended at the per-frame cursor (not offset 0): this renderer is drawn several times a frame
+    // (shadow cascades, Scene and Game views) and each draw keeps its records until the GPU reads them.
+    m_instanceBuffers[frameIndex]->Write(static_cast<std::uint64_t>(base) * sizeof(InstanceBlock), blocks.data(), bytes);
+    m_worldInstanceCursor = base + count;
+    return base;
+}
+
+bool StaticMeshRenderer::CreateShadowPipelines(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* shadowPass)
+{
+    if (!m_assets || !m_bindLayout || !shadowPass)
+        return false;
+    auto vs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_shadow_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex, "VSMain");
+    auto maskPs = LoadShader(rhi, *m_assets, "assets/shaders/static_mesh_shadow_mask_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "ShadowMaskPS");
+    if (!vs || !maskPs)
+        return false;
+
+    // Depth only, like the terrain's cascades: no culling (meshes may be open), a slope-scaled bias.
+    ixrhi::IXRHIGraphicsPipelineDesc desc;
+    desc.vertexShader = vs;
+    desc.fragmentShader = nullptr;
+    desc.bindGroupLayouts = {m_bindLayout.get()};
+    desc.vertexBindings = {{0, sizeof(Vertex)}};
+    desc.vertexAttributes = {
+        {0, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, position)},
+        {1, 0, ixrhi::IXRHIFormat::R32G32B32Float, offsetof(Vertex, normal)},
+        {2, 0, ixrhi::IXRHIFormat::R32G32Float, offsetof(Vertex, uv)},
+    };
+    desc.topology = ixrhi::IXRHIPrimitiveTopology::TriangleList;
+    desc.cullMode = ixrhi::IXRHICullMode::None;
+    desc.frontFace = ixrhi::IXRHIFrontFace::Clockwise;
+    desc.depthTestEnable = true;
+    desc.depthWriteEnable = true;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.depthBias.enable = true;
+    desc.depthBias.constantFactor = 1.25f;
+    desc.depthBias.slopeFactor = 1.75f;
+    desc.sampleCount = 1;
+    desc.targetRenderPass = shadowPass;
+    desc.debugName = "StaticMesh:Shadow";
+    m_shadowPipeline = rhi.CreateGraphicsPipeline(desc);
+    desc.fragmentShader = maskPs;
+    desc.debugName = "StaticMesh:ShadowMask";
+    m_shadowMaskPipeline = rhi.CreateGraphicsPipeline(desc);
+    return m_shadowPipeline && m_shadowMaskPipeline;
+}
+
+namespace
+{
+// IX_SHADOW_LOD=0: every caster draws its own triangles into every cascade (for comparing).
+bool ShadowLodsEnabled()
+{
+    return EnvironmentSwitchOn("IX_SHADOW_LOD");
+}
+} // namespace
+
+void StaticMeshRenderer::RenderShadowCasters(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame,
+    const WorldMat4& lightViewProj,
+    const InstanceList& instances,
+    const ixrhi::IXRHIRenderPass* shadowPass,
+    float shadowTexelMeters)
+{
+    if (!m_rhi || m_bindPages.empty() || !m_vertexBuffer || !m_indexBuffer || m_indices.empty() || m_draws.empty() ||
+        instances.empty() || !shadowPass || !frame.frameActive || !m_boundSunShadowTexture || !UploadsRecorded())
+        return;
+    if (m_shadowPass != shadowPass)
+    {
+        m_shadowPipeline.reset();
+        m_shadowMaskPipeline.reset();
+        m_shadowPipelinesFailed = false;
+        m_shadowPass = shadowPass;
+    }
+    if (!m_shadowPipeline && !m_shadowPipelinesFailed && !CreateShadowPipelines(*m_rhi, shadowPass))
+    {
+        m_shadowPipelinesFailed = true;
+        LogFormat("[MESH] static mesh sun shadow pipelines could not be created model=%s", m_modelPath.c_str());
+    }
+    if (!m_shadowPipeline || !m_shadowMaskPipeline)
+        return;
+
+    const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    BeginFrameSlots(frame);
+
+    // One record per draw (submesh) and instance, its mvp = model x the cascade's light
+    // view-projection; its material says whether it is alpha-masked.
+    std::vector<InstanceBlock> blocks(m_draws.size() * instances.size());
+    for (std::size_t drawIndex = 0; drawIndex < m_draws.size(); ++drawIndex)
+        FillInstanceBlocks(lightViewProj, instances, m_draws[drawIndex].materialSlot,
+            blocks.data() + drawIndex * instances.size());
+    const std::optional<std::uint32_t> base = AppendInstanceBlocks(frameIndex, blocks);
+    if (!base)
+        return;
+    // Each instance's shadow detail level here: how many of them stay within half a texel at its
+    // scale (0: its own triangles; the last: its leaf cards thinned too).
+    static const bool lodsEnabled = ShadowLodsEnabled();
+    std::vector<std::uint8_t> levels(instances.size(), 0);
+    if (lodsEnabled && m_lodIndexBuffer && shadowTexelMeters > 0.0f)
+    {
+        const float allowed = 0.5f * shadowTexelMeters;
+        for (std::size_t i = 0; i < instances.size(); ++i)
+        {
+            const float* scale = instances[i]->scale;
+            const float largest = std::max({std::abs(scale[0]), std::abs(scale[1]), std::abs(scale[2])});
+            std::uint8_t level = 0;
+            while (level < kLodLevels && kLodErrors[level] * largest <= allowed)
+                ++level;
+            levels[i] = level;
+        }
+    }
+
+    const ixrhi::IXRHIBuffer* boundVertexBuffer = nullptr;
+    const ixrhi::IXRHIBuffer* boundIndexBuffer = nullptr;
+    const auto thinCards = [&](std::uint32_t i) { return levels[i] == kLodLevels; };
+    // Opaque runs need no textures: one set of its own this frame (instances + shadow map bound),
+    // taken by the first of them.
+    std::optional<BindSlot> opaqueSlot;
+    const auto materialKey = [](const Instance& instance, std::uint32_t slot) -> std::string_view {
+        return slot < instance.materialSlots.size() ? std::string_view(instance.materialSlots[slot]) : std::string_view();
+    };
+    const ixrhi::IXRHIGraphicsPipeline* boundPipeline = nullptr;
+    const std::uint32_t instanceCount = static_cast<std::uint32_t>(instances.size());
+    for (std::size_t drawIndex = 0; drawIndex < m_draws.size(); ++drawIndex)
+    {
+        const MeshDraw& draw = m_draws[drawIndex];
+        if (draw.indexCount == 0)
+            continue;
+        const std::uint32_t drawBase = *base + static_cast<std::uint32_t>(drawIndex) * instanceCount;
+        for (std::uint32_t runStart = 0; runStart < instanceCount;)
+        {
+            // Alpha-masked and alpha-blended materials (mode 1, 2) cast where their alpha reaches the
+            // cutoff: a faint glass casts nothing instead of a solid block.
+            const bool masked = blocks[drawBase - *base + runStart].materialAlpha[0] >= 1.0f;
+            std::uint32_t runEnd = runStart + 1;
+            // Opaque instances share one draw, and masked ones of one material one with its texture.
+            if (masked)
+            {
+                const std::string_view material = materialKey(*instances[runStart], draw.materialSlot);
+                while (runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] >= 1.0f &&
+                       materialKey(*instances[runEnd], draw.materialSlot) == material &&
+                       thinCards(runEnd) == thinCards(runStart))
+                    ++runEnd;
+            }
+            else
+            {
+                while (runEnd < instanceCount && blocks[drawBase - *base + runEnd].materialAlpha[0] < 1.0f &&
+                       levels[runEnd] == levels[runStart])
+                    ++runEnd;
+            }
+            std::optional<BindSlot> slot;
+            if (masked)
+            {
+                slot = NextBindSlot(frameIndex);
+                if (slot)
+                    UpdateMaterialTextureDescriptors(*slot,
+                        ResolveMaterialTextureViews(*m_rhi, *instances[runStart], draw.materialSlot));
+            }
+            else
+            {
+                if (!opaqueSlot)
+                    opaqueSlot = NextBindSlot(frameIndex);
+                slot = opaqueSlot;
+            }
+            if (!slot)
+                return;
+            const ixrhi::IXRHIGraphicsPipeline* pipeline = masked ? m_shadowMaskPipeline.get() : m_shadowPipeline.get();
+            if (boundPipeline != pipeline)
+            {
+                cmd.SetGraphicsPipeline(*pipeline);
+                boundPipeline = pipeline;
+            }
+            cmd.BindGroup(0, *slot->page->group, slot->set);
+            // Opaque runs at their detail level; masked ones as they are, or as thinned cards.
+            const MeshDraw* lod = nullptr;
+            bool cards = false;
+            if (masked)
+            {
+                cards = thinCards(runStart) && m_shadowCardVertexBuffer && !m_shadowCardDraws.empty() &&
+                    m_shadowCardDraws[drawIndex].indexCount != 0;
+                if (cards)
+                    lod = &m_shadowCardDraws[drawIndex];
+            }
+            else if (levels[runStart] > 0 && !m_shadowLodDraws[levels[runStart] - 1u].empty() &&
+                     m_shadowLodDraws[levels[runStart] - 1u][drawIndex].indexCount != 0)
+            {
+                lod = &m_shadowLodDraws[levels[runStart] - 1u][drawIndex];
+            }
+            const ixrhi::IXRHIBuffer* vertexBuffer = cards ? m_shadowCardVertexBuffer.get() : m_vertexBuffer.get();
+            if (boundVertexBuffer != vertexBuffer)
+            {
+                cmd.SetVertexBuffer(0, *vertexBuffer, 0);
+                boundVertexBuffer = vertexBuffer;
+            }
+            const ixrhi::IXRHIBuffer* indexBuffer = lod ? m_lodIndexBuffer.get() : m_indexBuffer.get();
+            if (boundIndexBuffer != indexBuffer)
+            {
+                cmd.SetIndexBuffer(*indexBuffer, 0, /*thirtyTwoBit=*/true);
+                boundIndexBuffer = indexBuffer;
+            }
+            const MeshDraw& drawn = lod ? *lod : draw;
+            cmd.DrawIndexed(drawn.indexCount, runEnd - runStart, drawn.firstIndex, 0, drawBase + runStart);
+            runStart = runEnd;
+        }
+    }
+}
+
 void StaticMeshRenderer::DestroyPipeline()
 {
     // RAII release (pipelines own VkPipeline + layout in the backend).
@@ -3223,39 +4685,56 @@ void StaticMeshRenderer::DestroyPipeline()
     m_maskPipeline.reset();
     m_unlitPipeline.reset();
     m_unlitMaskPipeline.reset();
+    m_maskDepthPipeline.reset();
+    m_maskOnDepthPipeline.reset();
+    m_unlitMaskOnDepthPipeline.reset();
     m_outlinePipeline.reset();
+    for (auto& sides : m_blendPipelines)
+    {
+        for (auto& pipeline : sides)
+            pipeline.reset();
+    }
+    m_shadowPipeline.reset();
+    m_shadowMaskPipeline.reset();
+    m_shadowPass = nullptr;
+    m_shadowPipelinesFailed = false;
 }
 
 void StaticMeshRenderer::Destroy()
 {
     StopLodWorker();
+    m_treeImpostor.reset();
+    m_lastImpostorTrees = 0;
     if (!m_rhi)
         return;
     DestroyPipeline();
-    m_bindGroup.reset();
+    m_bindPages.clear();
     m_bindLayout.reset();
+    m_pendingUploads.reset();
     m_vertexBuffer.reset();
     m_indexBuffer.reset();
+    m_lodIndexBuffer.reset();
+    m_shadowCardVertexBuffer.reset();
     m_lodBuffers.clear();
     // Dropping in-flight uploads waits for their fences and releases staging
     // (parity with the old fence-wait in Destroy).
     m_pendingLodUploads.clear();
     m_retiredLodBuffers.clear();
-    for (auto& frameBuffers : m_uniformBuffers)
-    {
-        for (auto& buffer : frameBuffers)
-            buffer.reset();
-    }
     for (auto& buffer : m_instanceBuffers)
         buffer.reset();
     m_instanceBufferCapacity = {};
-    for (auto& mirror : m_instanceMirror)
-        mirror.clear();
+    m_worldRenderFrameNumber = std::numeric_limits<std::uint64_t>::max();
+    m_worldRenderFrameIndex = std::numeric_limits<uint32_t>::max();
     m_texture = {};
     m_normalTexture = {};
     m_ormTexture = {};
+    m_materialTextureLoads.clear();  // (waits for their decodes)
+    m_materialTextureStaging.clear();
     m_materialTextureCache.clear();
     m_failedMaterialTextureKeys.clear();
+    // The shadow map belongs to the terrain renderer; holding it past here leaks it at device teardown.
+    m_sunShadow = {};
+    m_boundSunShadowTexture = nullptr;
     m_vertices.clear();
     m_indices.clear();
     m_draws.clear();
@@ -3276,8 +4755,7 @@ void StaticMeshRenderer::Destroy()
     m_rhi = nullptr;
 }
 
-void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
-    uint32_t uniformSlot,
+void StaticMeshRenderer::UpdateWorldUniform(const BindSlot& slot,
     const WorldCamera& camera,
     const Instance& instance,
     double,
@@ -3296,7 +4774,7 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
 
     UniformBlock uniform{mvp, model,
         {instance.tint[0], instance.tint[1], instance.tint[2], instance.tint[3]}};
-    const MaterialDefaults defaults = ResolveMaterialSlotDefaults(instance, materialSlot, m_materialDefaults);
+    const MaterialDefaults defaults = ResolveMaterialSlotDefaults(instance, materialSlot, m_materialDefaults, m_isTreeImpostor);
     std::memcpy(uniform.materialBaseColor, defaults.baseColor, sizeof(uniform.materialBaseColor));
     uniform.materialParams[0] = defaults.metallic;
     uniform.materialParams[1] = defaults.roughness;
@@ -3308,8 +4786,12 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
     uniform.materialEmissive[3] = 1.0f;
     uniform.materialAlpha[0] = AlphaModeCode(defaults.alphaMode);
     uniform.materialAlpha[1] = std::clamp(defaults.alphaCutoff, 0.0f, 1.0f);
-    uniform.materialAlpha[2] = defaults.unlit ? 1.0f : 0.0f;
-    uniform.materialAlpha[3] = 0.0f;
+    uniform.materialAlpha[2] = instance.coverageMin;
+    uniform.materialUv[0] = defaults.uvTiling[0];
+    uniform.materialUv[1] = defaults.uvTiling[1];
+    uniform.materialUv[2] = defaults.uvOffset[0];
+    uniform.materialUv[3] = defaults.uvOffset[1];
+    uniform.materialAlpha[3] = instance.coverageMax;
     for (const MeshSceneEntity::MaterialOverride& overrideSlot : instance.materialOverrides)
     {
         if (overrideSlot.slot != materialSlot || !overrideSlot.enabled)
@@ -3336,8 +4818,8 @@ void StaticMeshRenderer::UpdateWorldUniform(uint32_t frameIndex,
     FillLightingUniform(m_lightingState, uniform);
     uniform.waterParams[0] = 0.0f;
     uniform.causticParams[0] = 0.0f;
+    FillSunShadowUniform(m_sunShadow, uniform);
 
-    if (frameIndex < kFramesInFlight && uniformSlot < kUniformSlots &&
-        m_uniformBuffers[frameIndex][uniformSlot])
-        m_uniformBuffers[frameIndex][uniformSlot]->Write(0, &uniform, sizeof(uniform));
+    if (slot.page && slot.page->uniforms)
+        slot.page->uniforms->Write(kUniformStride * slot.set, &uniform, sizeof(uniform));
 }

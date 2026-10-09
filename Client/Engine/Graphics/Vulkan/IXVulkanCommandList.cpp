@@ -10,6 +10,7 @@
 #include "IXVulkanSync.h"
 #include "VulkanDevice.h"
 
+#include <algorithm>
 #include <cassert>
 #include <functional>
 
@@ -212,14 +213,15 @@ void LayoutStageAccess(ixrhi::IXRHIImageLayout layout,
         stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
         access = VK_ACCESS_SHADER_READ_BIT;
         break;
+    // Attachments are read too: a pass that loads them (and depth testing) reads what is there.
     case L::ColorAttachment:
         stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-        access = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        access = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
         break;
     case L::DepthStencilAttachment:
         stage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        access = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
         break;
     case L::Present:
         stage = VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
@@ -245,16 +247,22 @@ void IXVulkanCommandList::TransitionTexture(ixrhi::IXRHITexture& texture,
     LayoutStageAccess(from, srcStage, srcAccess);
     LayoutStageAccess(to, dstStage, dstAccess);
 
+    // Sampled depth uses SHADER_READ_ONLY too: valid for any sampled image, while the depth-read
+    // layout needs depth-attachment usage, which a sampled-only depth snapshot does not have.
+    // Full-subresource range so layered depth (shadow cascades) transitions atomically.
+    const VkImageLayout oldLayout = ToVkImageLayout(from);
+    const VkImageLayout newLayout = ToVkImageLayout(to);
+
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.oldLayout = ToVkImageLayout(from);
-    barrier.newLayout = ToVkImageLayout(to);
+    barrier.oldLayout = oldLayout;
+    barrier.newLayout = newLayout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = native->Native();
     barrier.subresourceRange.aspectMask = ToVkAspectMask(native->Format());
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.layerCount = 1;
+    barrier.subresourceRange.levelCount = std::max(1u, native->MipLevels());
+    barrier.subresourceRange.layerCount = std::max(1u, native->ArrayLayers());
     barrier.srcAccessMask = srcAccess;
     barrier.dstAccessMask = dstAccess;
     vkCmdPipelineBarrier(m_cmd, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
@@ -274,6 +282,74 @@ void IXVulkanCommandList::CopyTexture(const ixrhi::IXRHITexture& src, ixrhi::IXR
     copy.dstSubresource.aspectMask = aspect;
     copy.dstSubresource.layerCount = 1;
     copy.extent = {nativeSrc->Width(), nativeSrc->Height(), 1};
+    vkCmdCopyImage(m_cmd,
+        nativeSrc->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        nativeDst->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copy);
+}
+
+void IXVulkanCommandList::CopyTextureLayer(const ixrhi::IXRHITexture& src,
+                                           std::uint32_t srcLayer,
+                                           ixrhi::IXRHITexture& dst,
+                                           std::uint32_t dstLayer)
+{
+    auto* nativeSrc = dynamic_cast<const IXVulkanTexture*>(&src);
+    auto* nativeDst = dynamic_cast<IXVulkanTexture*>(&dst);
+    assert(nativeSrc != nullptr && nativeDst != nullptr && "foreign IXRHITexture used with IXVulkan backend");
+    if (nativeSrc == nullptr || nativeDst == nullptr || srcLayer >= nativeSrc->ArrayLayers() ||
+        dstLayer >= nativeDst->ArrayLayers())
+        return;
+    const VkImageAspectFlags aspect = ToVkAspectMask(nativeSrc->Format());
+    VkImageCopy copy{};
+    copy.srcSubresource.aspectMask = aspect;
+    copy.srcSubresource.baseArrayLayer = srcLayer;
+    copy.srcSubresource.layerCount = 1;
+    copy.dstSubresource.aspectMask = aspect;
+    copy.dstSubresource.baseArrayLayer = dstLayer;
+    copy.dstSubresource.layerCount = 1;
+    copy.extent = {nativeSrc->Width(), nativeSrc->Height(), 1};
+    vkCmdCopyImage(m_cmd,
+        nativeSrc->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        nativeDst->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copy);
+}
+
+void IXVulkanCommandList::CopyTextureLayerRegion(const ixrhi::IXRHITexture& src,
+                                                 std::uint32_t srcLayer,
+                                                 std::uint32_t srcX,
+                                                 std::uint32_t srcY,
+                                                 ixrhi::IXRHITexture& dst,
+                                                 std::uint32_t dstLayer,
+                                                 std::uint32_t dstX,
+                                                 std::uint32_t dstY,
+                                                 std::uint32_t width,
+                                                 std::uint32_t height)
+{
+    auto* nativeSrc = dynamic_cast<const IXVulkanTexture*>(&src);
+    auto* nativeDst = dynamic_cast<IXVulkanTexture*>(&dst);
+    assert(nativeSrc != nullptr && nativeDst != nullptr && "foreign IXRHITexture used with IXVulkan backend");
+    if (nativeSrc == nullptr || nativeDst == nullptr || srcLayer >= nativeSrc->ArrayLayers() ||
+        dstLayer >= nativeDst->ArrayLayers() || width == 0 || height == 0 ||
+        srcX + width > nativeSrc->Width() || srcY + height > nativeSrc->Height() ||
+        dstX + width > nativeDst->Width() || dstY + height > nativeDst->Height())
+        return;
+    const VkImageAspectFlags aspect = ToVkAspectMask(nativeSrc->Format());
+    VkImageCopy copy{};
+    copy.srcSubresource.aspectMask = aspect;
+    copy.srcSubresource.baseArrayLayer = srcLayer;
+    copy.srcSubresource.layerCount = 1;
+    copy.srcOffset = {static_cast<std::int32_t>(srcX), static_cast<std::int32_t>(srcY), 0};
+    copy.dstSubresource.aspectMask = aspect;
+    copy.dstSubresource.baseArrayLayer = dstLayer;
+    copy.dstSubresource.layerCount = 1;
+    copy.dstOffset = {static_cast<std::int32_t>(dstX), static_cast<std::int32_t>(dstY), 0};
+    copy.extent = {width, height, 1};
     vkCmdCopyImage(m_cmd,
         nativeSrc->Native(),
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -314,6 +390,40 @@ void IXVulkanCommandList::CopyBuffer(const ixrhi::IXRHIBuffer& src,
     VkBufferCopy copy{};
     copy.size = static_cast<VkDeviceSize>(byteCount);
     vkCmdCopyBuffer(m_cmd, nativeSrc->Native(), nativeDst->Native(), 1, &copy);
+}
+
+void IXVulkanCommandList::CopyBufferToTexture(const ixrhi::IXRHIBuffer& src,
+                                              std::uint64_t srcOffsetBytes,
+                                              std::uint32_t srcRowTexels,
+                                              ixrhi::IXRHITexture& dst,
+                                              std::uint32_t mipLevel,
+                                              std::uint32_t arrayLayer,
+                                              std::uint32_t x,
+                                              std::uint32_t y,
+                                              std::uint32_t width,
+                                              std::uint32_t height)
+{
+    auto* nativeSrc = dynamic_cast<const IXVulkanBuffer*>(&src);
+    auto* nativeDst = dynamic_cast<IXVulkanTexture*>(&dst);
+    assert(nativeSrc != nullptr && nativeDst != nullptr && "foreign IXRHI resource used with IXVulkan backend");
+    if (nativeSrc == nullptr || nativeDst == nullptr || width == 0 || height == 0)
+        return;
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = static_cast<VkDeviceSize>(srcOffsetBytes);
+    copy.bufferRowLength = srcRowTexels;
+    copy.bufferImageHeight = 0;
+    copy.imageSubresource.aspectMask = ToVkAspectMask(nativeDst->Format());
+    copy.imageSubresource.mipLevel = mipLevel;
+    copy.imageSubresource.baseArrayLayer = arrayLayer;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageOffset = {static_cast<std::int32_t>(x), static_cast<std::int32_t>(y), 0};
+    copy.imageExtent = {width, height, 1};
+    vkCmdCopyBufferToImage(m_cmd,
+        nativeSrc->Native(),
+        nativeDst->Native(),
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copy);
 }
 
 namespace
@@ -392,6 +502,21 @@ void IXVulkanCommandList::TransitionBuffer(ixrhi::IXRHIBuffer& buffer,
     vkCmdPipelineBarrier(m_cmd, srcStage, dstStage, 0, 0, nullptr, 1, &barrier, 0, nullptr);
 }
 
+void IXVulkanCommandList::BufferMemoryBarrier(ixrhi::IXRHIBufferState from, ixrhi::IXRHIBufferState to)
+{
+    VkPipelineStageFlags srcStage = 0;
+    VkAccessFlags srcAccess = 0;
+    VkPipelineStageFlags dstStage = 0;
+    VkAccessFlags dstAccess = 0;
+    BufferStageAccess(from, srcStage, srcAccess);
+    BufferStageAccess(to, dstStage, dstAccess);
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.srcAccessMask = srcAccess;
+    barrier.dstAccessMask = dstAccess;
+    vkCmdPipelineBarrier(m_cmd, srcStage, dstStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
 std::unique_ptr<ixrhi::IXRHICommandList> IXVulkanDevice::CreateCommandList()
 {
     VkCommandPoolCreateInfo poolInfo{};
@@ -439,7 +564,10 @@ void IXVulkanDevice::ExecuteAndWait(const std::function<void(ixrhi::IXRHICommand
     submit.commandBufferCount = 1;
     VkCommandBuffer cmd = native->Native();
     submit.pCommandBuffers = &cmd;
-    IXVULKAN_CHECK(*this, vkQueueSubmit(Loop().GetGraphicsQueue(), 1, &submit, fence));
+    {
+        std::lock_guard<std::mutex> queueLock(QueueSubmitMutex());
+        IXVULKAN_CHECK(*this, vkQueueSubmit(Loop().GetGraphicsQueue(), 1, &submit, fence));
+    }
     IXVULKAN_CHECK(*this, vkWaitForFences(NativeDevice(), 1, &fence, VK_TRUE, UINT64_MAX));
     vkDestroyFence(NativeDevice(), fence, nullptr);
 }
@@ -452,6 +580,20 @@ std::unique_ptr<ixrhi::IXRHIFence> IXVulkanDevice::CreateFence(bool signaled)
     VkFence fence = VK_NULL_HANDLE;
     CheckVk(vkCreateFence(NativeDevice(), &create, nullptr, &fence), "vkCreateFence", __FILE__, __LINE__);
     return std::make_unique<IXVulkanFence>(*this, fence);
+}
+
+std::unique_ptr<ixrhi::IXRHIOcclusionQueries> IXVulkanDevice::CreateOcclusionQueries(std::uint32_t count)
+{
+    if (count == 0)
+        return nullptr;
+    VkQueryPoolCreateInfo create{};
+    create.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+    create.queryType = VK_QUERY_TYPE_OCCLUSION;
+    create.queryCount = count;
+    VkQueryPool pool = VK_NULL_HANDLE;
+    if (vkCreateQueryPool(NativeDevice(), &create, nullptr, &pool) != VK_SUCCESS)
+        return nullptr;
+    return std::make_unique<IXVulkanOcclusionQueries>(*this, pool, count);
 }
 
 std::unique_ptr<ixrhi::IXRHISemaphore> IXVulkanDevice::CreateSemaphore()

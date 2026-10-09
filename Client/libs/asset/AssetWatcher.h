@@ -19,6 +19,8 @@ public:
 
     void start(const std::filesystem::path& projectRoot);
     void stop();
+    // True when the asset library should refresh: the AssetDatabase registered a change, or a
+    // folder / asset file under the project's asset root appeared, disappeared or moved.
     bool processPendingEvents();
 
     void handleFileAction(efsw::WatchID watchId,

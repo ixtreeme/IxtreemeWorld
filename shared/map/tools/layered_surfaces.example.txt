@@ -1,0 +1,7 @@
+# collision/navmesh adapter output
+# surface id name min_x min_y max_x max_y min_z max_z tag|tag supports_ground_movement
+surface 1 road_west 0 0 8 16 0 4 ground|road 1
+surface 2 road_east 8 0 16 16 0 4 ground|road 1
+surface 3 building_floor 2 2 12 12 6 10 building|interior 1
+surface 4 underpass 0 0 16 16 -10 -6 connector|road 0
+surface 5 river 12 12 16 16 4.5 5.5 water 0

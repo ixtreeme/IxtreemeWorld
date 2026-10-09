@@ -1,3 +1,4 @@
+#include "asset/ExrImage.h"
 #include "AssetLibrary.h"
 
 #include "AssetDatabase.h"
@@ -5,6 +6,7 @@
 #include "Debug.h"
 #include "MaterialAssetManager.h"
 #include "math/IXMath.h"
+#include "particles/ParticleEffectIO.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -52,8 +54,10 @@ using ixtreeme::common::CanonicalPathString;
 using ixtreeme::common::EscapeJson;
 using ixtreeme::common::GenericPath;
 using ixtreeme::common::HasAnyExtension;
+using ixtreeme::common::IsValidUtf8;
 using ixtreeme::common::JsonFloatValue;
 using ixtreeme::common::JsonStringValue;
+using ixtreeme::common::LegacyTextToUtf8;
 using ixtreeme::common::TimestampUtc;
 
 AssetLibrary::FbxSidecarProcessor g_fbxSidecarProcessor = nullptr;
@@ -75,7 +79,7 @@ std::optional<int> JsonIntValue(const std::string& object, const std::string& ke
 bool HasJsonObjectShape(const std::string& text);
 bool ImportFbxSidecars(const std::filesystem::path& destination,
                        const std::filesystem::path& libraryRoot,
-                       std::string& error);
+                       std::string& error, const std::filesystem::path& source = {});
 
 bool JsonBoolValue(const std::string& object, const std::string& key, bool fallback)
 {
@@ -179,7 +183,7 @@ std::string JsonObjectValue(const std::string& object, const std::string& key)
 
 bool ImportFbxSidecars(const std::filesystem::path& destination,
                        const std::filesystem::path& libraryRoot,
-                       std::string& error)
+                       std::string& error, const std::filesystem::path& source)
 {
     if (!g_fbxSidecarProcessor)
     {
@@ -189,7 +193,7 @@ bool ImportFbxSidecars(const std::filesystem::path& destination,
             error.c_str());
         return false;
     }
-    return g_fbxSidecarProcessor(destination, libraryRoot, error);
+    return g_fbxSidecarProcessor(destination, libraryRoot, error, source);
 }
 
 LodConfig ReadLodConfigJson(const std::string& object)
@@ -268,7 +272,30 @@ bool JsonObjectAt(const std::string& text, size_t begin, std::string& out, size_
 
 std::string JsonNullableStringValue(const std::string& object, const std::string& key)
 {
+    // JsonStringValue skips a non-string value and returns the NEXT quoted string, which turned
+    // every null texture id into the following key's name ("diffuse_texture_id": "normal_texture_id").
+    const std::string needle = "\"" + key + "\"";
+    const size_t keyPos = object.find(needle);
+    if (keyPos == std::string::npos)
+        return {};
+    const size_t colon = object.find(':', keyPos + needle.size());
+    if (colon == std::string::npos)
+        return {};
+    const size_t value = object.find_first_not_of(" \t\r\n", colon + 1);
+    if (value == std::string::npos || object[value] != '"')
+        return {};
     return JsonStringValue(object, key);
+}
+
+// Material texture ids that an older manifest stored corrupted by the bug above (key names
+// instead of ids or null): read back as "no texture".
+std::string SanitizeMaterialTextureId(std::string id)
+{
+    static const std::unordered_set<std::string> corrupted = {
+        "diffuse_texture_id", "normal_texture_id", "ao_texture_id", "roughness_texture_id",
+        "metallic_texture_id", "height_texture_id", "tiling_scale",
+    };
+    return corrupted.contains(id) ? std::string{} : id;
 }
 
 std::vector<std::string> JsonStringArrayValue(const std::string& object, const std::string& key)
@@ -306,7 +333,7 @@ std::vector<std::string> JsonStringArrayValue(const std::string& object, const s
         }
         if (c == '"')
         {
-            values.push_back(value);
+            values.push_back(LegacyTextToUtf8(value));
             inString = false;
             continue;
         }
@@ -1456,6 +1483,15 @@ bool ReadDdsResolution(const std::filesystem::path& path, std::uint32_t& width, 
 
 bool ReadImageResolution(const std::filesystem::path& path, std::uint32_t& width, std::uint32_t& height)
 {
+    if (client::asset::IsExrPath(path))
+    {
+        std::string error;
+        int w = 0, h = 0;
+        if (!client::asset::ReadExrResolution(path, w, h, error)) return false;
+        width = static_cast<std::uint32_t>(w);
+        height = static_cast<std::uint32_t>(h);
+        return true;
+    }
     const std::string ext = ToLower(path.extension().string());
     if (ext == ".dds")
         return ReadDdsResolution(path, width, height);
@@ -1515,19 +1551,106 @@ std::vector<std::uint8_t> ResizeBilinearRgba(const std::uint8_t* pixels,
 
 std::string StemDisplayName(const std::string& filename)
 {
+    const std::string lower = ToLower(filename);
+    if (lower.ends_with(".material.json"))
+        return filename.substr(0, filename.size() - std::string(".material.json").size());
     return std::filesystem::path(filename).stem().string();
+}
+
+constexpr const char* kThumbnailFolder = "thumbnails";
+
+std::filesystem::path MetaSidecarPath(const std::filesystem::path& assetPath)
+{
+    std::filesystem::path meta = assetPath;
+    meta += ".meta";
+    return meta;
+}
+
+// Comparison key of a path inside the library: lexically normal, generic, lower case.
+std::string LibraryPathKey(const std::filesystem::path& path)
+{
+    return ToLower(path.lexically_normal().generic_string());
+}
+
+// Directories the library never looks into: its generated thumbnails, tool/VCS folders and
+// half-finished folder deletes.
+bool IsSkippedLibraryDirectory(const std::filesystem::path& directory, int depth)
+{
+    const std::string name = ToLower(directory.filename().generic_string());
+    if (depth == 0 && name == kThumbnailFolder)
+        return true;
+    if (name.empty() || name.front() == '.')
+        return true;
+    if (name.find(".delete_tmp") != std::string::npos)
+        return true;
+    static const std::unordered_set<std::string> ignored = {"build", "bin", "out", "cmakefiles"};
+    return ignored.contains(name);
+}
+
+// Keep GUID metadata and import diagnostics beside an asset through renames/moves.
+bool MoveAssetSidecars(const std::filesystem::path& source, const std::filesystem::path& destination, std::string& error)
+{
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> moved;
+    for (const char* suffix : {".meta", ".import.json"})
+    {
+        std::filesystem::path from = source, to = destination;
+        from += suffix;
+        to += suffix;
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(from, ec);
+        if (!ec && !exists) continue;
+        if (!ec) std::filesystem::rename(from, to, ec);
+        if (ec)
+        {
+            error = std::string("moving ") + suffix + " failed: " + ec.message();
+            for (auto it = moved.rbegin(); it != moved.rend(); ++it)
+            {
+                std::error_code rollback;
+                std::filesystem::rename(it->second, it->first, rollback);
+                if (rollback) error += "; sidecar rollback failed: " + rollback.message();
+            }
+            return false;
+        }
+        moved.emplace_back(from, to);
+    }
+    return true;
+}
+
+// The .meta of an FBX records its imported default materials once the FBX was processed.
+bool FbxWasProcessed(const std::filesystem::path& modelPath)
+{
+    std::ifstream meta(MetaSidecarPath(modelPath), std::ios::binary);
+    if (!meta)
+        return false;
+    const std::string text((std::istreambuf_iterator<char>(meta)), std::istreambuf_iterator<char>());
+    return text.find("\"defaultMaterials\"") != std::string::npos;
+}
+} // namespace
+
+namespace
+{
+// One spelling of the library root, so the paths derived from it compare and relate lexically to
+// the canonical ones the AssetDatabase hands out.
+std::filesystem::path CanonicalLibraryRoot(const std::filesystem::path& root)
+{
+    std::error_code ec;
+    std::filesystem::path absolute = std::filesystem::absolute(root, ec);
+    if (ec)
+        absolute = root;
+    const std::filesystem::path canonical = std::filesystem::weakly_canonical(absolute, ec);
+    return (ec ? absolute : canonical).lexically_normal();
 }
 } // namespace
 
 AssetLibrary::AssetLibrary(std::filesystem::path clientRoot)
     : m_clientRoot(std::move(clientRoot))
-    , m_libraryRoot(m_clientRoot / "assets" / "library")
+    , m_libraryRoot(CanonicalLibraryRoot(m_clientRoot / "assets" / "library"))
 {
 }
 
 AssetLibrary::AssetLibrary(std::filesystem::path clientRoot, std::filesystem::path libraryRoot)
     : m_clientRoot(std::move(clientRoot))
-    , m_libraryRoot(std::move(libraryRoot))
+    , m_libraryRoot(CanonicalLibraryRoot(libraryRoot))
 {
 }
 
@@ -1543,19 +1666,63 @@ bool AssetLibrary::Initialize()
     return LoadManifest();
 }
 
+bool AssetLibrary::InitializeReadOnly()
+{
+    return LoadManifest(false);
+}
+
 bool AssetLibrary::EnsureDirectories() const
 {
+    // No per-type folders: assets go wherever the user puts them. Only the root and the internal
+    // thumbnail cache are needed.
     std::error_code ec;
-    std::filesystem::create_directories(m_libraryRoot / "textures", ec);
-    std::filesystem::create_directories(m_libraryRoot / "models", ec);
-    std::filesystem::create_directories(m_libraryRoot / "animations", ec);
-    std::filesystem::create_directories(m_libraryRoot / "materials", ec);
-    std::filesystem::create_directories(m_libraryRoot / "materials" / "water", ec);
-    std::filesystem::create_directories(m_libraryRoot / "materials" / "physics", ec);
-    std::filesystem::create_directories(m_libraryRoot / "scenes", ec);
-    std::filesystem::create_directories(m_libraryRoot / "prefabs", ec);
-    std::filesystem::create_directories(m_libraryRoot / "thumbnails", ec);
+    std::filesystem::create_directories(m_libraryRoot / kThumbnailFolder, ec);
     return !ec;
+}
+
+std::optional<AssetLibrary::Category> AssetLibrary::DiscoverableCategory(const std::filesystem::path& path)
+{
+    const std::string name = ToLower(path.filename().generic_string());
+    if (name.ends_with(".material.json"))
+        return Category::Material;
+    const std::string ext = ToLower(path.extension().generic_string());
+    if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr" || ext == ".exr")
+        return Category::Texture;
+    if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
+        return Category::Model;
+    if (ext == ".material")
+        return Category::Material;
+    if (ext == ".watermat")
+        return Category::WaterMaterial;
+    if (ext == ".physmat")
+        return Category::PhysicsMaterial;
+    if (ext == ".ixclip")
+        return Category::AnimationClip;
+    if (ext == ".controller")
+        return Category::AnimatorController;
+    if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
+        return Category::Audio;
+    if (ext == ".lua" || ext == ".as" || ext == ".cpp")
+        return Category::Script;
+    if (ext == ".particle")
+        return Category::ParticleEffect;
+    if (ext == ".rml" || ext == ".rcss")
+        return Category::UiDocument;
+    if (ext == ".ixprefab")
+        return Category::Prefab;
+    return std::nullopt;
+}
+
+bool AssetLibrary::IsInternalFolder(const std::string& subpath)
+{
+    return ToLower(NormalizeSubpath(subpath)) == kThumbnailFolder;
+}
+
+void AssetLibrary::SyncLocation(Entry& entry) const
+{
+    entry.subpath = NormalizeSubpath(entry.subpath);
+    entry.originalPath = GenericPath(AbsolutePath(entry));
 }
 
 const char* AssetLibrary::CategoryName(Category category)
@@ -1570,8 +1737,10 @@ const char* AssetLibrary::CategoryName(Category category)
     case Category::PhysicsMaterial: return "Physics Materials";
     case Category::AnimationClip: return "Animation Clips";
     case Category::AnimatorController: return "Animators";
+    case Category::ParticleEffect: return "Particle Effects";
     case Category::Audio: return "Audio Clips";
     case Category::Script: return "Scripts";
+    case Category::UiDocument: return "UI";
     case Category::Scene: return "Scenes";
     case Category::Prefab: return "Prefabs";
     default: return "Assets";
@@ -1730,21 +1899,18 @@ bool AssetLibrary::IsValidRenameName(const std::string& name, std::string* error
 
 std::string AssetLibrary::NormalizeSubpath(const std::string& value)
 {
-    std::filesystem::path path;
+    // Keeps each folder name exactly as it is on disk (case, spaces, any character): a subpath must
+    // name the real folder, including ones created outside the editor. Only the separators and the
+    // empty / "." / ".." segments are normalized.
+    std::string result;
     std::string segment;
     auto flushSegment = [&]() {
-        if (segment.empty() || segment == "." || segment == "..")
+        if (!segment.empty() && segment != "." && segment != "..")
         {
-            segment.clear();
-            return;
+            if (!result.empty())
+                result += '/';
+            result += segment;
         }
-        for (char& c : segment)
-        {
-            const unsigned char uc = static_cast<unsigned char>(c);
-            if (!std::isalnum(uc) && c != '_' && c != '-' && c != '.')
-                c = '_';
-        }
-        path /= segment;
         segment.clear();
     };
 
@@ -1753,10 +1919,10 @@ std::string AssetLibrary::NormalizeSubpath(const std::string& value)
         if (c == '/' || c == '\\')
             flushSegment();
         else
-            segment += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            segment += c;
     }
     flushSegment();
-    return path.generic_string();
+    return result;
 }
 
 std::vector<std::string> AssetLibrary::NormalizeTags(const std::vector<std::string>& tags)
@@ -1878,8 +2044,10 @@ std::string AssetLibrary::CategoryString(Category category)
     case Category::PhysicsMaterial: return "physics_material";
     case Category::AnimationClip: return "animation_clip";
     case Category::AnimatorController: return "animator_controller";
+    case Category::ParticleEffect: return "particle_effect";
     case Category::Audio: return "audio";
     case Category::Script: return "script";
+    case Category::UiDocument: return "ui_document";
     case Category::Scene: return "scene";
     case Category::Prefab: return "prefab";
     default: return "texture";
@@ -1896,8 +2064,10 @@ std::optional<AssetLibrary::Category> AssetLibrary::ParseCategory(const std::str
     if (value == "physics_material" || value == "physicsmaterial") return Category::PhysicsMaterial;
     if (value == "animation_clip" || value == "animationclip") return Category::AnimationClip;
     if (value == "animator_controller" || value == "animatorcontroller") return Category::AnimatorController;
+    if (value == "particle_effect" || value == "particleeffect") return Category::ParticleEffect;
     if (value == "audio") return Category::Audio;
     if (value == "script") return Category::Script;
+    if (value == "ui_document" || value == "ui") return Category::UiDocument;
     if (value == "scene") return Category::Scene;
     if (value == "prefab") return Category::Prefab;
     return std::nullopt;
@@ -1916,7 +2086,7 @@ std::optional<AssetLibrary::TextureRole> AssetLibrary::ParseTextureRole(const st
     return std::nullopt;
 }
 
-std::filesystem::path AssetLibrary::CategoryDirectory(Category category) const
+std::filesystem::path AssetLibrary::LegacyCategoryDirectory(Category category) const
 {
     switch (category)
     {
@@ -1930,6 +2100,7 @@ std::filesystem::path AssetLibrary::CategoryDirectory(Category category) const
     case Category::AnimatorController: return m_libraryRoot / "animator_controllers";
     case Category::Audio: return m_libraryRoot / "audio_clips";
     case Category::Script: return m_libraryRoot / "scripts";
+    case Category::UiDocument: return m_libraryRoot / "ui";
     case Category::Scene: return m_libraryRoot / "scenes";
     case Category::Prefab: return m_libraryRoot / "prefabs";
     default: return m_libraryRoot / "textures";
@@ -1954,7 +2125,22 @@ bool AssetLibrary::GenerateTextureThumbnail(const Entry& entry, std::string& thu
     int width = 0;
     int height = 0;
     int channels = 0;
-    stbi_uc* decoded = stbi_load(source.string().c_str(), &width, &height, &channels, 4);
+    std::vector<std::uint8_t> exrPixels;
+    stbi_uc* stbPixels = nullptr;
+    if (client::asset::IsExrPath(source))
+    {
+        std::string decodeError;
+        auto exr = client::asset::LoadExr(source, decodeError);
+        if (exr)
+        {
+            width = exr->width;
+            height = exr->height;
+            exrPixels = client::asset::ExrRgba8(*exr, client::asset::ExrByteMode::Preview);
+        }
+        else TraceError("[EXR] %s", decodeError.c_str());
+    }
+    else stbPixels = stbi_load(source.string().c_str(), &width, &height, &channels, 4);
+    const std::uint8_t* decoded = exrPixels.empty() ? stbPixels : exrPixels.data();
     std::uint32_t outWidth = 96;
     std::uint32_t outHeight = 96;
     std::vector<std::uint8_t> output;
@@ -1969,12 +2155,12 @@ bool AssetLibrary::GenerateTextureThumbnail(const Entry& entry, std::string& thu
             static_cast<std::uint32_t>(height),
             outWidth,
             outHeight);
-        stbi_image_free(decoded);
+        stbi_image_free(stbPixels);
     }
     else
     {
         if (decoded)
-            stbi_image_free(decoded);
+            stbi_image_free(stbPixels);
 
         std::array<std::uint8_t, 4> color{130, 140, 150, 255};
         switch (entry.textureRole)
@@ -2073,7 +2259,11 @@ bool AssetLibrary::PopulateTextureMetadata(Entry& entry, bool generateThumbnail,
         }
     }
 
-    if (generateThumbnail || entry.thumbnail.empty() || !std::filesystem::exists(m_libraryRoot / entry.thumbnail))
+    // A thumbnail is <thumbnails>/<id>.png; any other name (e.g. one written before the entry had
+    // an id) is regenerated.
+    const std::string expectedThumbnail = std::string(kThumbnailFolder) + "/" + entry.id + ".png";
+    if (generateThumbnail || entry.thumbnail != expectedThumbnail ||
+        !std::filesystem::exists(m_libraryRoot / entry.thumbnail))
     {
         std::string thumbnail;
         if (GenerateTextureThumbnail(entry, thumbnail, error) && entry.thumbnail != thumbnail)
@@ -2086,27 +2276,36 @@ bool AssetLibrary::PopulateTextureMetadata(Entry& entry, bool generateThumbnail,
     return changed;
 }
 
-bool AssetLibrary::LoadManifest()
+bool AssetLibrary::LoadManifest(bool reconcile)
 {
+    ++m_revision;
     m_entries.clear();
     const auto path = m_libraryRoot / "manifest.json";
     std::string text;
+    bool haveManifest = false;
     {
         std::ifstream scopedFile(path, std::ios::binary);
-        if (!scopedFile)
+        if (scopedFile)
         {
-            std::string error;
-            return SaveManifest(error);
+            text.assign(std::istreambuf_iterator<char>(scopedFile), std::istreambuf_iterator<char>());
+            haveManifest = true;
         }
-        text.assign(std::istreambuf_iterator<char>(scopedFile), std::istreambuf_iterator<char>());
     }
-    m_lastSavedManifestHash = std::hash<std::string>{}(text);
-    m_lastFailedManifestHash.reset();
     std::string assetsText;
-    if (!JsonArrayBody(text, "assets", assetsText))
-        return true;
+    if (haveManifest)
+    {
+        m_lastSavedManifestHash = std::hash<std::string>{}(text);
+        m_lastFailedManifestHash.reset();
+        JsonArrayBody(text, "assets", assetsText);
+    }
 
-    bool metadataChanged = false;
+    // Version 1 stored each subpath relative to a per-type folder (textures/, materials/, ...) or an
+    // absolute original_path; version 2 stores it relative to the library root. No manifest yet: the
+    // reconcile below registers whatever the folder already holds.
+    const bool legacyLayout = haveManifest && JsonU32Value(text, "version", 1) < 2;
+    // A manifest saved before the engine wrote UTF-8 (Windows-1250 names) is read through
+    // LegacyTextToUtf8 and written back as UTF-8.
+    bool metadataChanged = legacyLayout || !haveManifest || !IsValidUtf8(text);
     size_t pos = 0;
     while ((pos = assetsText.find('{', pos)) != std::string::npos)
     {
@@ -2126,6 +2325,7 @@ bool AssetLibrary::LoadManifest()
         entry.subpath = NormalizeSubpath(JsonStringValue(object, "subpath"));
         entry.filename = JsonStringValue(object, "filename");
         entry.originalPath = JsonStringValue(object, "original_path");
+        entry.guid = JsonStringValue(object, "guid");
         entry.thumbnail = JsonStringValue(object, "thumbnail");
         entry.importedAt = JsonStringValue(object, "imported_at");
         entry.tags = NormalizeTags(JsonStringArrayValue(object, "tags"));
@@ -2137,12 +2337,12 @@ bool AssetLibrary::LoadManifest()
         const std::string materialObject = JsonObjectValue(object, "material_data");
         if (!materialObject.empty())
         {
-            entry.material.diffuseTextureId = JsonNullableStringValue(materialObject, "diffuse_texture_id");
-            entry.material.normalTextureId = JsonNullableStringValue(materialObject, "normal_texture_id");
-            entry.material.aoTextureId = JsonNullableStringValue(materialObject, "ao_texture_id");
-            entry.material.roughnessTextureId = JsonNullableStringValue(materialObject, "roughness_texture_id");
-            entry.material.metallicTextureId = JsonNullableStringValue(materialObject, "metallic_texture_id");
-            entry.material.heightTextureId = JsonNullableStringValue(materialObject, "height_texture_id");
+            entry.material.diffuseTextureId = SanitizeMaterialTextureId(JsonNullableStringValue(materialObject, "diffuse_texture_id"));
+            entry.material.normalTextureId = SanitizeMaterialTextureId(JsonNullableStringValue(materialObject, "normal_texture_id"));
+            entry.material.aoTextureId = SanitizeMaterialTextureId(JsonNullableStringValue(materialObject, "ao_texture_id"));
+            entry.material.roughnessTextureId = SanitizeMaterialTextureId(JsonNullableStringValue(materialObject, "roughness_texture_id"));
+            entry.material.metallicTextureId = SanitizeMaterialTextureId(JsonNullableStringValue(materialObject, "metallic_texture_id"));
+            entry.material.heightTextureId = SanitizeMaterialTextureId(JsonNullableStringValue(materialObject, "height_texture_id"));
             const std::string tiling = JsonObjectValue(materialObject, "tiling_scale");
             entry.material.tilingScaleX = JsonFloatValue(tiling, "x", 1.0f);
             entry.material.tilingScaleY = JsonFloatValue(tiling, "y", 1.0f);
@@ -2176,8 +2376,25 @@ bool AssetLibrary::LoadManifest()
                 entry.material.colorTint[2] = static_cast<float>(hex(tint[5]) * 16 + hex(tint[6])) / 255.0f;
             }
         }
-        if (entry.category == Category::Texture)
-            metadataChanged = PopulateTextureMetadata(entry, false) || metadataChanged;
+        if (legacyLayout)
+        {
+            // Where the version-1 entry lived: its absolute original_path when that points into
+            // this library, else <type folder>/<subpath>/<filename>. The reconcile below finds
+            // the file if it is not there.
+            std::filesystem::path location = LegacyCategoryDirectory(entry.category) / entry.subpath / entry.filename;
+            if (!entry.originalPath.empty())
+            {
+                const std::filesystem::path original = std::filesystem::path(entry.originalPath).lexically_normal();
+                const std::string originalKey = LibraryPathKey(original);
+                const std::string rootKey = LibraryPathKey(m_libraryRoot);
+                if (originalKey.rfind(rootKey + "/", 0) == 0)
+                    location = original;
+            }
+            const std::filesystem::path folder = location.parent_path().lexically_relative(m_libraryRoot);
+            entry.subpath = NormalizeSubpath(folder.generic_string());
+            entry.filename = location.filename().generic_string();
+        }
+        SyncLocation(entry);
         if (entry.category == Category::WaterMaterial)
         {
             const std::string waterObject = JsonObjectValue(object, "water_material_data");
@@ -2208,28 +2425,39 @@ bool AssetLibrary::LoadManifest()
         m_entries.push_back(std::move(entry));
     }
 
+    if (!reconcile)
+        return true;
     std::string error;
-    ReconcileFilesystem(error);
+    m_lastReconcileOk = ReconcileFilesystem(error);
+    m_lastReconcileError = error;
     if (metadataChanged)
-        SaveManifest(error);
+    {
+        std::string saveError;
+        SaveManifest(saveError);
+    }
     return true;
 }
 
 bool AssetLibrary::SaveManifest(std::string& error) const
 {
+    ++m_revision;  // every entry change is persisted through here
     const auto saveBegin = std::chrono::steady_clock::now();
     std::ostringstream json;
-    json << "{\n  \"version\": 1,\n  \"assets\": [\n";
+    json << "{\n  \"version\": 2,\n  \"assets\": [\n";
     for (size_t i = 0; i < m_entries.size(); ++i)
     {
         const Entry& entry = m_entries[i];
+        // Locations are stored relative to the library root (subpath + filename) so a copied or
+        // packaged project still resolves them; original_path repeats that relative path.
+        const std::string relativePath = entry.subpath.empty() ? entry.filename : entry.subpath + "/" + entry.filename;
         json << "    {\n"
              << "      \"id\": \"" << EscapeJson(entry.id) << "\",\n"
              << "      \"category\": \"" << CategoryString(entry.category) << "\",\n"
              << "      \"display_name\": \"" << EscapeJson(entry.displayName) << "\",\n"
              << "      \"subpath\": \"" << EscapeJson(entry.subpath) << "\",\n"
              << "      \"filename\": \"" << EscapeJson(entry.filename) << "\",\n"
-             << "      \"original_path\": \"" << EscapeJson(entry.originalPath) << "\",\n"
+             << "      \"original_path\": \"" << EscapeJson(relativePath) << "\",\n"
+             << "      \"guid\": \"" << EscapeJson(entry.guid) << "\",\n"
              << "      \"thumbnail\": \"" << EscapeJson(entry.thumbnail) << "\",\n"
              << "      \"imported_at\": \"" << EscapeJson(entry.importedAt) << "\",\n"
              << "      \"tags\": [";
@@ -2377,18 +2605,198 @@ bool AssetLibrary::SaveManifest(std::string& error) const
     return true;
 }
 
+std::optional<AssetLibrary::Entry> AssetLibrary::MakeDiscoveredEntry(Category category,
+                                                                     const std::filesystem::path& path,
+                                                                     const std::unordered_set<std::string>& takenIds,
+                                                                     std::vector<std::string>& failedMaterialPaths)
+{
+    Entry entry;
+    entry.category = category;
+    entry.filename = path.filename().generic_string();
+    entry.subpath = NormalizeSubpath(path.parent_path().lexically_relative(m_libraryRoot).generic_string());
+    entry.displayName = StemDisplayName(entry.filename);
+    entry.importedAt = TimestampUtc();
+    SyncLocation(entry);
+
+    const auto readText = [&path]() {
+        std::ifstream file(path, std::ios::binary);
+        return std::string((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    };
+    // An id the file itself carries (clips, controllers) wins unless another asset already has it.
+    const auto preferredId = [&takenIds](const std::string& id) {
+        return !id.empty() && !takenIds.contains(id) ? id : std::string{};
+    };
+
+    switch (category)
+    {
+    case Category::Texture:
+        entry.id = MakeUniqueId(category, path, takenIds);  // the thumbnail is named after the id
+        PopulateTextureMetadata(entry, true, nullptr);
+        break;
+    case Category::Model:
+        entry.thumbnail = "model_icon";
+        if (ToLower(path.extension().generic_string()) == ".fbx" && !FbxWasProcessed(path))
+        {
+            // Put in from outside the editor: give it what an in-editor import makes (materials,
+            // skeleton/animation sidecars, extracted textures), next to the model.
+            std::string fbxError;
+            if (!ImportFbxSidecars(path, m_libraryRoot, fbxError))
+            {
+                Tracenf("[ASSET-LIBRARY] fbx processing failed path=%s error=%s",
+                    entry.originalPath.c_str(),
+                    fbxError.c_str());
+            }
+        }
+        break;
+    case Category::Material:
+    {
+        entry.thumbnail = "material_icon";
+        entry.tags = {"material"};
+        if (ToLower(path.extension().generic_string()) != ".material")
+            break;  // a library .material.json: nothing to register
+        const std::string canonical = CanonicalPathString(path);
+        const auto registerBegin = std::chrono::steady_clock::now();
+        std::string failedStep;
+        std::string failedMessage;
+        Guid materialGuid{};
+        try
+        {
+            materialGuid = RegisterMaterialAssetFile(path, failedStep, failedMessage);
+        }
+        catch (const std::exception& ex)
+        {
+            failedStep = failedStep.empty() ? "cacheInsert" : failedStep;
+            failedMessage = ex.what();
+        }
+        catch (...)
+        {
+            failedStep = failedStep.empty() ? "cacheInsert" : failedStep;
+            failedMessage = "unknown exception";
+        }
+        if (IsEmptyGuid(materialGuid))
+        {
+            if (failedStep.empty())
+                failedStep = "dbRegister";
+            if (failedMessage.empty())
+                failedMessage = "registration failed";
+            m_failedMaterialDiscoveryAttempts.insert(canonical);
+            failedMaterialPaths.push_back(path.generic_string());
+            RecordMaterialDiscoveryDiag(path,
+                "AssetLibrary::ReconcileFilesystem::scanMaterialFolder",
+                "no",
+                "yes",
+                "register_failed",
+                nullptr);
+            Tracenf("[MATERIAL-ASSET] register_failed path=%s step=%s errorMessage=\"%s\" exceptionType=%s attemptCount=1 willRetry=no",
+                path.generic_string().c_str(),
+                failedStep.c_str(),
+                failedMessage.c_str(),
+                failedMessage == "unknown exception" ? "unknown" : "none");
+            return std::nullopt;
+        }
+        const std::string text = readText();
+        entry.material.shadingMode = ToLower(JsonStringValue(text, "shadingMode"));
+        if (entry.material.shadingMode.empty())
+            entry.material.shadingMode = "lit";
+        entry.material.alphaMode = JsonStringValue(text, "alphaMode");
+        if (entry.material.alphaMode.empty())
+            entry.material.alphaMode = "opaque";
+        entry.material.alphaCutoff = JsonFloatValue(text, "alphaCutoff", 0.5f);
+        entry.guid = materialGuid.toString();
+        Tracenf("[MATERIAL-ASSET] register_OK path=%s guid=%s durationMs=%.3f",
+            path.generic_string().c_str(),
+            entry.guid.c_str(),
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - registerBegin).count());
+        break;
+    }
+    case Category::WaterMaterial:
+        entry.thumbnail = "water_material_icon";
+        entry.tags = {"water", "material"};
+        entry.waterMaterial = ReadWaterMaterialJson(readText());
+        break;
+    case Category::PhysicsMaterial:
+        entry.thumbnail = "physics_material_icon";
+        entry.tags = {"physics", "material"};
+        entry.physicsMaterial = ReadPhysicsMaterialJson(readText());
+        break;
+    case Category::AnimationClip:
+    {
+        const std::string text = readText();
+        entry.thumbnail = "animation_clip_icon";
+        entry.tags = {"animation", "clip"};
+        if (const std::string name = JsonStringValue(text, "display_name"); !name.empty())
+            entry.displayName = name;
+        entry.animationClip = ReadAnimationClipJson(text);
+        entry.id = preferredId(JsonStringValue(text, "id"));
+        break;
+    }
+    case Category::AnimatorController:
+    {
+        const std::string text = readText();
+        entry.thumbnail = "animator_controller_icon";
+        entry.tags = {"animator", "controller"};
+        if (const std::string name = JsonStringValue(text, "display_name"); !name.empty())
+            entry.displayName = name;
+        entry.id = preferredId(JsonStringValue(text, "id"));
+        break;
+    }
+    case Category::ParticleEffect:
+    {
+        const std::string text = readText();
+        entry.tags = {"effect", "particle"};
+        if (const std::string name = JsonStringValue(text, "display_name"); !name.empty())
+            entry.displayName = name;
+        entry.id = preferredId(JsonStringValue(text, "id"));
+        break;
+    }
+    case Category::Audio:
+        entry.thumbnail = "audio_icon";
+        entry.tags = {"audio"};
+        break;
+    case Category::Script:
+        entry.tags = HasAnyExtension(path, {".cpp"}) ? std::vector<std::string>{"script", "cpp"}
+                   : HasAnyExtension(path, {".as"})  ? std::vector<std::string>{"script", "angelscript"}
+                                                     : std::vector<std::string>{"script", "lua"};
+        break;
+    case Category::UiDocument:
+        entry.tags = HasAnyExtension(path, {".rcss"}) ? std::vector<std::string>{"ui", "rcss"}
+                                                      : std::vector<std::string>{"ui", "rml"};
+        break;
+    case Category::Prefab:
+        entry.thumbnail = "prefab_icon";
+        entry.tags = {"prefab"};
+        break;
+    default:
+        break;
+    }
+
+    if (entry.id.empty())
+        entry.id = MakeUniqueId(category, path, takenIds);
+    if (entry.guid.empty())
+    {
+        // Registers the file with the AssetDatabase (writing its .meta when it has none), so the
+        // asset can be found again after it is moved.
+        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(path);
+        if (!IsEmptyGuid(guid))
+            entry.guid = guid.toString();
+    }
+    Tracenf("[ASSET-LIBRARY] discovered %s path=%s id=%s",
+        CategoryName(category),
+        entry.originalPath.c_str(),
+        entry.id.c_str());
+    return entry;
+}
+
 bool AssetLibrary::ReconcileFilesystem(std::string& error)
 {
     const auto reconcileBegin = std::chrono::steady_clock::now();
     bool changed = false;
     std::vector<Entry> reconciled;
     reconciled.reserve(m_entries.size());
-    std::unordered_set<std::string> knownMaterialPaths;
     std::vector<std::string> newlyRegisteredMaterialPaths;
     std::vector<std::string> failedMaterialPaths;
     std::uint32_t discoveredMaterials = 0;
     std::uint32_t registeredMaterials = 0;
-    std::uint32_t failedMaterials = 0;
     const std::vector<Entry> entriesBeforeReconcile = m_entries;
     auto logFailureHintIfNeeded = [&]() {
         if (!failedMaterialPaths.empty() && !m_loggedMaterialFailureHint)
@@ -2406,340 +2814,216 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
             ++it;
     }
 
-    for (Entry entry : m_entries)
+    // One walk over the whole library folder: every file the library picks up on its own, wherever
+    // it sits. A name the platform cannot represent in a narrow path is skipped, not fatal.
+    struct FoundFile
     {
-        if (std::filesystem::exists(AbsolutePath(entry)))
-        {
-            if (entry.category == Category::Texture)
-                changed = PopulateTextureMetadata(entry, false, &error) || changed;
-            if (entry.category == Category::Material)
-            {
-                const std::filesystem::path materialPath = AbsolutePath(entry);
-                knownMaterialPaths.insert(CanonicalPathString(materialPath));
-                if (ToLower(materialPath.extension().string()) == ".material")
-                {
-                    std::ifstream materialFile(materialPath, std::ios::binary);
-                    const std::string text((std::istreambuf_iterator<char>(materialFile)), std::istreambuf_iterator<char>());
-                    const std::string shadingMode = JsonStringValue(text, "shadingMode");
-                    const std::string alphaMode = JsonStringValue(text, "alphaMode");
-                    const float alphaCutoff = JsonFloatValue(text, "alphaCutoff", entry.material.alphaCutoff);
-                    if (!shadingMode.empty() && entry.material.shadingMode != ToLower(shadingMode))
-                    {
-                        entry.material.shadingMode = ToLower(shadingMode);
-                        changed = true;
-                    }
-                    if (!alphaMode.empty() && (entry.material.alphaMode != alphaMode ||
-                            ixtreeme::math::Abs(entry.material.alphaCutoff - alphaCutoff) > 0.0001f))
-                    {
-                        entry.material.alphaMode = alphaMode;
-                        entry.material.alphaCutoff = alphaCutoff;
-                        changed = true;
-                    }
-                }
-            }
-            reconciled.push_back(std::move(entry));
-            continue;
-        }
-
-        std::vector<std::filesystem::path> matches;
+        std::filesystem::path path;
+        std::string key;
+        Category category = Category::Texture;
+    };
+    std::vector<FoundFile> found;
+    std::unordered_map<std::string, size_t> foundByKey;
+    {
         std::error_code ec;
-        const auto categoryDir = CategoryDirectory(entry.category);
-        if (std::filesystem::exists(categoryDir, ec))
+        std::filesystem::recursive_directory_iterator it(
+            m_libraryRoot, std::filesystem::directory_options::skip_permission_denied, ec);
+        for (const std::filesystem::recursive_directory_iterator end; !ec && it != end; it.increment(ec))
         {
-            for (std::filesystem::recursive_directory_iterator it(categoryDir, ec), end; it != end && !ec; it.increment(ec))
-            {
-                if (it->is_regular_file(ec) && it->path().filename() == entry.filename)
-                    matches.push_back(it->path());
-            }
-        }
-
-        if (matches.size() == 1)
-        {
-            std::filesystem::path parentRel = std::filesystem::relative(matches.front().parent_path(), categoryDir, ec);
-            if (!ec)
-                entry.subpath = NormalizeSubpath(parentRel.generic_string());
-            if (entry.category == Category::Texture)
-                PopulateTextureMetadata(entry, false, &error);
-            if (entry.category == Category::Material)
-            {
-                knownMaterialPaths.insert(CanonicalPathString(matches.front()));
-            }
-            reconciled.push_back(std::move(entry));
-            changed = true;
-            continue;
-        }
-
-        Tracenf("[ASSET-LIBRARY] removing missing manifest entry id=%s file=%s",
-            entry.id.c_str(),
-            entry.filename.c_str());
-        changed = true;
-    }
-
-    std::error_code ec;
-    const auto materialDir = CategoryDirectory(Category::Material);
-    if (std::filesystem::exists(materialDir, ec))
-    {
-        for (std::filesystem::recursive_directory_iterator it(materialDir, ec), end; it != end && !ec; it.increment(ec))
-        {
-            if (!it->is_regular_file(ec) || !HasAnyExtension(it->path(), {".material"}))
-                continue;
-            const std::string canonical = CanonicalPathString(it->path());
-            if (knownMaterialPaths.find(canonical) != knownMaterialPaths.end())
-                continue;
-            if (m_failedMaterialDiscoveryAttempts.find(canonical) != m_failedMaterialDiscoveryAttempts.end())
-                continue;
-
-            ++discoveredMaterials;
-            const auto registerBegin = std::chrono::steady_clock::now();
-            std::string failedStep;
-            std::string failedMessage;
-            Guid materialGuid{};
             try
             {
-                materialGuid = RegisterMaterialAssetFile(it->path(), failedStep, failedMessage);
+                std::error_code entryEc;
+                if (it->is_directory(entryEc))
+                {
+                    if (IsSkippedLibraryDirectory(it->path(), it.depth()))
+                        it.disable_recursion_pending();
+                    continue;
+                }
+                if (!it->is_regular_file(entryEc))
+                    continue;
+                const std::optional<Category> category = DiscoverableCategory(it->path());
+                if (!category)
+                    continue;
+                FoundFile file{it->path().lexically_normal(), LibraryPathKey(it->path()), *category};
+                foundByKey.emplace(file.key, found.size());
+                found.push_back(std::move(file));
             }
             catch (const std::exception& ex)
             {
-                failedStep = failedStep.empty() ? "cacheInsert" : failedStep;
-                failedMessage = ex.what();
+                Tracenf("[ASSET-LIBRARY] skipped unreadable path: %s", ex.what());
             }
-            catch (...)
-            {
-                failedStep = failedStep.empty() ? "cacheInsert" : failedStep;
-                failedMessage = "unknown exception";
-            }
+        }
+    }
 
-            if (IsEmptyGuid(materialGuid))
+    std::unordered_set<std::string> claimed;
+    // Takes the folder/name spelling the disk has (an older manifest stored them lower-cased).
+    const auto adoptFoundSpelling = [&](Entry& entry, const std::string& key) {
+        const auto foundIt = foundByKey.find(key);
+        if (foundIt == foundByKey.end())
+            return false;
+        const std::filesystem::path& path = found[foundIt->second].path;
+        const std::string subpath = NormalizeSubpath(path.parent_path().lexically_relative(m_libraryRoot).generic_string());
+        const std::string filename = path.filename().generic_string();
+        if (entry.subpath == subpath && entry.filename == filename)
+            return false;
+        entry.subpath = subpath;
+        entry.filename = filename;
+        SyncLocation(entry);
+        return true;
+    };
+    const auto refreshFromFile = [&](Entry& entry) {
+        bool entryChanged = false;
+        if (entry.category == Category::Texture)
+            entryChanged = PopulateTextureMetadata(entry, false, &error) || entryChanged;
+        const std::filesystem::path path = AbsolutePath(entry);
+        if (entry.category == Category::Material && ToLower(path.extension().generic_string()) == ".material")
+        {
+            std::ifstream materialFile(path, std::ios::binary);
+            const std::string text((std::istreambuf_iterator<char>(materialFile)), std::istreambuf_iterator<char>());
+            const std::string shadingMode = JsonStringValue(text, "shadingMode");
+            const std::string alphaMode = JsonStringValue(text, "alphaMode");
+            const float alphaCutoff = JsonFloatValue(text, "alphaCutoff", entry.material.alphaCutoff);
+            if (!shadingMode.empty() && entry.material.shadingMode != ToLower(shadingMode))
             {
-                if (failedStep.empty())
-                    failedStep = "dbRegister";
-                if (failedMessage.empty())
-                    failedMessage = "registration failed";
-                m_failedMaterialDiscoveryAttempts.insert(canonical);
-                failedMaterialPaths.push_back(it->path().generic_string());
-                ++failedMaterials;
-                RecordMaterialDiscoveryDiag(it->path(),
+                entry.material.shadingMode = ToLower(shadingMode);
+                entryChanged = true;
+            }
+            if (!alphaMode.empty() && (entry.material.alphaMode != alphaMode ||
+                    ixtreeme::math::Abs(entry.material.alphaCutoff - alphaCutoff) > 0.0001f))
+            {
+                entry.material.alphaMode = alphaMode;
+                entry.material.alphaCutoff = alphaCutoff;
+                entryChanged = true;
+            }
+        }
+        // Follows the AssetDatabase: a file that moved without its .meta got a new GUID there.
+        if (const std::optional<Guid> guid = AssetDatabase::Instance().resolvePath(path))
+        {
+            const std::string current = guid->toString();
+            if (entry.guid != current)
+            {
+                entry.guid = current;
+                entryChanged = true;
+            }
+        }
+        return entryChanged;
+    };
+
+    // 1. Entries whose file is where the manifest says.
+    std::vector<Entry> missing;
+    for (Entry entry : m_entries)
+    {
+        const std::filesystem::path path = AbsolutePath(entry);
+        if (!std::filesystem::exists(path))
+        {
+            missing.push_back(std::move(entry));
+            continue;
+        }
+        const std::string key = LibraryPathKey(path);
+        claimed.insert(key);
+        changed = adoptFoundSpelling(entry, key) || changed;
+        changed = refreshFromFile(entry) || changed;
+        reconciled.push_back(std::move(entry));
+    }
+
+    // 2. Entries whose file moved outside the editor: by its GUID (a move together with its .meta),
+    //    else by an unclaimed file of the same name and type (a move without it). Only files no
+    //    other entry owns are candidates, so a deleted asset never takes over another one.
+    for (Entry& entry : missing)
+    {
+        const FoundFile* target = nullptr;
+        if (const std::optional<Guid> guid = Guid::fromString(entry.guid))
+        {
+            if (const std::optional<std::filesystem::path> moved = AssetDatabase::Instance().resolveGuid(*guid))
+            {
+                const auto foundIt = foundByKey.find(LibraryPathKey(*moved));
+                if (foundIt != foundByKey.end() && !claimed.contains(foundIt->first) &&
+                    found[foundIt->second].category == entry.category)
+                {
+                    target = &found[foundIt->second];
+                }
+            }
+        }
+        if (!target)
+        {
+            const std::string filename = ToLower(entry.filename);
+            std::uint32_t matches = 0;
+            const FoundFile* match = nullptr;
+            for (const FoundFile& file : found)
+            {
+                if (file.category != entry.category || claimed.contains(file.key) ||
+                    ToLower(file.path.filename().generic_string()) != filename)
+                {
+                    continue;
+                }
+                ++matches;
+                match = &file;
+            }
+            if (matches == 1)
+                target = match;
+        }
+
+        changed = true;
+        if (!target)
+        {
+            Tracenf("[ASSET-LIBRARY] removing missing manifest entry id=%s file=%s",
+                entry.id.c_str(),
+                entry.filename.c_str());
+            continue;
+        }
+        claimed.insert(target->key);
+        entry.subpath = NormalizeSubpath(target->path.parent_path().lexically_relative(m_libraryRoot).generic_string());
+        entry.filename = target->path.filename().generic_string();
+        SyncLocation(entry);
+        refreshFromFile(entry);
+        Tracenf("[ASSET-LIBRARY] relocated id=%s path=%s", entry.id.c_str(), entry.originalPath.c_str());
+        reconciled.push_back(std::move(entry));
+    }
+
+    // 3. Files no entry owns yet: new assets put anywhere under the folder.
+    std::unordered_set<std::string> takenIds;
+    for (const Entry& entry : reconciled)
+        takenIds.insert(entry.id);
+    for (const FoundFile& file : found)
+    {
+        if (claimed.contains(file.key))
+            continue;
+        const bool registersMaterial = file.category == Category::Material &&
+            ToLower(file.path.extension().generic_string()) == ".material";
+        if (registersMaterial &&
+            m_failedMaterialDiscoveryAttempts.contains(CanonicalPathString(file.path)))
+            continue;
+        try
+        {
+            if (registersMaterial)
+                ++discoveredMaterials;
+            std::optional<Entry> entry = MakeDiscoveredEntry(file.category, file.path, takenIds, failedMaterialPaths);
+            if (!entry)
+                continue;
+            if (registersMaterial)
+            {
+                ++registeredMaterials;
+                newlyRegisteredMaterialPaths.push_back(CanonicalPathString(file.path));
+                RecordMaterialDiscoveryDiag(file.path,
                     "AssetLibrary::ReconcileFilesystem::scanMaterialFolder",
                     "no",
                     "yes",
-                    "register_failed",
-                    nullptr);
-                Tracenf("[MATERIAL-ASSET] register_failed path=%s step=%s errorMessage=\"%s\" exceptionType=%s attemptCount=1 willRetry=no",
-                    it->path().generic_string().c_str(),
-                    failedStep.c_str(),
-                    failedMessage.c_str(),
-                    failedMessage == "unknown exception" ? "unknown" : "none");
-                continue;
+                    "register_OK",
+                    &*entry);
+                if (ShouldLogOriginalMaterialDiscovery(file.path.generic_string(), MaterialDiscoveryDiag().frame))
+                {
+                    Tracenf("[ASSET-LIBRARY] discovered material asset path=%s",
+                        file.path.generic_string().c_str());
+                }
             }
-
-            Entry entry;
-            entry.id = MakeUniqueId(Category::Material, it->path());
-            entry.category = Category::Material;
-            entry.displayName = it->path().stem().string();
-            ec.clear();
-            std::filesystem::path parentRel = std::filesystem::relative(it->path().parent_path(), materialDir, ec);
-            entry.subpath = ec ? "" : NormalizeSubpath(parentRel.generic_string());
-            entry.filename = it->path().filename().generic_string();
-            entry.originalPath = GenericPath(it->path());
-            entry.importedAt = TimestampUtc();
-            entry.thumbnail = "material_icon";
-            entry.tags = {"material"};
-            {
-                std::ifstream materialFile(it->path(), std::ios::binary);
-                const std::string text((std::istreambuf_iterator<char>(materialFile)), std::istreambuf_iterator<char>());
-                entry.material.shadingMode = JsonStringValue(text, "shadingMode");
-                if (entry.material.shadingMode.empty())
-                    entry.material.shadingMode = "lit";
-                entry.material.shadingMode = ToLower(entry.material.shadingMode);
-                entry.material.alphaMode = JsonStringValue(text, "alphaMode");
-                if (entry.material.alphaMode.empty())
-                    entry.material.alphaMode = "opaque";
-                entry.material.alphaCutoff = JsonFloatValue(text, "alphaCutoff", 0.5f);
-            }
-            knownMaterialPaths.insert(canonical);
-            reconciled.push_back(std::move(entry));
+            claimed.insert(file.key);
+            takenIds.insert(entry->id);
+            reconciled.push_back(std::move(*entry));
             changed = true;
-            ++registeredMaterials;
-            newlyRegisteredMaterialPaths.push_back(canonical);
-            const auto registerEnd = std::chrono::steady_clock::now();
-            const double registerMs =
-                std::chrono::duration<double, std::milli>(registerEnd - registerBegin).count();
-            RecordMaterialDiscoveryDiag(it->path(),
-                "AssetLibrary::ReconcileFilesystem::scanMaterialFolder",
-                "no",
-                "yes",
-                "register_OK",
-                &reconciled.back());
-            Tracenf("[MATERIAL-ASSET] register_OK path=%s guid=%s durationMs=%.3f",
-                it->path().generic_string().c_str(),
-                materialGuid.toString().c_str(),
-                registerMs);
-            if (ShouldLogOriginalMaterialDiscovery(it->path().generic_string(), MaterialDiscoveryDiag().frame))
-            {
-                Tracenf("[ASSET-LIBRARY] discovered material asset path=%s",
-                    it->path().generic_string().c_str());
-            }
         }
-    }
-
-    // Discover orphan .ixclip animation-clip files (emitted by the FBX/GLB importer next to a
-    // model's ozz sidecars) that aren't yet in the manifest, and register them as browser entries.
-    const auto animationClipDir = CategoryDirectory(Category::AnimationClip);
-    if (std::filesystem::exists(animationClipDir, ec))
-    {
-        std::unordered_set<std::string> knownClipPaths;
-        std::unordered_set<std::string> existingIds;
-        for (const Entry& existing : reconciled)
+        catch (const std::exception& ex)
         {
-            existingIds.insert(existing.id);
-            if (existing.category == Category::AnimationClip)
-                knownClipPaths.insert(CanonicalPathString(AbsolutePath(existing)));
-        }
-        for (std::filesystem::recursive_directory_iterator clipIt(animationClipDir, ec), clipEnd;
-             clipIt != clipEnd && !ec; clipIt.increment(ec))
-        {
-            if (!clipIt->is_regular_file(ec) || !HasAnyExtension(clipIt->path(), {".ixclip"}))
-                continue;
-            const std::string canonical = CanonicalPathString(clipIt->path());
-            if (knownClipPaths.find(canonical) != knownClipPaths.end())
-                continue;
-
-            std::ifstream clipFile(clipIt->path(), std::ios::binary);
-            const std::string text((std::istreambuf_iterator<char>(clipFile)), std::istreambuf_iterator<char>());
-
-            Entry entry;
-            entry.category = Category::AnimationClip;
-            entry.filename = clipIt->path().filename().generic_string();
-            std::error_code relEc;
-            std::filesystem::path parentRel = std::filesystem::relative(clipIt->path().parent_path(), animationClipDir, relEc);
-            entry.subpath = relEc ? "" : NormalizeSubpath(parentRel.generic_string());
-            entry.displayName = JsonStringValue(text, "display_name");
-            if (entry.displayName.empty())
-                entry.displayName = clipIt->path().stem().string();
-            entry.originalPath = GenericPath(clipIt->path());
-            entry.importedAt = TimestampUtc();
-            entry.thumbnail = "animation_clip_icon";
-            entry.tags = {"animation", "clip"};
-            entry.animationClip = ReadAnimationClipJson(text);
-
-            std::string clipId = JsonStringValue(text, "id");
-            if (clipId.empty() || existingIds.find(clipId) != existingIds.end())
-                clipId = MakeUniqueId(Category::AnimationClip, clipIt->path());
-            entry.id = clipId;
-
-            existingIds.insert(entry.id);
-            knownClipPaths.insert(canonical);
-            reconciled.push_back(std::move(entry));
-            changed = true;
-            Tracenf("[ANIM-CLIP] discovered path=%s", clipIt->path().generic_string().c_str());
-        }
-    }
-
-    // Discover orphan .controller animator assets (created via CreateAnimatorController or written
-    // by the editor) not yet in the manifest, and register them as browser entries.
-    const auto animatorControllerDir = CategoryDirectory(Category::AnimatorController);
-    if (std::filesystem::exists(animatorControllerDir, ec))
-    {
-        std::unordered_set<std::string> knownControllerPaths;
-        std::unordered_set<std::string> existingIds;
-        for (const Entry& existing : reconciled)
-        {
-            existingIds.insert(existing.id);
-            if (existing.category == Category::AnimatorController)
-                knownControllerPaths.insert(CanonicalPathString(AbsolutePath(existing)));
-        }
-        for (std::filesystem::recursive_directory_iterator ctrlIt(animatorControllerDir, ec), ctrlEnd;
-             ctrlIt != ctrlEnd && !ec; ctrlIt.increment(ec))
-        {
-            if (!ctrlIt->is_regular_file(ec) || !HasAnyExtension(ctrlIt->path(), {".controller"}))
-                continue;
-            const std::string canonical = CanonicalPathString(ctrlIt->path());
-            if (knownControllerPaths.find(canonical) != knownControllerPaths.end())
-                continue;
-
-            std::ifstream ctrlFile(ctrlIt->path(), std::ios::binary);
-            const std::string text((std::istreambuf_iterator<char>(ctrlFile)), std::istreambuf_iterator<char>());
-
-            Entry entry;
-            entry.category = Category::AnimatorController;
-            entry.filename = ctrlIt->path().filename().generic_string();
-            std::error_code relEc;
-            std::filesystem::path parentRel = std::filesystem::relative(ctrlIt->path().parent_path(), animatorControllerDir, relEc);
-            entry.subpath = relEc ? "" : NormalizeSubpath(parentRel.generic_string());
-            entry.displayName = JsonStringValue(text, "display_name");
-            if (entry.displayName.empty())
-                entry.displayName = ctrlIt->path().stem().string();
-            entry.originalPath = GenericPath(ctrlIt->path());
-            entry.importedAt = TimestampUtc();
-            entry.thumbnail = "animator_controller_icon";
-            entry.tags = {"animator", "controller"};
-
-            std::string ctrlId = JsonStringValue(text, "id");
-            if (ctrlId.empty() || existingIds.find(ctrlId) != existingIds.end())
-                ctrlId = MakeUniqueId(Category::AnimatorController, ctrlIt->path());
-            entry.id = ctrlId;
-
-            existingIds.insert(entry.id);
-            knownControllerPaths.insert(canonical);
-            reconciled.push_back(std::move(entry));
-            changed = true;
-            Tracenf("[ANIM-CTRL] discovered path=%s", ctrlIt->path().generic_string().c_str());
-        }
-    }
-
-    // Discover orphan script sources in the scripts dir not yet in the manifest, and register them as
-    // browser entries. This makes both languages first-class, drag-attachable assets — and upgrades
-    // existing projects (a native .cpp moved/seeded into the scripts dir shows up without a manual
-    // import). Lua (.lua) hot-reloads; C++ (.cpp) is compiled by the Build pipeline.
-    const auto scriptDir = CategoryDirectory(Category::Script);
-    if (std::filesystem::exists(scriptDir, ec))
-    {
-        std::unordered_set<std::string> knownScriptPaths;
-        std::unordered_set<std::string> existingIds;
-        for (const Entry& existing : reconciled)
-        {
-            existingIds.insert(existing.id);
-            if (existing.category == Category::Script)
-                knownScriptPaths.insert(CanonicalPathString(AbsolutePath(existing)));
-        }
-        for (std::filesystem::recursive_directory_iterator scriptIt(scriptDir, ec), scriptEnd;
-             scriptIt != scriptEnd && !ec; scriptIt.increment(ec))
-        {
-            if (!scriptIt->is_regular_file(ec) || !HasAnyExtension(scriptIt->path(), {".lua", ".cpp"}))
-                continue;
-            // Never index a CMake build tree that might sit under the scripts dir (its probe .cpp
-            // files are not game scripts).
-            if (scriptIt->path().generic_string().find("/build/") != std::string::npos)
-                continue;
-            const std::string canonical = CanonicalPathString(scriptIt->path());
-            if (knownScriptPaths.find(canonical) != knownScriptPaths.end())
-                continue;
-
-            const bool isCpp = HasAnyExtension(scriptIt->path(), {".cpp"});
-            Entry entry;
-            entry.category = Category::Script;
-            entry.filename = scriptIt->path().filename().generic_string();
-            std::error_code relEc;
-            std::filesystem::path parentRel = std::filesystem::relative(scriptIt->path().parent_path(), scriptDir, relEc);
-            entry.subpath = relEc ? "" : NormalizeSubpath(parentRel.generic_string());
-            entry.displayName = scriptIt->path().stem().string();
-            entry.originalPath = GenericPath(scriptIt->path());
-            entry.importedAt = TimestampUtc();
-            entry.tags = isCpp ? std::vector<std::string>{"script", "cpp"}
-                               : std::vector<std::string>{"script", "lua"};
-            // MakeUniqueId only dedupes against m_entries (still the pre-reconcile list here), so two
-            // same-stem sources discovered in ONE pass (e.g. a/Foo.cpp + b/Foo.cpp) would otherwise
-            // collide. Disambiguate against the ids already chosen in this pass.
-            std::string scriptId = MakeUniqueId(Category::Script, scriptIt->path());
-            for (uint32_t bump = 2; existingIds.find(scriptId) != existingIds.end(); ++bump)
-                scriptId = MakeUniqueId(Category::Script, scriptIt->path()) + "_" + std::to_string(bump);
-            entry.id = scriptId;
-
-            existingIds.insert(entry.id);
-            knownScriptPaths.insert(canonical);
-            reconciled.push_back(std::move(entry));
-            changed = true;
-            Tracenf("[SCRIPT-ASSET] discovered path=%s", scriptIt->path().generic_string().c_str());
+            Tracenf("[ASSET-LIBRARY] discovery failed path=%s error=%s", file.key.c_str(), ex.what());
         }
     }
 
@@ -2757,9 +3041,8 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
                     path.c_str(),
                     error.c_str());
             }
-            const auto reconcileEnd = std::chrono::steady_clock::now();
-            const double durationMs =
-                std::chrono::duration<double, std::milli>(reconcileEnd - reconcileBegin).count();
+            const double durationMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - reconcileBegin).count();
             Tracenf("[MATERIAL-ASSET] reconcile_summary durationMs=%.3f discovered=%u registered=0 failed=%zu failedPaths=%s",
                 durationMs,
                 discoveredMaterials,
@@ -2769,16 +3052,15 @@ bool AssetLibrary::ReconcileFilesystem(std::string& error)
             return false;
         }
     }
-    if (discoveredMaterials > 0 || registeredMaterials > 0 || failedMaterials > 0)
+    if (discoveredMaterials > 0 || registeredMaterials > 0 || !failedMaterialPaths.empty())
     {
-        const auto reconcileEnd = std::chrono::steady_clock::now();
-        const double durationMs =
-            std::chrono::duration<double, std::milli>(reconcileEnd - reconcileBegin).count();
-        Tracenf("[MATERIAL-ASSET] reconcile_summary durationMs=%.3f discovered=%u registered=%u failed=%u failedPaths=%s",
+        const double durationMs = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - reconcileBegin).count();
+        Tracenf("[MATERIAL-ASSET] reconcile_summary durationMs=%.3f discovered=%u registered=%u failed=%zu failedPaths=%s",
             durationMs,
             discoveredMaterials,
             registeredMaterials,
-            failedMaterials,
+            failedMaterialPaths.size(),
             FailedPathList(failedMaterialPaths).c_str());
         logFailureHintIfNeeded();
     }
@@ -2865,24 +3147,27 @@ std::vector<std::string> AssetLibrary::SubpathsFor(Category category) const
 
 std::vector<std::string> AssetLibrary::FolderSubpathsFor(Category category) const
 {
+    // Folders are shared by every asset type now: all folders under the root, plus the folders of
+    // this category's entries.
     std::set<std::string> paths;
     paths.insert("");
 
-    const std::filesystem::path root = CategoryDirectory(category);
     std::error_code ec;
-    if (std::filesystem::exists(root, ec))
+    std::filesystem::recursive_directory_iterator it(
+        m_libraryRoot, std::filesystem::directory_options::skip_permission_denied, ec);
+    for (const std::filesystem::recursive_directory_iterator end; !ec && it != end; it.increment(ec))
     {
-        for (std::filesystem::recursive_directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
+        std::error_code entryEc;
+        if (!it->is_directory(entryEc))
+            continue;
+        if (IsSkippedLibraryDirectory(it->path(), it.depth()))
         {
-            if (!it->is_directory(ec))
-                continue;
-            const std::filesystem::path relative = std::filesystem::relative(it->path(), root, ec);
-            if (ec)
-                continue;
-            const std::string normalized = NormalizeSubpath(relative.generic_string());
-            if (!normalized.empty())
-                paths.insert(normalized);
+            it.disable_recursion_pending();
+            continue;
         }
+        const std::string normalized = NormalizeSubpath(it->path().lexically_relative(m_libraryRoot).generic_string());
+        if (!normalized.empty())
+            paths.insert(normalized);
     }
 
     for (const Entry& entry : m_entries)
@@ -2949,11 +3234,13 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
     switch (category)
     {
     case Category::Texture:
-        if (!HasAnyExtension(path, {".png", ".jpg", ".jpeg", ".dds", ".tga"}))
+        if (!HasAnyExtension(path, {".png", ".jpg", ".jpeg", ".dds", ".tga", ".hdr", ".exr"}))
         {
-            error = "textures must be PNG, JPG, DDS or TGA";
+            error = "textures must be PNG, JPG, DDS, TGA, HDR or EXR";
             return false;
         }
+        if (client::asset::IsExrPath(path) && !client::asset::LoadExr(path, error))
+            return false;
         break;
     case Category::Model:
         if (!HasAnyExtension(path, {".gltf", ".glb", ".fbx"}))
@@ -3005,11 +3292,19 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
         }
         break;
     case Category::Script:
-        // Scripts are either Lua (.lua, hot-reloaded) or native C++ game-module sources (.cpp,
-        // compiled by the Build pipeline). Both are first-class, browsable, drag-attachable assets.
-        if (!HasAnyExtension(path, {".lua", ".cpp"}))
+        // Scripts are AngelScript (.as) or Lua (.lua) — both hot-reloaded in Play — or legacy native
+        // C++ game-module sources (.cpp, compiled by the Build pipeline).
+        if (!HasAnyExtension(path, {".lua", ".as", ".cpp"}))
         {
-            error = "scripts must be LUA or C++ (.cpp)";
+            error = "scripts must be AngelScript (.as), LUA (.lua) or legacy C++ (.cpp)";
+            return false;
+        }
+        break;
+    case Category::UiDocument:
+        // Game UI (RmlUi): documents and the style sheets they link, loaded by scripts (UiOpen).
+        if (!HasAnyExtension(path, {".rml", ".rcss"}))
+        {
+            error = "UI documents must be RML or RCSS files";
             return false;
         }
         break;
@@ -3017,6 +3312,13 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
         if (!HasAnyExtension(path, {".controller"}))
         {
             error = "animator controllers must be CONTROLLER files";
+            return false;
+        }
+        break;
+    case Category::ParticleEffect:
+        if (!HasAnyExtension(path, {".particle"}))
+        {
+            error = "particle effects must be PARTICLE files";
             return false;
         }
         break;
@@ -3038,7 +3340,58 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
     return true;
 }
 
+AssetLibrary::ModelContents AssetLibrary::QueryModelContents(const Entry& model) const
+{
+    ModelContents contents;
+    if (model.category != Category::Model) return contents;
+    const auto modelPath = AbsolutePath(model);
+    auto& database = AssetDatabase::Instance();
+    std::unordered_map<std::string, const Entry*> byPath;
+    for (const auto& entry : m_entries)
+        if (entry.category == Category::Material || entry.category == Category::Texture)
+            byPath[ToLower(AbsolutePath(entry).lexically_normal().generic_string())] = &entry;
+    std::unordered_set<Guid> seen;
+    std::vector<Entry> textures;
+    const auto add = [&](const Guid& guid) {
+        if (!seen.insert(guid).second) return;
+        const auto path = database.resolveGuid(guid);
+        if (!path) return;
+        const auto found = byPath.find(ToLower(path->lexically_normal().generic_string()));
+        if (found == byPath.end()) return;
+        if (found->second->category == Category::Material) contents.assets.push_back(*found->second);
+        else textures.push_back(*found->second);
+    };
+    for (const auto& guid : database.loadDefaultMaterials(modelPath))
+    {
+        add(guid);
+        // Live material edits can add textures not present at import time.
+        if (const auto* material = MaterialAssetManager::Instance().getOrLoad(guid))
+            for (const auto& texture : {material->baseColorTexture, material->normalTexture, material->metallicRoughnessTexture,
+                    material->aoTexture, material->emissiveTexture, material->roughnessTexture, material->metallicTexture, material->heightTexture})
+                if (texture) add(*texture);
+    }
+    for (const auto& guid : database.loadDependencies(modelPath)) add(guid);
+    contents.assets.insert(contents.assets.end(), textures.begin(), textures.end());
+    std::ifstream report(modelPath.string() + ".import.json", std::ios::binary);
+    if (report)
+    {
+        const std::string text((std::istreambuf_iterator<char>(report)), std::istreambuf_iterator<char>());
+        contents.missingTextures = JsonStringArrayValue(text, "missing_textures");
+    }
+    return contents;
+}
+
 std::string AssetLibrary::MakeUniqueId(Category category, const std::filesystem::path& sourcePath) const
+{
+    std::unordered_set<std::string> existing;
+    for (const Entry& entry : m_entries)
+        existing.insert(entry.id);
+    return MakeUniqueId(category, sourcePath, existing);
+}
+
+std::string AssetLibrary::MakeUniqueId(Category category,
+                                       const std::filesystem::path& sourcePath,
+                                       const std::unordered_set<std::string>& existing) const
 {
     const std::string prefix = category == Category::Texture ? "tex_" :
         (category == Category::Model ? "model_" :
@@ -3047,14 +3400,13 @@ std::string AssetLibrary::MakeUniqueId(Category category, const std::filesystem:
                     (category == Category::PhysicsMaterial ? "physmat_" :
                         (category == Category::AnimationClip ? "clip_" :
                             (category == Category::AnimatorController ? "ctrl_" :
+                                (category == Category::ParticleEffect ? "fx_" :
                                 (category == Category::Audio ? "audio_" :
                                     (category == Category::Script ? "script_" :
-                                        (category == Category::Scene ? "scene_" :
-                                            (category == Category::Prefab ? "prefab_" : "mat_"))))))))));
+                                        (category == Category::UiDocument ? "ui_" :
+                                            (category == Category::Scene ? "scene_" :
+                                                (category == Category::Prefab ? "prefab_" : "mat_"))))))))))));
     const std::string base = prefix + SanitizeStem(sourcePath.stem().string());
-    std::unordered_set<std::string> existing;
-    for (const Entry& entry : m_entries)
-        existing.insert(entry.id);
     if (!existing.contains(base))
         return base;
     for (uint32_t i = 2; i < 10000; ++i)
@@ -3063,14 +3415,13 @@ std::string AssetLibrary::MakeUniqueId(Category category, const std::filesystem:
         if (!existing.contains(candidate))
             return candidate;
     }
-    return base + "_" + std::to_string(m_entries.size() + 1);
+    return base + "_" + std::to_string(existing.size() + 1);
 }
 
-std::filesystem::path AssetLibrary::MakeUniqueDestination(Category category,
-                                                          const std::string& subpath,
+std::filesystem::path AssetLibrary::MakeUniqueDestination(const std::string& subpath,
                                                           const std::filesystem::path& sourcePath) const
 {
-    const auto dir = CategoryDirectory(category) / NormalizeSubpath(subpath);
+    const auto dir = m_libraryRoot / NormalizeSubpath(subpath);
     const std::string stem = SanitizeStem(sourcePath.stem().string());
     const std::string ext = ToLower(sourcePath.extension().string());
     auto candidate = dir / (stem + ext);
@@ -3083,7 +3434,7 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
 {
     const std::string ext = ToLower(sourcePath.extension().string());
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
-        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2")
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr" || ext == ".exr")
         return AssetLibrary::Category::Texture;
     if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
         return AssetLibrary::Category::Model;
@@ -3091,8 +3442,12 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
         return AssetLibrary::Category::Animation;
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
         return AssetLibrary::Category::Audio;
-    if (ext == ".lua" || ext == ".cpp")
+    if (ext == ".lua" || ext == ".as" || ext == ".cpp")
         return AssetLibrary::Category::Script;
+    if (ext == ".particle")
+        return AssetLibrary::Category::ParticleEffect;
+    if (ext == ".rml" || ext == ".rcss")
+        return AssetLibrary::Category::UiDocument;
     if (ext == ".material")
         return AssetLibrary::Category::Material;
     if (ext == ".physmat")
@@ -3119,7 +3474,7 @@ bool AssetLibrary::Import(Category category,
         return false;
 
     const std::string subpath = NormalizeSubpath(options.subpath);
-    const auto destination = MakeUniqueDestination(category, subpath, sourcePath);
+    const auto destination = MakeUniqueDestination(subpath, sourcePath);
     std::error_code ec;
     std::filesystem::create_directories(destination.parent_path(), ec);
     if (ec)
@@ -3146,7 +3501,7 @@ bool AssetLibrary::Import(Category category,
     }
     if (category == Category::Model &&
         ToLower(sourcePath.extension().string()) == ".fbx" &&
-        !ImportFbxSidecars(destination, m_libraryRoot, error))
+        !ImportFbxSidecars(destination, m_libraryRoot, error, sourcePath))
     {
         std::filesystem::remove(destination, ec);
         return false;
@@ -3160,7 +3515,7 @@ bool AssetLibrary::Import(Category category,
         : (options.displayName.empty() ? sourcePath.stem().string() : options.displayName);
     entry.subpath = subpath;
     entry.filename = destination.filename().generic_string();
-    entry.originalPath = GenericPath(sourcePath);
+    SyncLocation(entry);
     entry.importedAt = TimestampUtc();
     entry.thumbnail = category == Category::Texture ? "" :
         (category == Category::Model ? "model_icon" :
@@ -3281,7 +3636,7 @@ bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
     }
     if (*category == Category::Model &&
         ToLower(absoluteSource.extension().string()) == ".fbx" &&
-        !ImportFbxSidecars(destination, m_libraryRoot, error))
+        !ImportFbxSidecars(destination, m_libraryRoot, error, absoluteSource))
     {
         if (!sameFile)
             std::filesystem::remove(destination, ec);
@@ -3296,7 +3651,7 @@ bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
     if (ec)
         entry.subpath.clear();
     entry.filename = destination.filename().generic_string();
-    entry.originalPath = GenericPath(destination);
+    SyncLocation(entry);
     entry.importedAt = TimestampUtc();
     entry.thumbnail = *category == Category::Texture ? "" :
         (*category == Category::Model ? "model_icon" :
@@ -3360,7 +3715,6 @@ bool AssetLibrary::CreateMaterial(const ImportOptions& options,
     entry.displayName = displayName;
     entry.subpath = subpath;
     entry.filename = SanitizeStem(displayName) + ".material.json";
-    entry.originalPath.clear();
     entry.importedAt = TimestampUtc();
     entry.tags = NormalizeTags(options.tags);
     entry.thumbnail = "material_icon";
@@ -3376,6 +3730,7 @@ bool AssetLibrary::CreateMaterial(const ImportOptions& options,
     if (!AtomicWriteText(destination, MaterialFileJson(entry), error))
         return false;
 
+    SyncLocation(entry);
     m_entries.push_back(entry);
     if (!SaveManifest(error))
     {
@@ -3403,7 +3758,6 @@ bool AssetLibrary::CreateLuaScript(const ImportOptions& options, Entry& outEntry
     entry.displayName = displayName;
     entry.subpath = subpath;
     entry.filename = SanitizeStem(displayName) + ".lua";
-    entry.originalPath.clear();
     entry.importedAt = TimestampUtc();
     entry.tags = NormalizeTags(options.tags);
 
@@ -3429,6 +3783,7 @@ bool AssetLibrary::CreateLuaScript(const ImportOptions& options, Entry& outEntry
     if (!AtomicWriteText(destination, body, error))
         return false;
 
+    SyncLocation(entry);
     m_entries.push_back(entry);
     if (!SaveManifest(error))
     {
@@ -3438,6 +3793,68 @@ bool AssetLibrary::CreateLuaScript(const ImportOptions& options, Entry& outEntry
         return false;
     }
     Tracenf("[ASSET-LIBRARY] lua script created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::CreateAngelScript(const ImportOptions& options, Entry& outEntry, std::string& error)
+{
+    const std::string displayName = options.displayName.empty() ? "Script" : options.displayName;
+    const std::string subpath = NormalizeSubpath(options.subpath);
+    Entry entry;
+    entry.id = MakeUniqueId(Category::Script, displayName);
+    entry.category = Category::Script;
+    entry.displayName = displayName;
+    entry.subpath = subpath;
+    entry.filename = SanitizeStem(displayName) + ".as";
+    entry.importedAt = TimestampUtc();
+    entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"script", "angelscript"}
+                                                    : options.tags);
+
+    std::filesystem::path destination = AbsolutePath(entry);
+    for (uint32_t i = 2; std::filesystem::exists(destination); ++i)
+    {
+        entry.filename = SanitizeStem(displayName) + "_" + std::to_string(i) + ".as";
+        destination = AbsolutePath(entry);
+    }
+
+    const std::string body =
+        "// " + displayName + " : an AngelScript script. Attach by dragging it onto an entity (or pick it\n"
+        "// in the Script component). Edit + save -> it hot-reloads live in Play. The engine creates ONE\n"
+        "// `Script` object per entity; same-named members are auto-filled before OnStart (uint\n"
+        "// id/entityId = the entity; inspector parameters by name). Keep state in members — module\n"
+        "// globals are shared by every entity using this asset. The full engine API is bound as global\n"
+        "// functions (GetPosition, IsKeyDown, Raycast, SpawnMesh, UiOpen, NetConnect, ...).\n\n"
+        "class Script\n"
+        "{\n"
+        "    uint entityId;        // filled by the engine\n"
+        "    float speed = 90.0f;  // Inspector parameter \"speed\" (declare a member with the same name)\n\n"
+        "    void OnStart()\n"
+        "    {\n"
+        "    }\n\n"
+        "    void OnUpdate(float dt)\n"
+        "    {\n"
+        "        float3 r = GetRotation(entityId);  // Euler degrees\n"
+        "        SetRotation(entityId, r.x, r.y + speed * dt, r.z);\n"
+        "    }\n\n"
+        "    void OnDestroy()\n"
+        "    {\n"
+        "    }\n\n"
+        "    // void OnCollision(uint otherEntityId) {}\n"
+        "}\n";
+    if (!AtomicWriteText(destination, body, error))
+        return false;
+
+    SyncLocation(entry);
+    m_entries.push_back(entry);
+    if (!SaveManifest(error))
+    {
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        m_entries.pop_back();
+        return false;
+    }
+    Tracenf("[ASSET-LIBRARY] angelscript created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
     outEntry = entry;
     return true;
 }
@@ -3463,7 +3880,6 @@ bool AssetLibrary::CreateNativeScript(const ImportOptions& options, Entry& outEn
     entry.displayName = className;
     entry.subpath = NormalizeSubpath(options.subpath);
     entry.filename = className + ".cpp";
-    entry.originalPath.clear();
     entry.importedAt = TimestampUtc();
     entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"script", "cpp"} : options.tags);
 
@@ -3504,6 +3920,7 @@ bool AssetLibrary::CreateNativeScript(const ImportOptions& options, Entry& outEn
     if (!AtomicWriteText(destination, body, error))
         return false;
 
+    SyncLocation(entry);
     m_entries.push_back(entry);
     if (!SaveManifest(error))
     {
@@ -3598,7 +4015,6 @@ bool AssetLibrary::CreateWaterMaterial(const ImportOptions& options,
     entry.displayName = displayName;
     entry.subpath = subpath;
     entry.filename = SanitizeStem(displayName) + ".watermat";
-    entry.originalPath.clear();
     entry.importedAt = TimestampUtc();
     entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"water", "material"} : options.tags);
     entry.thumbnail = "water_material_icon";
@@ -3614,6 +4030,7 @@ bool AssetLibrary::CreateWaterMaterial(const ImportOptions& options,
     if (!AtomicWriteText(destination, WaterMaterialFileJson(entry), error))
         return false;
 
+    SyncLocation(entry);
     m_entries.push_back(entry);
     if (!SaveManifest(error))
     {
@@ -3710,7 +4127,6 @@ bool AssetLibrary::CreatePhysicsMaterial(const ImportOptions& options,
     entry.displayName = displayName;
     entry.subpath = subpath;
     entry.filename = SanitizeStem(displayName) + ".physmat";
-    entry.originalPath.clear();
     entry.importedAt = TimestampUtc();
     entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"physics", "material"} : options.tags);
     entry.thumbnail = "physics_material_icon";
@@ -3726,6 +4142,7 @@ bool AssetLibrary::CreatePhysicsMaterial(const ImportOptions& options,
     if (!AtomicWriteText(destination, PhysicsMaterialFileJson(entry), error))
         return false;
 
+    SyncLocation(entry);
     m_entries.push_back(entry);
     if (!SaveManifest(error))
     {
@@ -3759,7 +4176,6 @@ bool AssetLibrary::CreateAnimationClip(const ImportOptions& options,
     entry.displayName = displayName;
     entry.subpath = subpath;
     entry.filename = SanitizeStem(displayName) + ".ixclip";
-    entry.originalPath.clear();
     entry.importedAt = TimestampUtc();
     entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"animation", "clip"} : options.tags);
     entry.thumbnail = "animation_clip_icon";
@@ -3775,6 +4191,7 @@ bool AssetLibrary::CreateAnimationClip(const ImportOptions& options,
     if (!AtomicWriteText(destination, AnimationClipFileJson(entry), error))
         return false;
 
+    SyncLocation(entry);
     m_entries.push_back(entry);
     if (!SaveManifest(error))
     {
@@ -3803,7 +4220,6 @@ bool AssetLibrary::CreateAnimatorController(const ImportOptions& options, Entry&
     entry.displayName = displayName;
     entry.subpath = subpath;
     entry.filename = SanitizeStem(displayName) + ".controller";
-    entry.originalPath.clear();
     entry.importedAt = TimestampUtc();
     entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"animator", "controller"} : options.tags);
     entry.thumbnail = "animator_controller_icon";
@@ -3843,6 +4259,7 @@ bool AssetLibrary::CreateAnimatorController(const ImportOptions& options, Entry&
     if (!AtomicWriteText(destination, body.str(), error))
         return false;
 
+    SyncLocation(entry);
     m_entries.push_back(entry);
     if (!SaveManifest(error))
     {
@@ -3853,6 +4270,48 @@ bool AssetLibrary::CreateAnimatorController(const ImportOptions& options, Entry&
     }
 
     Tracenf("[ANIM-CTRL] created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
+    outEntry = entry;
+    return true;
+}
+
+bool AssetLibrary::CreateParticleEffect(const ImportOptions& options,
+                                        const ixparticle::ParticleSystemComponent& effect,
+                                        Entry& outEntry,
+                                        std::string& error)
+{
+    const std::string displayName = options.displayName.empty() ? "Particle_Effect" : options.displayName;
+    const std::string subpath = NormalizeSubpath(options.subpath);
+    Entry entry;
+    entry.id = MakeUniqueId(Category::ParticleEffect, displayName);
+    entry.category = Category::ParticleEffect;
+    entry.displayName = displayName;
+    entry.subpath = subpath;
+    entry.filename = SanitizeStem(displayName) + ".particle";
+    entry.importedAt = TimestampUtc();
+    entry.tags = NormalizeTags(options.tags.empty() ? std::vector<std::string>{"effect", "particle"} : options.tags);
+
+    std::filesystem::path destination = AbsolutePath(entry);
+    for (uint32_t i = 2; std::filesystem::exists(destination); ++i)
+    {
+        entry.filename = SanitizeStem(displayName) + "_" + std::to_string(i) + ".particle";
+        destination = AbsolutePath(entry);
+    }
+
+    const std::string body = ixparticle::WriteParticleEffectJson(effect, entry.id, displayName);
+    if (!AtomicWriteText(destination, body, error))
+        return false;
+
+    SyncLocation(entry);
+    m_entries.push_back(entry);
+    if (!SaveManifest(error))
+    {
+        std::error_code ec;
+        std::filesystem::remove(destination, ec);
+        m_entries.pop_back();
+        return false;
+    }
+
+    Tracenf("[PARTICLE-FX] created id=%s file=%s", entry.id.c_str(), entry.filename.c_str());
     outEntry = entry;
     return true;
 }
@@ -4024,6 +4483,7 @@ bool AssetLibrary::MoveAssetToSubpath(const std::string& id,
     const Entry oldEntry = *it;
     Entry moved = oldEntry;
     moved.subpath = targetSubpath;
+    SyncLocation(moved);
     const std::filesystem::path source = AbsolutePath(oldEntry);
     const std::filesystem::path destination = AbsolutePath(moved);
 
@@ -4046,9 +4506,14 @@ bool AssetLibrary::MoveAssetToSubpath(const std::string& id,
         return false;
     }
 
+    // The .meta (the asset's GUID) travels with the file so references stay valid.
+    if (!MoveAssetSidecars(source, destination, error))
+        return false;
     std::filesystem::rename(source, destination, ec);
     if (ec)
     {
+        std::string ignored;
+        MoveAssetSidecars(destination, source, ignored);
         error = ec.message();
         return false;
     }
@@ -4061,6 +4526,8 @@ bool AssetLibrary::MoveAssetToSubpath(const std::string& id,
         std::filesystem::create_directories(source.parent_path(), rollbackEc);
         if (!rollbackEc)
             std::filesystem::rename(destination, source, rollbackEc);
+        std::string ignored;
+        MoveAssetSidecars(destination, source, ignored);
         *it = oldEntry;
         error = "manifest save failed: " + manifestError;
         if (rollbackEc)
@@ -4114,6 +4581,7 @@ bool AssetLibrary::RenameAsset(const std::string& id,
     Entry renamed = oldEntry;
     renamed.displayName = baseName;
     renamed.filename = baseName + oldExtension;
+    SyncLocation(renamed);
 
     if (renamed.filename == oldEntry.filename && renamed.displayName == oldEntry.displayName)
     {
@@ -4168,8 +4636,11 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         return false;
     }
 
+    // Library material files embed their name and are rewritten; a PBR .material (MaterialAsset
+    // format, textures by GUID) is only renamed — rewriting it in the library format would lose it.
+    const bool rewritesMaterial = renamed.category == Category::Material && oldExtension == ".material.json";
     std::string oldStructuredText;
-    if (oldEntry.category == Category::Material ||
+    if (rewritesMaterial ||
         oldEntry.category == Category::WaterMaterial ||
         oldEntry.category == Category::PhysicsMaterial)
     {
@@ -4177,20 +4648,26 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         oldStructuredText.assign(std::istreambuf_iterator<char>(oldFile), std::istreambuf_iterator<char>());
     }
 
+    if (!MoveAssetSidecars(source, destination, error))
+        return false;
     std::error_code ec;
     std::filesystem::rename(source, destination, ec);
     if (ec)
     {
+        std::string ignored;
+        MoveAssetSidecars(destination, source, ignored);
         error = ec.message();
         return false;
     }
 
-    if (renamed.category == Category::Material)
+    if (rewritesMaterial)
     {
         if (!AtomicWriteText(destination, MaterialFileJson(renamed), error))
         {
             std::error_code rollbackEc;
             std::filesystem::rename(destination, source, rollbackEc);
+            std::string ignoredMetaError;
+            MoveAssetSidecars(destination, source, ignoredMetaError);
             if (!oldStructuredText.empty())
             {
                 std::string ignored;
@@ -4207,6 +4684,8 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         {
             std::error_code rollbackEc;
             std::filesystem::rename(destination, source, rollbackEc);
+            std::string ignoredMetaError;
+            MoveAssetSidecars(destination, source, ignoredMetaError);
             if (!oldStructuredText.empty())
             {
                 std::string ignored;
@@ -4223,6 +4702,8 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         {
             std::error_code rollbackEc;
             std::filesystem::rename(destination, source, rollbackEc);
+            std::string ignoredMetaError;
+            MoveAssetSidecars(destination, source, ignoredMetaError);
             if (!oldStructuredText.empty())
             {
                 std::string ignored;
@@ -4240,10 +4721,9 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         const std::string manifestError = error;
         std::error_code rollbackEc;
         std::filesystem::rename(destination, source, rollbackEc);
-        if ((oldEntry.category == Category::Material ||
-                oldEntry.category == Category::WaterMaterial ||
-                oldEntry.category == Category::PhysicsMaterial) &&
-            !oldStructuredText.empty())
+        std::string ignoredMetaError;
+        MoveAssetSidecars(destination, source, ignoredMetaError);
+        if (!oldStructuredText.empty())
         {
             std::string ignored;
             AtomicWriteText(source, oldStructuredText, ignored);
@@ -4259,7 +4739,9 @@ bool AssetLibrary::RenameAsset(const std::string& id,
     return true;
 }
 
-bool AssetLibrary::RenameFolder(Category category,
+// Folders are shared by all asset types (the category parameter is kept for API compatibility):
+// renaming one moves every asset inside it.
+bool AssetLibrary::RenameFolder(Category,
                                 const std::string& oldSubpath,
                                 const std::string& newName,
                                 std::string& newSubpath,
@@ -4288,67 +4770,32 @@ bool AssetLibrary::RenameFolder(Category category,
         return true;
     }
 
-    for (const Entry& entry : m_entries)
-    {
-        if (entry.category == category && IsSubpathInside(NormalizeSubpath(entry.subpath), targetPath))
-        {
-            error = "a folder with this name already exists";
-            return false;
-        }
-    }
-
-    std::vector<Entry> backup = m_entries;
-    std::uint32_t affected = 0;
-    for (Entry& entry : m_entries)
-    {
-        if (entry.category != category)
-            continue;
-        const std::string subpath = NormalizeSubpath(entry.subpath);
-        if (!IsSubpathInside(subpath, oldPath))
-            continue;
-        entry.subpath = ReplaceSubpathPrefix(subpath, oldPath, targetPath);
-        ++affected;
-    }
-    const std::filesystem::path source = CategoryDirectory(category) / oldPath;
-    const std::filesystem::path destination = CategoryDirectory(category) / targetPath;
+    const std::filesystem::path source = m_libraryRoot / oldPath;
+    const std::filesystem::path destination = m_libraryRoot / targetPath;
     if (!std::filesystem::exists(source))
     {
-        m_entries = backup;
         error = "source folder does not exist";
         return false;
     }
     if (std::filesystem::exists(destination))
     {
-        m_entries = backup;
-        error = "destination folder already exists";
+        error = "a folder with this name already exists";
         return false;
     }
 
     std::error_code ec;
-    std::filesystem::create_directories(destination.parent_path(), ec);
-    if (ec)
-    {
-        m_entries = backup;
-        error = ec.message();
-        return false;
-    }
-
     std::filesystem::rename(source, destination, ec);
     if (ec)
     {
-        m_entries = backup;
         error = ec.message();
         return false;
     }
 
-    if (!SaveManifest(error))
+    if (!RelocateFolder(oldPath, targetPath, error))
     {
         const std::string manifestError = error;
         std::error_code rollbackEc;
-        std::filesystem::create_directories(source.parent_path(), rollbackEc);
-        if (!rollbackEc)
-            std::filesystem::rename(destination, source, rollbackEc);
-        m_entries = backup;
+        std::filesystem::rename(destination, source, rollbackEc);
         error = "manifest save failed: " + manifestError;
         if (rollbackEc)
             error += "; rollback failed: " + rollbackEc.message();
@@ -4359,7 +4806,7 @@ bool AssetLibrary::RenameFolder(Category category,
     return true;
 }
 
-bool AssetLibrary::CreateFolder(Category category,
+bool AssetLibrary::CreateFolder(Category,
                                 const std::string& parentSubpath,
                                 const std::string& name,
                                 std::string& outSubpath,
@@ -4377,7 +4824,7 @@ bool AssetLibrary::CreateFolder(Category category,
     }
 
     const std::string target = parent.empty() ? normalizedName : parent + "/" + normalizedName;
-    const std::filesystem::path directory = CategoryDirectory(category) / target;
+    const std::filesystem::path directory = m_libraryRoot / target;
     if (std::filesystem::exists(directory))
     {
         error = "folder already exists";
@@ -4396,7 +4843,7 @@ bool AssetLibrary::CreateFolder(Category category,
     return true;
 }
 
-bool AssetLibrary::DeleteFolder(Category category,
+bool AssetLibrary::DeleteFolder(Category,
                                 const std::string& subpath,
                                 std::uint32_t& removedAssets,
                                 std::string& error)
@@ -4409,7 +4856,7 @@ bool AssetLibrary::DeleteFolder(Category category,
         return false;
     }
 
-    const std::filesystem::path source = CategoryDirectory(category) / target;
+    const std::filesystem::path source = m_libraryRoot / target;
     if (!std::filesystem::exists(source))
     {
         error = "folder does not exist";
@@ -4434,7 +4881,7 @@ bool AssetLibrary::DeleteFolder(Category category,
     auto writeIt = m_entries.begin();
     for (auto readIt = m_entries.begin(); readIt != m_entries.end(); ++readIt)
     {
-        if (readIt->category == category && IsSubpathInside(NormalizeSubpath(readIt->subpath), target))
+        if (IsSubpathInside(NormalizeSubpath(readIt->subpath), target))
         {
             removedEntries.push_back(*readIt);
             continue;
@@ -4470,12 +4917,78 @@ bool AssetLibrary::DeleteFolder(Category category,
     std::filesystem::remove_all(trash, ec);
     for (const Entry& entry : removedEntries)
     {
-        if (!entry.thumbnail.empty())
+        if (!entry.thumbnail.empty() && ToLower(entry.thumbnail).rfind(std::string(kThumbnailFolder) + "/", 0) == 0)
         {
             std::error_code thumbEc;
             std::filesystem::remove(m_libraryRoot / entry.thumbnail, thumbEc);
         }
     }
+    return true;
+}
+
+bool AssetLibrary::RelocateFolder(const std::string& oldSubpath, const std::string& newSubpath, std::string& error)
+{
+    const std::string oldPath = NormalizeSubpath(oldSubpath);
+    const std::string newPath = NormalizeSubpath(newSubpath);
+    if (oldPath.empty() || oldPath == newPath)
+        return true;
+
+    const std::vector<Entry> backup = m_entries;
+    std::uint32_t affected = 0;
+    for (Entry& entry : m_entries)
+    {
+        const std::string subpath = NormalizeSubpath(entry.subpath);
+        if (!IsSubpathInside(subpath, oldPath))
+            continue;
+        entry.subpath = ReplaceSubpathPrefix(subpath, oldPath, newPath);
+        SyncLocation(entry);
+        ++affected;
+    }
+    if (affected == 0)
+        return true;
+    if (!SaveManifest(error))
+    {
+        m_entries = backup;
+        return false;
+    }
+    Tracenf("[ASSET-LIBRARY] folder relocated from=%s to=%s assets=%u",
+        oldPath.c_str(),
+        newPath.c_str(),
+        affected);
+    return true;
+}
+
+bool AssetLibrary::ForgetPath(const std::filesystem::path& absolutePath, std::string& error)
+{
+    const std::string key = LibraryPathKey(absolutePath);
+    const std::vector<Entry> backup = m_entries;
+    std::vector<Entry> forgotten;
+    std::erase_if(m_entries, [&](const Entry& entry) {
+        const std::string entryKey = LibraryPathKey(AbsolutePath(entry));
+        if (entryKey != key && entryKey.rfind(key + "/", 0) != 0)
+            return false;
+        forgotten.push_back(entry);
+        return true;
+    });
+    if (forgotten.empty())
+        return true;
+    if (!SaveManifest(error))
+    {
+        m_entries = backup;
+        return false;
+    }
+    for (const Entry& entry : forgotten)
+    {
+        m_failedMaterialDiscoveryAttempts.erase(CanonicalPathString(AbsolutePath(entry)));
+        if (!entry.thumbnail.empty() && ToLower(entry.thumbnail).rfind(std::string(kThumbnailFolder) + "/", 0) == 0)
+        {
+            std::error_code thumbEc;
+            std::filesystem::remove(m_libraryRoot / entry.thumbnail, thumbEc);
+        }
+    }
+    Tracenf("[ASSET-LIBRARY] forgot path=%s assets=%zu",
+        absolutePath.generic_string().c_str(),
+        forgotten.size());
     return true;
 }
 
@@ -4491,27 +5004,14 @@ bool AssetLibrary::Refresh(std::string& error)
         error = "failed to load manifest";
         return false;
     }
-    return ReconcileFilesystem(error);
+    error = m_lastReconcileError;
+    return m_lastReconcileOk;
 }
 
 std::filesystem::path AssetLibrary::AbsolutePath(const Entry& entry) const
 {
-    if (!entry.originalPath.empty())
-    {
-        std::error_code originalEc;
-        std::error_code rootEc;
-        const std::filesystem::path original = std::filesystem::absolute(std::filesystem::path(entry.originalPath), originalEc);
-        const std::filesystem::path root = std::filesystem::weakly_canonical(m_libraryRoot, rootEc);
-        const std::filesystem::path canonicalOriginal = std::filesystem::weakly_canonical(original, originalEc);
-        if (!originalEc && !rootEc)
-        {
-            const std::string originalText = ToLower(canonicalOriginal.generic_string());
-            const std::string rootText = ToLower(root.generic_string());
-            if (originalText == rootText || originalText.rfind(rootText + "/", 0) == 0)
-                return canonicalOriginal;
-        }
-    }
-    return CategoryDirectory(entry.category) / NormalizeSubpath(entry.subpath) / entry.filename;
+    const std::string subpath = NormalizeSubpath(entry.subpath);
+    return subpath.empty() ? m_libraryRoot / entry.filename : m_libraryRoot / subpath / entry.filename;
 }
 
 std::string AssetLibrary::AssetRelativePath(const Entry& entry) const

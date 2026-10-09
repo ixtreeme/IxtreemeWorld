@@ -1,7 +1,9 @@
+#include "asset/ExrImage.h"
 #include "EditorImGui.h"
 
-#include "NativeBackend.h"  // ixscript::NativeBackend::RegisteredNames() for the Script inspector
-#include "platform/open_external.h"  // open .lua/.cpp scripts in the OS default editor
+#include "NativeBackend.h"  // legacy native C++ scripting (kept; no longer offered to projects)
+#include "particles/ParticleEffectIO.h"  // .particle preset read/write
+#include "platform/open_external.h"  // open .lua/.as/.cpp scripts in the OS default editor
 
 #include "AssetDatabase.h"
 #include "AssimpExporter.h"
@@ -11,9 +13,15 @@
 #include "MaterialAssetManager.h"
 #include "ProjectManager.h"
 #include "SceneManager.h"
+#include "StaticMeshRenderer.h"
+#include "asset/FileAssetReader.h"
+#include "import_export/tree/TreeImpostor.h"
+#include "map/LayeredWorld.h"
 #include "math/IXMath.h"
 #include "platform/trash.h"
 #include "tools/tree/TreeTexturePalette.h"
+
+#include <algorithm>  // script prompt handoff (both editor and runtime builds)
 
 #if defined(IXTREEME_WITH_EDITOR) && defined(_WIN32)
 #include "IconsFontAwesome6.h"
@@ -26,12 +34,14 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <filesystem>
+#include <format>
 #include <limits>
 #include <map>
 #include <optional>
@@ -43,7 +53,31 @@
 
 namespace
 {
-constexpr const char* kLayoutFile = "editor_layout.ini";
+// v2: the editor shell (fixed toolbar and status bar, renamed panels) starts from a fresh default
+// layout; the old file stays untouched.
+constexpr const char* kLayoutFile = "editor_layout_v2.ini";
+constexpr const char* kRecentProjectsFile = "editor_recent_projects.txt";  // beside the layout
+// Editor windows: "<icon> <title>###<id>". The id after ### keeps docking and the saved layout
+// stable whatever the title shows; FindWindowByName/SetWindowFocus accept the full name.
+namespace EditorWindow
+{
+constexpr const char* SceneView = ICON_FA_CUBES "  Scene View###SceneView";
+constexpr const char* Game = ICON_FA_GAMEPAD "  Game###Game";
+constexpr const char* Animator = ICON_FA_PERSON_RUNNING "  Animator###Animator";
+constexpr const char* Hierarchy = ICON_FA_LIST_TREE "  Hierarchy###Hierarchy";
+constexpr const char* Inspector = ICON_FA_CIRCLE_INFO "  Inspector###Inspector";
+constexpr const char* SceneSettings = ICON_FA_SLIDERS "  Scene Settings###SceneSettings";
+constexpr const char* AssetBrowser = ICON_FA_FOLDER_OPEN "  Asset Browser###AssetBrowser";
+constexpr const char* Scripts = ICON_FA_CODE "  Scripts###Scripts";
+constexpr const char* Console = ICON_FA_TERMINAL "  Console###Console";
+constexpr const char* BuildOutput = ICON_FA_HAMMER "  Build Output###BuildOutput";
+constexpr const char* Statistics = ICON_FA_GAUGE_HIGH "  Statistics###Statistics";
+constexpr const char* PhysicsDebugger = ICON_FA_BUG "  Physics Debugger###PhysicsDebugger";
+constexpr const char* ProjectSettings = ICON_FA_GEAR "  Project Settings###ProjectSettings";
+constexpr const char* LayeredWorld = ICON_FA_LAYER_GROUP "  Layered World###LayeredWorld";
+constexpr const char* Shortcuts = ICON_FA_KEYBOARD "  Keyboard Shortcuts###Shortcuts";
+}
+
 constexpr const char* kAssetPayloadType = "ASSET_ID";
 constexpr const char* kAssetFolderPayloadType = "ASSET_FOLDER_PATH";
 constexpr const char* kHierarchyEntityPayloadType = "HIERARCHY_ENTITY";
@@ -169,9 +203,9 @@ struct InspectorComponentDefinition
     bool addableToMesh;
 };
 
-const std::array<InspectorComponentDefinition, 20>& InspectorComponentRegistry()
+const std::array<InspectorComponentDefinition, 21>& InspectorComponentRegistry()
 {
-    static const std::array<InspectorComponentDefinition, 20> registry{{
+    static const std::array<InspectorComponentDefinition, 21> registry{{
         {"builtin.transform", "Transform", "Core", EditorComponentType::None, false},
         {"builtin.mesh_renderer", "MeshRenderer", "Rendering", EditorComponentType::MeshRenderer, false},
         {kLodComponentId, "LOD Group", "Rendering", EditorComponentType::None, true},
@@ -188,6 +222,7 @@ const std::array<InspectorComponentDefinition, 20>& InspectorComponentRegistry()
         {"audio.audio_source", "Audio Source", "Audio", EditorComponentType::AudioSource, true},
         {"audio.audio_listener", "Audio Listener", "Audio", EditorComponentType::AudioListener, true},
         {"scripting.script", "Script", "Scripting", EditorComponentType::Script, true},
+        {"effects.particle_system", "Particle System", "Effects", EditorComponentType::ParticleSystem, true},
         {"builtin.water_body", "Water Body", "Rendering", EditorComponentType::WaterBody, false},
         {"builtin.point_light", "Point Light", "Lighting", EditorComponentType::PointLight, false},
         {"builtin.spot_light", "Spot Light", "Lighting", EditorComponentType::SpotLight, false},
@@ -276,19 +311,6 @@ std::string FolderDisplayName(const std::string& subpath)
     return slash == std::string::npos ? normalized : normalized.substr(slash + 1);
 }
 
-bool IsDirectChildFolder(const std::string& parent, const std::string& child)
-{
-    const std::string normalizedParent = AssetLibrary::NormalizeSubpath(parent);
-    const std::string normalizedChild = AssetLibrary::NormalizeSubpath(child);
-    if (normalizedChild.empty() || normalizedChild == normalizedParent)
-        return false;
-    if (normalizedParent.empty())
-        return normalizedChild.find('/') == std::string::npos;
-    if (normalizedChild.rfind(normalizedParent + "/", 0) != 0)
-        return false;
-    return normalizedChild.find('/', normalizedParent.size() + 1) == std::string::npos;
-}
-
 std::filesystem::path MetaSidecarPath(const std::filesystem::path& path)
 {
     return std::filesystem::path(path.string() + ".meta");
@@ -302,17 +324,17 @@ bool IsMetaFile(const std::filesystem::path& path)
 std::string UniqueFolderName(const std::filesystem::path& parent)
 {
     std::error_code ec;
-    const std::string base = "New Folder";
+    const std::string base = "NewFolder";  // a valid name as is (IsValidRenameName rejects spaces)
     if (!std::filesystem::exists(parent / base, ec))
         return base;
     for (int i = 2; i < 1000; ++i)
     {
-        const std::string candidate = base + " " + std::to_string(i);
+        const std::string candidate = base + "_" + std::to_string(i);
         ec.clear();
         if (!std::filesystem::exists(parent / candidate, ec))
             return candidate;
     }
-    return base + " 1000";
+    return base + "_1000";
 }
 
 bool IsSubpathOrSelf(const std::string& maybeChild, const std::string& maybeParent)
@@ -336,7 +358,13 @@ ImVec4 AssetCategoryColor(AssetLibrary::Category category)
     case AssetLibrary::Category::PhysicsMaterial: return ImVec4(0.64f, 0.54f, 0.30f, 1.0f);
     case AssetLibrary::Category::Scene: return ImVec4(0.42f, 0.50f, 0.66f, 1.0f);
     case AssetLibrary::Category::Prefab: return ImVec4(0.67f, 0.48f, 0.82f, 1.0f);
-    default: return ImVec4(0.35f, 0.35f, 0.35f, 1.0f);
+    case AssetLibrary::Category::AnimationClip: return ImVec4(0.86f, 0.60f, 0.26f, 1.0f);
+    case AssetLibrary::Category::AnimatorController: return ImVec4(0.90f, 0.47f, 0.36f, 1.0f);
+    case AssetLibrary::Category::ParticleEffect: return ImVec4(0.95f, 0.72f, 0.30f, 1.0f);
+    case AssetLibrary::Category::Audio: return ImVec4(0.36f, 0.74f, 0.62f, 1.0f);
+    case AssetLibrary::Category::Script: return ImVec4(0.55f, 0.72f, 0.95f, 1.0f);
+    case AssetLibrary::Category::UiDocument: return ImVec4(0.93f, 0.55f, 0.85f, 1.0f);
+    default: return ImVec4(0.60f, 0.62f, 0.66f, 1.0f);
     }
 }
 
@@ -352,6 +380,12 @@ const char* AssetCategoryIcon(AssetLibrary::Category category)
     case AssetLibrary::Category::PhysicsMaterial: return ICON_FA_GEAR;
     case AssetLibrary::Category::Scene: return ICON_FA_GLOBE;
     case AssetLibrary::Category::Prefab: return ICON_FA_LAYER_GROUP;
+    case AssetLibrary::Category::AnimationClip: return ICON_FA_PERSON_RUNNING;
+    case AssetLibrary::Category::AnimatorController: return ICON_FA_DIAGRAM_PROJECT;
+    case AssetLibrary::Category::ParticleEffect: return ICON_FA_SHAPES;
+    case AssetLibrary::Category::Audio: return ICON_FA_MUSIC;
+    case AssetLibrary::Category::Script: return ICON_FA_FILE_CODE;
+    case AssetLibrary::Category::UiDocument: return ICON_FA_WINDOW_MAXIMIZE;
     default: return ICON_FA_FILE;
     }
 }
@@ -369,7 +403,7 @@ const char* ImportDetectedTypeName(const std::filesystem::path& path)
 {
     const std::string ext = ToLowerAscii(path.extension().string());
     if (ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".tga" ||
-        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2")
+        ext == ".bmp" || ext == ".dds" || ext == ".ktx" || ext == ".ktx2" || ext == ".hdr" || ext == ".exr")
         return "Texture";
     if (ext == ".glb" || ext == ".gltf" || ext == ".fbx" || ext == ".obj")
         return "Model";
@@ -379,8 +413,10 @@ const char* ImportDetectedTypeName(const std::filesystem::path& path)
         return "Anim";
     if (ext == ".wav" || ext == ".ogg" || ext == ".mp3" || ext == ".flac")
         return "Audio";
-    if (ext == ".lua")
+    if (ext == ".lua" || ext == ".as" || ext == ".cpp")
         return "Script";
+    if (ext == ".particle")
+        return "Particle Effect";
     if (ext == ".scene")
         return "Scene";
     return "Unknown";
@@ -480,16 +516,13 @@ void LoadEditorFonts()
     UI::SetEditorFonts({regular, bold});
 }
 
+// Editor colors are sRGB, like every color written in the panels; the UI backend decodes them for
+// an sRGB render target.
 ImVec4 ColorU8(int r, int g, int b, int a = 255)
 {
-    const auto toLinear = [](int value) {
-        const float srgb = static_cast<float>(value) / 255.0f;
-        return srgb <= 0.04045f ? srgb / 12.92f : ixtreeme::math::Pow((srgb + 0.055f) / 1.055f, 2.4f);
-    };
-    return ImVec4(
-        toLinear(r),
-        toLinear(g),
-        toLinear(b),
+    return ImVec4(static_cast<float>(r) / 255.0f,
+        static_cast<float>(g) / 255.0f,
+        static_cast<float>(b) / 255.0f,
         static_cast<float>(a) / 255.0f);
 }
 
@@ -564,7 +597,8 @@ void ApplyEditorStyle()
     colors[ImGuiCol_TableBorderStrong] = ColorU8(52, 56, 63);
     colors[ImGuiCol_TableBorderLight] = ColorU8(46, 50, 58);
     colors[ImGuiCol_TableRowBg] = ImVec4(0.0f, 0.0f, 0.0f, 0.0f);
-    colors[ImGuiCol_TableRowBgAlt] = ColorU8(255, 255, 255, 10);
+    // Very faint: blending happens in linear space on the sRGB target, where a little white goes far.
+    colors[ImGuiCol_TableRowBgAlt] = ColorU8(255, 255, 255, 3);
     colors[ImGuiCol_NavHighlight] = ColorU8(61, 126, 219, 190);
     colors[ImGuiCol_DockingPreview] = ColorU8(61, 126, 219, 102);
     colors[ImGuiCol_DockingEmptyBg] = ColorU8(27, 29, 33);
@@ -602,6 +636,7 @@ bool EditorImGui::Create()
     io.ConfigFlags |= ImGuiConfigFlags_DockingEnable;
     io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
     io.IniFilename = kLayoutFile;
+    ProjectManager::Instance().SetRecentProjectsFile(kRecentProjectsFile);
     m_applyDefaultDockLayout = !std::filesystem::exists(kLayoutFile);
 
     LoadEditorFonts();
@@ -626,9 +661,9 @@ void EditorImGui::SetEditorPlayModeState(const EditorPlayModeState& state)
     const bool wasEditing = m_playModeState.mode == EditorPlayMode::Edit;
     const bool nowEditing = state.mode == EditorPlayMode::Edit;
     if (wasEditing && !nowEditing)
-        m_pendingViewFocusWindow = "Game";        // entered Play: show the Main Camera
+        m_pendingViewFocusWindow = EditorWindow::Game;        // entered Play: show the Main Camera
     else if (!wasEditing && nowEditing)
-        m_pendingViewFocusWindow = "Scene View";  // stopped Play: back to free-fly editor camera
+        m_pendingViewFocusWindow = EditorWindow::SceneView;  // stopped Play: back to free-fly editor camera
     m_playModeState = state;
     if (!CanUseEditorTools())
     {
@@ -691,6 +726,15 @@ void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
     m_sceneRootEntity = sceneRootEntity;
     m_sceneRootName = sceneRootName.empty() ? "Untitled" : std::move(sceneRootName);
     m_hierarchyEntities = std::move(entities);
+    m_hierarchyIndexByEntity.clear();
+    for (auto& [parent, children] : m_hierarchyChildren)
+        children.clear();  // the lists keep their storage from frame to frame
+    for (std::size_t i = 0; i < m_hierarchyEntities.size(); ++i)
+    {
+        const HierarchySceneEntity& entity = m_hierarchyEntities[i];
+        m_hierarchyIndexByEntity.emplace(entity.entity, i);
+        m_hierarchyChildren[entity.parent].push_back(entity.entity);
+    }
     m_selectedHierarchyEntity = 0;
     for (const HierarchySceneEntity& entity : m_hierarchyEntities)
     {
@@ -777,6 +821,25 @@ void EditorImGui::SyncWaterMaterialSnapshot()
     m_waterMaterials = GetWaterMaterialsSnapshot();
 }
 
+std::uint64_t EditorImGui::WaterMaterialsRevision() const
+{
+    // While a material has unsaved edits the snapshot changes with them: a new revision every call
+    // (and once more when the editing stops, which may have discarded them).
+    const bool drafting = (m_waterMaterialEditor.windowOpen && m_waterMaterialEditor.dirty) ||
+        (m_pbrMaterialEditor.windowOpen && m_pbrMaterialEditor.dirty);
+    if (drafting || drafting != m_waterMaterialsDrafting)
+        ++m_waterMaterialsTick;
+    m_waterMaterialsDrafting = drafting;
+    const std::uint64_t revision = m_assetLibrary ? m_assetLibrary->Revision() : 0;
+    return revision * 1000003ull + m_waterMaterialsTick;
+}
+
+std::uint64_t EditorImGui::AssetLibraryRevision() const
+{
+    const std::uint64_t revision = m_assetLibrary ? m_assetLibrary->Revision() : 0;
+    return (m_assetLibraryGeneration << 40) ^ revision;
+}
+
 void EditorImGui::SetEngineRoot(const std::filesystem::path& clientRoot)
 {
     m_engineRoot = clientRoot;
@@ -788,9 +851,13 @@ void EditorImGui::SetEngineRoot(const std::filesystem::path& clientRoot)
 
 void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot)
 {
+    m_expandedModelAssets.clear();
     SetEngineRoot(clientRoot);
     DestroyAssetPreviewTextures();
+    InvalidateAssetBrowserCache();
     m_assetLibrary = std::make_unique<AssetLibrary>(clientRoot);
+    ++m_waterMaterialsTick;  // another library: see WaterMaterialsRevision
+    ++m_assetLibraryGeneration;
     if (!m_assetLibrary->Initialize())
     {
         m_assetLibrary.reset();
@@ -810,8 +877,12 @@ void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot
 void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot,
                                                 const std::filesystem::path& assetRoot)
 {
+    m_expandedModelAssets.clear();
     DestroyAssetPreviewTextures();
+    InvalidateAssetBrowserCache();
     m_assetLibrary = std::make_unique<AssetLibrary>(projectRoot, assetRoot);
+    ++m_waterMaterialsTick;  // another library: see WaterMaterialsRevision
+    ++m_assetLibraryGeneration;
     if (!m_assetLibrary->Initialize())
     {
         m_assetLibrary.reset();
@@ -820,7 +891,6 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
         return;
     }
 
-    m_assetFilter = AssetBrowserFilter::All;
     m_assetSubpath.clear();
     m_selectedAssetId.clear();
     m_assetInspectorSelectionActive = false;
@@ -1120,6 +1190,7 @@ MapEditorCommands EditorImGui::ConsumeCommands()
         commands.renderResolutionWidth = renderResolutionWidth;
         commands.renderResolutionHeight = renderResolutionHeight;
     }
+    commands.showLayerVolumes = m_showLayerVolumes;
     return commands;
 }
 
@@ -1147,10 +1218,14 @@ void EditorImGui::EnsureModelAnimationClips(const std::filesystem::path& modelPa
 
     const std::filesystem::path modelDir = modelPath.parent_path();
     const std::string stem = modelPath.stem().string();
-    std::string subpath;
-    subpath.reserve(stem.size());
+    // The clips go next to the model, in <model>_clips (no per-type folder).
+    std::string clipFolder;
+    clipFolder.reserve(stem.size() + 6);
     for (char c : stem)
-        subpath.push_back(std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+        clipFolder.push_back(std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+    clipFolder += "_clips";
+    const std::string modelSubpath = AssetBrowserSubpath(modelDir);
+    const std::string subpath = modelSubpath.empty() ? clipFolder : modelSubpath + "/" + clipFolder;
 
     bool createdAny = false;
     for (int i = 0; i < 8; ++i)
@@ -1230,6 +1305,42 @@ std::string EditorImGui::AudioClipFilePath(const std::string& clipId) const
     return m_assetLibrary->AbsolutePath(*entry).generic_string();
 }
 
+std::string EditorImGui::TextureFilePath(const std::string& textureId) const
+{
+    if (!m_assetLibrary || textureId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(textureId);
+    if (!entry || entry->category != AssetLibrary::Category::Texture)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::ParticleEffectFilePath(const std::string& effectId) const
+{
+    if (!m_assetLibrary || effectId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(effectId);
+    if (!entry || entry->category != AssetLibrary::Category::ParticleEffect)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+bool EditorImGui::ApplyParticleEffectPreset(const std::string& effectId,
+                                            ixparticle::ParticleSystemComponent& out) const
+{
+    const std::string path = ParticleEffectFilePath(effectId);
+    if (path.empty())
+        return false;
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+        return false;
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (!ixparticle::ParseParticleEffectJson(text, out))
+        return false;
+    out.effectAssetId = effectId;
+    return true;
+}
+
 std::string EditorImGui::ScriptSourceFilePath(const std::string& scriptId) const
 {
     if (!m_assetLibrary || scriptId.empty())
@@ -1278,194 +1389,6 @@ bool EditorImGui::SaveModelLodDefault(const std::string& assetId, const LodConfi
     return true;
 }
 
-bool EditorImGui::ActiveAssetCategory(AssetLibrary::Category category) const
-{
-    switch (m_assetFilter)
-    {
-    case AssetBrowserFilter::All: return true;
-    case AssetBrowserFilter::Texture: return category == AssetLibrary::Category::Texture;
-    case AssetBrowserFilter::Model: return category == AssetLibrary::Category::Model;
-    case AssetBrowserFilter::Animation: return category == AssetLibrary::Category::Animation;
-    case AssetBrowserFilter::AnimationClip: return category == AssetLibrary::Category::AnimationClip;
-    case AssetBrowserFilter::AnimatorController: return category == AssetLibrary::Category::AnimatorController;
-    case AssetBrowserFilter::Audio: return category == AssetLibrary::Category::Audio;
-    case AssetBrowserFilter::Script: return category == AssetLibrary::Category::Script;
-    case AssetBrowserFilter::Material: return category == AssetLibrary::Category::Material;
-    case AssetBrowserFilter::WaterMaterial: return category == AssetLibrary::Category::WaterMaterial;
-    case AssetBrowserFilter::PhysicsMaterial: return category == AssetLibrary::Category::PhysicsMaterial;
-    case AssetBrowserFilter::Scene: return category == AssetLibrary::Category::Scene;
-    case AssetBrowserFilter::Prefab: return category == AssetLibrary::Category::Prefab;
-    default: return true;
-    }
-}
-
-AssetLibrary::Category EditorImGui::FolderCategory() const
-{
-    switch (m_assetFilter)
-    {
-    case AssetBrowserFilter::Model: return AssetLibrary::Category::Model;
-    case AssetBrowserFilter::Animation: return AssetLibrary::Category::Animation;
-    case AssetBrowserFilter::AnimationClip: return AssetLibrary::Category::AnimationClip;
-    case AssetBrowserFilter::AnimatorController: return AssetLibrary::Category::AnimatorController;
-    case AssetBrowserFilter::Audio: return AssetLibrary::Category::Audio;
-    case AssetBrowserFilter::Script: return AssetLibrary::Category::Script;
-    case AssetBrowserFilter::Material: return AssetLibrary::Category::Material;
-    case AssetBrowserFilter::WaterMaterial: return AssetLibrary::Category::WaterMaterial;
-    case AssetBrowserFilter::PhysicsMaterial: return AssetLibrary::Category::PhysicsMaterial;
-    case AssetBrowserFilter::Scene: return AssetLibrary::Category::Scene;
-    case AssetBrowserFilter::Prefab: return AssetLibrary::Category::Prefab;
-    case AssetBrowserFilter::All:
-    case AssetBrowserFilter::Texture:
-    default:
-        return AssetLibrary::Category::Texture;
-    }
-}
-
-const char* EditorImGui::AssetFilterName() const
-{
-    switch (m_assetFilter)
-    {
-    case AssetBrowserFilter::All: return "All";
-    case AssetBrowserFilter::Texture: return "Textures";
-    case AssetBrowserFilter::Model: return "Models";
-    case AssetBrowserFilter::Animation: return "Anims";
-    case AssetBrowserFilter::AnimationClip: return "Anim Clips";
-    case AssetBrowserFilter::AnimatorController: return "Animators";
-    case AssetBrowserFilter::Audio: return "Audio";
-    case AssetBrowserFilter::Script: return "Scripts";
-    case AssetBrowserFilter::Material: return "Materials";
-    case AssetBrowserFilter::WaterMaterial: return "Water Mats";
-    case AssetBrowserFilter::PhysicsMaterial: return "Physics Mats";
-    case AssetBrowserFilter::Scene: return "Scenes";
-    case AssetBrowserFilter::Prefab: return "Prefabs";
-    default: return "Assets";
-    }
-}
-
-bool EditorImGui::AssetPassesCurrentFilters(const AssetLibrary::Entry& entry) const
-{
-    if (!ActiveAssetCategory(entry.category))
-        return false;
-    if (AssetLibrary::NormalizeSubpath(entry.subpath) != AssetLibrary::NormalizeSubpath(m_assetSubpath))
-        return false;
-
-    for (const std::string& tag : m_activeAssetTags)
-    {
-        if (std::find(entry.tags.begin(), entry.tags.end(), tag) == entry.tags.end())
-            return false;
-    }
-
-    const std::string search = m_assetSearchBuffer;
-    if (!search.empty() &&
-        !ContainsCaseInsensitive(entry.displayName, search) &&
-        !ContainsCaseInsensitive(entry.filename, search) &&
-        !ContainsCaseInsensitive(AssetLibrary::CategoryName(entry.category), search) &&
-        !ContainsCaseInsensitive(AssetLibrary::TextureRoleName(entry.textureRole), search) &&
-        !ContainsCaseInsensitive(AssetLibrary::TagsToCsv(entry.tags), search))
-    {
-        return false;
-    }
-    return true;
-}
-
-std::vector<AssetLibrary::Entry> EditorImGui::QueryVisibleAssets() const
-{
-    std::vector<AssetLibrary::Entry> result;
-    if (m_assetLibrary)
-    {
-        for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
-        {
-            if (AssetPassesCurrentFilters(entry))
-                result.push_back(entry);
-        }
-    }
-    for (const AssetLibrary::Entry& entry : QuerySceneAssets())
-    {
-        if (AssetPassesCurrentFilters(entry))
-            result.push_back(entry);
-    }
-
-    std::sort(result.begin(), result.end(), [](const AssetLibrary::Entry& a, const AssetLibrary::Entry& b) {
-        if (a.category != b.category)
-            return static_cast<int>(a.category) < static_cast<int>(b.category);
-        return ToLowerAscii(a.displayName) < ToLowerAscii(b.displayName);
-    });
-    return result;
-}
-
-std::vector<std::string> EditorImGui::QueryVisibleFolders() const
-{
-    std::set<std::string> folders;
-    if (!m_assetLibrary)
-        return {};
-
-    const AssetLibrary::Category categories[] = {
-        AssetLibrary::Category::Texture,
-        AssetLibrary::Category::Model,
-        AssetLibrary::Category::Animation,
-        AssetLibrary::Category::AnimationClip,
-        AssetLibrary::Category::AnimatorController,
-        AssetLibrary::Category::Material,
-        AssetLibrary::Category::WaterMaterial,
-        AssetLibrary::Category::PhysicsMaterial,
-        AssetLibrary::Category::Scene,
-        AssetLibrary::Category::Prefab,
-    };
-    for (AssetLibrary::Category category : categories)
-    {
-        if (!ActiveAssetCategory(category))
-            continue;
-        if (category == AssetLibrary::Category::Scene)
-        {
-            for (const AssetLibrary::Entry& entry : QuerySceneAssets())
-            {
-                if (!entry.subpath.empty())
-                    folders.insert(AssetLibrary::NormalizeSubpath(entry.subpath));
-            }
-        }
-        else
-        {
-            for (const std::string& folder : m_assetLibrary->FolderSubpathsFor(category))
-                folders.insert(AssetLibrary::NormalizeSubpath(folder));
-        }
-    }
-    return {folders.begin(), folders.end()};
-}
-
-std::vector<std::pair<std::string, std::uint32_t>> EditorImGui::QueryVisibleTags() const
-{
-    std::map<std::string, std::uint32_t> counts;
-    if (!m_assetLibrary)
-        return {};
-
-    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
-    {
-        if (!ActiveAssetCategory(entry.category))
-            continue;
-        if (AssetLibrary::NormalizeSubpath(entry.subpath) != AssetLibrary::NormalizeSubpath(m_assetSubpath))
-            continue;
-        for (const std::string& tag : entry.tags)
-            ++counts[tag];
-    }
-    for (const AssetLibrary::Entry& entry : QuerySceneAssets())
-    {
-        if (!ActiveAssetCategory(entry.category))
-            continue;
-        if (AssetLibrary::NormalizeSubpath(entry.subpath) != AssetLibrary::NormalizeSubpath(m_assetSubpath))
-            continue;
-        for (const std::string& tag : entry.tags)
-            ++counts[tag];
-    }
-
-    std::vector<std::pair<std::string, std::uint32_t>> result(counts.begin(), counts.end());
-    std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
-        if (a.second != b.second)
-            return a.second > b.second;
-        return a.first < b.first;
-    });
-    return result;
-}
-
 std::filesystem::path EditorImGui::AssetBrowserRoot() const
 {
     return m_assetLibrary ? m_assetLibrary->LibraryRoot() : std::filesystem::path{};
@@ -1496,9 +1419,61 @@ void EditorImGui::SelectAssetBrowserFolder(const std::string& subpath)
     m_activeAssetTags.clear();
 }
 
-std::vector<std::string> EditorImGui::QueryFilesystemChildFolders(const std::string& subpath) const
+void EditorImGui::ValidateAssetBrowserCache() const
 {
-    std::vector<std::string> folders;
+    // Checked (and rebuilt) at most once a frame, at the frame's first query: the lists the panels
+    // iterate by reference stay valid through the frame even when something in the loop refreshes
+    // the library (a drop on a folder tile, "Create Here"); the change shows from the next frame.
+    const int frame = ImGui::GetFrameCount();
+    AssetBrowserCache& cache = m_assetBrowserCache;
+    if (cache.validatedFrame == frame)
+        return;
+    constexpr double kAssetBrowserCacheSeconds = 10.0;
+    const double now = ImGui::GetTime();
+    const std::uint64_t revision = m_assetLibrary ? m_assetLibrary->Revision() : 0;
+    const std::uint64_t materialRevision = MaterialAssetManager::Instance().Revision();
+    if (cache.builtAt >= 0.0 && now >= cache.builtAt && now - cache.builtAt < kAssetBrowserCacheSeconds &&
+        cache.library == m_assetLibrary.get() && cache.revision == revision)
+    {
+        if (cache.materialRevision != materialRevision)
+        {
+            cache.modelContents.clear();
+            cache.materialRevision = materialRevision;
+        }
+        cache.validatedFrame = frame;
+        return;
+    }
+    cache = {};
+    cache.library = m_assetLibrary.get();
+    cache.revision = revision;
+    cache.materialRevision = materialRevision;
+    cache.builtAt = now;
+    cache.validatedFrame = frame;
+}
+
+std::string EditorImGui::CachedComparablePath(const std::filesystem::path& path) const
+{
+    ValidateAssetBrowserCache();
+    auto [cached, inserted] = m_assetBrowserCache.comparablePaths.try_emplace(path.generic_string());
+    if (inserted)
+        cached->second = ComparablePath(path);
+    return cached->second;
+}
+
+const AssetLibrary::ModelContents& EditorImGui::QueryModelContents(const AssetLibrary::Entry& model) const
+{
+    ValidateAssetBrowserCache();
+    auto [found, inserted] = m_assetBrowserCache.modelContents.try_emplace(model.id);
+    if (inserted && m_assetLibrary) found->second = m_assetLibrary->QueryModelContents(model);
+    return found->second;
+}
+
+const std::vector<std::string>& EditorImGui::QueryFilesystemChildFolders(const std::string& subpath) const
+{
+    ValidateAssetBrowserCache();
+    if (const auto cached = m_assetBrowserCache.childFolders.find(subpath); cached != m_assetBrowserCache.childFolders.end())
+        return cached->second;
+    std::vector<std::string>& folders = m_assetBrowserCache.childFolders[subpath];
     const std::filesystem::path directory = AssetBrowserPath(subpath);
     std::error_code ec;
     if (!std::filesystem::exists(directory, ec) || !std::filesystem::is_directory(directory, ec))
@@ -1508,10 +1483,24 @@ std::vector<std::string> EditorImGui::QueryFilesystemChildFolders(const std::str
     {
         if (ec)
             break;
-        std::error_code itemEc;
-        if (!entry.is_directory(itemEc))
-            continue;
-        folders.push_back(AssetBrowserSubpath(entry.path()));
+        try
+        {
+            std::error_code itemEc;
+            if (!entry.is_directory(itemEc))
+                continue;
+            const std::string name = entry.path().filename().string();
+            // Hidden folders and the library's generated thumbnails are not part of the user's tree.
+            if (name.empty() || name.front() == '.' || name.find(".delete_tmp") != std::string::npos)
+                continue;
+            const std::string child = AssetBrowserSubpath(entry.path());
+            if (AssetLibrary::IsInternalFolder(child))
+                continue;
+            folders.push_back(child);
+        }
+        catch (const std::exception&)
+        {
+            // a folder name the narrow path API cannot represent: not listed
+        }
     }
     std::sort(folders.begin(), folders.end(), [](const std::string& a, const std::string& b) {
         return ToLowerAscii(FolderDisplayName(a)) < ToLowerAscii(FolderDisplayName(b));
@@ -1519,32 +1508,34 @@ std::vector<std::string> EditorImGui::QueryFilesystemChildFolders(const std::str
     return folders;
 }
 
-std::vector<AssetLibrary::Entry> EditorImGui::QueryFilesystemAssetsInFolder(const std::string& subpath) const
+const std::vector<AssetLibrary::Entry>& EditorImGui::QueryFilesystemAssetsInFolder(const std::string& subpath) const
 {
-    std::vector<AssetLibrary::Entry> result;
     if (!m_assetLibrary)
-        return result;
+    {
+        static const std::vector<AssetLibrary::Entry> kEmpty;
+        return kEmpty;
+    }
+    ValidateAssetBrowserCache();
+    if (const auto cached = m_assetBrowserCache.folderAssets.find(subpath); cached != m_assetBrowserCache.folderAssets.end())
+        return cached->second;
+    std::vector<AssetLibrary::Entry>& result = m_assetBrowserCache.folderAssets[subpath];
 
-    const std::string target = ComparablePath(AssetBrowserPath(subpath));
-    auto addIfInFolder = [&](const AssetLibrary::Entry& entry, const std::filesystem::path& absolutePath) {
-        if (absolutePath.empty() || IsMetaFile(absolutePath))
-            return;
-        if (ComparablePath(absolutePath.parent_path()) == target)
-            result.push_back(entry);
-    };
-
+    // Library entries know their folder (relative to the asset root): no path canonicalization needed.
+    const std::string target = ToLowerAscii(AssetLibrary::NormalizeSubpath(subpath));
     for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
-        addIfInFolder(entry, m_assetLibrary->AbsolutePath(entry));
+    {
+        if (ToLowerAscii(AssetLibrary::NormalizeSubpath(entry.subpath)) == target && !IsMetaFile(entry.filename))
+            result.push_back(entry);
+    }
 
+    const std::string targetComparable = ComparablePath(AssetBrowserPath(subpath));
     for (const AssetLibrary::Entry& entry : QuerySceneAssets())
     {
         if (entry.originalPath.empty())
             continue;
         const std::filesystem::path scenePath(entry.originalPath);
-        const std::string sceneComparable = ComparablePath(scenePath);
-        const std::string rootComparable = ComparablePath(AssetBrowserRoot());
-        if (sceneComparable.rfind(rootComparable + "/", 0) == 0)
-            addIfInFolder(entry, scenePath);
+        if (ComparablePath(scenePath.parent_path()) == targetComparable)
+            result.push_back(entry);
     }
 
     std::sort(result.begin(), result.end(), [](const AssetLibrary::Entry& a, const AssetLibrary::Entry& b) {
@@ -1576,7 +1567,15 @@ std::optional<std::filesystem::path> EditorImGui::AssetPreviewPathFor(const Asse
 {
     if (!m_assetLibrary)
         return std::nullopt;
+    ValidateAssetBrowserCache();
+    auto [cached, inserted] = m_assetBrowserCache.previewPaths.try_emplace(entry.id);
+    if (inserted)
+        cached->second = ResolveAssetPreviewPath(entry);
+    return cached->second;
+}
 
+std::optional<std::filesystem::path> EditorImGui::ResolveAssetPreviewPath(const AssetLibrary::Entry& entry) const
+{
     const auto thumbnailPath = [this](const AssetLibrary::Entry& textureEntry) -> std::optional<std::filesystem::path> {
         if (textureEntry.thumbnail.empty() ||
             textureEntry.thumbnail == "model_icon" ||
@@ -1631,11 +1630,26 @@ bool EditorImGui::LoadAssetPreviewTexture(const std::filesystem::path& path, Ass
     int width = 0;
     int height = 0;
     int channels = 0;
-    stbi_uc* decoded = stbi_load(path.string().c_str(), &width, &height, &channels, 4);
+    std::vector<std::uint8_t> exrPixels;
+    stbi_uc* stbPixels = nullptr;
+    if (client::asset::IsExrPath(path))
+    {
+        std::string decodeError;
+        auto exr = client::asset::LoadExr(path, decodeError);
+        if (exr)
+        {
+            width = exr->width;
+            height = exr->height;
+            exrPixels = client::asset::ExrRgba8(*exr, client::asset::ExrByteMode::Preview);
+        }
+        else TraceError("[EXR] %s", decodeError.c_str());
+    }
+    else stbPixels = stbi_load(path.string().c_str(), &width, &height, &channels, 4);
+    const std::uint8_t* decoded = exrPixels.empty() ? stbPixels : exrPixels.data();
     if (!decoded || width <= 0 || height <= 0)
     {
         if (decoded)
-            stbi_image_free(decoded);
+            stbi_image_free(stbPixels);
         TraceError("[EDITOR-IMGUI] Failed to decode asset thumbnail: %s", path.string().c_str());
         return false;
     }
@@ -1646,7 +1660,7 @@ bool EditorImGui::LoadAssetPreviewTexture(const std::filesystem::path& path, Ass
         static_cast<std::uint32_t>(width),
         static_cast<std::uint32_t>(height),
         path.filename().generic_string().c_str());
-    stbi_image_free(decoded);
+    stbi_image_free(stbPixels);
     if (!outTexture.handle.IsValid())
         return false;
 
@@ -1675,71 +1689,6 @@ EditorImGui::AssetPreviewTexture* EditorImGui::GetAssetPreviewTexture(const Asse
         m_textureProvider->GetPreviewTexture(it->second.handle) == nullptr)
         return nullptr;
     return &it->second;
-}
-
-void EditorImGui::CreateAssetFolder()
-{
-    if (!m_assetLibrary)
-        return;
-    std::string outSubpath;
-    std::string error;
-    if (!m_assetLibrary->CreateFolder(FolderCategory(), m_assetSubpath, m_newAssetFolderName, outSubpath, error))
-    {
-        m_assetStatus = "Folder create failed: " + error;
-        return;
-    }
-    m_assetSubpath = outSubpath;
-    m_newAssetFolderName[0] = '\0';
-    m_assetStatus = "Folder created: " + FolderDisplayName(outSubpath);
-    Tracenf("[EDITOR-IMGUI-3] Folder created: %s", outSubpath.c_str());
-}
-
-void EditorImGui::DeleteAssetFolder()
-{
-    if (!m_assetLibrary || m_assetSubpath.empty())
-        return;
-
-    std::uint32_t removedAssets = 0;
-    std::string error;
-    const std::string deleted = m_assetSubpath;
-    if (!m_assetLibrary->DeleteFolder(FolderCategory(), m_assetSubpath, removedAssets, error))
-    {
-        m_assetStatus = "Folder delete failed: " + error;
-        return;
-    }
-    m_assetSubpath = ParentSubpath(deleted);
-    m_assetStatus = "Folder deleted, removed assets: " + std::to_string(removedAssets);
-    Tracenf("[EDITOR-IMGUI-3] Folder deleted: %s removed=%u", deleted.c_str(), removedAssets);
-}
-
-void EditorImGui::DeleteAsset(const AssetLibrary::Entry& entry)
-{
-    if (!m_assetLibrary)
-        return;
-
-    const std::string deletedId = entry.id;
-    const std::string deletedName = entry.displayName;
-    std::string error;
-    if (!m_assetLibrary->Remove(entry.id, error))
-    {
-        m_assetStatus = "Delete failed: " + error;
-        return;
-    }
-
-    if (m_selectedAssetId == deletedId)
-    {
-        m_selectedAssetId.clear();
-        m_assetInspectorSelectionActive = false;
-    }
-    if (m_waterMaterialEditor.materialId == deletedId)
-        m_waterMaterialEditor = {};
-    if (m_pbrMaterialEditor.materialId == deletedId)
-        m_pbrMaterialEditor = {};
-    SyncWaterMaterialSnapshot();
-    m_assetStatus = "Deleted asset: " + deletedName;
-    Tracenf("[EDITOR-IMGUI-3] Asset deleted: asset_id=%s type=%s",
-        deletedId.c_str(),
-        AssetLibrary::CategoryName(entry.category));
 }
 
 void EditorImGui::CreateFilesystemFolder(const std::string& parentSubpath, const std::string& requestedName)
@@ -1773,6 +1722,7 @@ void EditorImGui::BeginAssetRename(const AssetLibrary::Entry& entry)
         return;
     const std::filesystem::path path = entry.originalPath.empty() ? m_assetLibrary->AbsolutePath(entry) : std::filesystem::path(entry.originalPath);
     m_assetRenamePath = path.generic_string();
+    m_assetRenameAssetId = m_assetLibrary->FindById(entry.id) ? entry.id : std::string{};
     m_assetRenameIsFolder = false;
     CopyToBuffer(m_assetRenameBuffer, sizeof(m_assetRenameBuffer), path.filename().string());
     m_assetOpenRenamePopup = true;
@@ -1784,6 +1734,7 @@ void EditorImGui::BeginFolderRename(const std::string& subpath)
         return;
     const std::filesystem::path path = AssetBrowserPath(subpath);
     m_assetRenamePath = path.generic_string();
+    m_assetRenameAssetId.clear();
     m_assetRenameIsFolder = true;
     CopyToBuffer(m_assetRenameBuffer, sizeof(m_assetRenameBuffer), path.filename().string());
     m_assetOpenRenamePopup = true;
@@ -1798,6 +1749,24 @@ void EditorImGui::RenameFilesystemSelection()
     if (!AssetLibrary::IsValidRenameName(std::filesystem::path(requested).stem().string()))
     {
         m_assetStatus = "Rename failed: invalid name";
+        return;
+    }
+
+    // A library asset is renamed by the library: file and .meta together, keeping its id (and with
+    // it every reference to the asset).
+    if (!m_assetRenameIsFolder && m_assetLibrary && !m_assetRenameAssetId.empty())
+    {
+        AssetLibrary::Entry renamed;
+        std::string error;
+        if (!m_assetLibrary->RenameAsset(m_assetRenameAssetId, requested, true, renamed, error))
+        {
+            m_assetStatus = "Rename failed: " + error;
+            return;
+        }
+        m_assetStatus = "Renamed: " + renamed.filename;
+        Tracenf("[EDITOR-ASSET-BROWSER] renamed asset id=%s dst=%s",
+            renamed.id.c_str(),
+            renamed.originalPath.c_str());
         return;
     }
 
@@ -1826,6 +1795,7 @@ void EditorImGui::RenameFilesystemSelection()
         metaMoved = true;
     }
 
+    const std::string sourceSubpath = AssetBrowserSubpath(source);
     std::filesystem::rename(source, destination, ec);
     if (ec)
     {
@@ -1838,8 +1808,15 @@ void EditorImGui::RenameFilesystemSelection()
         return;
     }
 
+    // The assets inside a renamed folder keep their ids: their entries follow the folder.
+    std::string relocateError;
+    if (m_assetRenameIsFolder && m_assetLibrary &&
+        !m_assetLibrary->RelocateFolder(sourceSubpath, AssetBrowserSubpath(destination), relocateError))
+    {
+        TraceError("[EDITOR-ASSET-BROWSER] folder rename manifest update failed: %s", relocateError.c_str());
+    }
     RefreshAssetLibrary();
-    if (m_assetRenameIsFolder && AssetLibrary::NormalizeSubpath(m_assetSubpath).rfind(AssetBrowserSubpath(source), 0) == 0)
+    if (m_assetRenameIsFolder && AssetLibrary::NormalizeSubpath(m_assetSubpath).rfind(sourceSubpath, 0) == 0)
         SelectAssetBrowserFolder(AssetBrowserSubpath(destination));
     m_assetStatus = "Renamed: " + destination.filename().string();
     Tracenf("[EDITOR-ASSET-BROWSER] renamed src=%s dst=%s metaMoved=%s",
@@ -1883,6 +1860,11 @@ void EditorImGui::DeleteFilesystemSelection()
         m_selectedAssetId.clear();
         m_assetInspectorSelectionActive = false;
     }
+    // Drop the deleted assets' entries outright, so the refresh never mistakes another file with the
+    // same name for one of them having moved.
+    std::string forgetError;
+    if (m_assetLibrary && !m_assetLibrary->ForgetPath(path, forgetError))
+        TraceError("[EDITOR-ASSET-BROWSER] delete manifest update failed: %s", forgetError.c_str());
     RefreshAssetLibrary();
     m_assetStatus = "Deleted: " + path.filename().string();
     Tracenf("[EDITOR-ASSET-BROWSER] deleted path=Assets/%s metaDeleted=%s targetTrash=ok",
@@ -1897,58 +1879,28 @@ bool EditorImGui::MoveAssetEntryToFolder(const std::string& assetId, const std::
     auto entry = m_assetLibrary->FindById(assetId);
     if (!entry)
         return false;
-    const std::filesystem::path source = entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
-    const std::filesystem::path targetFolder = AssetBrowserPath(targetFolderSubpath);
-    const std::filesystem::path destination = targetFolder / source.filename();
-    std::error_code ec;
-    if (ComparablePath(source.parent_path()) == ComparablePath(targetFolder))
+    const std::string target = AssetLibrary::NormalizeSubpath(targetFolderSubpath);
+    if (ToLowerAscii(AssetLibrary::NormalizeSubpath(entry->subpath)) == ToLowerAscii(target))
         return true;
-    if (std::filesystem::exists(destination, ec))
+
+    // The library moves the file and its .meta and keeps the asset's id.
+    const std::filesystem::path source = m_assetLibrary->AbsolutePath(*entry);
+    AssetLibrary::Entry moved;
+    std::string error;
+    if (!m_assetLibrary->MoveAssetToSubpath(assetId, target, moved, error))
     {
-        m_assetStatus = "Move failed: target already exists";
-        Tracenf("[EDITOR-ASSET-BROWSER] move_failed reason=target_exists src=%s dst=%s",
+        m_assetStatus = "Move failed: " + error;
+        Tracenf("[EDITOR-ASSET-BROWSER] move_failed src=%s target=Assets/%s reason=%s",
             source.generic_string().c_str(),
-            destination.generic_string().c_str());
+            target.c_str(),
+            error.c_str());
         return false;
     }
-    std::filesystem::create_directories(targetFolder, ec);
-    if (ec)
-    {
-        m_assetStatus = "Move failed: " + ec.message();
-        return false;
-    }
-
-    bool metaMoved = false;
-    const std::filesystem::path sourceMeta = MetaSidecarPath(source);
-    const std::filesystem::path destinationMeta = MetaSidecarPath(destination);
-    if (std::filesystem::exists(sourceMeta, ec))
-    {
-        std::filesystem::rename(sourceMeta, destinationMeta, ec);
-        if (ec)
-        {
-            m_assetStatus = "Move failed moving .meta: " + ec.message();
-            return false;
-        }
-        metaMoved = true;
-    }
-
-    std::filesystem::rename(source, destination, ec);
-    if (ec)
-    {
-        if (metaMoved)
-        {
-            std::error_code rollbackEc;
-            std::filesystem::rename(destinationMeta, sourceMeta, rollbackEc);
-        }
-        m_assetStatus = "Move failed: " + ec.message();
-        return false;
-    }
-    RefreshAssetLibrary();
-    m_assetStatus = "Moved: " + source.filename().string();
-    Tracenf("[EDITOR-ASSET-BROWSER] moved src=%s dst=%s metaMoved=%s",
+    m_assetStatus = "Moved: " + moved.filename;
+    Tracenf("[EDITOR-ASSET-BROWSER] moved id=%s src=%s dst=%s",
+        moved.id.c_str(),
         source.generic_string().c_str(),
-        destination.generic_string().c_str(),
-        metaMoved ? "yes" : "no");
+        moved.originalPath.c_str());
     return true;
 }
 
@@ -1978,6 +1930,10 @@ bool EditorImGui::MoveFolderToFolder(const std::string& sourceSubpath, const std
         m_assetStatus = "Move failed: " + ec.message();
         return false;
     }
+    // The assets inside keep their ids: their entries follow the folder.
+    std::string relocateError;
+    if (m_assetLibrary && !m_assetLibrary->RelocateFolder(sourceNorm, AssetBrowserSubpath(destination), relocateError))
+        TraceError("[EDITOR-ASSET-BROWSER] folder move manifest update failed: %s", relocateError.c_str());
     RefreshAssetLibrary();
     if (IsSubpathOrSelf(m_assetSubpath, sourceNorm))
         SelectAssetBrowserFolder(AssetBrowserSubpath(destination));
@@ -2118,19 +2074,82 @@ void EditorImGui::ImportAssetFromPath(const std::filesystem::path& sourcePath,
     SelectAssetBrowserFolder(normalizedTarget);
     m_selectedAssetId = entry.id;
     m_assetStatus = "Imported: " + entry.filename;
+    if (entry.category == AssetLibrary::Category::Model)
+    {
+        const auto contents = m_assetLibrary->QueryModelContents(entry);
+        if (!contents.assets.empty()) m_expandedModelAssets.insert(entry.id);
+        if (!contents.missingTextures.empty())
+            m_assetStatus += " (" + std::to_string(contents.missingTextures.size()) + " missing textures; hover the model for details)";
+    }
 }
 
 void EditorImGui::ImportExternalFiles(const std::vector<std::string>& paths, const char* trigger)
 {
     const std::string target = AssetLibrary::NormalizeSubpath(m_assetSubpath);
     for (const std::string& path : paths)
-        ImportAssetFromPath(std::filesystem::path(path), target, trigger ? trigger : "dragdrop");
+    {
+        const std::filesystem::path source(path);
+        std::error_code ec;
+        if (std::filesystem::is_directory(source, ec))
+            ImportFolderFromPath(source, target);
+        else
+            ImportAssetFromPath(source, target, trigger ? trigger : "dragdrop");
+    }
+}
+
+void EditorImGui::ImportFolderFromPath(const std::filesystem::path& sourceFolder, const std::string& targetSubpath)
+{
+    if (!m_assetLibrary)
+        return;
+    std::error_code ec;
+    std::filesystem::path source = std::filesystem::absolute(sourceFolder, ec).lexically_normal();
+    if (!source.has_filename())
+        source = source.parent_path();
+    // A folder that already is (or holds) the asset folder is not copied into itself.
+    const std::string sourceKey = ComparablePath(source);
+    const std::string rootKey = ComparablePath(AssetBrowserRoot());
+    if (sourceKey == rootKey || rootKey.rfind(sourceKey + "/", 0) == 0 || sourceKey.rfind(rootKey + "/", 0) == 0)
+    {
+        m_assetStatus = "Import skipped: that folder is already part of the project assets";
+        return;
+    }
+
+    const std::filesystem::path targetParent = AssetBrowserPath(targetSubpath);
+    std::filesystem::path destination = targetParent / source.filename();
+    for (int i = 2; std::filesystem::exists(destination, ec); ++i)
+        destination = targetParent / (source.filename().string() + "_" + std::to_string(i));
+    std::filesystem::copy(source, destination, std::filesystem::copy_options::recursive, ec);
+    if (ec)
+    {
+        m_assetStatus = "Folder import failed: " + ec.message();
+        return;
+    }
+    RefreshAssetLibrary();  // registers every asset inside the copied folder
+    SelectAssetBrowserFolder(AssetBrowserSubpath(destination));
+    m_assetStatus = "Imported folder: " + destination.filename().string();
+    Tracenf("[EDITOR-ASSET-BROWSER] folder_imported src=%s dst=%s",
+        source.generic_string().c_str(),
+        destination.generic_string().c_str());
+}
+
+std::string EditorImGui::CreateTargetSubpath()
+{
+    const std::string target = m_assetCreateTarget.value_or(m_assetSubpath);
+    m_assetCreateTarget.reset();
+    return AssetLibrary::NormalizeSubpath(target);
+}
+
+void EditorImGui::RevealCreatedAsset(const AssetLibrary::Entry& entry)
+{
+    SelectAssetBrowserFolder(entry.subpath);
+    m_selectedAssetId = entry.id;
 }
 
 void EditorImGui::CreatePbrMaterialAsset()
 {
     if (!m_assetLibrary)
         return;
+    m_createMaterialTargetSubpath = CreateTargetSubpath();
     CopyToBuffer(m_createMaterialName, sizeof(m_createMaterialName), "material");
     m_createMaterialShadingMode = -1;
     m_assetOpenCreateMaterialPopup = true;
@@ -2142,13 +2161,13 @@ void EditorImGui::CreateLuaScriptAsset()
         return;
     AssetLibrary::ImportOptions options;
     options.displayName = "Script";  // CreateLuaScript uniquifies (Script_2, ...); rename via F2 after
-    options.subpath = m_assetSubpath;
+    options.subpath = CreateTargetSubpath();
     options.tags = {"script", "lua"};
     AssetLibrary::Entry entry;
     std::string error;
     if (m_assetLibrary->CreateLuaScript(options, entry, error))
     {
-        m_selectedAssetId = entry.id;
+        RevealCreatedAsset(entry);
         m_assetInspectorSelectionActive = true;
         m_assetStatus = "Created Lua script: " + entry.displayName + " (drag it onto an entity to attach)";
     }
@@ -2158,11 +2177,106 @@ void EditorImGui::CreateLuaScriptAsset()
     }
 }
 
+void EditorImGui::CreateAngelScriptAsset()
+{
+    if (!m_assetLibrary)
+        return;
+    AssetLibrary::ImportOptions options;
+    options.displayName = "Script";  // CreateAngelScript uniquifies (Script_2, ...); rename via F2 after
+    options.subpath = CreateTargetSubpath();
+    options.tags = {"script", "angelscript"};
+    AssetLibrary::Entry entry;
+    std::string error;
+    if (m_assetLibrary->CreateAngelScript(options, entry, error))
+    {
+        RevealCreatedAsset(entry);
+        m_assetInspectorSelectionActive = true;
+        m_assetStatus = "Created AngelScript: " + entry.displayName + " (drag it onto an entity to attach)";
+    }
+    else
+    {
+        m_assetStatus = "Create AngelScript failed: " + error;
+    }
+}
+
+// A native C++ script source (.cpp/.h/...) under the asset folder. Only the path BELOW that folder is
+// checked for a CMake "build" tree: the project itself may well live under a "build" directory.
+static bool IsNativeScriptSource(const std::filesystem::path& scriptsDir, const std::filesystem::path& file)
+{
+    std::string ext = file.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (ext != ".cpp" && ext != ".h" && ext != ".hpp" && ext != ".cxx" && ext != ".cc")
+        return false;
+    std::error_code ec;
+    const std::filesystem::path relative = std::filesystem::relative(file, scriptsDir, ec);
+    if (ec || relative.empty())
+        return false;
+    for (const std::filesystem::path& part : relative.parent_path())
+    {
+        if (part == "build" || part == "..")
+            return false;
+    }
+    return true;
+}
+
 std::filesystem::path EditorImGui::ProjectScriptSourceDir() const
 {
-    // Native .cpp game scripts live alongside .lua in the asset library's scripts folder (so both are
-    // first-class, browsable, drag-attachable assets). CategoryDirectory(Script) resolves here too.
-    return ProjectManager::Instance().AssetRootPath() / "scripts";
+    // Native .cpp game scripts are assets like any other: they may sit anywhere in the asset folder.
+    return ProjectManager::Instance().AssetRootPath();
+}
+
+bool EditorImGui::ProjectHasNativeScriptSources() const
+{
+    if (!m_assetLibrary)
+        return false;
+    // Cached per library revision: the check resolves paths on disk (std::filesystem::relative) and
+    // the toolbar asks every frame.
+    const std::filesystem::path scriptsDir = ProjectScriptSourceDir();
+    const std::uint64_t revision = m_assetLibrary->Revision();
+    if (m_nativeSourcesValid && m_nativeSourcesLibrary == m_assetLibrary.get() &&
+        m_nativeSourcesRevision == revision && m_nativeSourcesDir == scriptsDir)
+        return m_hasNativeSources;
+    m_hasNativeSources = false;
+    for (const AssetLibrary::Entry& e : CachedScriptAssets(".cpp"))
+    {
+        if (IsNativeScriptSource(scriptsDir, m_assetLibrary->AbsolutePath(e)))
+        {
+            m_hasNativeSources = true;
+            break;
+        }
+    }
+    m_nativeSourcesLibrary = m_assetLibrary.get();
+    m_nativeSourcesRevision = revision;
+    m_nativeSourcesDir = scriptsDir;
+    m_nativeSourcesValid = true;
+    return m_hasNativeSources;
+}
+
+const std::vector<AssetLibrary::Entry>& EditorImGui::CachedScriptAssets(const char* extension) const
+{
+    static const std::vector<AssetLibrary::Entry> kEmpty;
+    if (!m_assetLibrary || extension == nullptr)
+        return kEmpty;
+    CachedScriptList& cache = m_scriptAssetCache[extension];
+    const std::uint64_t revision = m_assetLibrary->Revision();
+    if (cache.valid && cache.library == m_assetLibrary.get() && cache.revision == revision)
+        return cache.entries;
+
+    cache.entries = m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
+    const std::string wanted = extension;
+    cache.entries.erase(std::remove_if(cache.entries.begin(), cache.entries.end(),
+        [&wanted](const AssetLibrary::Entry& entry) {
+            std::string ext = std::filesystem::path(entry.filename).extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(),
+                [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            return ext != wanted;
+        }),
+        cache.entries.end());
+    cache.library = m_assetLibrary.get();
+    cache.revision = revision;
+    cache.valid = true;
+    return cache.entries;
 }
 
 void EditorImGui::CreateNativeScriptAsset()
@@ -2178,10 +2292,10 @@ void EditorImGui::CreateNativeScriptFile(const std::string& className)
         return;
     }
     // Create the .cpp as a first-class Script asset (same path as a Lua script): written into the
-    // library scripts dir, registered, browsable + drag-attachable. The class is named after the file.
+    // target folder, registered, browsable + drag-attachable. The class is named after the file.
     AssetLibrary::ImportOptions options;
     options.displayName = className.empty() ? "MyScript" : className;
-    options.subpath = m_assetSubpath;
+    options.subpath = CreateTargetSubpath();
     options.tags = {"script", "cpp"};
     AssetLibrary::Entry entry;
     std::string error;
@@ -2190,7 +2304,7 @@ void EditorImGui::CreateNativeScriptFile(const std::string& className)
         m_assetStatus = "Create C++ script failed: " + error;
         return;
     }
-    m_selectedAssetId = entry.id;
+    RevealCreatedAsset(entry);
     m_assetInspectorSelectionActive = true;
     // Stamp the new file so the save-to-live poll doesn't see it as a spurious "new .cpp" change.
     std::error_code ec;
@@ -2198,6 +2312,58 @@ void EditorImGui::CreateNativeScriptFile(const std::string& className)
     if (const auto mt = std::filesystem::last_write_time(dest, ec); !ec)
         m_cppMtimes[dest.generic_string()] = mt;
     m_assetStatus = "Created C++ script: " + entry.filename + " (drag it onto an entity, then Build)";
+}
+
+void EditorImGui::CreateAnimatorControllerAsset()
+{
+    if (!m_assetLibrary)
+        return;
+    AssetLibrary::ImportOptions options;
+    options.displayName = "Animator_Controller";
+    options.subpath = CreateTargetSubpath();
+    AssetLibrary::Entry entry;
+    std::string error;
+    if (!m_assetLibrary->CreateAnimatorController(options, entry, error))
+    {
+        m_assetStatus = "Create animator controller failed: " + error;
+        return;
+    }
+    RevealCreatedAsset(entry);
+    m_assetInspectorSelectionActive = true;
+    m_assetStatus = "Animator controller created: " + entry.displayName;
+}
+
+void EditorImGui::CreateParticleEffectAsset()
+{
+    ixparticle::ParticleSystemComponent effect;  // defaults
+    if (m_meshRendererState.selected && m_meshRendererState.hasParticleSystem)
+        effect = m_meshRendererState.particleSystem;
+    CreateParticleEffectFromComponent(effect);
+}
+
+void EditorImGui::CreateParticleEffectFromComponent(const ixparticle::ParticleSystemComponent& effect)
+{
+    if (!m_assetLibrary)
+    {
+        m_assetStatus = "Open a project to create a particle effect";
+        return;
+    }
+    AssetLibrary::ImportOptions options;
+    options.displayName = m_meshRendererState.name.empty()
+        ? std::string("Particle_Effect")
+        : m_meshRendererState.name + "_Effect";
+    options.subpath = CreateTargetSubpath();
+    options.tags = {"effect", "particle"};
+    AssetLibrary::Entry entry;
+    std::string error;
+    if (!m_assetLibrary->CreateParticleEffect(options, effect, entry, error))
+    {
+        m_assetStatus = "Create particle effect failed: " + error;
+        return;
+    }
+    RevealCreatedAsset(entry);
+    m_assetInspectorSelectionActive = true;
+    m_assetStatus = "Particle effect created: " + entry.displayName;
 }
 
 void EditorImGui::CreateWaterMaterialAsset()
@@ -2213,7 +2379,7 @@ bool EditorImGui::CreateWaterMaterialAsset(const std::string& displayName, Asset
         return false;
     AssetLibrary::ImportOptions options{};
     options.displayName = displayName.empty() ? "Water_Material" : displayName;
-    options.subpath = m_assetSubpath;
+    options.subpath = CreateTargetSubpath();
     options.tags = {"water", "material"};
     AssetLibrary::Entry entry{};
     std::string error;
@@ -2222,8 +2388,7 @@ bool EditorImGui::CreateWaterMaterialAsset(const std::string& displayName, Asset
         m_assetStatus = "Water material create failed: " + error;
         return false;
     }
-    m_assetFilter = AssetBrowserFilter::WaterMaterial;
-    m_selectedAssetId = entry.id;
+    RevealCreatedAsset(entry);
     SyncWaterMaterialSnapshot();
     m_assetStatus = "Water material created: " + entry.displayName;
     Tracenf("[EDITOR-IMGUI-4] Material saved: id=%s name=%s",
@@ -2243,7 +2408,7 @@ void EditorImGui::CreatePhysicsMaterialAsset()
 
     AssetLibrary::ImportOptions options{};
     options.displayName = "Physics_Material";
-    options.subpath = m_assetSubpath;
+    options.subpath = CreateTargetSubpath();
     options.tags = {"physics", "material"};
     AssetLibrary::PhysicsMaterialData material{};
     AssetLibrary::Entry entry{};
@@ -2254,8 +2419,7 @@ void EditorImGui::CreatePhysicsMaterialAsset()
         return;
     }
 
-    m_assetFilter = AssetBrowserFilter::PhysicsMaterial;
-    m_selectedAssetId = entry.id;
+    RevealCreatedAsset(entry);
     m_assetInspectorSelectionActive = true;
     m_assetStatus = "Physics material created: " + entry.displayName;
     Tracenf("[PHYSICS-MAT] asset created path=%s", m_assetLibrary->AbsolutePath(entry).generic_string().c_str());
@@ -2330,6 +2494,16 @@ bool EditorImGui::OpenPbrMaterialEditor(const std::string& materialId)
             m_pbrMaterialEditor.draft.colorTint[0] = material->baseColor[0];
             m_pbrMaterialEditor.draft.colorTint[1] = material->baseColor[1];
             m_pbrMaterialEditor.draft.colorTint[2] = material->baseColor[2];
+            m_pbrMaterialEditor.draft.colorTint[3] = material->baseColor[3];
+            m_pbrMaterialEditor.draft.tilingScaleX = material->uvTiling[0];
+            m_pbrMaterialEditor.draft.tilingScaleY = material->uvTiling[1];
+            // The textures as the material file has them (the asset list's copy may be older).
+            m_pbrMaterialEditor.draft.diffuseTextureId = TextureEntryIdForGuid(material->baseColorTexture);
+            m_pbrMaterialEditor.draft.normalTextureId = TextureEntryIdForGuid(material->normalTexture);
+            m_pbrMaterialEditor.draft.aoTextureId = TextureEntryIdForGuid(material->aoTexture);
+            m_pbrMaterialEditor.draft.roughnessTextureId = TextureEntryIdForGuid(material->roughnessTexture);
+            m_pbrMaterialEditor.draft.metallicTextureId = TextureEntryIdForGuid(material->metallicTexture);
+            m_pbrMaterialEditor.draft.heightTextureId = TextureEntryIdForGuid(material->heightTexture);
             m_pbrMaterialEditor.draft.normalStrength = material->normalStrength;
             m_pbrMaterialEditor.draft.aoStrength = material->aoStrength;
             m_pbrMaterialEditor.draft.roughnessStrength = material->roughness;
@@ -2358,6 +2532,92 @@ void EditorImGui::MarkWaterMaterialChanged(const char* field)
         field ? field : "unknown");
 }
 
+bool EditorImGui::PbrEditorEditsMaterialFile() const
+{
+    if (!m_assetLibrary || m_pbrMaterialEditor.materialId.empty())
+        return false;
+    const std::optional<AssetLibrary::Entry> entry = m_assetLibrary->FindById(m_pbrMaterialEditor.materialId);
+    return entry && !entry->originalPath.empty() &&
+        ToLowerAscii(std::filesystem::path(entry->originalPath).extension().string()) == ".material";
+}
+
+std::string EditorImGui::TextureEntryIdForGuid(const std::optional<Guid>& guid) const
+{
+    if (!guid || !m_assetLibrary)
+        return {};
+    const std::string text = guid->toString();
+    const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*guid);
+    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+    {
+        if (entry.category != AssetLibrary::Category::Texture)
+            continue;
+        if (entry.guid == text)
+            return entry.id;
+        if (path && entry.filename == path->filename().string())
+        {
+            std::error_code ec;
+            if (std::filesystem::equivalent(m_assetLibrary->AbsolutePath(entry), *path, ec))
+                return entry.id;
+        }
+    }
+    return {};
+}
+
+std::optional<Guid> EditorImGui::TextureGuidForEntryId(const std::string& entryId) const
+{
+    if (entryId.empty() || !m_assetLibrary)
+        return std::nullopt;
+    const std::optional<AssetLibrary::Entry> entry = m_assetLibrary->FindById(entryId);
+    if (!entry)
+        return std::nullopt;
+    if (const std::optional<Guid> known = Guid::fromString(entry->guid); known && AssetDatabase::Instance().resolveGuid(*known))
+        return known;
+    std::filesystem::path path =
+        entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
+    if (path.is_relative())
+        path = m_assetLibrary->AbsolutePath(*entry);
+    return AssetDatabase::Instance().getOrCreateGuid(path);
+}
+
+void EditorImGui::ApplyPbrDraftToMaterial(MaterialAsset& material, bool packMaps)
+{
+    const AssetLibrary::MaterialData& draft = m_pbrMaterialEditor.draft;
+    for (std::size_t c = 0; c < 4u; ++c)
+        material.baseColor[c] = std::clamp(draft.colorTint[c], 0.0f, 1.0f);
+    material.metallic = draft.metallicStrength;
+    material.roughness = draft.roughnessStrength;
+    material.normalStrength = draft.normalStrength;
+    material.aoStrength = draft.aoStrength;
+    material.uvTiling = {std::max(draft.tilingScaleX, 0.001f), std::max(draft.tilingScaleY, 0.001f)};
+    material.shadingMode =
+        ToLowerAscii(draft.shadingMode) == "unlit" ? MaterialAsset::ShadingMode::Unlit : MaterialAsset::ShadingMode::Lit;
+    const std::string alphaMode = ToLowerAscii(draft.alphaMode);
+    material.alphaMode = alphaMode == "mask" ? MaterialAsset::AlphaMode::Mask :
+        (alphaMode == "blend" ? MaterialAsset::AlphaMode::Blend : MaterialAsset::AlphaMode::Opaque);
+    material.alphaCutoff = std::clamp(draft.alphaCutoff, 0.0f, 1.0f);
+    material.baseColorTexture = TextureGuidForEntryId(draft.diffuseTextureId);
+    material.normalTexture = TextureGuidForEntryId(draft.normalTextureId);
+    material.heightTexture = TextureGuidForEntryId(draft.heightTextureId);
+    // The occlusion, roughness and metallic maps go to the shaders as one packed texture: packed again
+    // when they changed (a packed one the material came with, a glTF's, stays while they do not).
+    const std::optional<Guid> ao = TextureGuidForEntryId(draft.aoTextureId);
+    const std::optional<Guid> roughness = TextureGuidForEntryId(draft.roughnessTextureId);
+    const std::optional<Guid> metallic = TextureGuidForEntryId(draft.metallicTextureId);
+    const bool hadMaps = material.aoTexture || material.roughnessTexture || material.metallicTexture;
+    const bool mapsChanged = ao != material.aoTexture || roughness != material.roughnessTexture || metallic != material.metallicTexture;
+    material.aoTexture = ao;
+    material.roughnessTexture = roughness;
+    material.metallicTexture = metallic;
+    const bool anyMap = ao || roughness || metallic;
+    if (packMaps && (mapsChanged || (anyMap && !material.metallicRoughnessTexture)))
+    {
+        if (anyMap)
+            material.metallicRoughnessTexture = MaterialAssetManager::Instance().packOcclusionRoughnessMetallic(material);
+        else if (hadMaps)
+            material.metallicRoughnessTexture.reset();
+    }
+}
+
 void EditorImGui::MarkPbrMaterialChanged(const char* field)
 {
     if (m_pbrMaterialEditor.materialId.empty())
@@ -2365,6 +2625,17 @@ void EditorImGui::MarkPbrMaterialChanged(const char* field)
     m_pbrMaterialEditor.dirty = true;
     SceneManager::Instance().MarkDirty();
     SyncWaterMaterialSnapshot();
+    // A .material shows the change at once (Save writes it): the loaded material takes the draft.
+    if (PbrEditorEditsMaterialFile())
+    {
+        const std::optional<AssetLibrary::Entry> entry = m_assetLibrary->FindById(m_pbrMaterialEditor.materialId);
+        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(std::filesystem::path(entry->originalPath));
+        if (MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(guid))
+        {
+            ApplyPbrDraftToMaterial(*material, field && std::strcmp(field, "texture_slot") == 0);
+            MaterialAssetManager::Instance().markChanged();
+        }
+    }
     Tracenf("[EDITOR-IMGUI-4] Material parameter changed: material_id=%s field=%s",
         m_pbrMaterialEditor.materialId.c_str(),
         field ? field : "unknown");
@@ -2495,22 +2766,11 @@ bool EditorImGui::SavePbrMaterialEditor()
             m_assetStatus = "Material save failed: unable to load material asset";
             return false;
         }
+        // Every field the editor shows: the textures and the tiling too (they were not written, so a
+        // material's textures changed here never reached the renderer).
         material->name = requestedName;
-        material->baseColor[0] = m_pbrMaterialEditor.draft.colorTint[0];
-        material->baseColor[1] = m_pbrMaterialEditor.draft.colorTint[1];
-        material->baseColor[2] = m_pbrMaterialEditor.draft.colorTint[2];
-        material->metallic = m_pbrMaterialEditor.draft.metallicStrength;
-        material->roughness = m_pbrMaterialEditor.draft.roughnessStrength;
-        material->normalStrength = m_pbrMaterialEditor.draft.normalStrength;
-        material->aoStrength = m_pbrMaterialEditor.draft.aoStrength;
-        material->shadingMode =
-            ToLowerAscii(m_pbrMaterialEditor.draft.shadingMode) == "unlit"
-                ? MaterialAsset::ShadingMode::Unlit
-                : MaterialAsset::ShadingMode::Lit;
+        ApplyPbrDraftToMaterial(*material, true);
         const std::string alphaMode = ToLowerAscii(m_pbrMaterialEditor.draft.alphaMode);
-        material->alphaMode = alphaMode == "mask" ? MaterialAsset::AlphaMode::Mask :
-            (alphaMode == "blend" ? MaterialAsset::AlphaMode::Blend : MaterialAsset::AlphaMode::Opaque);
-        material->alphaCutoff = std::clamp(m_pbrMaterialEditor.draft.alphaCutoff, 0.0f, 1.0f);
         if (!MaterialAssetManager::Instance().save(*material))
         {
             m_assetStatus = "Material save failed: write failed";
@@ -2691,11 +2951,72 @@ void EditorImGui::BeginFrame(bool editorModeActive)
 #include "editor_panels/EditorImGuiAnimatorPanels.inl"
 #include "editor_panels/EditorImGuiProjectPanels.inl"
 #include "editor_panels/EditorImGuiMenuToolbarPanels.inl"
+#include "editor_panels/EditorImGuiShellPanels.inl"
 #include "editor_panels/EditorImGuiHierarchyPanels.inl"
 #include "editor_panels/EditorImGuiInspectorPanels.inl"
 #include "editor_panels/EditorImGuiAssetBrowserPanels.inl"
 #include "editor_panels/EditorImGuiMaterialPanels.inl"
 #include "editor_panels/EditorImGuiPanelDispatcher.inl"
+void EditorImGui::RenderScriptPrompts()
+{
+    if (m_scriptPrompts.empty())
+        return;
+    const ImGuiViewport* viewport = ImGui::GetMainViewport();
+    const ImVec2 center = viewport->GetCenter();
+    float stagger = 0.0f;
+    for (auto it = m_scriptPrompts.begin(); it != m_scriptPrompts.end();)
+    {
+        ScriptPromptBuffer& prompt = *it;
+        ImGui::SetNextWindowPos(ImVec2(center.x + stagger, center.y + stagger), ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+        stagger += 24.0f;
+        const std::string windowName = (prompt.view.title.empty() ? std::string("Script") : prompt.view.title) +
+            "###ScriptPrompt" + std::to_string(prompt.view.id);
+        bool open = true;
+        int outcome = 0;  // 1 submit, -1 cancel
+        if (ImGui::Begin(windowName.c_str(), &open,
+                ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoCollapse |
+                ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking))
+        {
+            if (!prompt.view.label.empty())
+                ImGui::TextUnformatted(prompt.view.label.c_str());
+            if (prompt.focusPending)
+            {
+                ImGui::SetKeyboardFocusHere();
+                prompt.focusPending = false;
+            }
+            ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue;
+            if (prompt.view.secret)
+                flags |= ImGuiInputTextFlags_Password | ImGuiInputTextFlags_NoUndoRedo;
+            ImGui::SetNextItemWidth(280.0f);
+            if (ImGui::InputText("##value", prompt.text.data(), prompt.text.size(), flags))
+                outcome = 1;
+            if (ImGui::Button("OK"))
+                outcome = 1;
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel"))
+                outcome = -1;
+        }
+        ImGui::End();
+        if (!open)
+            outcome = -1;
+        if (outcome == 0)
+        {
+            ++it;
+            continue;
+        }
+        ScriptPromptAnswer answer;
+        answer.id = prompt.view.id;
+        answer.submitted = outcome == 1;
+        if (answer.submitted)
+            answer.text = prompt.text.data();
+        std::fill(prompt.text.begin(), prompt.text.end(), '\0');
+        if (prompt.view.secret)
+            ImGui::ClearActiveID();  // ImGui's own edit state must not keep the secret around
+        m_scriptPromptAnswers.push_back(std::move(answer));
+        it = m_scriptPrompts.erase(it);
+    }
+}
+
 void EditorImGui::RenderPanels()
 {
     const bool backendReady = m_textureProvider && m_textureProvider->IsReady();
@@ -2718,6 +3039,7 @@ void EditorImGui::RenderPanels()
 
     RenderEditorPanels();
     RenderDemoPanels();
+    RenderScriptPrompts();
     ImGui::Render();
 
     m_frameActive = false;
@@ -2817,6 +3139,21 @@ InputEvent EditorImGui::MapInputToSceneView(const InputEvent& event) const
     return mapped;
 }
 
+bool EditorImGui::MapInputToGameView(const InputEvent& event, InputEvent& out) const
+{
+    const GameViewRect& rect = m_gameViewRect;
+    if (!rect.valid || !m_gameViewVisible || rect.size[0] <= 1.0f || rect.size[1] <= 1.0f)
+        return false;
+    const float u = (static_cast<float>(event.x) - rect.min[0]) / rect.size[0];
+    const float v = (static_cast<float>(event.y) - rect.min[1]) / rect.size[1];
+    if (u < 0.0f || u >= 1.0f || v < 0.0f || v >= 1.0f)
+        return false;
+    out = event;
+    out.x = static_cast<int>(u * static_cast<float>(rect.extent[0]));
+    out.y = static_cast<int>(v * static_cast<float>(rect.extent[1]));
+    return true;
+}
+
 void EditorImGui::SetSceneViewKeyboardFocus(bool focused)
 {
     if (m_sceneViewKeyboardFocus == focused)
@@ -2868,6 +3205,11 @@ bool EditorImGui::IsSceneViewInputTarget(const InputEvent&) const
 InputEvent EditorImGui::MapInputToSceneView(const InputEvent& event) const
 {
     return event;
+}
+
+bool EditorImGui::MapInputToGameView(const InputEvent&, InputEvent&) const
+{
+    return false;
 }
 
 void EditorImGui::SetSceneViewKeyboardFocus(bool)
@@ -2927,6 +3269,16 @@ std::vector<std::pair<std::string, WaterMaterialData>> EditorImGui::GetWaterMate
     return {};
 }
 
+std::uint64_t EditorImGui::WaterMaterialsRevision() const
+{
+    return 0;
+}
+
+std::uint64_t EditorImGui::AssetLibraryRevision() const
+{
+    return 0;
+}
+
 void EditorImGui::InitializeAssetLibrary(const std::filesystem::path&)
 {
 }
@@ -2937,7 +3289,8 @@ void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& pro
                                                 const std::filesystem::path& assetRoot)
 {
     m_assetLibrary = std::make_unique<AssetLibrary>(projectRoot, assetRoot);
-    if (!m_assetLibrary->Initialize())
+    // The shipped game only reads the manifest the editor wrote: no folder scan, nothing written.
+    if (!m_assetLibrary->InitializeReadOnly())
         m_assetLibrary.reset();
 }
 
@@ -2945,8 +3298,8 @@ void EditorImGui::RefreshAssetLibrary()
 {
     if (!m_assetLibrary)
         return;
-    std::string error;
-    m_assetLibrary->Refresh(error);
+    // The game only re-reads the manifest the editor wrote: it never scans or writes its own folder.
+    m_assetLibrary->InitializeReadOnly();
 }
 
 // Real (non-stub) native game-module loader for the runtime: scans <ProjectRoot>/Binaries for module
@@ -3031,13 +3384,56 @@ std::optional<LodConfig> EditorImGui::FindModelLodDefault(const std::string&) co
 
 // Asset-path resolvers are NOT editor UI — they're plain asset-library lookups (imgui-free), so they
 // get REAL implementations in the runtime build too. They resolve once the runtime initializes the
-// project asset library (InitializeProjectAssetLibrary), letting the shared sim load audio + Lua.
+// project asset library (InitializeProjectAssetLibrary), letting the shared sim load audio + Lua,
+// and animate characters through their AnimatorControllers and clips.
+std::string EditorImGui::AnimationClipFilePath(const std::string& clipId) const
+{
+    if (!m_assetLibrary || clipId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(clipId);
+    if (!entry || entry->category != AssetLibrary::Category::AnimationClip)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::AnimatorControllerFilePath(const std::string& controllerId) const
+{
+    if (!m_assetLibrary || controllerId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(controllerId);
+    if (!entry || entry->category != AssetLibrary::Category::AnimatorController)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::FindAnimationClipIdByDisplayName(const std::string& displayName) const
+{
+    if (!m_assetLibrary || displayName.empty())
+        return {};
+    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+    {
+        if (entry.category == AssetLibrary::Category::AnimationClip && entry.displayName == displayName)
+            return entry.id;
+    }
+    return {};
+}
+
 std::string EditorImGui::AudioClipFilePath(const std::string& clipId) const
 {
     if (!m_assetLibrary || clipId.empty())
         return {};
     const auto entry = m_assetLibrary->FindById(clipId);
     if (!entry || entry->category != AssetLibrary::Category::Audio)
+        return {};
+    return m_assetLibrary->AbsolutePath(*entry).generic_string();
+}
+
+std::string EditorImGui::TextureFilePath(const std::string& textureId) const
+{
+    if (!m_assetLibrary || textureId.empty())
+        return {};
+    const auto entry = m_assetLibrary->FindById(textureId);
+    if (!entry || entry->category != AssetLibrary::Category::Texture)
         return {};
     return m_assetLibrary->AbsolutePath(*entry).generic_string();
 }
@@ -3056,3 +3452,38 @@ void EditorImGui::Destroy()
 {
 }
 #endif
+
+// Script text prompts: the data handoff is build-agnostic; only the drawing needs the editor UI.
+void EditorImGui::SetScriptPrompts(std::vector<ScriptPromptView> prompts)
+{
+    // Drop (and wipe) buffers whose prompt is no longer open.
+    for (auto it = m_scriptPrompts.begin(); it != m_scriptPrompts.end();)
+    {
+        const bool listed = std::any_of(prompts.begin(), prompts.end(),
+            [&](const ScriptPromptView& view) { return view.id == it->view.id; });
+        if (listed)
+        {
+            ++it;
+            continue;
+        }
+        std::fill(it->text.begin(), it->text.end(), '\0');
+        it = m_scriptPrompts.erase(it);
+    }
+    for (ScriptPromptView& view : prompts)
+    {
+        const bool known = std::any_of(m_scriptPrompts.begin(), m_scriptPrompts.end(),
+            [&](const ScriptPromptBuffer& buffer) { return buffer.view.id == view.id; });
+        if (known)
+            continue;
+        ScriptPromptBuffer buffer;
+        buffer.view = std::move(view);
+        m_scriptPrompts.push_back(std::move(buffer));
+    }
+}
+
+std::vector<EditorImGui::ScriptPromptAnswer> EditorImGui::TakeScriptPromptAnswers()
+{
+    std::vector<ScriptPromptAnswer> answers;
+    answers.swap(m_scriptPromptAnswers);
+    return answers;
+}

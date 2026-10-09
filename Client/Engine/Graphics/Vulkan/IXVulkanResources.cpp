@@ -3,8 +3,10 @@
 #include "IXVulkanResources.h"
 
 #include "IXVulkanDevice.h"
+#include "IXVulkanCommandList.h"
 #include "VulkanDevice.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace ixvulkan
@@ -30,42 +32,38 @@ IXVulkanBuffer::~IXVulkanBuffer()
     if (m_device == nullptr)
         return;
     const VkDevice native = m_device->NativeDevice();
+    if (m_mapped != nullptr)
+        vkUnmapMemory(native, m_memory);
     if (m_buffer != VK_NULL_HANDLE)
         vkDestroyBuffer(native, m_buffer, nullptr);
     if (m_memory != VK_NULL_HANDLE)
         vkFreeMemory(native, m_memory, nullptr);
 }
 
+void* IXVulkanBuffer::Mapped()
+{
+    if (m_mapped == nullptr)
+    {
+        IXVULKAN_CHECK(*m_device,
+            vkMapMemory(m_device->NativeDevice(), m_memory, 0, VK_WHOLE_SIZE, 0, &m_mapped));
+    }
+    return m_mapped;
+}
+
 void IXVulkanBuffer::Write(std::uint64_t dstOffsetBytes, const void* src, std::size_t byteCount)
 {
     if (src == nullptr || byteCount == 0 || dstOffsetBytes + byteCount > m_sizeBytes)
         return; // InvalidArgument-class misuse: ignore (validated at higher level)
-    void* mapped = nullptr;
-    IXVULKAN_CHECK(*m_device,
-        vkMapMemory(m_device->NativeDevice(),
-            m_memory,
-            static_cast<VkDeviceSize>(dstOffsetBytes),
-            static_cast<VkDeviceSize>(byteCount),
-            0,
-            &mapped));
-    std::memcpy(mapped, src, byteCount);
-    vkUnmapMemory(m_device->NativeDevice(), m_memory);
+    if (void* mapped = Mapped())
+        std::memcpy(static_cast<std::uint8_t*>(mapped) + dstOffsetBytes, src, byteCount);
 }
 
 void IXVulkanBuffer::Read(std::uint64_t srcOffsetBytes, void* dst, std::size_t byteCount)
 {
     if (dst == nullptr || byteCount == 0 || srcOffsetBytes + byteCount > m_sizeBytes)
         return;
-    void* mapped = nullptr;
-    IXVULKAN_CHECK(*m_device,
-        vkMapMemory(m_device->NativeDevice(),
-            m_memory,
-            static_cast<VkDeviceSize>(srcOffsetBytes),
-            static_cast<VkDeviceSize>(byteCount),
-            0,
-            &mapped));
-    std::memcpy(dst, mapped, byteCount);
-    vkUnmapMemory(m_device->NativeDevice(), m_memory);
+    if (const void* mapped = Mapped())
+        std::memcpy(dst, static_cast<const std::uint8_t*>(mapped) + srcOffsetBytes, byteCount);
 }
 
 IXVulkanTexture::IXVulkanTexture(IXVulkanDevice& device,
@@ -74,6 +72,8 @@ IXVulkanTexture::IXVulkanTexture(IXVulkanDevice& device,
                                  VkImageView view,
                                  std::uint32_t width,
                                  std::uint32_t height,
+                                 std::uint32_t mipLevels,
+                                 std::uint32_t arrayLayers,
                                  ixrhi::IXRHIFormat format,
                                  std::string debugName)
     : m_device(&device)
@@ -82,6 +82,8 @@ IXVulkanTexture::IXVulkanTexture(IXVulkanDevice& device,
     , m_view(view)
     , m_width(width)
     , m_height(height)
+    , m_mipLevels(mipLevels == 0 ? 1u : mipLevels)
+    , m_arrayLayers(arrayLayers == 0 ? 1u : arrayLayers)
     , m_format(format)
     , m_debugName(std::move(debugName))
 {
@@ -92,6 +94,8 @@ IXVulkanTexture::~IXVulkanTexture()
     if (m_device == nullptr)
         return;
     const VkDevice native = m_device->NativeDevice();
+    if (m_sampledView != VK_NULL_HANDLE)
+        vkDestroyImageView(native, m_sampledView, nullptr);
     if (m_view != VK_NULL_HANDLE)
         vkDestroyImageView(native, m_view, nullptr);
     if (m_image != VK_NULL_HANDLE)
@@ -206,6 +210,7 @@ IXVulkanBufferUpload::IXVulkanBufferUpload(IXVulkanDevice& device,
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cmd;
     // No wait: completion is polled via IsReady (parity with the old LOD path).
+    std::lock_guard<std::mutex> queueLock(device.QueueSubmitMutex());
     IXVULKAN_CHECK(device,
         vkQueueSubmit(device.Loop().GetGraphicsQueue(), 1, &submit, m_fence));
 }
@@ -262,6 +267,54 @@ void IXVulkanBufferUpload::ReleaseStaging()
     if (m_stagingMemory != VK_NULL_HANDLE)
         vkFreeMemory(native, m_stagingMemory, nullptr);
     m_stagingMemory = VK_NULL_HANDLE;
+}
+
+IXVulkanOcclusionQueries::IXVulkanOcclusionQueries(IXVulkanDevice& device, VkQueryPool pool, std::uint32_t count)
+    : m_device(&device)
+    , m_pool(pool)
+    , m_count(count)
+{
+}
+
+IXVulkanOcclusionQueries::~IXVulkanOcclusionQueries()
+{
+    if (m_device != nullptr && m_pool != VK_NULL_HANDLE)
+        vkDestroyQueryPool(m_device->NativeDevice(), m_pool, nullptr);
+}
+
+void IXVulkanOcclusionQueries::Reset(ixrhi::IXRHICommandList& cmd, std::uint32_t first, std::uint32_t count)
+{
+    auto* native = dynamic_cast<IXVulkanCommandList*>(&cmd);
+    if (native == nullptr || first >= m_count)
+        return;
+    vkCmdResetQueryPool(native->Native(), m_pool, first, std::min(count, m_count - first));
+}
+
+void IXVulkanOcclusionQueries::Begin(ixrhi::IXRHICommandList& cmd, std::uint32_t index)
+{
+    auto* native = dynamic_cast<IXVulkanCommandList*>(&cmd);
+    if (native != nullptr && index < m_count)
+        vkCmdBeginQuery(native->Native(), m_pool, index, 0);  // not precise: zero or not is enough
+}
+
+void IXVulkanOcclusionQueries::End(ixrhi::IXRHICommandList& cmd, std::uint32_t index)
+{
+    auto* native = dynamic_cast<IXVulkanCommandList*>(&cmd);
+    if (native != nullptr && index < m_count)
+        vkCmdEndQuery(native->Native(), m_pool, index);
+}
+
+bool IXVulkanOcclusionQueries::TryGetResult(std::uint32_t index, std::uint64_t& samples)
+{
+    if (m_device == nullptr || index >= m_count)
+        return false;
+    std::uint64_t result[2] = {0, 0};  // value, availability
+    const VkResult status = vkGetQueryPoolResults(m_device->NativeDevice(), m_pool, index, 1, sizeof(result),
+        result, sizeof(result), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+    if ((status != VK_SUCCESS && status != VK_NOT_READY) || result[1] == 0)
+        return false;
+    samples = result[0];
+    return true;
 }
 
 } // namespace ixvulkan

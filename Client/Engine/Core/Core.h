@@ -14,9 +14,12 @@
 //     Core/Math       -> libs/math (IXMath.h/Types.h/Vector.h/Matrix.h/...)
 //     Core/Platform   -> libs/platform (NativeWindow/VulkanDevice/Process/...)
 //     Core/Common     -> libs/common
-// - Known Phase 1 violation under review: libs/platform/VulkanDevice.* lives in the
-//   Platform lib but is really Graphics/Vulkan. It stays put in Phase 1 (moving it
-//   would touch every renderer include); Phase 2 relocates it behind IXVulkanDevice.
+// - Known placement debt (Phase 1 → 3H, unchanged): libs/platform/VulkanDevice.*
+//   lives in the Platform lib but is really backend bootstrap for Graphics/Vulkan.
+//   It stays put (moving it would touch every consumer include for zero behavior
+//   gain); the IXVulkan backend owns all frame/device authority behind
+//   IXVulkanDevice, and no generic renderer calls VulkanDevice frame APIs
+//   anymore (deleted in Phase 3F).
 
 namespace ixengine::core
 {

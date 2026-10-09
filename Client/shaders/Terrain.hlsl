@@ -175,18 +175,39 @@ float SampleShadowPCF(float3 worldPos, int cascadeIndex)
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0)
         return 1.0;
 
-    const float texelSize = 1.0 / max(u_shadowParams.y, 1.0);
-    const float compareDepth = ndc.z - u_shadowParams.z;
+    const float shadowSize = max(u_shadowParams.y, 1.0);
+    // The bias: u_shadowParams.z depth units less u_shadowParams.w metres of the cascade's depth (its
+    // matrix's z column is 1 / its depth range in metres): the padding the range carries for its moves
+    // takes no bias.
+    const float4x4 cascadeMatrix = u_cascadeViewProj[cascadeIndex];
+    const float depthPerMetre = length(float3(cascadeMatrix[0][2], cascadeMatrix[1][2], cascadeMatrix[2][2]));
+    const float compareDepth = ndc.z - (u_shadowParams.z - u_shadowParams.w * depthPerMetre);
+    // A 5x5 grid of bilinear compare taps one texel apart weights, along each axis, the texels
+    // base-2 .. base+3 by (1-f, 1, 1, 1, 1, f). Each adjacent pair of them is one bilinear tap placed
+    // at the pair's weight ratio, so the same filter takes 3x3 = 9 taps instead of 25 (the shadow
+    // lookup was about half of the terrain pass).
+    const float2 texCoord = uv * shadowSize - 0.5;
+    const float2 base = floor(texCoord);
+    const float2 f = texCoord - base;
+    const float2 weight0 = 2.0 - f;
+    const float2 weight2 = 1.0 + f;
+    const float2 tap0 = base - 2.0 + 1.0 / weight0;
+    const float2 tap1 = base + 0.5;
+    const float2 tap2 = base + 2.0 + f / weight2;
     float lit = 0.0;
     [unroll]
-    for (int x = -2; x <= 2; ++x)
+    for (int ix = 0; ix < 3; ++ix)
     {
+        const float tapX = ix == 0 ? tap0.x : (ix == 1 ? tap1.x : tap2.x);
+        const float weightX = ix == 0 ? weight0.x : (ix == 1 ? 2.0 : weight2.x);
         [unroll]
-        for (int y = -2; y <= 2; ++y)
+        for (int iy = 0; iy < 3; ++iy)
         {
-            lit += u_shadowTex.SampleCmpLevelZero(
+            const float tapY = iy == 0 ? tap0.y : (iy == 1 ? tap1.y : tap2.y);
+            const float weightY = iy == 0 ? weight0.y : (iy == 1 ? 2.0 : weight2.y);
+            lit += weightX * weightY * u_shadowTex.SampleCmpLevelZero(
                 u_shadowSampler,
-                float3(uv + float2((float)x, (float)y) * texelSize, (float)cascadeIndex),
+                float3((float2(tapX, tapY) + 0.5) / shadowSize, (float)cascadeIndex),
                 compareDepth);
         }
     }
@@ -287,6 +308,13 @@ float3 DecodeLayerNormalGrad(float2 uv, float2 uvDx, float2 uvDy, int layer)
     float3 sampledNormal = u_normalTex.SampleGrad(u_normalSampler, float3(uv, (float)layer), uvDx, uvDy).rgb * 2.0 - 1.0;
     sampledNormal.xy *= u_materialTintNormal[layer].w;
     return SafeNormalize(sampledNormal, float3(0.0, 0.0, 1.0));
+}
+
+// A layer's ambient occlusion, roughness and metallic in one fetch: the renderer packs them into one
+// RGBA array (bound to the ao, roughness and metallic slots alike).
+float3 SampleLayerOrm(float2 uv, float2 uvDx, float2 uvDy, int layer)
+{
+    return u_aoTex.SampleGrad(u_aoSampler, float3(uv, (float)layer), uvDx, uvDy).rgb;
 }
 
 float3 TriplanarNormalToWorld(float3 normalTs, int axis, float3 surfaceNormal)
@@ -472,9 +500,10 @@ float4 PSMain(VSOutput input) : SV_Target0
         {
             const float3 normalY = TriplanarNormalToWorld(DecodeLayerNormalGrad(uvY, uvYDx, uvYDy, layer), 1, surfaceNormal);
             diffuse = u_paletteTex.SampleGrad(u_paletteSampler, float3(uvY, (float)layer), uvYDx, uvYDy).rgb;
-            sampledAo = u_aoTex.SampleGrad(u_aoSampler, float3(uvY, (float)layer), uvYDx, uvYDy).r;
-            sampledRoughness = u_roughnessTex.SampleGrad(u_roughnessSampler, float3(uvY, (float)layer), uvYDx, uvYDy).r;
-            sampledMetallic = u_metallicTex.SampleGrad(u_metallicSampler, float3(uvY, (float)layer), uvYDx, uvYDy).r;
+            const float3 ormY = SampleLayerOrm(uvY, uvYDx, uvYDy, layer);
+            sampledAo = ormY.r;
+            sampledRoughness = ormY.g;
+            sampledMetallic = ormY.b;
             sampledNormalWs = normalY;
 
             [branch]
@@ -482,18 +511,12 @@ float4 PSMain(VSOutput input) : SV_Target0
             {
                 const float3 diffuseX = u_paletteTex.SampleGrad(u_paletteSampler, float3(uvX, (float)layer), uvXDx, uvXDy).rgb;
                 const float3 diffuseZ = u_paletteTex.SampleGrad(u_paletteSampler, float3(uvZ, (float)layer), uvZDx, uvZDy).rgb;
-                const float triAo =
-                    u_aoTex.SampleGrad(u_aoSampler, float3(uvX, (float)layer), uvXDx, uvXDy).r * triplanarWeights.x +
-                    sampledAo * triplanarWeights.y +
-                    u_aoTex.SampleGrad(u_aoSampler, float3(uvZ, (float)layer), uvZDx, uvZDy).r * triplanarWeights.z;
-                const float triRoughness =
-                    u_roughnessTex.SampleGrad(u_roughnessSampler, float3(uvX, (float)layer), uvXDx, uvXDy).r * triplanarWeights.x +
-                    sampledRoughness * triplanarWeights.y +
-                    u_roughnessTex.SampleGrad(u_roughnessSampler, float3(uvZ, (float)layer), uvZDx, uvZDy).r * triplanarWeights.z;
-                const float triMetallic =
-                    u_metallicTex.SampleGrad(u_metallicSampler, float3(uvX, (float)layer), uvXDx, uvXDy).r * triplanarWeights.x +
-                    sampledMetallic * triplanarWeights.y +
-                    u_metallicTex.SampleGrad(u_metallicSampler, float3(uvZ, (float)layer), uvZDx, uvZDy).r * triplanarWeights.z;
+                const float3 ormX = SampleLayerOrm(uvX, uvXDx, uvXDy, layer);
+                const float3 ormZ = SampleLayerOrm(uvZ, uvZDx, uvZDy, layer);
+                const float3 triOrm = ormX * triplanarWeights.x + ormY * triplanarWeights.y + ormZ * triplanarWeights.z;
+                const float triAo = triOrm.r;
+                const float triRoughness = triOrm.g;
+                const float triMetallic = triOrm.b;
                 const float3 triDiffuse = diffuseX * triplanarWeights.x +
                     diffuse * triplanarWeights.y +
                     diffuseZ * triplanarWeights.z;
@@ -516,9 +539,10 @@ float4 PSMain(VSOutput input) : SV_Target0
         {
             diffuse = u_paletteTex.SampleGrad(u_paletteSampler, float3(materialUv, (float)layer), materialUvDx, materialUvDy).rgb;
             sampledNormal = DecodeLayerNormalGrad(materialUv, materialUvDx, materialUvDy, layer);
-            sampledAo = u_aoTex.SampleGrad(u_aoSampler, float3(materialUv, (float)layer), materialUvDx, materialUvDy).r;
-            sampledRoughness = u_roughnessTex.SampleGrad(u_roughnessSampler, float3(materialUv, (float)layer), materialUvDx, materialUvDy).r;
-            sampledMetallic = u_metallicTex.SampleGrad(u_metallicSampler, float3(materialUv, (float)layer), materialUvDx, materialUvDy).r;
+            const float3 orm = SampleLayerOrm(materialUv, materialUvDx, materialUvDy, layer);
+            sampledAo = orm.r;
+            sampledRoughness = orm.g;
+            sampledMetallic = orm.b;
         }
         albedo += weights[layer] * diffuse * u_materialTintNormal[layer].rgb;
         if (triplanarEnabled)

@@ -24,6 +24,8 @@ struct AudioSourceRuntime
 {
     ::ma_sound* sound = nullptr;
     bool ok = false;
+    bool pausedByEntity = false;
+    bool resumeAfterEntityPause = false;
     AudioSourceRuntime() = default;
     AudioSourceRuntime(AudioSourceRuntime&& other) noexcept;
     AudioSourceRuntime& operator=(AudioSourceRuntime&& other) noexcept;
@@ -55,6 +57,7 @@ public:
     // Per-entity AudioSource lifecycle (driven by the Play loop).
     bool CreateSource(AudioSourceRuntime& rt, const AudioSourceComponent& comp, const std::string& absFilePath);
     void StartSource(AudioSourceRuntime& rt);
+    void SetSourcePaused(AudioSourceRuntime& rt, bool paused);
     // Pushes live state (volume/pitch/loop) every frame; pos is the world position for 3D sources.
     void UpdateSource(AudioSourceRuntime& rt, const AudioSourceComponent& comp, const float pos[3]);
     // Listener (the "ears") — Chunk 4 drives this from the camera / a listener entity each frame.
