@@ -142,6 +142,16 @@ endif()
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
 
 if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(FbxImportTest tests/FbxImportTest.cpp)
+    target_link_libraries(FbxImportTest PRIVATE IXEngineRender)
+    target_compile_features(FbxImportTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(FbxImportTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME FbxImportTest COMMAND FbxImportTest)
+    set_tests_properties(FbxImportTest PROPERTIES TIMEOUT 60)
+
     add_executable(ExrImageTest tests/ExrImageTest.cpp)
     target_link_libraries(ExrImageTest PRIVATE IXEngineRender)
     target_compile_features(ExrImageTest PRIVATE cxx_std_20)

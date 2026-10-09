@@ -79,7 +79,7 @@ std::optional<int> JsonIntValue(const std::string& object, const std::string& ke
 bool HasJsonObjectShape(const std::string& text);
 bool ImportFbxSidecars(const std::filesystem::path& destination,
                        const std::filesystem::path& libraryRoot,
-                       std::string& error);
+                       std::string& error, const std::filesystem::path& source = {});
 
 bool JsonBoolValue(const std::string& object, const std::string& key, bool fallback)
 {
@@ -183,7 +183,7 @@ std::string JsonObjectValue(const std::string& object, const std::string& key)
 
 bool ImportFbxSidecars(const std::filesystem::path& destination,
                        const std::filesystem::path& libraryRoot,
-                       std::string& error)
+                       std::string& error, const std::filesystem::path& source)
 {
     if (!g_fbxSidecarProcessor)
     {
@@ -193,7 +193,7 @@ bool ImportFbxSidecars(const std::filesystem::path& destination,
             error.c_str());
         return false;
     }
-    return g_fbxSidecarProcessor(destination, libraryRoot, error);
+    return g_fbxSidecarProcessor(destination, libraryRoot, error, source);
 }
 
 LodConfig ReadLodConfigJson(const std::string& object)
@@ -1587,19 +1587,31 @@ bool IsSkippedLibraryDirectory(const std::filesystem::path& directory, int depth
     return ignored.contains(name);
 }
 
-// Moves an asset's .meta sidecar along with it (when it has one). Returns false only when a
-// sidecar exists and could not be moved.
-bool MoveMetaSidecar(const std::filesystem::path& source, const std::filesystem::path& destination, std::string& error)
+// Keep GUID metadata and import diagnostics beside an asset through renames/moves.
+bool MoveAssetSidecars(const std::filesystem::path& source, const std::filesystem::path& destination, std::string& error)
 {
-    std::error_code ec;
-    const std::filesystem::path sourceMeta = MetaSidecarPath(source);
-    if (!std::filesystem::exists(sourceMeta, ec))
-        return true;
-    std::filesystem::rename(sourceMeta, MetaSidecarPath(destination), ec);
-    if (ec)
+    std::vector<std::pair<std::filesystem::path, std::filesystem::path>> moved;
+    for (const char* suffix : {".meta", ".import.json"})
     {
-        error = "moving .meta failed: " + ec.message();
-        return false;
+        std::filesystem::path from = source, to = destination;
+        from += suffix;
+        to += suffix;
+        std::error_code ec;
+        const bool exists = std::filesystem::exists(from, ec);
+        if (!ec && !exists) continue;
+        if (!ec) std::filesystem::rename(from, to, ec);
+        if (ec)
+        {
+            error = std::string("moving ") + suffix + " failed: " + ec.message();
+            for (auto it = moved.rbegin(); it != moved.rend(); ++it)
+            {
+                std::error_code rollback;
+                std::filesystem::rename(it->second, it->first, rollback);
+                if (rollback) error += "; sidecar rollback failed: " + rollback.message();
+            }
+            return false;
+        }
+        moved.emplace_back(from, to);
     }
     return true;
 }
@@ -3328,6 +3340,47 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
     return true;
 }
 
+AssetLibrary::ModelContents AssetLibrary::QueryModelContents(const Entry& model) const
+{
+    ModelContents contents;
+    if (model.category != Category::Model) return contents;
+    const auto modelPath = AbsolutePath(model);
+    auto& database = AssetDatabase::Instance();
+    std::unordered_map<std::string, const Entry*> byPath;
+    for (const auto& entry : m_entries)
+        if (entry.category == Category::Material || entry.category == Category::Texture)
+            byPath[ToLower(AbsolutePath(entry).lexically_normal().generic_string())] = &entry;
+    std::unordered_set<Guid> seen;
+    std::vector<Entry> textures;
+    const auto add = [&](const Guid& guid) {
+        if (!seen.insert(guid).second) return;
+        const auto path = database.resolveGuid(guid);
+        if (!path) return;
+        const auto found = byPath.find(ToLower(path->lexically_normal().generic_string()));
+        if (found == byPath.end()) return;
+        if (found->second->category == Category::Material) contents.assets.push_back(*found->second);
+        else textures.push_back(*found->second);
+    };
+    for (const auto& guid : database.loadDefaultMaterials(modelPath))
+    {
+        add(guid);
+        // Live material edits can add textures not present at import time.
+        if (const auto* material = MaterialAssetManager::Instance().getOrLoad(guid))
+            for (const auto& texture : {material->baseColorTexture, material->normalTexture, material->metallicRoughnessTexture,
+                    material->aoTexture, material->emissiveTexture, material->roughnessTexture, material->metallicTexture, material->heightTexture})
+                if (texture) add(*texture);
+    }
+    for (const auto& guid : database.loadDependencies(modelPath)) add(guid);
+    contents.assets.insert(contents.assets.end(), textures.begin(), textures.end());
+    std::ifstream report(modelPath.string() + ".import.json", std::ios::binary);
+    if (report)
+    {
+        const std::string text((std::istreambuf_iterator<char>(report)), std::istreambuf_iterator<char>());
+        contents.missingTextures = JsonStringArrayValue(text, "missing_textures");
+    }
+    return contents;
+}
+
 std::string AssetLibrary::MakeUniqueId(Category category, const std::filesystem::path& sourcePath) const
 {
     std::unordered_set<std::string> existing;
@@ -3448,7 +3501,7 @@ bool AssetLibrary::Import(Category category,
     }
     if (category == Category::Model &&
         ToLower(sourcePath.extension().string()) == ".fbx" &&
-        !ImportFbxSidecars(destination, m_libraryRoot, error))
+        !ImportFbxSidecars(destination, m_libraryRoot, error, sourcePath))
     {
         std::filesystem::remove(destination, ec);
         return false;
@@ -3583,7 +3636,7 @@ bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
     }
     if (*category == Category::Model &&
         ToLower(absoluteSource.extension().string()) == ".fbx" &&
-        !ImportFbxSidecars(destination, m_libraryRoot, error))
+        !ImportFbxSidecars(destination, m_libraryRoot, error, absoluteSource))
     {
         if (!sameFile)
             std::filesystem::remove(destination, ec);
@@ -4454,13 +4507,13 @@ bool AssetLibrary::MoveAssetToSubpath(const std::string& id,
     }
 
     // The .meta (the asset's GUID) travels with the file so references stay valid.
-    if (!MoveMetaSidecar(source, destination, error))
+    if (!MoveAssetSidecars(source, destination, error))
         return false;
     std::filesystem::rename(source, destination, ec);
     if (ec)
     {
         std::string ignored;
-        MoveMetaSidecar(destination, source, ignored);
+        MoveAssetSidecars(destination, source, ignored);
         error = ec.message();
         return false;
     }
@@ -4474,7 +4527,7 @@ bool AssetLibrary::MoveAssetToSubpath(const std::string& id,
         if (!rollbackEc)
             std::filesystem::rename(destination, source, rollbackEc);
         std::string ignored;
-        MoveMetaSidecar(destination, source, ignored);
+        MoveAssetSidecars(destination, source, ignored);
         *it = oldEntry;
         error = "manifest save failed: " + manifestError;
         if (rollbackEc)
@@ -4595,14 +4648,14 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         oldStructuredText.assign(std::istreambuf_iterator<char>(oldFile), std::istreambuf_iterator<char>());
     }
 
-    if (!MoveMetaSidecar(source, destination, error))
+    if (!MoveAssetSidecars(source, destination, error))
         return false;
     std::error_code ec;
     std::filesystem::rename(source, destination, ec);
     if (ec)
     {
         std::string ignored;
-        MoveMetaSidecar(destination, source, ignored);
+        MoveAssetSidecars(destination, source, ignored);
         error = ec.message();
         return false;
     }
@@ -4614,7 +4667,7 @@ bool AssetLibrary::RenameAsset(const std::string& id,
             std::error_code rollbackEc;
             std::filesystem::rename(destination, source, rollbackEc);
             std::string ignoredMetaError;
-            MoveMetaSidecar(destination, source, ignoredMetaError);
+            MoveAssetSidecars(destination, source, ignoredMetaError);
             if (!oldStructuredText.empty())
             {
                 std::string ignored;
@@ -4632,7 +4685,7 @@ bool AssetLibrary::RenameAsset(const std::string& id,
             std::error_code rollbackEc;
             std::filesystem::rename(destination, source, rollbackEc);
             std::string ignoredMetaError;
-            MoveMetaSidecar(destination, source, ignoredMetaError);
+            MoveAssetSidecars(destination, source, ignoredMetaError);
             if (!oldStructuredText.empty())
             {
                 std::string ignored;
@@ -4650,7 +4703,7 @@ bool AssetLibrary::RenameAsset(const std::string& id,
             std::error_code rollbackEc;
             std::filesystem::rename(destination, source, rollbackEc);
             std::string ignoredMetaError;
-            MoveMetaSidecar(destination, source, ignoredMetaError);
+            MoveAssetSidecars(destination, source, ignoredMetaError);
             if (!oldStructuredText.empty())
             {
                 std::string ignored;
@@ -4669,7 +4722,7 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         std::error_code rollbackEc;
         std::filesystem::rename(destination, source, rollbackEc);
         std::string ignoredMetaError;
-        MoveMetaSidecar(destination, source, ignoredMetaError);
+        MoveAssetSidecars(destination, source, ignoredMetaError);
         if (!oldStructuredText.empty())
         {
             std::string ignored;

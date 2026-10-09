@@ -80,6 +80,7 @@ public:
     std::optional<Guid> resolvePath(const std::filesystem::path& absPath) const;
     Guid getOrCreateGuid(const std::filesystem::path& absPath);
     std::vector<Guid> loadDefaultMaterials(const std::filesystem::path& modelPath) const;
+    std::vector<Guid> loadDependencies(const std::filesystem::path& assetPath) const;
     bool writeDefaultMaterials(const std::filesystem::path& modelPath, const std::vector<Guid>& materials) const;
     bool writeDependencies(const std::filesystem::path& assetPath, const std::vector<Guid>& dependencies) const;
     bool writeSkeletalAsset(const std::filesystem::path& modelPath,

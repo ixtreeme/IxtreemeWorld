@@ -964,6 +964,17 @@ bool AssetDatabase::writeDefaultMaterials(const std::filesystem::path& modelPath
     return true;
 }
 
+std::vector<Guid> AssetDatabase::loadDependencies(const std::filesystem::path& assetPath) const
+{
+    std::ifstream file(metaPathFor(canonicalPath(assetPath)), std::ios::binary);
+    if (!file) return {};
+    const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    std::vector<Guid> result;
+    for (const auto& value : JsonStringArrayValue(text, "dependencies"))
+        if (const auto guid = Guid::fromString(value)) result.push_back(*guid);
+    return result;
+}
+
 bool AssetDatabase::writeDependencies(const std::filesystem::path& assetPathInput,
                                       const std::vector<Guid>& dependencies) const
 {

@@ -88,6 +88,8 @@ public:
         std::uint32_t embeddedTextures = 0;
         std::uint32_t externalTextures = 0;
         std::uint32_t missingTextures = 0;
+        std::vector<std::filesystem::path> texturePaths;
+        std::vector<std::string> missingTexturePaths;
         bool skeletalIgnored = false;
         bool hasSkeletal = false;
     };
@@ -95,6 +97,7 @@ public:
     struct ImportOptions
     {
         std::filesystem::path textureOutputDir;
+        std::filesystem::path textureSourceDir; // Original FBX folder, before the model was copied.
         bool extractTextures = false;
     };
 

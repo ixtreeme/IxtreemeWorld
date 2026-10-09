@@ -134,6 +134,26 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
 
     const ImVec2 previewMin = ImGui::GetCursorScreenPos();
     const ImVec2 previewMax(previewMin.x + tileSize, previewMin.y + tileSize);
+    if (entry.category == AssetLibrary::Category::Model)
+    {
+        const bool expanded = m_expandedModelAssets.contains(entry.id);
+        ImGui::SetCursorScreenPos(ImVec2(previewMin.x - 23.0f, previewMin.y + (tileSize - ImGui::GetFrameHeight()) * 0.5f));
+        if (ImGui::ArrowButton("##model_contents", expanded ? ImGuiDir_Down : ImGuiDir_Right))
+        {
+            if (expanded) m_expandedModelAssets.erase(entry.id);
+            else m_expandedModelAssets.insert(entry.id);
+        }
+        if (ImGui::IsItemHovered())
+        {
+            const auto& contents = QueryModelContents(entry);
+            ImGui::BeginTooltip();
+            ImGui::Text("%zu materials/textures", contents.assets.size());
+            if (!contents.missingTextures.empty())
+                ImGui::TextColored(UI::Theme::Warning, "%zu missing textures", contents.missingTextures.size());
+            ImGui::EndTooltip();
+        }
+        ImGui::SetCursorScreenPos(previewMin);
+    }
     ImGui::InvisibleButton("##asset_tile", ImVec2(tileSize, tileSize));
     const bool clicked = ImGui::IsItemClicked(ImGuiMouseButton_Left);
     const bool doubleClicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
@@ -312,6 +332,13 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         if (!entry.displayName.empty() && entry.displayName != entry.filename)
             ImGui::TextDisabled("Name: %s", entry.displayName.c_str());
         ImGui::TextDisabled("Type: %s", AssetLibrary::CategoryName(entry.category));
+        if (entry.category == AssetLibrary::Category::Model)
+        {
+            const auto& contents = QueryModelContents(entry);
+            ImGui::TextDisabled("Contents: %zu materials/textures (use the arrow to expand)", contents.assets.size());
+            for (const auto& missing : contents.missingTextures)
+                ImGui::TextColored(UI::Theme::Warning, "Missing texture: %s", missing.c_str());
+        }
         if (!entry.subpath.empty())
             ImGui::TextDisabled("Folder: %s", entry.subpath.c_str());
         if (entry.category == AssetLibrary::Category::Texture)
@@ -545,6 +572,28 @@ void EditorImGui::RenderAssetBrowserContent()
             beginCell();
             RenderAssetTile(entry, kAssetTileSize);
             ImGui::EndGroup();
+            if (entry.category == AssetLibrary::Category::Model && m_expandedModelAssets.contains(entry.id))
+            {
+                const auto& contents = QueryModelContents(entry);
+                ImGui::PushID(entry.id.c_str());
+                for (const auto& child : contents.assets)
+                {
+                    beginCell();
+                    const ImVec2 childMin = ImGui::GetCursorScreenPos();
+                    ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(childMin.x - 5.0f, childMin.y - 3.0f),
+                        ImVec2(childMin.x + kAssetTileSize + 5.0f, childMin.y + kAssetTileSize + 24.0f),
+                        IM_COL32(45, 65, 78, 120), 5.0f);
+                    RenderAssetTile(child, kAssetTileSize);
+                    ImGui::EndGroup();
+                }
+                if (contents.assets.empty())
+                {
+                    beginCell();
+                    ImGui::TextDisabled(contents.missingTextures.empty() ? "No materials\nor textures" : "Missing textures\nSee model tooltip");
+                    ImGui::EndGroup();
+                }
+                ImGui::PopID();
+            }
         }
         ImGui::EndTable();
     }

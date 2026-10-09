@@ -848,6 +848,7 @@ void EditorImGui::SetEngineRoot(const std::filesystem::path& clientRoot)
 
 void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot)
 {
+    m_expandedModelAssets.clear();
     SetEngineRoot(clientRoot);
     DestroyAssetPreviewTextures();
     InvalidateAssetBrowserCache();
@@ -873,6 +874,7 @@ void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot
 void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot,
                                                 const std::filesystem::path& assetRoot)
 {
+    m_expandedModelAssets.clear();
     DestroyAssetPreviewTextures();
     InvalidateAssetBrowserCache();
     m_assetLibrary = std::make_unique<AssetLibrary>(projectRoot, assetRoot);
@@ -1426,15 +1428,22 @@ void EditorImGui::ValidateAssetBrowserCache() const
     constexpr double kAssetBrowserCacheSeconds = 10.0;
     const double now = ImGui::GetTime();
     const std::uint64_t revision = m_assetLibrary ? m_assetLibrary->Revision() : 0;
+    const std::uint64_t materialRevision = MaterialAssetManager::Instance().Revision();
     if (cache.builtAt >= 0.0 && now >= cache.builtAt && now - cache.builtAt < kAssetBrowserCacheSeconds &&
         cache.library == m_assetLibrary.get() && cache.revision == revision)
     {
+        if (cache.materialRevision != materialRevision)
+        {
+            cache.modelContents.clear();
+            cache.materialRevision = materialRevision;
+        }
         cache.validatedFrame = frame;
         return;
     }
     cache = {};
     cache.library = m_assetLibrary.get();
     cache.revision = revision;
+    cache.materialRevision = materialRevision;
     cache.builtAt = now;
     cache.validatedFrame = frame;
 }
@@ -1446,6 +1455,14 @@ std::string EditorImGui::CachedComparablePath(const std::filesystem::path& path)
     if (inserted)
         cached->second = ComparablePath(path);
     return cached->second;
+}
+
+const AssetLibrary::ModelContents& EditorImGui::QueryModelContents(const AssetLibrary::Entry& model) const
+{
+    ValidateAssetBrowserCache();
+    auto [found, inserted] = m_assetBrowserCache.modelContents.try_emplace(model.id);
+    if (inserted && m_assetLibrary) found->second = m_assetLibrary->QueryModelContents(model);
+    return found->second;
 }
 
 const std::vector<std::string>& EditorImGui::QueryFilesystemChildFolders(const std::string& subpath) const
@@ -2054,6 +2071,13 @@ void EditorImGui::ImportAssetFromPath(const std::filesystem::path& sourcePath,
     SelectAssetBrowserFolder(normalizedTarget);
     m_selectedAssetId = entry.id;
     m_assetStatus = "Imported: " + entry.filename;
+    if (entry.category == AssetLibrary::Category::Model)
+    {
+        const auto contents = m_assetLibrary->QueryModelContents(entry);
+        if (!contents.assets.empty()) m_expandedModelAssets.insert(entry.id);
+        if (!contents.missingTextures.empty())
+            m_assetStatus += " (" + std::to_string(contents.missingTextures.size()) + " missing textures; hover the model for details)";
+    }
 }
 
 void EditorImGui::ImportExternalFiles(const std::vector<std::string>& paths, const char* trigger)

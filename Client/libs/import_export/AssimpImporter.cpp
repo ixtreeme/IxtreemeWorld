@@ -69,24 +69,35 @@ std::string Lower(std::string value)
     return value;
 }
 
-std::filesystem::path ResolveTexturePath(const std::filesystem::path& sourceFolder, const std::string& texturePath)
+std::filesystem::path PortableTexturePath(std::string value)
 {
-    std::filesystem::path path(texturePath);
-    if (path.is_absolute())
-        return path;
-    return sourceFolder / path;
+    std::replace(value.begin(), value.end(), '\\', '/');
+    return std::filesystem::path(value);
 }
 
-std::filesystem::path UniquePath(const std::filesystem::path& folder, const std::filesystem::path& filename)
+bool SameBytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes)
+{
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec) || std::filesystem::file_size(path, ec) != bytes.size()) return false;
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return false;
+    const std::vector<std::uint8_t> existing((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    return existing == bytes;
+}
+
+// Preserve edited assets, reuse identical imports, and separate different files sharing a basename.
+std::filesystem::path TextureDestination(const std::filesystem::path& folder, const std::filesystem::path& filename,
+                                        const std::vector<std::uint8_t>& bytes)
 {
     const std::string stem = SanitizeName(filename.stem().string());
-    std::string ext = filename.extension().string();
-    if (ext.empty())
-        ext = ".png";
-    std::filesystem::path candidate = folder / (stem + ext);
-    for (int i = 2; std::filesystem::exists(candidate) && i < 10000; ++i)
-        candidate = folder / (stem + "_" + std::to_string(i) + ext);
-    return candidate;
+    const std::string ext = filename.has_extension() ? filename.extension().string() : ".png";
+    for (int i = 1; i < 10000; ++i)
+    {
+        const auto candidate = folder / (stem + (i == 1 ? "" : "_" + std::to_string(i)) + ext);
+        std::error_code ec;
+        if (!std::filesystem::exists(candidate, ec) || SameBytes(candidate, bytes)) return candidate;
+    }
+    return {};
 }
 
 std::string EmbeddedTextureExtension(const aiTexture& texture)
@@ -111,95 +122,120 @@ bool WriteBytes(const std::filesystem::path& path, const void* data, std::size_t
     return file.good();
 }
 
-bool WriteRawTextureAsTga(const std::filesystem::path& path, const aiTexture& texture)
+struct TextureImportContext
 {
-    if (texture.mHeight == 0 || !texture.pcData)
-        return false;
-    std::error_code ec;
-    std::filesystem::create_directories(path.parent_path(), ec);
-    std::ofstream file(path, std::ios::binary | std::ios::trunc);
-    if (!file)
-        return false;
+    const aiScene& scene;
+    const std::filesystem::path& model;
+    const AssimpImporter::ImportOptions& options;
+    AssimpImporter::ImportResult& result;
+    std::unordered_map<std::string, std::filesystem::path> resolved;
+    std::unordered_map<std::string, std::vector<std::filesystem::path>> byFilename;
+    bool indexed = false;
 
-    const std::uint8_t header[18] = {
-        0, 0, 2,
-        0, 0, 0, 0, 0,
-        0, 0,
-        0, 0,
-        static_cast<std::uint8_t>(texture.mWidth & 0xff),
-        static_cast<std::uint8_t>((texture.mWidth >> 8) & 0xff),
-        static_cast<std::uint8_t>(texture.mHeight & 0xff),
-        static_cast<std::uint8_t>((texture.mHeight >> 8) & 0xff),
-        32,
-        0x20
-    };
-    file.write(reinterpret_cast<const char*>(header), sizeof(header));
-    file.write(reinterpret_cast<const char*>(texture.pcData),
-        static_cast<std::streamsize>(texture.mWidth) * static_cast<std::streamsize>(texture.mHeight) * 4);
-    return file.good();
-}
-
-std::optional<std::filesystem::path> ExtractOrCopyTexture(const aiScene& scene,
-                                                          const std::filesystem::path& fbxPath,
-                                                          const std::string& texturePath,
-                                                          const std::filesystem::path& textureOutputDir,
-                                                          std::uint32_t& embedded,
-                                                          std::uint32_t& external,
-                                                          std::uint32_t& missing)
-{
-    if (texturePath.empty() || textureOutputDir.empty())
-        return std::nullopt;
-
-    if (const aiTexture* embeddedTexture = scene.GetEmbeddedTexture(texturePath.c_str()))
+    std::filesystem::path FindExternal(const std::string& reference)
     {
-        std::string name = embeddedTexture->mFilename.length > 0
-            ? embeddedTexture->mFilename.C_Str()
-            : ("embedded_" + std::to_string(embedded));
-        std::filesystem::path filename(name);
-        if (!filename.has_extension())
-            filename += embeddedTexture->mHeight == 0 ? EmbeddedTextureExtension(*embeddedTexture) : ".tga";
-        const std::filesystem::path destination = UniquePath(textureOutputDir, filename.filename());
-        const bool ok = embeddedTexture->mHeight == 0
-            ? WriteBytes(destination, embeddedTexture->pcData, embeddedTexture->mWidth)
-            : WriteRawTextureAsTga(destination, *embeddedTexture);
-        if (ok)
+        const auto path = PortableTexturePath(reference);
+        const auto root = options.textureSourceDir.empty() ? model.parent_path() : options.textureSourceDir;
+        const auto nativeFolder = model.parent_path() / (SanitizeName(model.stem().string()) + "_textures");
+        std::error_code ec;
+        const auto exists = [&](const std::filesystem::path& candidate) {
+            ec.clear(); return std::filesystem::is_regular_file(candidate, ec);
+        };
+        // The original folder is essential: the destination contains only the copied FBX at this point.
+        for (const auto& candidate : {path.is_absolute() ? path : root / path, root / path.filename(),
+                model.parent_path() / path, nativeFolder / path.filename(),
+                nativeFolder / (SanitizeName(path.stem().string()) + path.extension().string())})
+            if (exists(candidate)) return candidate;
+        if (!options.extractTextures) return {};
+        if (!indexed)
         {
-            ++embedded;
-            return destination;
+            indexed = true;
+            std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+            for (; !ec && it != end; it.increment(ec))
+            {
+                std::error_code itemError;
+                if (it->is_regular_file(itemError)) byFilename[Lower(it->path().filename().string())].push_back(it->path());
+            }
         }
-        ++missing;
-        TraceError("[FBX-IMPORT] failed to extract embedded texture: %s", texturePath.c_str());
-        return std::nullopt;
+        const auto found = byFilename.find(Lower(path.filename().string()));
+        // Never guess between two textures with the same filename in a downloaded package.
+        return found != byFilename.end() && found->second.size() == 1 ? found->second.front() : std::filesystem::path{};
     }
 
-    const std::filesystem::path source = ResolveTexturePath(fbxPath.parent_path(), texturePath);
-    std::error_code ec;
-    if (!std::filesystem::exists(source, ec) || !std::filesystem::is_regular_file(source, ec))
+    std::filesystem::path Get(const std::string& reference)
     {
-        ++missing;
-        TraceError("[FBX-IMPORT] missing external texture: %s", source.generic_string().c_str());
-        return std::nullopt;
-    }
-
-    const std::filesystem::path destination = UniquePath(textureOutputDir, source.filename());
-    std::filesystem::create_directories(destination.parent_path(), ec);
-    ec.clear();
-    if (!std::filesystem::equivalent(source, destination, ec))
-    {
-        ec.clear();
-        std::filesystem::copy_file(source, destination, std::filesystem::copy_options::overwrite_existing, ec);
-        if (ec)
+        const aiTexture* embeddedTexture = scene.GetEmbeddedTexture(reference.c_str());
+        std::filesystem::path source;
+        if (!embeddedTexture) source = FindExternal(reference);
+        else if (!options.extractTextures)
         {
-            ++missing;
-            TraceError("[FBX-IMPORT] failed to copy external texture: %s error=%s",
-                source.generic_string().c_str(),
-                ec.message().c_str());
-            return std::nullopt;
+            auto filename = PortableTexturePath(embeddedTexture->mFilename.length ? embeddedTexture->mFilename.C_Str() : reference);
+            if (embeddedTexture->mHeight) filename.replace_extension(".tga");
+            else if (!filename.has_extension()) filename += EmbeddedTextureExtension(*embeddedTexture);
+            source = FindExternal(filename.generic_string());
         }
+        std::error_code ec;
+        const std::string key = embeddedTexture
+            ? "embedded:" + std::to_string(reinterpret_cast<std::uintptr_t>(embeddedTexture))
+            : (source.empty() ? "missing:" + reference : std::filesystem::weakly_canonical(source, ec).generic_string());
+        if (const auto found = resolved.find(key); found != resolved.end()) return found->second;
+        const auto missing = [&]() -> std::filesystem::path {
+            resolved[key] = std::filesystem::path{};
+            ++result.missingTextures;
+            result.missingTexturePaths.push_back(reference);
+            TraceError("[FBX-IMPORT] missing/unreadable texture: %s", reference.c_str());
+            return {};
+        };
+        if (!options.extractTextures)
+        {
+            resolved[key] = source;
+            return source;
+        }
+        if (!embeddedTexture && source.empty()) return missing();
+        std::filesystem::path filename;
+        std::vector<std::uint8_t> bytes;
+        if (embeddedTexture)
+        {
+            filename = PortableTexturePath(embeddedTexture->mFilename.length ? embeddedTexture->mFilename.C_Str() : reference).filename();
+            if (embeddedTexture->mHeight == 0)
+            {
+                if (!embeddedTexture->pcData || !embeddedTexture->mWidth) return missing();
+                const auto* begin = reinterpret_cast<const std::uint8_t*>(embeddedTexture->pcData);
+                bytes.assign(begin, begin + embeddedTexture->mWidth);
+                if (!filename.has_extension()) filename += EmbeddedTextureExtension(*embeddedTexture);
+            }
+            else
+            {
+                // Uncompressed aiTexel is BGRA; write a top-origin 32-bit TGA with alpha bits.
+                if (!embeddedTexture->pcData || embeddedTexture->mWidth > 65535 || embeddedTexture->mHeight > 65535) return missing();
+                filename.replace_extension(".tga");
+                bytes.assign(18, 0);
+                bytes[2] = 2;
+                bytes[12] = static_cast<std::uint8_t>(embeddedTexture->mWidth);
+                bytes[13] = static_cast<std::uint8_t>(embeddedTexture->mWidth >> 8);
+                bytes[14] = static_cast<std::uint8_t>(embeddedTexture->mHeight);
+                bytes[15] = static_cast<std::uint8_t>(embeddedTexture->mHeight >> 8);
+                bytes[16] = 32; bytes[17] = 0x28;
+                const auto* begin = reinterpret_cast<const std::uint8_t*>(embeddedTexture->pcData);
+                bytes.insert(bytes.end(), begin, begin + static_cast<std::size_t>(embeddedTexture->mWidth) * embeddedTexture->mHeight * 4u);
+            }
+        }
+        else
+        {
+            filename = source.filename();
+            std::ifstream file(source, std::ios::binary);
+            if (!file) return missing();
+            bytes.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+            if (bytes.empty()) return missing();
+        }
+        const auto destination = TextureDestination(options.textureOutputDir, filename, bytes);
+        if (destination.empty() || (!SameBytes(destination, bytes) && !WriteBytes(destination, bytes.data(), bytes.size()))) return missing();
+        resolved[key] = destination;
+        result.texturePaths.push_back(destination);
+        if (embeddedTexture) ++result.embeddedTextures; else ++result.externalTextures;
+        return destination;
     }
-    ++external;
-    return destination;
-}
+};
 
 float MetadataFloat(const aiScene& scene, const char* key, float fallback)
 {
@@ -249,47 +285,13 @@ void ApplyVectorTransform(const xm::Mat4& transform, float& x, float& y, float& 
     z = transformed.z;
 }
 
-std::filesystem::path TextureFor(aiMaterial& material,
-                                 const aiScene& scene,
-                                 const std::filesystem::path& fbxPath,
-                                 const std::filesystem::path& textureOutputDir,
-                                 aiTextureType type,
-                                 std::uint32_t& embedded,
-                                 std::uint32_t& external,
-                                 std::uint32_t& missing)
+std::filesystem::path TextureFor(aiMaterial& material, TextureImportContext& textures, aiTextureType type)
 {
-    if (material.GetTextureCount(type) == 0)
-        return {};
-    aiString texturePath;
-    if (material.GetTexture(type, 0, &texturePath) != aiReturn_SUCCESS)
-        return {};
-    if (textureOutputDir.empty())
-    {
-        const std::filesystem::path source = ResolveTexturePath(fbxPath.parent_path(), texturePath.C_Str());
-        std::error_code ec;
-        if (std::filesystem::exists(source, ec) && std::filesystem::is_regular_file(source, ec))
-            return source;
-
-        const std::filesystem::path sidecar = fbxPath.parent_path() /
-            (SanitizeName(fbxPath.stem().string()) + "_textures") /
-            std::filesystem::path(texturePath.C_Str()).filename();
-        ec.clear();
-        if (std::filesystem::exists(sidecar, ec) && std::filesystem::is_regular_file(sidecar, ec))
-            return sidecar;
-        return {};
-    }
-    if (const auto path = ExtractOrCopyTexture(scene, fbxPath, texturePath.C_Str(), textureOutputDir, embedded, external, missing))
-        return *path;
-    return {};
+    aiString path;
+    return material.GetTexture(type, 0, &path) == aiReturn_SUCCESS ? textures.Get(path.C_Str()) : std::filesystem::path{};
 }
 
-GltfMaterialSource BuildMaterialSource(aiMaterial& material,
-                                       const aiScene& scene,
-                                       const std::filesystem::path& fbxPath,
-                                       const std::filesystem::path& textureOutputDir,
-                                       std::uint32_t& embedded,
-                                       std::uint32_t& external,
-                                       std::uint32_t& missing)
+GltfMaterialSource BuildMaterialSource(aiMaterial& material, TextureImportContext& textures)
 {
     GltfMaterialSource out{};
     aiString name;
@@ -305,10 +307,12 @@ GltfMaterialSource BuildMaterialSource(aiMaterial& material,
         out.baseColor = {base.r, base.g, base.b, base.a};
     }
     float value = 0.0f;
-    if (material.Get(AI_MATKEY_METALLIC_FACTOR, value) == aiReturn_SUCCESS)
+    const bool hasMetallicFactor = material.Get(AI_MATKEY_METALLIC_FACTOR, value) == aiReturn_SUCCESS;
+    if (hasMetallicFactor)
         out.metallic = value;
     value = 0.5f;
-    if (material.Get(AI_MATKEY_ROUGHNESS_FACTOR, value) == aiReturn_SUCCESS)
+    const bool hasRoughnessFactor = material.Get(AI_MATKEY_ROUGHNESS_FACTOR, value) == aiReturn_SUCCESS;
+    if (hasRoughnessFactor)
         out.roughness = value;
     value = 1.0f;
     if (material.Get(AI_MATKEY_OPACITY, value) == aiReturn_SUCCESS)
@@ -318,20 +322,34 @@ GltfMaterialSource BuildMaterialSource(aiMaterial& material,
             out.alphaMode = "blend";
     }
 
-    out.baseColorTexturePath = TextureFor(material, scene, fbxPath, textureOutputDir, aiTextureType_BASE_COLOR, embedded, external, missing);
+    out.baseColorTexturePath = TextureFor(material, textures, aiTextureType_BASE_COLOR);
     if (out.baseColorTexturePath.empty())
-        out.baseColorTexturePath = TextureFor(material, scene, fbxPath, textureOutputDir, aiTextureType_DIFFUSE, embedded, external, missing);
-    out.normalTexturePath = TextureFor(material, scene, fbxPath, textureOutputDir, aiTextureType_NORMALS, embedded, external, missing);
+        out.baseColorTexturePath = TextureFor(material, textures, aiTextureType_DIFFUSE);
+    out.normalTexturePath = TextureFor(material, textures, aiTextureType_NORMALS);
     if (out.normalTexturePath.empty())
-        out.normalTexturePath = TextureFor(material, scene, fbxPath, textureOutputDir, aiTextureType_HEIGHT, embedded, external, missing);
-    out.metallicRoughnessTexturePath = TextureFor(material, scene, fbxPath, textureOutputDir, aiTextureType_GLTF_METALLIC_ROUGHNESS, embedded, external, missing);
-    if (out.metallicRoughnessTexturePath.empty())
-        out.metallicRoughnessTexturePath = TextureFor(material, scene, fbxPath, textureOutputDir, aiTextureType_METALNESS, embedded, external, missing);
-    if (out.metallicRoughnessTexturePath.empty())
-        out.metallicRoughnessTexturePath = TextureFor(material, scene, fbxPath, textureOutputDir, aiTextureType_DIFFUSE_ROUGHNESS, embedded, external, missing);
-    out.aoTexturePath = TextureFor(material, scene, fbxPath, textureOutputDir, aiTextureType_AMBIENT_OCCLUSION, embedded, external, missing);
-    out.emissiveTexturePath = TextureFor(material, scene, fbxPath, textureOutputDir, aiTextureType_EMISSIVE, embedded, external, missing);
-
+        out.normalTexturePath = TextureFor(material, textures, aiTextureType_NORMAL_CAMERA);
+    out.metallicRoughnessTexturePath = TextureFor(material, textures, aiTextureType_GLTF_METALLIC_ROUGHNESS);
+    out.metallicTexturePath = TextureFor(material, textures, aiTextureType_METALNESS);
+    out.roughnessTexturePath = TextureFor(material, textures, aiTextureType_DIFFUSE_ROUGHNESS);
+    if (!hasMetallicFactor && !out.metallicTexturePath.empty()) out.metallic = 1.0f;
+    if (!hasRoughnessFactor && !out.roughnessTexturePath.empty()) out.roughness = 1.0f;
+    out.heightTexturePath = TextureFor(material, textures, aiTextureType_DISPLACEMENT);
+    if (out.heightTexturePath.empty()) out.heightTexturePath = TextureFor(material, textures, aiTextureType_HEIGHT);
+    out.aoTexturePath = TextureFor(material, textures, aiTextureType_AMBIENT_OCCLUSION);
+    out.emissiveTexturePath = TextureFor(material, textures, aiTextureType_EMISSIVE);
+    if (out.emissiveTexturePath.empty()) out.emissiveTexturePath = TextureFor(material, textures, aiTextureType_EMISSION_COLOR);
+    aiColor3D emissive;
+    if (material.Get(AI_MATKEY_COLOR_EMISSIVE, emissive) == aiReturn_SUCCESS)
+        out.emissive = {emissive.r, emissive.g, emissive.b, 1.0f};
+    // Preserve every referenced texture, including maps the current PBR shader does not consume.
+    if (textures.options.extractTextures)
+        for (unsigned int type = 1; type <= AI_TEXTURE_TYPE_MAX; ++type)
+            for (unsigned int index = 0; index < material.GetTextureCount(static_cast<aiTextureType>(type)); ++index)
+            {
+                aiString reference;
+                if (material.GetTexture(static_cast<aiTextureType>(type), index, &reference) == aiReturn_SUCCESS)
+                    textures.Get(reference.C_Str());
+            }
     return out;
 }
 
@@ -812,18 +830,13 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
         ExtractAnimations(*scene, fbxPath, *result.skeleton, result);
     }
 
+    TextureImportContext textures{*scene, fbxPath, options, result};
     result.materials.reserve(std::max(1u, scene->mNumMaterials));
     for (unsigned int i = 0; i < scene->mNumMaterials; ++i)
     {
         if (!scene->mMaterials[i])
             continue;
-        result.materials.push_back(BuildMaterialSource(*scene->mMaterials[i],
-            *scene,
-            fbxPath,
-            options.extractTextures ? options.textureOutputDir : std::filesystem::path{},
-            result.embeddedTextures,
-            result.externalTextures,
-            result.missingTextures));
+        result.materials.push_back(BuildMaterialSource(*scene->mMaterials[i], textures));
     }
     if (result.materials.empty())
         result.materials.push_back(GltfMaterialSource{});

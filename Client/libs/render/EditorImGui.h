@@ -498,6 +498,7 @@ private:
     // cache invalidation (library swap) or across frames; use within the current frame is safe.
     const std::vector<std::string>& QueryFilesystemChildFolders(const std::string& subpath) const;
     const std::vector<AssetLibrary::Entry>& QueryFilesystemAssetsInFolder(const std::string& subpath) const;
+    const AssetLibrary::ModelContents& QueryModelContents(const AssetLibrary::Entry& model) const;
     // Drops the cached asset browser listings when the asset library changed (or they are too old
     // to trust for edits made outside the editor).
     void ValidateAssetBrowserCache() const;
@@ -783,10 +784,12 @@ private:
     {
         const AssetLibrary* library = nullptr;
         std::uint64_t revision = 0;
+        std::uint64_t materialRevision = 0;
         double builtAt = -1.0;
         int validatedFrame = -1;  // the ImGui frame it was last checked in (at most once a frame)
         std::unordered_map<std::string, std::vector<std::string>> childFolders;
         std::unordered_map<std::string, std::vector<AssetLibrary::Entry>> folderAssets;
+        std::unordered_map<std::string, AssetLibrary::ModelContents> modelContents;
         std::optional<std::vector<AssetLibrary::Entry>> sceneAssets;
         std::unordered_map<std::string, std::optional<std::filesystem::path>> previewPaths;
         // Scripts panel: native C++ sources (absolute path, path shown relative to the scripts dir).
@@ -795,6 +798,7 @@ private:
         std::unordered_map<std::string, std::string> comparablePaths;
     };
     mutable AssetBrowserCache m_assetBrowserCache;
+    std::unordered_set<std::string> m_expandedModelAssets;
     bool m_assetBrowserLogged = false;
     std::string m_loggedDragAssetId;
     bool m_gameViewVisible = false;

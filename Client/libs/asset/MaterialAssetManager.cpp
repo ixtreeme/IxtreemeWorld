@@ -324,7 +324,7 @@ MaterialAsset* MaterialAssetManager::getOrLoad(const Guid& guid)
     return result;
 }
 
-std::optional<Guid> MaterialAssetManager::packOcclusionRoughnessMetallic(const MaterialAsset& material)
+std::optional<Guid> MaterialAssetManager::packOcclusionRoughnessMetallic(const MaterialAsset& material, bool pruneEarlierPacks)
 {
     const std::array<std::optional<Guid>, 3> sources = {material.aoTexture, material.roughnessTexture, material.metallicTexture};
     if (!sources[0] && !sources[1] && !sources[2])
@@ -430,7 +430,7 @@ std::optional<Guid> MaterialAssetManager::packOcclusionRoughnessMetallic(const M
     for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(folder, ec))
     {
         const std::string name = entry.path().filename().string();
-        if (name != packedPath.filename().string() && name.size() == prefix.size() + 12u &&
+        if (pruneEarlierPacks && name != packedPath.filename().string() && name.size() == prefix.size() + 12u &&
             name.compare(0, prefix.size(), prefix) == 0 && name.compare(name.size() - 4u, 4u, ".png") == 0)
             earlierPacks.push_back(entry.path());
     }
@@ -486,11 +486,18 @@ Guid MaterialAssetManager::createFromGltfMaterial(const GltfMaterialSource& gltf
         ResolveTextureGuid(db_, gltfMat.metallicRoughnessTexturePath, "metallicRoughness", material.name);
     material.aoTexture = ResolveTextureGuid(db_, gltfMat.aoTexturePath, "ao", material.name);
     material.emissiveTexture = ResolveTextureGuid(db_, gltfMat.emissiveTexturePath, "emissive", material.name);
+    material.roughnessTexture = ResolveTextureGuid(db_, gltfMat.roughnessTexturePath, "roughness", material.name);
+    material.metallicTexture = ResolveTextureGuid(db_, gltfMat.metallicTexturePath, "metallic", material.name);
+    material.heightTexture = ResolveTextureGuid(db_, gltfMat.heightTexturePath, "height", material.name);
 
     std::error_code ec;
     std::filesystem::create_directories(materialFolder, ec);
     const std::string baseFilename = SanitizeName(material.name);
     material.path = materialFolder / (baseFilename + ".material");
+    if (!material.metallicRoughnessTexture && (material.roughnessTexture || material.metallicTexture || material.aoTexture))
+    {
+        material.metallicRoughnessTexture = packOcclusionRoughnessMetallic(material, false);
+    }
 
     std::string content = MaterialJson(material);
     if (std::filesystem::exists(material.path) && SameTextFile(material.path, content))

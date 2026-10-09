@@ -19,10 +19,10 @@ std::string SanitizeStem(std::string value)
 {
     for (char& c : value)
     {
-        if (!std::isalnum(static_cast<unsigned char>(c)))
+        if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '-')
             c = '_';
     }
-    while (!value.empty() && value.back() == '_')
+    while (!value.empty() && (value.back() == '_' || value.back() == '-'))
         value.pop_back();
     return value.empty() ? "asset" : value;
 }
@@ -33,6 +33,14 @@ std::string EscapeJsonInline(const std::string& value)
     out.reserve(value.size() + 2);
     for (char c : value)
     {
+        if (static_cast<unsigned char>(c) < 0x20)
+        {
+            constexpr char hex[] = "0123456789abcdef";
+            out += "\\u00";
+            out.push_back(hex[(static_cast<unsigned char>(c) >> 4) & 15]);
+            out.push_back(hex[static_cast<unsigned char>(c) & 15]);
+            continue;
+        }
         if (c == '"' || c == '\\')
             out.push_back('\\');
         out.push_back(c);
@@ -87,11 +95,13 @@ bool WriteAnimationClipSidecar(const std::filesystem::path& clipPath,
 
 bool ProcessImportedFbxAsset(const std::filesystem::path& destination,
                              const std::filesystem::path& /*libraryRoot: everything goes next to the model*/,
-                             std::string& error)
+                             std::string& error,
+                             const std::filesystem::path& source)
 {
     AssimpImporter importer;
     AssimpImporter::ImportOptions options{};
     options.extractTextures = true;
+    options.textureSourceDir = source.empty() ? destination.parent_path() : source.parent_path();
     options.textureOutputDir = destination.parent_path() / (SanitizeStem(destination.stem().string()) + "_textures");
     Tracenf("[FBX-IMPORT] start path=%s target=%s",
         destination.generic_string().c_str(),
@@ -167,13 +177,11 @@ bool ProcessImportedFbxAsset(const std::filesystem::path& destination,
             }
         }
     }
-    if (std::filesystem::exists(options.textureOutputDir))
+    std::vector<Guid> dependencies;
+    for (const auto& texture : result.texturePaths)
     {
-        for (const auto& texture : std::filesystem::recursive_directory_iterator(options.textureOutputDir))
-        {
-            if (texture.is_regular_file())
-                db.runtimeAdd(texture.path());
-        }
+        db.runtimeAdd(texture);
+        if (const auto guid = db.resolvePath(texture)) dependencies.push_back(*guid);
     }
 
     std::vector<Guid> defaultMaterials;
@@ -191,15 +199,36 @@ bool ProcessImportedFbxAsset(const std::filesystem::path& destination,
             materialsDir,
             materialName,
             &summary));
+        if (defaultMaterials.back() == Guid{})
+        {
+            error = "Failed to save FBX material: " + materialName;
+            return false;
+        }
     }
 
     for (const Guid& materialGuid : defaultMaterials)
     {
         if (const auto path = db.resolveGuid(materialGuid))
             db.runtimeAdd(*path);
+        dependencies.push_back(materialGuid);
+        if (const auto* material = MaterialAssetManager::Instance().getOrLoad(materialGuid))
+            for (const auto& texture : {material->baseColorTexture, material->normalTexture, material->metallicRoughnessTexture,
+                    material->aoTexture, material->emissiveTexture, material->roughnessTexture, material->metallicTexture, material->heightTexture})
+                if (texture) dependencies.push_back(*texture);
     }
     db.runtimeAdd(destination);
-    db.writeDefaultMaterials(destination, defaultMaterials);
+    if (!db.writeDefaultMaterials(destination, defaultMaterials) || !db.writeDependencies(destination, dependencies))
+    {
+        error = "Failed to save FBX material/texture references";
+        return false;
+    }
+    // Missing references remain visible in the browser after reopening the project.
+    std::ofstream report(destination.string() + ".import.json", std::ios::binary | std::ios::trunc);
+    report << "{\n  \"version\": 1,\n  \"missing_textures\": [";
+    for (std::size_t i = 0; i < result.missingTexturePaths.size(); ++i)
+        report << (i ? ", " : "") << "\"" << EscapeJsonInline(result.missingTexturePaths[i]) << "\"";
+    report << "]\n}\n";
+    if (!report.good()) { error = "Failed to save FBX import report"; return false; }
     if (skeletonGuid)
         db.writeSkeletalAsset(destination, *skeletonGuid, animationGuids);
 

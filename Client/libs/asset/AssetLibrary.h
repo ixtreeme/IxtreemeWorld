@@ -16,7 +16,8 @@ class AssetLibrary
 public:
     using FbxSidecarProcessor = bool (*)(const std::filesystem::path& destination,
                                          const std::filesystem::path& libraryRoot,
-                                         std::string& error);
+                                         std::string& error,
+                                         const std::filesystem::path& source);
 
     enum class Category
     {
@@ -150,6 +151,12 @@ public:
                                     const std::vector<std::string>& activeTags,
                                     const std::string& search) const;
     std::optional<Entry> FindById(const std::string& id) const;
+    struct ModelContents
+    {
+        std::vector<Entry> assets; // Materials first, then distinct referenced/extracted textures.
+        std::vector<std::string> missingTextures;
+    };
+    ModelContents QueryModelContents(const Entry& model) const;
     std::vector<std::string> SubpathsFor(Category category) const;
     std::vector<std::string> FolderSubpathsFor(Category category) const;
     std::vector<std::pair<std::string, std::uint32_t>> TagsFor(Category category) const;
