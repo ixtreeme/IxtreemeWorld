@@ -45,6 +45,7 @@
 namespace client::asset {
 class IAssetReader;
 }
+namespace tree_tool { struct TreeImpostorSettings; }
 
 class StaticMeshRenderer
 {
@@ -98,6 +99,9 @@ public:
         // looking up its materials; one made by another renderer, or before the material assets
         // changed, is not used.
         const PreparedInstance* prepared = nullptr;
+        // Screen-space coverage interval for LOD fades; [0,1] keeps every pixel.
+        float coverageMin = 0.0f;
+        float coverageMax = 1.0f;
     };
     // The instances of one batch draw. Pointers: the caller keeps its instances (and their material
     // lists) where they are instead of copying them into every batch of every pass.
@@ -133,7 +137,7 @@ public:
         float materialParams[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         float materialEmissive[4] = {0.0f, 0.0f, 0.0f, 0.0f};
         float materialUv[4] = {1.0f, 1.0f, 0.0f, 0.0f};
-        float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 0.0f};
+        float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 1.0f};
     };
 
     struct PreparedInstance
@@ -243,6 +247,11 @@ public:
     std::uint32_t LastSubmittedDrawCalls() const { return m_lastSubmittedDrawCalls; }
     std::uint32_t LastSubmittedInstances() const { return m_lastSubmittedInstances; }
     std::uint32_t LastSubmittedIndexCount() const { return m_lastSubmittedIndexCount; }
+    std::uint64_t LastSubmittedTriangles() const { return m_lastSubmittedTriangles; }
+    std::uint32_t LastImpostorTrees() const { return m_lastImpostorTrees; }
+    bool HasTreeImpostor() const;
+    // Call between frames after device.WaitIdle(); parent mesh/scene records stay valid.
+    void ReloadTreeImpostor();
     bool LastUsedFullResFallback() const { return m_lastUsedFullResFallback; }
     std::uint32_t LastMaterialUniformUpdates() const { return m_lastMaterialUniformUpdates; }
     std::uint32_t LastOverrideActiveDraws() const { return m_lastOverrideActiveDraws; }
@@ -253,6 +262,9 @@ public:
     const std::array<float, 3>& BoundsMax() const { return m_boundsMax; }
     const std::string& TextureName() const { return m_texture.name; }
     bool CopyPhysicsMesh(std::vector<std::array<float, 3>>& outVertices, std::vector<std::uint32_t>& outIndices) const;
+    // Bake an existing two-material tree without changing its mesh or GUID (editor/offline utility).
+    static bool BakeTreeImpostorAsset(client::asset::IAssetReader& assets, const std::filesystem::path& modelPath,
+        const tree_tool::TreeImpostorSettings& settings, std::string& error);
 
     static bool DetectSkinnedGltf(client::asset::IAssetReader& assets,
         const std::string& modelPath,
@@ -260,6 +272,15 @@ public:
         std::string* error);
 
 private:
+    struct TreeImpostorState;
+    void LoadTreeImpostorCpu();
+    std::unique_ptr<TreeImpostorState> m_treeImpostor;
+    bool m_isTreeImpostor = false;
+    std::uint32_t m_lastImpostorTrees = 0;
+    bool RenderTreeImpostors(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
+        double timeSeconds, const WorldCamera& camera, const InstanceList& instances,
+        const LodConfig& config, std::uint64_t configHash, std::uint32_t lodLevel,
+        std::uint32_t targetWidth, std::uint32_t targetHeight);
     static constexpr uint32_t kFramesInFlight = 2;
     // Bind sets per page and frame in flight (see BindPage), and the most pages a renderer makes.
     static constexpr uint32_t kUniformSlots = 64;
@@ -629,6 +650,7 @@ private:
     std::uint32_t m_lastSubmittedDrawCalls = 0;
     std::uint32_t m_lastSubmittedInstances = 0;
     std::uint32_t m_lastSubmittedIndexCount = 0;
+    std::uint64_t m_lastSubmittedTriangles = 0;
     bool m_lastUsedFullResFallback = false;
     std::uint32_t m_lastMaterialUniformUpdates = 0;
     std::uint32_t m_lastOverrideActiveDraws = 0;

@@ -73,6 +73,10 @@ private:
     ixtreemetree::TreeOptions options_;
     ixtreemetree::TreeMesh mesh_;
     double leafCardArea_ = 0.0;  // the leaf cards' area, mesh units squared (Regenerate)
+    bool bakeImpostor_ = true;
+    float impostorDistance_ = 180.0f;
+    float impostorTransition_ = 30.0f;
+    int impostorResolution_ = 256;
     TreePreviewRenderer preview_;
     char assetName_[96]{};
     std::string status_;

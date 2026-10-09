@@ -6540,6 +6540,18 @@ int RunGame(NativeWindow& window,
         running = window.PumpMessages();
         if (!running)
             break;
+#if defined(IXTREEME_WITH_EDITOR)
+        const auto impostorChanges = editorImGui.TakeTreeImpostorChanges();
+        if (!impostorChanges.empty())
+        {
+            rhiDevice->WaitIdle();
+            for (const auto& changed : impostorChanges)
+                for (auto& [path, entry] : staticMeshCache)
+                    if (entry.renderer && entry.renderer->IsLoaded() &&
+                        std::filesystem::path(path).lexically_normal() == changed.lexically_normal())
+                        entry.renderer->ReloadTreeImpostor();
+        }
+#endif
         validateMeshCaches();
         // The mesh render records are checked again (once) in each frame that asks for them; those of
         // entities that are gone (not asked for in a while) are dropped here, between frames.
@@ -12241,6 +12253,7 @@ int RunGame(NativeWindow& window,
             size_t frameStaticMeshSubmitted = 0;
             size_t frameStaticMeshDrawCalls = 0;
             size_t frameStaticMeshTriangles = 0;
+            size_t frameTreeImpostors = 0;
             size_t frameStaticMeshUniformUpdates = 0;
             size_t frameStaticMeshOverrideActiveDraws = 0;
             size_t frameStaticMeshFrustumCulled = 0;
@@ -13796,9 +13809,8 @@ int RunGame(NativeWindow& window,
                         frameStaticMeshMaxBatchSize = std::max(frameStaticMeshMaxBatchSize, instances.size());
                         frameStaticMeshSubmitted += submittedInstances;
                         frameStaticMeshDrawCalls += submittedDrawCalls;
-                        frameStaticMeshTriangles += (renderer->LastUsedFullResFallback()
-                            ? renderer->TriangleCount()
-                            : renderer->TriangleCountForLod(key.configHash, key.lodLevel)) * submittedInstances;
+                        frameStaticMeshTriangles += renderer->LastSubmittedTriangles();
+                        frameTreeImpostors += renderer->LastImpostorTrees();
                         frameStaticMeshUniformUpdates += renderer->LastMaterialUniformUpdates();
                         frameStaticMeshOverrideActiveDraws += renderer->LastOverrideActiveDraws();
                         frameStaticMeshInstanceBufferBytes += renderer->LastInstanceBufferBytes();
@@ -14405,6 +14417,9 @@ int RunGame(NativeWindow& window,
                 : (frameNumber < 3 || (frameNumber % 60u) == 0u);
             if (frameHeartbeatLog)
             {
+                if (frameTreeImpostors != 0)
+                    Tracenf("[TREE-IMPOSTOR] main trees=%zu colour_triangles=%zu drawcalls=%zu",
+                        frameTreeImpostors, frameStaticMeshTriangles, frameStaticMeshDrawCalls);
                 if (!QuietLogsForLodDiag())
                 {
                     TraceDiagf("[FRAME] static_mesh entities=%zu submitted=%zu drawcalls=%zu",

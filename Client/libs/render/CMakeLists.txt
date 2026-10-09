@@ -142,6 +142,16 @@ endif()
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
 
 if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(TreeImpostorTest tests/TreeImpostorTest.cpp)
+    target_link_libraries(TreeImpostorTest PRIVATE IXEngineRender)
+    target_compile_features(TreeImpostorTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(TreeImpostorTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME TreeImpostorTest COMMAND TreeImpostorTest)
+    set_tests_properties(TreeImpostorTest PROPERTIES TIMEOUT 90)
+
     add_executable(FbxImportTest tests/FbxImportTest.cpp)
     target_link_libraries(FbxImportTest PRIVATE IXEngineRender)
     target_compile_features(FbxImportTest PRIVATE cxx_std_20)

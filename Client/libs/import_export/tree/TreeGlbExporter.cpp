@@ -546,6 +546,15 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
 
     AssetDatabase::Instance().scan(normalizedProjectRoot);
     AssetDatabase::Instance().writeDefaultMaterials(modelPath, defaultMaterials);
+    std::vector<Guid> dependencies = defaultMaterials;
+    if (!barkTexturePath.empty()) dependencies.push_back(AssetDatabase::Instance().getOrCreateGuid(barkTexturePath));
+    if (!leafTexturePath.empty()) dependencies.push_back(AssetDatabase::Instance().getOrCreateGuid(leafTexturePath));
+    // A failed/disabled bake must never leave a previous atlas active for the newly saved model.
+    std::filesystem::remove(modelPath.string() + ".impostor.json", ec);
+    if (materialBinding.impostor.enabled)
+        result.impostorBaked = BakeTreeImpostor(*outputMesh, modelPath, defaultMaterials, materialBinding.impostor,
+                                              dependencies, result.impostorWarning);
+    AssetDatabase::Instance().writeDependencies(modelPath, dependencies);
     if (!barkTexturePath.empty())
         AssetDatabase::Instance().getOrCreateGuid(barkTexturePath);
     if (!leafTexturePath.empty())

@@ -22,7 +22,7 @@ struct SpotLightUbo
     float4 u_materialParams; // metallic, roughness, normal strength, AO strength
     float4 u_materialEmissive; // rgb, intensity
     float4 u_materialUv; // tiling.xy, offset.xy
-    float4 u_materialAlpha; // mode: 0 opaque, 1 mask, 2 blend; cutoff
+    float4 u_materialAlpha; // mode: 0 opaque, 1 mask, 2 blend; cutoff; coverage min/max
     float4 u_cameraPosition;
     float4 u_sunDir;
     float4 u_sunColor;
@@ -115,10 +115,21 @@ VSOutput VSMain(VSInput input, uint instanceId : SV_InstanceID)
 }
 
 // The sun shadow pass of alpha-tested (mask) materials: their cut-out parts cast no shadow.
+void ApplyLodCoverage(VSOutput input)
+{
+    if (input.materialAlpha.z > 0.0 || input.materialAlpha.w < 1.0)
+    {
+        // Complementary intervals keep mesh/view transitions stable without blending or sorting.
+        float noise = frac(52.9829189 * frac(dot(floor(input.position.xy), float2(0.06711056, 0.00583715))));
+        if (noise < input.materialAlpha.z || noise >= input.materialAlpha.w) discard;
+    }
+}
+
 void ShadowMaskPS(VSOutput input)
 {
+    ApplyLodCoverage(input);
     const float alpha = u_diffuse.Sample(u_sampler, input.uv).a * input.materialBaseColor.a * input.tint.a;
-    if (alpha < input.materialAlpha.y)
+    if (input.materialAlpha.x > 0.5 && alpha < input.materialAlpha.y)
         discard;
 }
 
@@ -143,7 +154,8 @@ float3 ApplyNormalMap(float3 vertexNormal, float3 worldPos, float2 uv, float str
     float2 duv1 = ddx(uv);
     float2 duv2 = ddy(uv);
     float3 tangent = dp1 * duv2.y - dp2 * duv1.y;
-    if (dot(tangent, tangent) < 0.000001)
+    // Atlas UVs are small: retain their tangent basis at distant-tree screen sizes.
+    if (dot(tangent, tangent) < 0.000000000001)
         return n;
     tangent = normalize(tangent);
     float3 bitangent = normalize(cross(n, tangent));
@@ -158,6 +170,7 @@ float4 PSMain(VSOutput input) : SV_Target0
     // The opaque draws' variant (STATIC_MESH_OPAQUE) has no discard at all: a shader that can discard
     // keeps the hardware from testing depth before shading, so every hidden layer was shaded.
 #if !defined(STATIC_MESH_OPAQUE)
+    ApplyLodCoverage(input);
     if (u_lightPadding.x > 0.5 && input.worldPos.y < u_lightPadding.y)
         discard;
 #endif

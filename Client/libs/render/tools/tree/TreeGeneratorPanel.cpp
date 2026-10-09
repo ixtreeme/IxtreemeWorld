@@ -579,6 +579,17 @@ void TreeGeneratorPanel::RenderOutput()
                     "leaves make the cheapest forest; saving trims the texture's transparent borders away.");
     UI::Prop::Text("Height", "%.1f m", mesh_.bboxMax.y - mesh_.bboxMin.y);
     UI::Prop::Text("Generated in", "%.2f ms", mesh_.stats.generationMs);
+    ImGui::Checkbox("Bake distant-tree impostor", &bakeImpostor_);
+    UI::ItemTooltip("Save an atlas of the tree for distant views. The game uses lit billboards beyond the chosen distance.");
+    if (bakeImpostor_)
+    {
+        UI::Prop::SliderFloat("Impostor distance", &impostorDistance_, 50.0f, 500.0f, "%.0f m");
+        UI::Prop::SliderFloat("Transition range", &impostorTransition_, 5.0f, 100.0f, "%.0f m");
+        const char* resolutions[] = {"128", "256", "512"};
+        int resolution = impostorResolution_ == 128 ? 0 : impostorResolution_ == 512 ? 2 : 1;
+        if (UI::Prop::Combo("Atlas view size", &resolution, resolutions, 3)) impostorResolution_ = 128 << resolution;
+        UI::ItemTooltip("8 directions and 3 elevations. Larger images use more texture memory and take longer to bake.");
+    }
     ImGui::Spacing();
     if (UI::IconButton(ICON_FA_CAMERA, "Reset View"))
         preview_.ResetView(mesh_);
@@ -604,6 +615,10 @@ TreeMaterialBinding TreeGeneratorPanel::CurrentMaterialBinding()
     binding.barkBaseColorTexturePath = bark.path;
     binding.leafBaseColorTexturePath = leaf.path;
     binding.leafAlphaCutoff = options_.leaves.alphaTest;
+    binding.impostor.enabled = bakeImpostor_;
+    binding.impostor.distance = impostorDistance_;
+    binding.impostor.transition = impostorTransition_;
+    binding.impostor.resolution = impostorResolution_;
     return binding;
 }
 
@@ -655,6 +670,8 @@ void TreeGeneratorPanel::RenderSavePopup(bool& savedAsset)
             if (result.ok)
             {
                 status_ = "Saved: " + result.modelPath.filename().string();
+                if (result.impostorBaked) status_ += " (distant impostor ready)";
+                else if (!result.impostorWarning.empty()) status_ += " (impostor unavailable: " + result.impostorWarning + ")";
                 if (result.leafAreaReduction > 0.0f)
                 {
                     char trimmed[64];

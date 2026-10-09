@@ -1,6 +1,7 @@
 #pragma once
 
 #include "AssetDatabase.h"
+#include "TreeImpostor.h"
 
 #include <ixtreemetree/tree_mesh.h>
 
@@ -18,6 +19,8 @@ struct TreeExportResult
     std::string error;
     float durationMs = 0.0f;
     float leafAreaReduction = 0.0f;  // the share of the leaf cards' area trimmed away (0..1)
+    bool impostorBaked = false;
+    std::string impostorWarning;
 };
 
 struct TreeMaterialBinding
@@ -30,6 +33,7 @@ struct TreeMaterialBinding
     std::filesystem::path leafBaseColorTexturePath;
     float leafAlphaCutoff = 0.5f;  // for a made leaf material
     bool trimTransparentLeafBorders = true;  // see trimLeafCards
+    TreeImpostorSettings impostor;
 };
 
 class TreeGlbExporter

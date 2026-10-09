@@ -7,6 +7,8 @@ add_library(IXEngineImportExport STATIC
     FbxAssetSidecars.h
     tree/TreeGlbExporter.cpp
     tree/TreeGlbExporter.h
+    tree/TreeImpostor.cpp
+    tree/TreeImpostor.h
 )
 
 target_include_directories(IXEngineImportExport

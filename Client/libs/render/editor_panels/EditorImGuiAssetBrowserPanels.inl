@@ -313,6 +313,32 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
             ImGui::Separator();
             if (ImGui::MenuItem("Export to FBX..."))
                 OpenFbxExportDialogForAsset(entry);
+            const auto modelPath = entry.originalPath.empty() && m_assetLibrary
+                ? m_assetLibrary->AbsolutePath(entry) : std::filesystem::path(entry.originalPath);
+            if (modelPath.extension() == ".glb" && ProjectManager::Instance().HasProject() &&
+                AssetDatabase::Instance().loadDefaultMaterials(modelPath).size() == 2)
+            {
+                if (ImGui::MenuItem("Bake tree impostor"))
+                {
+                    client::asset::FileAssetReader reader(ProjectManager::Instance().ProjectRoot());
+                    std::string error;
+                    if (StaticMeshRenderer::BakeTreeImpostorAsset(reader, modelPath, {}, error))
+                    {
+                        m_assetStatus = "Tree impostor baked (180m): " + entry.displayName;
+                        m_treeImpostorChanges.push_back(modelPath);
+                    }
+                    else m_assetStatus = "Tree impostor failed: " + error;
+                }
+                std::error_code existsError;
+                if (std::filesystem::exists(modelPath.string() + ".impostor.json", existsError) &&
+                    ImGui::MenuItem("Disable tree impostor"))
+                {
+                    std::error_code error;
+                    std::filesystem::remove(modelPath.string() + ".impostor.json", error);
+                    m_assetStatus = error ? "Cannot disable impostor: " + error.message() : "Tree impostor disabled: " + entry.displayName;
+                    if (!error) m_treeImpostorChanges.push_back(modelPath);
+                }
+            }
         }
         ImGui::Separator();
         if (ImGui::BeginMenu("Create Here"))

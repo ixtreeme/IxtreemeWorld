@@ -2,6 +2,7 @@
 #include "StaticMeshRenderer.h"
 
 #include "AssimpImporter.h"
+#include "import_export/tree/TreeImpostor.h"
 #include "Debug.h"
 #include "IXRHIShader.h"
 #include "JobSystem.h"
@@ -80,7 +81,7 @@ struct UniformBlock
     float materialParams[4] = {1.0f, 1.0f, 1.0f, 1.0f}; // metallic, roughness, normal strength, AO strength
     float materialEmissive[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float materialUv[4] = {1.0f, 1.0f, 0.0f, 0.0f}; // tiling.xy, offset.xy
-    float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 0.0f}; // mode: 0 opaque, 1 mask, 2 blend; cutoff
+    float materialAlpha[4] = {0.0f, 0.5f, 0.0f, 1.0f}; // mode, cutoff, coverage interval
     float cameraPosition[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float sunDir[4];
     float sunColor[4];
@@ -367,12 +368,14 @@ void LogPinkFallbackOnce(std::uint32_t entityId,
 StaticMeshRenderer::MaterialDefaults ResolveMaterialSlotDefaults(
     const StaticMeshRenderer::Instance& instance,
     uint32_t materialSlot,
-    const std::vector<StaticMeshRenderer::MaterialDefaults>& bakedDefaults)
+    const std::vector<StaticMeshRenderer::MaterialDefaults>& bakedDefaults,
+    bool internalBakedMaterial = false)
 {
     const StaticMeshRenderer::MaterialDefaults bakedFallback{};
     StaticMeshRenderer::MaterialDefaults defaults = bakedDefaults.empty()
         ? bakedFallback
         : (materialSlot < bakedDefaults.size() ? bakedDefaults[materialSlot] : bakedDefaults.front());
+    if (internalBakedMaterial) return defaults;
 
     if (materialSlot >= instance.materialSlots.size() || instance.materialSlots[materialSlot].empty())
     {
@@ -405,7 +408,8 @@ void FillStaticMeshInstanceBlock(const Mat4& viewProjection,
     const StaticMeshRenderer::Instance& instance,
     uint32_t materialSlot,
     const std::vector<StaticMeshRenderer::MaterialDefaults>& materialDefaults,
-    StaticMeshRenderer::InstanceBlock& out)
+    StaticMeshRenderer::InstanceBlock& out,
+    bool internalBakedMaterial = false)
 {
     out = {};
     out.model = BuildStaticMeshModelMatrix(instance);
@@ -416,7 +420,7 @@ void FillStaticMeshInstanceBlock(const Mat4& viewProjection,
     out.tint[3] = instance.tint[3];
 
     const StaticMeshRenderer::MaterialDefaults defaults =
-        ResolveMaterialSlotDefaults(instance, materialSlot, materialDefaults);
+        ResolveMaterialSlotDefaults(instance, materialSlot, materialDefaults, internalBakedMaterial);
     std::memcpy(out.materialBaseColor, defaults.baseColor, sizeof(out.materialBaseColor));
     out.materialParams[0] = defaults.metallic;
     out.materialParams[1] = defaults.roughness;
@@ -432,8 +436,8 @@ void FillStaticMeshInstanceBlock(const Mat4& viewProjection,
     out.materialUv[3] = defaults.uvOffset[1];
     out.materialAlpha[0] = AlphaModeCode(defaults.alphaMode);
     out.materialAlpha[1] = std::clamp(defaults.alphaCutoff, 0.0f, 1.0f);
-    out.materialAlpha[2] = defaults.unlit ? 1.0f : 0.0f;
-    out.materialAlpha[3] = 0.0f;
+    out.materialAlpha[2] = instance.coverageMin;
+    out.materialAlpha[3] = instance.coverageMax;
 
     for (const MeshSceneEntity::MaterialOverride& overrideSlot : instance.materialOverrides)
     {
@@ -515,6 +519,9 @@ std::optional<fastgltf::Asset> ParseGltf(client::asset::IAssetReader& assets,
 {
     const size_t slash = modelPath.find_last_of("\\/");
     const std::string dir = slash == std::string::npos ? std::string(".") : modelPath.substr(0, slash);
+    auto gltfDirectory = std::filesystem::path(dir);
+    if (!gltfDirectory.is_absolute())
+        if (auto root = assets.RootPath()) gltfDirectory = *root / gltfDirectory;
     auto modelBytes = assets.ReadAll(modelPath);
     if (!modelBytes)
     {
@@ -538,7 +545,7 @@ std::optional<fastgltf::Asset> ParseGltf(client::asset::IAssetReader& assets,
         options |= fastgltf::Options::LoadExternalImages;
 
     fastgltf::Parser parser;
-    auto assetResult = parser.loadGltf(data.get(), std::filesystem::path(dir),
+    auto assetResult = parser.loadGltf(data.get(), gltfDirectory,
         options);
     if (assetResult.error() != fastgltf::Error::None)
     {
@@ -1046,6 +1053,22 @@ struct StaticMeshRenderer::PendingMaterialImport
     fastgltf::Asset asset;
 };
 
+struct StaticMeshRenderer::TreeImpostorState
+{
+    tree_tool::TreeImpostorData data;
+    std::unique_ptr<StaticMeshRenderer> renderer;
+    std::uint64_t checkedRevision = 0;
+    std::vector<std::filesystem::file_time_type> sourceTimes;
+    std::filesystem::file_time_type metadataTime{};
+    std::chrono::steady_clock::time_point checkedFiles{};
+    bool filesValid = true;
+    bool valid = true;
+    bool partitioning = false;
+    InstanceList nearInstances, farInstances;
+    std::vector<Instance> fading, billboards;
+    std::vector<PreparedInstance> billboardPrepared;
+};
+
 StaticMeshRenderer::StaticMeshRenderer() = default;
 
 StaticMeshRenderer::~StaticMeshRenderer()
@@ -1132,8 +1155,53 @@ bool StaticMeshRenderer::LoadCpu(client::asset::IAssetReader& assets, const std:
     }
     BuildLods();
     DecodeTextures(modelPath);
+    if (!builtinPrimitive) LoadTreeImpostorCpu();
     m_status = LoadStatus::NotLoaded;  // on the CPU; FinishGpu makes it LoadedStatic
     return true;
+}
+
+void StaticMeshRenderer::LoadTreeImpostorCpu()
+{
+    m_treeImpostor.reset();
+    if (!m_isTreeImpostor)
+    {
+        std::string impostorError;
+        if (auto data = tree_tool::LoadTreeImpostor(*m_assets, m_modelPath, impostorError))
+        {
+            auto state = std::make_unique<TreeImpostorState>();
+            state->data = std::move(*data);
+            if (auto root = m_assets->RootPath())
+            {
+                std::error_code metadataError;
+                state->metadataTime = std::filesystem::last_write_time(*root / (m_modelPath + ".impostor.json"), metadataError);
+                state->filesValid &= !metadataError;
+                for (const auto& source : state->data.sourcePaths)
+                {
+                    std::error_code error;
+                    state->sourceTimes.push_back(std::filesystem::last_write_time(*root / source, error));
+                    state->filesValid &= !error;
+                }
+            }
+            state->renderer = std::make_unique<StaticMeshRenderer>();
+            state->renderer->m_isTreeImpostor = true; // Never recursively load another impostor.
+            if (state->renderer->LoadCpu(*m_assets, state->data.billboardPath) &&
+                state->renderer->VertexCount() == 4 && state->renderer->IndexCount() == 6)
+                m_treeImpostor = std::move(state);
+        }
+        else if (!impostorError.empty()) LogFormat("[TREE-IMPOSTOR] fallback model=%s reason=%s", m_modelPath.c_str(), impostorError.c_str());
+    }
+}
+
+void StaticMeshRenderer::ReloadTreeImpostor()
+{
+    if (!m_rhi || !m_assets || !IsLoaded() || m_isTreeImpostor) return;
+    LoadTreeImpostorCpu();
+    if (m_treeImpostor)
+    {
+        m_treeImpostor->renderer->SetTargetPass(m_targetPass);
+        if (!m_treeImpostor->renderer->FinishGpu(*m_rhi)) m_treeImpostor.reset();
+    }
+    LogFormat("[TREE-IMPOSTOR] reloaded model=%s active=%u", m_modelPath.c_str(), m_treeImpostor ? 1u : 0u);
 }
 
 void StaticMeshRenderer::BuildLods()
@@ -1419,6 +1487,13 @@ bool StaticMeshRenderer::FinishGpu(ixrhi::IXRHIDevice& rhi, bool deferUploads)
     }
     pipeline = HasPipeline();
 
+    if (m_treeImpostor)
+    {
+        m_treeImpostor->renderer->SetTargetPass(m_targetPass);
+        if (!m_treeImpostor->renderer->FinishGpu(rhi, deferUploads)) m_treeImpostor.reset();
+        else LogFormat("[TREE-IMPOSTOR] ready model=%s views=%d start=%.1f transition=%.1f",
+            modelPath.c_str(), m_treeImpostor->data.azimuths * 3, m_treeImpostor->data.distance, m_treeImpostor->data.transition);
+    }
     m_status = LoadStatus::LoadedStatic;
     logCreateState();
     LogFormat("[STATIC-MESH] loaded: %s verts=%zu indices=%zu draws=%zu",
@@ -1435,6 +1510,11 @@ bool StaticMeshRenderer::RecreatePipeline(ixrhi::IXRHIDevice& rhi)
     // Deferred-true while the target pass is torn down (parity); real failures
     // abort in the backend like the pre-migration VK_CHECK path.
     CreatePipeline(rhi);
+    if (m_treeImpostor)
+    {
+        m_treeImpostor->renderer->SetTargetPass(m_targetPass);
+        m_treeImpostor->renderer->RecreatePipeline(rhi);
+    }
     return true;
 }
 
@@ -1521,6 +1601,35 @@ bool StaticMeshRenderer::CopyPhysicsMesh(
 
     outIndices = m_indices;
     return !outVertices.empty() && outIndices.size() >= 3;
+}
+
+bool StaticMeshRenderer::BakeTreeImpostorAsset(client::asset::IAssetReader& assets,
+    const std::filesystem::path& modelPath, const tree_tool::TreeImpostorSettings& settings, std::string& error)
+{
+    const auto materials = AssetDatabase::Instance().loadDefaultMaterials(modelPath);
+    StaticMeshRenderer source;
+    source.m_isTreeImpostor = true; // Load just the original geometry, regardless of an earlier bake.
+    if (materials.size() != 2 || !source.LoadCpu(assets, modelPath.generic_string()) ||
+        source.m_draws.empty() || std::any_of(source.m_draws.begin(), source.m_draws.end(), [](const auto& draw) { return draw.materialSlot >= 2; }))
+    { error = "A static tree with two default materials (bark/leaves) is required"; return false; }
+    ixtreemetree::TreeMesh mesh;
+    mesh.bboxMin = {source.m_boundsMin[0], source.m_boundsMin[1], source.m_boundsMin[2]};
+    mesh.bboxMax = {source.m_boundsMax[0], source.m_boundsMax[1], source.m_boundsMax[2]};
+    for (const auto& vertex : source.m_vertices)
+    {
+        const ixtreemetree::Vertex treeVertex{{vertex.position[0], vertex.position[1], vertex.position[2]},
+            {vertex.normal[0], vertex.normal[1], vertex.normal[2]}, {vertex.uv[0], vertex.uv[1]}};
+        mesh.bark.vertices.push_back(treeVertex); mesh.leaves.vertices.push_back(treeVertex);
+    }
+    for (const auto& draw : source.m_draws)
+    {
+        auto& indices = draw.materialSlot == 0 ? mesh.bark.indices : mesh.leaves.indices;
+        indices.insert(indices.end(), source.m_indices.begin() + draw.firstIndex,
+            source.m_indices.begin() + draw.firstIndex + draw.indexCount);
+    }
+    auto dependencies = AssetDatabase::Instance().loadDependencies(modelPath);
+    if (!tree_tool::BakeTreeImpostor(mesh, modelPath, materials, settings, dependencies, error)) return false;
+    return AssetDatabase::Instance().writeDependencies(modelPath, dependencies);
 }
 
 void StaticMeshRenderer::DumpMaterialState(const char* entityName, const Instance& instance) const
@@ -2797,6 +2906,7 @@ void StaticMeshRenderer::RecordTextureUpload(ixrhi::IXRHICommandList& cmd, const
 
 void StaticMeshRenderer::RecordPendingUploads(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame)
 {
+    if (m_treeImpostor) m_treeImpostor->renderer->RecordPendingUploads(cmd, frame);
     if (!m_rhi || !frame.frameActive)
         return;
     // The material textures decoded since: made, and copied in ahead of the frame's draws.
@@ -3035,6 +3145,16 @@ StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialText
     views.baseColor = materialOf(m_texture);
     views.normal = materialOf(m_normalTexture);
     views.orm = materialOf(m_ormTexture);
+    if (m_isTreeImpostor && !m_materialDefaults.empty())
+    {
+        const auto& defaults = m_materialDefaults.front();
+        views.alphaMode = defaults.alphaMode;
+        views.alphaCutoff = defaults.alphaCutoff;
+        views.fragmentShaderAlphaPath = AlphaFragmentPath(views.alphaMode);
+        views.unlit = defaults.unlit;
+        views.resolvedMaterial = "tree_impostor";
+        return views;
+    }
 
     if (materialSlot >= instance.materialSlots.size())
         return views;
@@ -3439,6 +3559,153 @@ bool EnvironmentSwitchOn(const char* name)
 }
 } // namespace
 
+bool StaticMeshRenderer::HasTreeImpostor() const
+{
+    return m_treeImpostor && m_treeImpostor->valid && m_treeImpostor->filesValid && m_treeImpostor->renderer->IsLoaded();
+}
+
+bool StaticMeshRenderer::RenderTreeImpostors(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
+    double timeSeconds, const WorldCamera& camera, const InstanceList& instances,
+    const LodConfig& config, std::uint64_t configHash, std::uint32_t lodLevel,
+    std::uint32_t targetWidth, std::uint32_t targetHeight)
+{
+    static const bool enabled = EnvironmentSwitchOn("IX_TREE_IMPOSTORS");
+    auto* state = m_treeImpostor.get();
+    if (!enabled || !state || state->partitioning || !frame.frameActive || !state->renderer->IsLoaded() ||
+        !UploadsRecorded() || !state->renderer->UploadsRecorded() || !m_boundSunShadowTexture) return false;
+    const auto revision = MaterialAssetManager::Instance().Revision();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - state->checkedFiles >= std::chrono::seconds(1) && !state->sourceTimes.empty())
+    {
+        state->checkedFiles = now;
+        if (auto root = m_assets->RootPath())
+        {
+            std::error_code metadataError;
+            const auto metadataStamp = std::filesystem::last_write_time(*root / (m_modelPath + ".impostor.json"), metadataError);
+            state->filesValid &= !metadataError && metadataStamp == state->metadataTime;
+            for (std::size_t i=0;i<state->sourceTimes.size();++i)
+            {
+                std::error_code error;
+                const auto stamp = std::filesystem::last_write_time(*root / state->data.sourcePaths[i], error);
+                state->filesValid &= !error && stamp == state->sourceTimes[i];
+            }
+        }
+    }
+    if (state->checkedRevision != revision)
+    {
+        bool valid = true;
+        for (std::size_t i=0;i<state->data.materials.size();++i)
+        {
+            const auto guid = Guid::fromString(state->data.materials[i]);
+            const auto* material = guid ? MaterialAssetManager::Instance().getOrLoad(*guid) : nullptr;
+            valid &= material && tree_tool::TreeImpostorMaterialSignature(*material) == state->data.materialSignatures[i];
+        }
+        if (state->valid && !valid) LogFormat("[TREE-IMPOSTOR] material/texture changed; using mesh until rebaked model=%s", m_modelPath.c_str());
+        state->valid = valid;
+        state->checkedRevision = revision;
+    }
+    if (!state->valid || !state->filesValid || instances.empty()) return false;
+    constexpr float pi = 3.14159265358979323846f;
+    state->nearInstances.clear(); state->farInstances.clear();
+    std::size_t faded = 0, sprites = 0;
+    std::uint32_t impostorTrees = 0;
+    // Grow arenas without clearing their per-instance vector capacities each frame.
+    if (state->fading.size() < instances.size()) state->fading.resize(instances.size());
+    if (state->billboards.size() < instances.size() * 2) state->billboards.resize(instances.size() * 2);
+    if (state->billboardPrepared.size() < instances.size() * 2) state->billboardPrepared.resize(instances.size() * 2);
+    for (const Instance* source : instances)
+    {
+        const float scale = source->scale[0];
+        bool eligible = !source->selectedForOutline && scale > 0 &&
+            std::abs(source->scale[1]-scale) <= scale*0.001f && std::abs(source->scale[2]-scale) <= scale*0.001f &&
+            std::abs(source->rotation[0]) < 0.001f && std::abs(source->rotation[2]) < 0.001f &&
+            source->materialSlots.size() == state->data.materials.size() &&
+            std::equal(source->materialSlots.begin(), source->materialSlots.end(), state->data.materials.begin()) &&
+            std::none_of(source->materialOverrides.begin(), source->materialOverrides.end(), [](const auto& entry) { return entry.enabled; });
+        const auto center = xm::TransformPoint(BuildStaticMeshModelMatrix(*source),
+            {state->data.center[0], state->data.center[1], state->data.center[2]});
+        const float dx = static_cast<float>(camera.eye.x) - center.x;
+        const float dy = static_cast<float>(camera.eye.y) - center.y;
+        const float dz = static_cast<float>(camera.eye.z) - center.z;
+        const float distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+        const float elevation = std::atan2(dy, std::sqrt(dx*dx + dz*dz));
+        // Outside the captured elevations, tilted/reflected trees and edited materials stay meshes.
+        eligible &= std::abs(elevation) <= pi/4;
+        const float weight = eligible ? tree_tool::TreeImpostorWeight(distance, state->data.distance * scale,
+            state->data.transition * scale) : 0.0f;
+        if (weight <= 0)
+        {
+            state->nearInstances.push_back(source);
+            continue;
+        }
+        ++impostorTrees;
+        if (weight < 1)
+        {
+            auto& copy = state->fading[faded++];
+            copy = *source;
+            copy.coverageMax = 1-weight;
+        }
+        const float yaw = std::atan2(dx,dz);
+        // Original tree yaw uses row-vector RotationY; positive yaw turns +Z toward -X.
+        const auto view = tree_tool::SelectTreeImpostorView(yaw + source->rotation[1], elevation, state->data.azimuths);
+        float coverage = 1-weight;
+        for (int image = 0; image < 2; ++image)
+        {
+            const float share = weight * (image == 0 ? 1-view.blend : view.blend);
+            if (share <= 0) continue;
+            const auto uv = tree_tool::TreeImpostorUv(image == 0 ? view.first : view.second,
+                view.row, state->data.azimuths, state->data.resolution);
+            auto& prepared = state->billboardPrepared[sprites];
+            auto& billboard = state->billboards[sprites++];
+            const bool changed = prepared.renderer != state->renderer.get() || prepared.materialRevision != revision ||
+                billboard.position.x != center.x || billboard.position.y != center.y || billboard.position.z != center.z ||
+                billboard.rotation[0] != elevation || billboard.rotation[1] != -yaw || billboard.scale[0] != scale ||
+                billboard.tint != source->tint || billboard.materialOverrides.empty() ||
+                billboard.materialOverrides[0].uvTiling[0] != uv[0] || billboard.materialOverrides[0].uvTiling[1] != uv[1] ||
+                billboard.materialOverrides[0].uvOffset[0] != uv[2] || billboard.materialOverrides[0].uvOffset[1] != uv[3];
+            billboard.entityId = source->entityId;
+            billboard.position = {center.x,center.y,center.z};
+            billboard.rotation[0] = elevation;
+            billboard.rotation[1] = -yaw;
+            billboard.rotation[2] = 0;
+            for (float& value : billboard.scale) value = scale;
+            billboard.tint = source->tint;
+            billboard.prepared = nullptr;
+            billboard.selectedForOutline = false;
+            billboard.coverageMin = coverage;
+            coverage += share;
+            billboard.coverageMax = image == 1 ? 1.0f : coverage;
+            billboard.materialOverrides.resize(1);
+            auto& material = billboard.materialOverrides.front();
+            material = {};
+            material.enabled = true;
+            material.uvTiling[0] = uv[0]; material.uvTiling[1] = uv[1];
+            material.uvOffset[0] = uv[2]; material.uvOffset[1] = uv[3];
+            if (changed) state->renderer->PrepareInstance(billboard, prepared);
+            billboard.prepared = &prepared;
+            state->farInstances.push_back(&billboard);
+        }
+    }
+    if (state->farInstances.empty()) return false;
+    for (std::size_t i = 0; i < faded; ++i) state->nearInstances.push_back(&state->fading[i]);
+    state->partitioning = true;
+    RenderLodBatchInWorld(cmd, frame, timeSeconds, camera, state->nearInstances, config, configHash, lodLevel, targetWidth, targetHeight);
+    state->partitioning = false;
+    auto& renderer = *state->renderer;
+    renderer.SetLightingState(m_lightingState);
+    renderer.SetSunShadow(m_sunShadow);
+    renderer.RenderBatchInWorld(cmd, frame, timeSeconds, camera, state->farInstances, targetWidth, targetHeight);
+    m_lastSubmittedDrawCalls += renderer.LastSubmittedDrawCalls();
+    m_lastSubmittedInstances += renderer.LastSubmittedInstances();
+    m_lastSubmittedIndexCount += renderer.LastSubmittedIndexCount();
+    m_lastSubmittedTriangles += renderer.LastSubmittedTriangles();
+    m_lastInstanceBufferBytes += renderer.LastInstanceBufferBytes();
+    m_lastInstanceBufferRebuilt |= renderer.LastInstanceBufferRebuilt();
+    m_lastMaterialUniformUpdates += renderer.LastMaterialUniformUpdates();
+    m_lastImpostorTrees = impostorTrees;
+    return true;
+}
+
 void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const ixrhi::IXRHIFrameInfo& frame,
     double timeSeconds,
@@ -3450,9 +3717,12 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     std::uint32_t targetWidth,
     std::uint32_t targetHeight)
 {
+    if (RenderTreeImpostors(cmd, frame, timeSeconds, camera, instancesIn, lodConfig, configHash, lodLevel, targetWidth, targetHeight)) return;
+    if (!m_treeImpostor || !m_treeImpostor->partitioning) m_lastImpostorTrees = 0;
     m_lastSubmittedDrawCalls = 0;
     m_lastSubmittedInstances = 0;
     m_lastSubmittedIndexCount = 0;
+    m_lastSubmittedTriangles = 0;
     m_lastUsedFullResFallback = false;
     m_lastMaterialUniformUpdates = 0;
     m_lastOverrideActiveDraws = 0;
@@ -3798,6 +4068,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     // The texture descriptors and the world uniform are bound once per draw call, so one instanced
     // draw may only cover instances that share this slot's material: split each command into runs of
     // consecutive instances with the same material GUID (instances of one material stay one draw).
+    const auto fades = [](const Instance& instance) { return instance.coverageMin > 0.0f || instance.coverageMax < 1.0f; };
     const auto materialKey = [](const Instance& instance, std::uint32_t slot) -> std::string_view {
         return slot < instance.materialSlots.size() ? std::string_view(instance.materialSlots[slot]) : std::string_view();
     };
@@ -3823,6 +4094,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         while (runEnd < command.instanceCount &&
                materialKey(*instances[runEnd], command.materialSlot) ==
                    materialKey(*instances[runStart], command.materialSlot) &&
+               fades(*instances[runEnd]) == fades(*instances[runStart]) &&
                (!byLevel || viewLevels[runEnd] == viewLevels[runStart]))
             ++runEnd;
         MaterialRun& run = materialRuns.emplace_back();
@@ -3832,7 +4104,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         run.draw.instanceCount = runEnd - runStart;
         run.instance = instances[runStart];
         run.textures = ResolveMaterialTextureViews(*m_rhi, *run.instance, run.draw.materialSlot);
-        run.isMask = std::strcmp(run.textures.fragmentShaderAlphaPath, "discard") == 0;
+        run.isMask = std::strcmp(run.textures.fragmentShaderAlphaPath, "discard") == 0 || fades(*run.instance);
         run.isBlend = std::strcmp(run.textures.fragmentShaderAlphaPath, "blend") == 0;
         run.level = byLevel ? viewLevels[runStart] : 0;
         runStart = runEnd;
@@ -3884,6 +4156,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
                 cmd.DrawIndexed(draw.indexCount, draw.instanceCount, draw.firstIndex, 0, draw.firstInstance);
                 ++m_lastSubmittedDrawCalls;
                 m_lastSubmittedIndexCount += draw.indexCount;
+                m_lastSubmittedTriangles += static_cast<std::uint64_t>(draw.indexCount/3) * draw.instanceCount;
                 continue;
             }
             const std::optional<BindSlot> slot = NextBindSlot(frameIndex);
@@ -3977,6 +4250,8 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
             cmd.DrawIndexed(indexCount, draw.instanceCount, lod ? lod->firstIndex : draw.firstIndex, 0, draw.firstInstance);
             ++m_lastSubmittedDrawCalls;
             m_lastSubmittedIndexCount += indexCount;
+            if (step != MaskStep::Depth)
+                m_lastSubmittedTriangles += static_cast<std::uint64_t>(indexCount/3) * draw.instanceCount;
         }
     };
     drawPass(false, MaskStep::Single);
@@ -4039,7 +4314,7 @@ bool StaticMeshRenderer::PrepareInstance(const Instance& instance, PreparedInsta
     for (std::uint32_t slot = 0; slot < slotCount; ++slot)
     {
         InstanceBlock block{};
-        FillStaticMeshInstanceBlock(identity, instance, slot, m_materialDefaults, block);
+        FillStaticMeshInstanceBlock(identity, instance, slot, m_materialDefaults, block, m_isTreeImpostor);
         changed = changed || std::memcmp(&block, &out.slots[slot], sizeof(InstanceBlock)) != 0;
         out.slots[slot] = block;
     }
@@ -4070,9 +4345,11 @@ void StaticMeshRenderer::FillInstanceBlock(const WorldMat4& viewProjection,
         out = prepared->slots[materialSlot];
         out.mvp = Multiply(out.model, viewProjection);
         std::memcpy(out.tint, instance.tint.data(), sizeof(out.tint));
+        out.materialAlpha[2] = instance.coverageMin;
+        out.materialAlpha[3] = instance.coverageMax;
         return;
     }
-    FillStaticMeshInstanceBlock(viewProjection, instance, materialSlot, m_materialDefaults, out);
+    FillStaticMeshInstanceBlock(viewProjection, instance, materialSlot, m_materialDefaults, out, m_isTreeImpostor);
 }
 
 bool StaticMeshRenderer::PreparedUsable(const Instance& instance) const
@@ -4426,6 +4703,8 @@ void StaticMeshRenderer::DestroyPipeline()
 void StaticMeshRenderer::Destroy()
 {
     StopLodWorker();
+    m_treeImpostor.reset();
+    m_lastImpostorTrees = 0;
     if (!m_rhi)
         return;
     DestroyPipeline();
@@ -4495,7 +4774,7 @@ void StaticMeshRenderer::UpdateWorldUniform(const BindSlot& slot,
 
     UniformBlock uniform{mvp, model,
         {instance.tint[0], instance.tint[1], instance.tint[2], instance.tint[3]}};
-    const MaterialDefaults defaults = ResolveMaterialSlotDefaults(instance, materialSlot, m_materialDefaults);
+    const MaterialDefaults defaults = ResolveMaterialSlotDefaults(instance, materialSlot, m_materialDefaults, m_isTreeImpostor);
     std::memcpy(uniform.materialBaseColor, defaults.baseColor, sizeof(uniform.materialBaseColor));
     uniform.materialParams[0] = defaults.metallic;
     uniform.materialParams[1] = defaults.roughness;
@@ -4507,12 +4786,12 @@ void StaticMeshRenderer::UpdateWorldUniform(const BindSlot& slot,
     uniform.materialEmissive[3] = 1.0f;
     uniform.materialAlpha[0] = AlphaModeCode(defaults.alphaMode);
     uniform.materialAlpha[1] = std::clamp(defaults.alphaCutoff, 0.0f, 1.0f);
-    uniform.materialAlpha[2] = defaults.unlit ? 1.0f : 0.0f;
+    uniform.materialAlpha[2] = instance.coverageMin;
     uniform.materialUv[0] = defaults.uvTiling[0];
     uniform.materialUv[1] = defaults.uvTiling[1];
     uniform.materialUv[2] = defaults.uvOffset[0];
     uniform.materialUv[3] = defaults.uvOffset[1];
-    uniform.materialAlpha[3] = 0.0f;
+    uniform.materialAlpha[3] = instance.coverageMax;
     for (const MeshSceneEntity::MaterialOverride& overrideSlot : instance.materialOverrides)
     {
         if (overrideSlot.slot != materialSlot || !overrideSlot.enabled)

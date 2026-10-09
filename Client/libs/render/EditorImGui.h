@@ -218,6 +218,12 @@ public:
     void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
     void InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot, const std::filesystem::path& assetRoot);
     void RefreshAssetLibrary();
+    std::vector<std::filesystem::path> TakeTreeImpostorChanges()
+    {
+        std::vector<std::filesystem::path> paths;
+        paths.swap(m_treeImpostorChanges);
+        return paths;
+    }
     // The folder the asset browser shows (relative to the asset root): where new assets go.
     const std::string& CurrentAssetFolder() const { return m_assetSubpath; }
     // Generates retargetable .ixclip assets for a loaded rigged model's existing _anim_<i>.ozz
@@ -665,6 +671,7 @@ private:
     // WaterMaterialsRevision: bumped per unsaved material edit and when the asset library is replaced.
     mutable std::uint64_t m_waterMaterialsTick = 0;
     std::uint64_t m_assetLibraryGeneration = 0;  // bumped for each new library (AssetLibraryRevision)
+    std::vector<std::filesystem::path> m_treeImpostorChanges;
     mutable bool m_waterMaterialsDrafting = false;
     std::unique_ptr<tree_tool::TreeGeneratorPanel> m_treeGeneratorPanel;
     bool m_inspectorShowsTreeGenerator = false;
