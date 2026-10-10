@@ -35,8 +35,7 @@ void EditorImGui::RenderEditorPanels()
     RenderShortcutsWindow();
     RenderAboutPopup();
     RenderTreeGeneratorPanel();
-    RenderWaterMaterialEditor();
-    RenderPbrMaterialEditor();
+    RenderMaterialEditor();
     RenderCreatePbrMaterialPopup();
     RenderFbxExportPopup();
     TrackStatusMessages();

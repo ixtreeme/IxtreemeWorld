@@ -413,6 +413,8 @@ private:
     void RenderTerrainSculptTool();
     void RenderTerrainPaintTool();
     void RenderSplatLayerSlot(std::uint32_t slotIndex);
+    void RenderMaterialEditor();
+    // Type-specific controls rendered inside the shared Material Editor window.
     void RenderWaterMaterialEditor();
     void RenderTreeGeneratorPanel();
     // Whether the Inspector shows the Tree Generator's settings (instead of the selection).
@@ -537,9 +539,15 @@ private:
     void SetToolMode(MapEditorToolMode mode);
     MapEditorPaletteSlot BuildPaletteSlotFromAsset(std::uint32_t slotIndex, const AssetLibrary::Entry& entry) const;
 
-    struct WaterMaterialEditorState
+    struct MaterialEditorState
     {
         bool windowOpen = false;
+        bool focusRequested = false;
+        AssetLibrary::Category selectedTab = AssetLibrary::Category::Material;
+    };
+
+    struct WaterMaterialEditorState
+    {
         bool dirty = false;
         std::string materialId;
         WaterMaterialData draft;
@@ -549,7 +557,6 @@ private:
 
     struct PbrMaterialEditorState
     {
-        bool windowOpen = false;
         bool dirty = false;
         std::string materialId;
         AssetLibrary::MaterialData draft;
@@ -666,6 +673,7 @@ private:
     std::array<MapEditorPaletteSlot, 8> m_paletteSlots{};
     std::vector<std::pair<std::string, WaterMaterialData>> m_waterMaterials;
     std::unordered_map<std::string, std::uint32_t> m_waterMaterialUsageCounts;
+    MaterialEditorState m_materialEditor;
     WaterMaterialEditorState m_waterMaterialEditor;
     PbrMaterialEditorState m_pbrMaterialEditor;
     // WaterMaterialsRevision: bumped per unsaved material edit and when the asset library is replaced.

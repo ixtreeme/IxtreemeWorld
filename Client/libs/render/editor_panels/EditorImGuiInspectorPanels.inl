@@ -439,7 +439,8 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
     const std::string materialLabel = m_waterBodyState.materialName.empty()
         ? (m_waterBodyState.materialId.empty() ? std::string("Inline Water") : m_waterBodyState.materialId)
         : m_waterBodyState.materialName;
-    UI::AssetField("Material", ICON_FA_WATER, materialLabel, "The water material. Drop a water material from the Asset Browser here to change it.");
+    UI::AssetField("Material", ICON_FA_WATER, materialLabel, "Double-click to edit this water material. Drop a water material from the Asset Browser here to change it.");
+    const bool openWaterMaterial = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     if (ImGui::BeginDragDropTarget())
     {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
@@ -450,7 +451,7 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
         ImGui::EndDragDropTarget();
     }
 
-    if (UI::IconButton(ICON_FA_PALETTE, "Edit Material"))
+    if (UI::IconButton(ICON_FA_PALETTE, "Edit Material") || openWaterMaterial)
     {
         m_commands.selectedWaterBodyChanged = true;
         m_commands.selectedWaterBody = m_waterBodyState;
@@ -1931,6 +1932,10 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
                 emptySlot ? ImVec4(0.22f, 0.22f, 0.25f, 1.0f) : ImVec4(0.34f, 0.42f, 0.34f, 1.0f));
             ImGui::Button(label.c_str(), ImVec2(-1.0f, 42.0f));
             ImGui::PopStyleColor();
+            if (!emptySlot && ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                OpenPbrMaterialEditor(m_meshRendererState.materialSlots[slot]);
+            if (!emptySlot)
+                UI::ItemTooltip("Double-click to edit this material. Drop a material here to replace it.");
             if (ImGui::BeginDragDropTarget())
             {
                 if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
@@ -2641,6 +2646,15 @@ void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
         m_editorSettings.tool = MapEditorTool::Paint;
         SetToolMode(MapEditorToolMode::SplatPaint);
     }
+    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && m_assetLibrary)
+    {
+        const auto entry = m_assetLibrary->FindById(slot.assetId);
+        if (entry && entry->category == AssetLibrary::Category::Material)
+        {
+            OpenPbrMaterialEditor(entry->id);
+            SetToolMode(MapEditorToolMode::None);
+        }
+    }
     if (selected)
         ImGui::PopStyleColor(3);
 
@@ -2680,7 +2694,7 @@ void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
         ? (slot.texturePath.empty() ? std::string("(empty)") : std::filesystem::path(slot.texturePath).stem().string())
         : slot.displayName;
     UI::ItemTooltip(("Layer " + std::to_string(slotIndex + 1u) + ": " + name +
-        "\nClick to paint with it; drop a texture or material here to change it").c_str());
+        "\nClick to paint; double-click a material layer to edit its material; drop a texture or material to change it").c_str());
     ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + slotWidth);
     ImGui::TextDisabled("%s", name.c_str());
     ImGui::PopTextWrapPos();

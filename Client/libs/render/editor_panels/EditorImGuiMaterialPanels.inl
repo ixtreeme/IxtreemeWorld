@@ -10,7 +10,8 @@ void EditorImGui::RenderWaterMaterialHeader()
     const std::string title = entry ? entry->displayName : m_waterMaterialEditor.materialId;
     UI::SectionHeader(ICON_FA_PALETTE " Water Material");
     ImGui::Text("Editing: %s%s", title.c_str(), m_waterMaterialEditor.dirty ? " *" : "");
-    UI::Prop::InputText("Name", m_waterMaterialEditor.name, sizeof(m_waterMaterialEditor.name));
+    if (UI::Prop::InputText("Name", m_waterMaterialEditor.name, sizeof(m_waterMaterialEditor.name)))
+        MarkWaterMaterialChanged("name");
 
     if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save"))
         SaveWaterMaterialEditor();
@@ -259,50 +260,91 @@ void EditorImGui::RenderWaterMaterialTexturesSection(WaterMaterialData& material
     if (UI::Prop::SliderFloat("Normal Tiling", &material.normalTiling, 0.1f, 20.0f, "%.2f")) MarkWaterMaterialChanged("normal_tiling");
 }
 
-void EditorImGui::RenderWaterMaterialEditor()
+void EditorImGui::RenderMaterialEditor()
 {
-    if (!m_editorModeActive || !m_waterMaterialEditor.windowOpen)
+    if (!m_editorModeActive || !m_materialEditor.windowOpen)
         return;
 
-    if (ImGui::Begin("Water Material Editor", &m_waterMaterialEditor.windowOpen))
+    const bool selectTab = m_materialEditor.focusRequested;
+    const AssetLibrary::Category requestedTab = m_materialEditor.selectedTab;
+    if (selectTab)
+    {
+        ImGui::SetNextWindowFocus();
+        ImGui::SetNextWindowCollapsed(false);
+        m_materialEditor.focusRequested = false;
+    }
+    ImGui::SetNextWindowSize(ImVec2(460.0f, 650.0f), ImGuiCond_FirstUseEver);
+    if (ImGui::Begin("Material Editor", &m_materialEditor.windowOpen))
     {
         const bool toolsEnabled = CanUseEditorTools();
         if (!toolsEnabled)
-        {
             ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Read-only during Play Mode");
-            ImGui::BeginDisabled();
-        }
-        if (m_waterMaterialEditor.materialId.empty())
-        {
-            ImGui::TextDisabled("No water material loaded.");
-            if (!toolsEnabled)
-                ImGui::EndDisabled();
-            ImGui::End();
-            return;
-        }
 
-        RenderWaterMaterialHeader();
-        ImGui::Separator();
-        WaterMaterialData& material = m_waterMaterialEditor.draft;
-        RenderWaterMaterialColorsSection(material);
-        RenderWaterMaterialWaveSection(material);
-        RenderWaterMaterialFoamSection(material);
-        RenderWaterMaterialCausticSection(material);
-        RenderWaterMaterialReflectionSection(material);
-        RenderWaterMaterialRefractionSection(material);
-        RenderWaterMaterialEdgeFadeSection(material);
-        RenderWaterMaterialTexturesSection(material);
-        if (!toolsEnabled)
-            ImGui::EndDisabled();
+        if (ImGui::BeginTabBar("##material_editor_types"))
+        {
+            const ImGuiTabItemFlags materialFlags = selectTab &&
+                requestedTab == AssetLibrary::Category::Material
+                ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+            if (ImGui::BeginTabItem("Material", nullptr, materialFlags))
+            {
+                m_materialEditor.selectedTab = AssetLibrary::Category::Material;
+                ImGui::PushID("Material");
+                ImGui::BeginDisabled(!toolsEnabled);
+                RenderPbrMaterialEditor();
+                ImGui::EndDisabled();
+                ImGui::PopID();
+                ImGui::EndTabItem();
+            }
+            const ImGuiTabItemFlags waterFlags = selectTab &&
+                requestedTab == AssetLibrary::Category::WaterMaterial
+                ? ImGuiTabItemFlags_SetSelected : ImGuiTabItemFlags_None;
+            if (ImGui::BeginTabItem("Water", nullptr, waterFlags))
+            {
+                m_materialEditor.selectedTab = AssetLibrary::Category::WaterMaterial;
+                ImGui::PushID("Water");
+                ImGui::BeginDisabled(!toolsEnabled);
+                RenderWaterMaterialEditor();
+                ImGui::EndDisabled();
+                ImGui::PopID();
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
     }
     ImGui::End();
+}
+
+void EditorImGui::RenderWaterMaterialEditor()
+{
+    if (m_waterMaterialEditor.materialId.empty())
+    {
+        ImGui::TextDisabled("Open a water material from the Asset Browser or Inspector.");
+        if (UI::IconButton(ICON_FA_PLUS, "New Water Material"))
+            CreateWaterMaterialAsset();
+        return;
+    }
+
+    RenderWaterMaterialHeader();
+    if (m_waterMaterialEditor.materialId.empty())
+        return;
+    ImGui::Separator();
+    WaterMaterialData& material = m_waterMaterialEditor.draft;
+    RenderWaterMaterialColorsSection(material);
+    RenderWaterMaterialWaveSection(material);
+    RenderWaterMaterialFoamSection(material);
+    RenderWaterMaterialCausticSection(material);
+    RenderWaterMaterialReflectionSection(material);
+    RenderWaterMaterialRefractionSection(material);
+    RenderWaterMaterialEdgeFadeSection(material);
+    RenderWaterMaterialTexturesSection(material);
 }
 
 void EditorImGui::RenderPbrMaterialHeader()
 {
     UI::SectionHeader(ICON_FA_PALETTE " PBR Material");
     ImGui::Text("Editing: %s%s", m_pbrMaterialEditor.name, m_pbrMaterialEditor.dirty ? " *" : "");
-    UI::Prop::InputText("Name", m_pbrMaterialEditor.name, sizeof(m_pbrMaterialEditor.name));
+    if (UI::Prop::InputText("Name", m_pbrMaterialEditor.name, sizeof(m_pbrMaterialEditor.name)))
+        MarkPbrMaterialChanged("name");
     if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Save"))
         SavePbrMaterialEditor();
     ImGui::SameLine();
@@ -359,86 +401,79 @@ void EditorImGui::RenderPbrTextureSlot(const char* label, std::string& textureId
 
 void EditorImGui::RenderPbrMaterialEditor()
 {
-    if (!m_editorModeActive || !m_pbrMaterialEditor.windowOpen)
-        return;
-
-    if (ImGui::Begin("PBR Material Editor", &m_pbrMaterialEditor.windowOpen))
+    if (m_pbrMaterialEditor.materialId.empty())
     {
-        const bool toolsEnabled = CanUseEditorTools();
-        if (!toolsEnabled)
-        {
-            ImGui::TextColored(ImVec4(0.95f, 0.74f, 0.30f, 1.0f), "Read-only during Play Mode");
-            ImGui::BeginDisabled();
-        }
-        RenderPbrMaterialHeader();
-        ImGui::Separator();
-        AssetLibrary::MaterialData& material = m_pbrMaterialEditor.draft;
-        int shadingModeIndex = ToLowerAscii(material.shadingMode) == "unlit" ? 1 : 0;
-        const char* shadingModes[] = {"Lit", "Unlit"};
-        if (UI::Prop::Combo("Shading Mode", &shadingModeIndex, shadingModes, IM_ARRAYSIZE(shadingModes)))
-        {
-            material.shadingMode = shadingModeIndex == 1 ? "unlit" : "lit";
-            MarkPbrMaterialChanged("shading_mode");
-            Tracenf("[MATERIAL] editor shadingMode=%s material_id=%s",
-                shadingModeIndex == 1 ? "Unlit" : "Lit",
-                m_pbrMaterialEditor.materialId.c_str());
-        }
-        const bool unlitMode = shadingModeIndex == 1;
-        if (ImGui::CollapsingHeader("Textures", ImGuiTreeNodeFlags_DefaultOpen))
-        {
-            bool changed = false;
-            RenderPbrTextureSlot("Diffuse / Albedo", material.diffuseTextureId, changed);
-            if (unlitMode)
-                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.55f);
-            RenderPbrTextureSlot("Normal Map", material.normalTextureId, changed);
-            RenderPbrTextureSlot("AO", material.aoTextureId, changed);
-            RenderPbrTextureSlot("Roughness", material.roughnessTextureId, changed);
-            RenderPbrTextureSlot("Metallic", material.metallicTextureId, changed);
-            if (unlitMode)
-                ImGui::PopStyleVar();
-            RenderPbrTextureSlot("Height", material.heightTextureId, changed);
-            if (changed)
-                MarkPbrMaterialChanged("texture_slot");
-        }
-        if (ImGui::CollapsingHeader("Parameters", ImGuiTreeNodeFlags_DefaultOpen))
-        {
-            if (UI::Prop::SliderFloat("Tiling X", &material.tilingScaleX, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_x");
-            if (UI::Prop::SliderFloat("Tiling Y", &material.tilingScaleY, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_y");
-            // (The alpha too for a .material: it multiplies the texture's, for the mask cut-off and blending.)
-            const bool tintChanged = PbrEditorEditsMaterialFile()
-                ? UI::Prop::ColorEdit4("Tint", material.colorTint, ImGuiColorEditFlags_AlphaBar)
-                : UI::Prop::ColorEdit3("Tint", material.colorTint);
-            if (tintChanged)
-                MarkPbrMaterialChanged("color_tint");
-            if (unlitMode)
-                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.55f);
-            if (UI::Prop::SliderFloat("Normal Strength", &material.normalStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("normal_strength");
-            if (UI::Prop::SliderFloat("AO Strength", &material.aoStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("ao_strength");
-            if (UI::Prop::SliderFloat("Roughness Strength", &material.roughnessStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("roughness_strength");
-            if (UI::Prop::SliderFloat("Metallic Strength", &material.metallicStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("metallic_strength");
-            if (unlitMode)
-                ImGui::PopStyleVar();
-        }
-        if (ImGui::CollapsingHeader("Transparency", ImGuiTreeNodeFlags_DefaultOpen))
-        {
-            int alphaModeIndex = ToLowerAscii(material.alphaMode) == "mask" ? 1 :
-                (ToLowerAscii(material.alphaMode) == "blend" ? 2 : 0);
-            const char* alphaModes[] = {"OPAQUE", "MASK", "BLEND"};
-            if (UI::Prop::Combo("Alpha Mode", &alphaModeIndex, alphaModes, IM_ARRAYSIZE(alphaModes)))
-            {
-                material.alphaMode = alphaModeIndex == 1 ? "mask" : (alphaModeIndex == 2 ? "blend" : "opaque");
-                MarkPbrMaterialChanged("alpha_mode");
-            }
-            if (alphaModeIndex == 1)
-            {
-                if (UI::Prop::SliderFloat("Alpha Cutoff", &material.alphaCutoff, 0.0f, 1.0f, "%.3f"))
-                    MarkPbrMaterialChanged("alpha_cutoff");
-            }
-        }
-        if (!toolsEnabled)
-            ImGui::EndDisabled();
+        ImGui::TextDisabled("Open a material from the Asset Browser or Inspector.");
+        if (UI::IconButton(ICON_FA_PLUS, "New Material"))
+            CreatePbrMaterialAsset();
+        return;
     }
-    ImGui::End();
+
+    RenderPbrMaterialHeader();
+    ImGui::Separator();
+    AssetLibrary::MaterialData& material = m_pbrMaterialEditor.draft;
+    int shadingModeIndex = ToLowerAscii(material.shadingMode) == "unlit" ? 1 : 0;
+    const char* shadingModes[] = {"Lit", "Unlit"};
+    if (UI::Prop::Combo("Shading Mode", &shadingModeIndex, shadingModes, IM_ARRAYSIZE(shadingModes)))
+    {
+        material.shadingMode = shadingModeIndex == 1 ? "unlit" : "lit";
+        MarkPbrMaterialChanged("shading_mode");
+        Tracenf("[MATERIAL] editor shadingMode=%s material_id=%s",
+            shadingModeIndex == 1 ? "Unlit" : "Lit",
+            m_pbrMaterialEditor.materialId.c_str());
+    }
+    const bool unlitMode = shadingModeIndex == 1;
+    if (ImGui::CollapsingHeader("Textures", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        bool changed = false;
+        RenderPbrTextureSlot("Diffuse / Albedo", material.diffuseTextureId, changed);
+        if (unlitMode)
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.55f);
+        RenderPbrTextureSlot("Normal Map", material.normalTextureId, changed);
+        RenderPbrTextureSlot("AO", material.aoTextureId, changed);
+        RenderPbrTextureSlot("Roughness", material.roughnessTextureId, changed);
+        RenderPbrTextureSlot("Metallic", material.metallicTextureId, changed);
+        if (unlitMode)
+            ImGui::PopStyleVar();
+        RenderPbrTextureSlot("Height", material.heightTextureId, changed);
+        if (changed)
+            MarkPbrMaterialChanged("texture_slot");
+    }
+    if (ImGui::CollapsingHeader("Parameters", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        if (UI::Prop::SliderFloat("Tiling X", &material.tilingScaleX, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_x");
+        if (UI::Prop::SliderFloat("Tiling Y", &material.tilingScaleY, 0.01f, 32.0f, "%.2f")) MarkPbrMaterialChanged("tiling_y");
+        // (The alpha too for a .material: it multiplies the texture's, for the mask cut-off and blending.)
+        const bool tintChanged = PbrEditorEditsMaterialFile()
+            ? UI::Prop::ColorEdit4("Tint", material.colorTint, ImGuiColorEditFlags_AlphaBar)
+            : UI::Prop::ColorEdit3("Tint", material.colorTint);
+        if (tintChanged)
+            MarkPbrMaterialChanged("color_tint");
+        if (unlitMode)
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * 0.55f);
+        if (UI::Prop::SliderFloat("Normal Strength", &material.normalStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("normal_strength");
+        if (UI::Prop::SliderFloat("AO Strength", &material.aoStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("ao_strength");
+        if (UI::Prop::SliderFloat("Roughness Strength", &material.roughnessStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("roughness_strength");
+        if (UI::Prop::SliderFloat("Metallic Strength", &material.metallicStrength, 0.0f, 2.0f, "%.2f")) MarkPbrMaterialChanged("metallic_strength");
+        if (unlitMode)
+            ImGui::PopStyleVar();
+    }
+    if (ImGui::CollapsingHeader("Transparency", ImGuiTreeNodeFlags_DefaultOpen))
+    {
+        int alphaModeIndex = ToLowerAscii(material.alphaMode) == "mask" ? 1 :
+            (ToLowerAscii(material.alphaMode) == "blend" ? 2 : 0);
+        const char* alphaModes[] = {"OPAQUE", "MASK", "BLEND"};
+        if (UI::Prop::Combo("Alpha Mode", &alphaModeIndex, alphaModes, IM_ARRAYSIZE(alphaModes)))
+        {
+            material.alphaMode = alphaModeIndex == 1 ? "mask" : (alphaModeIndex == 2 ? "blend" : "opaque");
+            MarkPbrMaterialChanged("alpha_mode");
+        }
+        if (alphaModeIndex == 1)
+        {
+            if (UI::Prop::SliderFloat("Alpha Cutoff", &material.alphaCutoff, 0.0f, 1.0f, "%.3f"))
+                MarkPbrMaterialChanged("alpha_cutoff");
+        }
+    }
 }
 
 void EditorImGui::RenderSelectedTerrainInspector()

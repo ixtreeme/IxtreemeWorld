@@ -786,7 +786,7 @@ std::vector<std::pair<std::string, WaterMaterialData>> EditorImGui::GetWaterMate
         if (entry.category == AssetLibrary::Category::WaterMaterial && !entry.id.empty())
         {
             WaterMaterialData material = entry.waterMaterial;
-            if (m_waterMaterialEditor.windowOpen &&
+            if (m_materialEditor.windowOpen &&
                 m_waterMaterialEditor.materialId == entry.id &&
                 m_waterMaterialEditor.dirty)
             {
@@ -797,7 +797,7 @@ std::vector<std::pair<std::string, WaterMaterialData>> EditorImGui::GetWaterMate
         else if (entry.category == AssetLibrary::Category::Material && !entry.id.empty())
         {
             const AssetLibrary::MaterialData& source =
-                (m_pbrMaterialEditor.windowOpen && m_pbrMaterialEditor.materialId == entry.id && m_pbrMaterialEditor.dirty)
+                (m_materialEditor.windowOpen && m_pbrMaterialEditor.materialId == entry.id && m_pbrMaterialEditor.dirty)
                     ? m_pbrMaterialEditor.draft
                     : entry.material;
             WaterMaterialData converted{};
@@ -825,8 +825,8 @@ std::uint64_t EditorImGui::WaterMaterialsRevision() const
 {
     // While a material has unsaved edits the snapshot changes with them: a new revision every call
     // (and once more when the editing stops, which may have discarded them).
-    const bool drafting = (m_waterMaterialEditor.windowOpen && m_waterMaterialEditor.dirty) ||
-        (m_pbrMaterialEditor.windowOpen && m_pbrMaterialEditor.dirty);
+    const bool drafting = m_materialEditor.windowOpen &&
+        (m_waterMaterialEditor.dirty || m_pbrMaterialEditor.dirty);
     if (drafting || drafting != m_waterMaterialsDrafting)
         ++m_waterMaterialsTick;
     m_waterMaterialsDrafting = drafting;
@@ -851,6 +851,9 @@ void EditorImGui::SetEngineRoot(const std::filesystem::path& clientRoot)
 
 void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot)
 {
+    m_materialEditor = {};
+    m_waterMaterialEditor = {};
+    m_pbrMaterialEditor = {};
     m_expandedModelAssets.clear();
     SetEngineRoot(clientRoot);
     DestroyAssetPreviewTextures();
@@ -877,6 +880,9 @@ void EditorImGui::InitializeAssetLibrary(const std::filesystem::path& clientRoot
 void EditorImGui::InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot,
                                                 const std::filesystem::path& assetRoot)
 {
+    m_materialEditor = {};
+    m_waterMaterialEditor = {};
+    m_pbrMaterialEditor = {};
     m_expandedModelAssets.clear();
     DestroyAssetPreviewTextures();
     InvalidateAssetBrowserCache();
@@ -2453,11 +2459,22 @@ bool EditorImGui::OpenWaterMaterialEditor(const std::string& materialId)
         return false;
     }
 
-    m_waterMaterialEditor.windowOpen = true;
-    m_waterMaterialEditor.dirty = false;
-    m_waterMaterialEditor.materialId = entry->id;
-    m_waterMaterialEditor.draft = entry->waterMaterial;
-    std::snprintf(m_waterMaterialEditor.name, sizeof(m_waterMaterialEditor.name), "%s", entry->displayName.c_str());
+    if (!m_materialEditor.windowOpen)
+    {
+        m_waterMaterialEditor = {};
+        m_pbrMaterialEditor = {};
+    }
+    // Focusing an already edited material must not replace its unsaved draft.
+    if (m_waterMaterialEditor.materialId != entry->id || !m_waterMaterialEditor.dirty)
+    {
+        m_waterMaterialEditor.dirty = false;
+        m_waterMaterialEditor.materialId = entry->id;
+        m_waterMaterialEditor.draft = entry->waterMaterial;
+        std::snprintf(m_waterMaterialEditor.name, sizeof(m_waterMaterialEditor.name), "%s", entry->displayName.c_str());
+    }
+    m_materialEditor.windowOpen = true;
+    m_materialEditor.focusRequested = true;
+    m_materialEditor.selectedTab = AssetLibrary::Category::WaterMaterial;
     m_assetStatus = "Editing water material: " + entry->displayName;
     Tracenf("[EDITOR-IMGUI-4] Water Material Editor opened: material_id=%s name=%s",
         entry->id.c_str(),
@@ -2471,48 +2488,84 @@ bool EditorImGui::OpenPbrMaterialEditor(const std::string& materialId)
         return false;
 
     auto entry = m_assetLibrary->FindById(materialId);
+    // Mesh material slots store AssetDatabase GUIDs, whereas the browser/editor uses library IDs.
+    // Resolve the actual asset identity, never its display name (names may repeat across folders).
+    if (!entry)
+    {
+        if (const auto guid = Guid::fromString(materialId))
+        {
+            const auto path = AssetDatabase::Instance().resolveGuid(*guid);
+            const std::string guidText = guid->toString();
+            for (const auto& candidate : m_assetLibrary->Entries())
+            {
+                if (candidate.category != AssetLibrary::Category::Material)
+                    continue;
+                bool matches = candidate.guid == guidText;
+                if (!matches && path)
+                {
+                    std::error_code error;
+                    matches = std::filesystem::equivalent(m_assetLibrary->AbsolutePath(candidate), *path, error);
+                }
+                if (matches)
+                {
+                    entry = candidate;
+                    break;
+                }
+            }
+        }
+    }
     if (!entry || entry->category != AssetLibrary::Category::Material)
     {
         m_assetStatus = "PBR material not found: " + materialId;
         return false;
     }
 
-    m_pbrMaterialEditor.windowOpen = true;
-    m_pbrMaterialEditor.dirty = false;
-    m_pbrMaterialEditor.materialId = entry->id;
-    m_pbrMaterialEditor.draft = entry->material;
-    if (!entry->originalPath.empty() && ToLowerAscii(std::filesystem::path(entry->originalPath).extension().string()) == ".material")
+    if (!m_materialEditor.windowOpen)
     {
-        const std::filesystem::path materialPath(entry->originalPath);
-        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
-        if (MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(guid))
-        {
-            m_pbrMaterialEditor.draft.alphaMode =
-                material->alphaMode == MaterialAsset::AlphaMode::Mask ? "mask" :
-                (material->alphaMode == MaterialAsset::AlphaMode::Blend ? "blend" : "opaque");
-            m_pbrMaterialEditor.draft.alphaCutoff = material->alphaCutoff;
-            m_pbrMaterialEditor.draft.colorTint[0] = material->baseColor[0];
-            m_pbrMaterialEditor.draft.colorTint[1] = material->baseColor[1];
-            m_pbrMaterialEditor.draft.colorTint[2] = material->baseColor[2];
-            m_pbrMaterialEditor.draft.colorTint[3] = material->baseColor[3];
-            m_pbrMaterialEditor.draft.tilingScaleX = material->uvTiling[0];
-            m_pbrMaterialEditor.draft.tilingScaleY = material->uvTiling[1];
-            // The textures as the material file has them (the asset list's copy may be older).
-            m_pbrMaterialEditor.draft.diffuseTextureId = TextureEntryIdForGuid(material->baseColorTexture);
-            m_pbrMaterialEditor.draft.normalTextureId = TextureEntryIdForGuid(material->normalTexture);
-            m_pbrMaterialEditor.draft.aoTextureId = TextureEntryIdForGuid(material->aoTexture);
-            m_pbrMaterialEditor.draft.roughnessTextureId = TextureEntryIdForGuid(material->roughnessTexture);
-            m_pbrMaterialEditor.draft.metallicTextureId = TextureEntryIdForGuid(material->metallicTexture);
-            m_pbrMaterialEditor.draft.heightTextureId = TextureEntryIdForGuid(material->heightTexture);
-            m_pbrMaterialEditor.draft.normalStrength = material->normalStrength;
-            m_pbrMaterialEditor.draft.aoStrength = material->aoStrength;
-            m_pbrMaterialEditor.draft.roughnessStrength = material->roughness;
-            m_pbrMaterialEditor.draft.metallicStrength = material->metallic;
-            m_pbrMaterialEditor.draft.shadingMode =
-                material->shadingMode == MaterialAsset::ShadingMode::Unlit ? "unlit" : "lit";
-        }
+        m_waterMaterialEditor = {};
+        m_pbrMaterialEditor = {};
     }
-    std::snprintf(m_pbrMaterialEditor.name, sizeof(m_pbrMaterialEditor.name), "%s", entry->displayName.c_str());
+    if (m_pbrMaterialEditor.materialId != entry->id || !m_pbrMaterialEditor.dirty)
+    {
+        m_pbrMaterialEditor.dirty = false;
+        m_pbrMaterialEditor.materialId = entry->id;
+        m_pbrMaterialEditor.draft = entry->material;
+        if (!entry->originalPath.empty() && ToLowerAscii(std::filesystem::path(entry->originalPath).extension().string()) == ".material")
+        {
+            const std::filesystem::path materialPath(entry->originalPath);
+            const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
+            if (MaterialAsset* material = MaterialAssetManager::Instance().getOrLoad(guid))
+            {
+                m_pbrMaterialEditor.draft.alphaMode =
+                    material->alphaMode == MaterialAsset::AlphaMode::Mask ? "mask" :
+                    (material->alphaMode == MaterialAsset::AlphaMode::Blend ? "blend" : "opaque");
+                m_pbrMaterialEditor.draft.alphaCutoff = material->alphaCutoff;
+                m_pbrMaterialEditor.draft.colorTint[0] = material->baseColor[0];
+                m_pbrMaterialEditor.draft.colorTint[1] = material->baseColor[1];
+                m_pbrMaterialEditor.draft.colorTint[2] = material->baseColor[2];
+                m_pbrMaterialEditor.draft.colorTint[3] = material->baseColor[3];
+                m_pbrMaterialEditor.draft.tilingScaleX = material->uvTiling[0];
+                m_pbrMaterialEditor.draft.tilingScaleY = material->uvTiling[1];
+                // The textures as the material file has them (the asset list's copy may be older).
+                m_pbrMaterialEditor.draft.diffuseTextureId = TextureEntryIdForGuid(material->baseColorTexture);
+                m_pbrMaterialEditor.draft.normalTextureId = TextureEntryIdForGuid(material->normalTexture);
+                m_pbrMaterialEditor.draft.aoTextureId = TextureEntryIdForGuid(material->aoTexture);
+                m_pbrMaterialEditor.draft.roughnessTextureId = TextureEntryIdForGuid(material->roughnessTexture);
+                m_pbrMaterialEditor.draft.metallicTextureId = TextureEntryIdForGuid(material->metallicTexture);
+                m_pbrMaterialEditor.draft.heightTextureId = TextureEntryIdForGuid(material->heightTexture);
+                m_pbrMaterialEditor.draft.normalStrength = material->normalStrength;
+                m_pbrMaterialEditor.draft.aoStrength = material->aoStrength;
+                m_pbrMaterialEditor.draft.roughnessStrength = material->roughness;
+                m_pbrMaterialEditor.draft.metallicStrength = material->metallic;
+                m_pbrMaterialEditor.draft.shadingMode =
+                    material->shadingMode == MaterialAsset::ShadingMode::Unlit ? "unlit" : "lit";
+            }
+        }
+        std::snprintf(m_pbrMaterialEditor.name, sizeof(m_pbrMaterialEditor.name), "%s", entry->displayName.c_str());
+    }
+    m_materialEditor.windowOpen = true;
+    m_materialEditor.focusRequested = true;
+    m_materialEditor.selectedTab = AssetLibrary::Category::Material;
     m_assetStatus = "Editing material: " + entry->displayName;
     Tracenf("[EDITOR-IMGUI-4] PBR Material Editor opened: material_id=%s name=%s",
         entry->id.c_str(),
