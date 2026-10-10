@@ -1570,6 +1570,12 @@ StaticMeshRenderer::LodDiagnostics StaticMeshRenderer::GetLodDiagnostics(std::ui
 {
     LodDiagnostics diag{};
     diag.vertexCount = m_vertices.size();
+    {
+        std::lock_guard<std::mutex> lock(m_lodMutex);
+        diag.buildPending = configHash != 0 && (m_lodRunningHash == configHash ||
+            (m_lodRequestPending && m_lodRequest.configHash == configHash) ||
+            m_lodPendingResults.contains(configHash));
+    }
     if (configHash == 0)
     {
         diag.bufferKnown = true;
@@ -2407,6 +2413,8 @@ bool StaticMeshRenderer::CreateBuffers(ixrhi::IXRHIDevice& rhi)
 
 std::filesystem::path StaticMeshRenderer::LodCachePath(const std::string& modelPath, std::uint64_t configHash) const
 {
+    if (modelPath.empty() || modelPath.rfind("builtin://", 0) == 0)
+        return {};
     std::filesystem::path assetPath(modelPath);
     if (assetPath.is_relative() && m_assets)
     {
@@ -2431,22 +2439,14 @@ bool StaticMeshRenderer::EnsureLodBuffers(const LodConfig& config, std::uint64_t
     if (HasPendingLodUpload(configHash))
         return false;
 
-    const std::filesystem::path cachePath = LodCachePath(m_modelPath, configHash);
-    if (!cachePath.empty())
-    {
-        LodCpuSet cachedCpu;
-        if (LoadLodCpuCache(configHash, cachedCpu))
-        {
-            cachedCpu.diagnosticEntityId = entityId;
-            std::lock_guard<std::mutex> lock(m_lodMutex);
-            m_lodPendingResults[configHash] = std::move(cachedCpu);
-        }
-        if (ApplyPendingLodResult(configHash))
-            return true;
-    }
-
-    RequestLodBuild(config, configHash, false, entityId);
+    // Cache IO and simplification belong to the worker, even for a nearby mesh.
+    RequestLodBuild(config, configHash, true, entityId);
     return false;
+}
+
+bool StaticMeshRenderer::PrepareLods(const LodConfig& config, std::uint64_t configHash, std::uint32_t entityId)
+{
+    return EnsureLodBuffers(config, configHash, entityId);
 }
 
 bool StaticMeshRenderer::EnsureLodPreviewProxy()
@@ -2568,7 +2568,7 @@ StaticMeshRenderer::LodCpuSet StaticMeshRenderer::BuildLodCpuSet(const LodConfig
                 targetIndexCount = std::max<std::size_t>(3u, (targetIndexCount / 3u) * 3u);
                 targetIndexCount = std::min<std::size_t>(draw.indexCount, targetIndexCount);
                 simplified.resize(draw.indexCount);
-                const std::size_t written = quality
+                std::size_t written = quality
                     ? meshopt_simplify(simplified.data(),
                         sourceIndices.data() + draw.firstIndex,
                         draw.indexCount,
@@ -2586,7 +2586,43 @@ StaticMeshRenderer::LodCpuSet StaticMeshRenderer::BuildLodCpuSet(const LodConfig
                         sizeof(Vertex),
                         targetIndexCount,
                         1e-2f);
-                simplified.resize(std::max<std::size_t>(3u, (written / 3u) * 3u));
+                if (quality && written > targetIndexCount)
+                {
+                    // The requested ratio is a triangle budget. A fixed 1% error
+                    // used to pin every distant LOD to almost the same geometry.
+                    // Prefer seam-preserving collapses, relaxing their error first.
+                    std::vector<std::uint32_t> candidate(draw.indexCount);
+                    for (const float error : {0.02f, 0.05f, 0.1f})
+                    {
+                        const auto count = meshopt_simplify(candidate.data(),
+                            sourceIndices.data() + draw.firstIndex, draw.indexCount,
+                            &m_vertices.front().position[0], m_vertices.size(), sizeof(Vertex),
+                            targetIndexCount, error, 0);
+                        if (count >= 3u && count < written)
+                        {
+                            written = count;
+                            std::copy_n(candidate.begin(), count, simplified.begin());
+                        }
+                        if (written <= targetIndexCount) break;
+                    }
+                    if (written > targetIndexCount)
+                    {
+                        // Disconnected FBX vertices/UV seams can prevent further
+                        // collapses. At a deliberately low budget, allow clustering
+                        // within this submesh, retaining original vertex attributes
+                        // and its material. Never invent indices for an empty result.
+                        const auto count = meshopt_simplifySloppy(candidate.data(),
+                            sourceIndices.data() + draw.firstIndex, draw.indexCount,
+                            &m_vertices.front().position[0], m_vertices.size(), sizeof(Vertex),
+                            targetIndexCount, 1.0f);
+                        if (count >= 3u && count < written)
+                        {
+                            written = count;
+                            std::copy_n(candidate.begin(), count, simplified.begin());
+                        }
+                    }
+                }
+                simplified.resize((written / 3u) * 3u);
                 if (simplified.empty())
                 {
                     simplified.assign(sourceIndices.begin() + draw.firstIndex,
@@ -2875,6 +2911,11 @@ void StaticMeshRenderer::RequestLodBuild(const LodConfig& config,
                 return;
         }
         if (m_lodRunningHash == configHash && m_lodRunningQuality == quality)
+            return;
+        if (m_lodRequestPending && m_lodRequest.configHash == configHash && m_lodRequest.quality == quality)
+            return;
+        const auto readyResult = m_lodPendingResults.find(configHash);
+        if (readyResult != m_lodPendingResults.end() && (!quality || readyResult->second.quality))
             return;
         if (m_lodRequestPending &&
             (m_lodRequest.configHash != configHash || m_lodRequest.quality != quality))
@@ -3872,6 +3913,10 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
                                                std::uint64_t configHash, std::uint32_t lodLevel,
                                                std::uint32_t targetWidth, std::uint32_t targetHeight)
 {
+    // The selected level controls drawing, not the generation lifecycle. Pump
+    // before impostor/visibility early returns so completed work reaches the GPU.
+    const bool lodReady = configHash != 0 && !instancesIn.empty() &&
+        PrepareLods(lodConfig, configHash, instancesIn.front()->entityId);
     auto* culler = OcclusionCuller::Active();
     auto* viewCache = ViewImpostorRenderer::Active();
     const bool capturing = viewCache && viewCache->IsCapturing();
@@ -4021,8 +4066,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
         return;
 
     const std::uint32_t diagnosticEntityId = instancesIn.empty() ? 0u : instancesIn.front()->entityId;
-    const bool useLodBuffer = configHash != 0 && lodLevel > 0 &&
-        EnsureLodBuffers(lodConfig, configHash, diagnosticEntityId);
+    const bool useLodBuffer = configHash != 0 && lodLevel > 0 && lodReady;
     const LodIndexBuffer* lodSet = nullptr;
     if (useLodBuffer)
     {

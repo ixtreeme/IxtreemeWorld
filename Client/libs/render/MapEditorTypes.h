@@ -600,6 +600,19 @@ struct MeshRendererEditorState
     std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
     std::vector<EditorAttachedComponent> editorComponents;
     LodComponent lod;
+    // Read-only renderer diagnostics for the LOD Group inspector; never serialized to a scene.
+    std::array<std::uint64_t, LodConfig::MaxLevels> lodTriangles{};
+    std::array<bool, LodConfig::MaxLevels> lodTrianglesKnown{};
+    std::uint32_t lodSubmeshCount = 0;
+    float lodObjectSize = 0.0f;
+    float lodCameraDistance = 0.0f;
+    bool lodDiagnosticsAvailable = false;
+    bool lodBuildPending = false;
+    bool lodCpuBuildPending = false;
+    std::uint32_t lodActiveLevel = 0;
+    bool lodGameDiagnosticsAvailable = false;
+    float lodGameCameraDistance = 0.0f;
+    std::uint32_t lodGameActiveLevel = 0;
     LayerAuthoringSettings layerAuthoring;
     bool hasRigidbody = false;
     ixtreeme::physics::RigidbodyComponent rigidbody;

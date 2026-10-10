@@ -3453,6 +3453,7 @@ int RunGame(NativeWindow& window,
     SpatialIndex staticMeshSpatialIndex;
     std::unordered_set<std::uint32_t> staticMeshSpatialIndexed;
     std::unordered_map<std::uint32_t, std::uint32_t> staticMeshSelectedLods;
+    std::unordered_map<std::uint32_t, std::uint32_t> gameMeshSelectedLods;
     std::unordered_map<std::uint32_t, LodDispositionState> staticMeshLodDispositionStates;
     std::unordered_map<std::uint32_t, LodCfgLogState> lodCfgLogStates;
     std::unordered_map<std::uint32_t, LodPickLogState> lodPickLogStates;
@@ -4057,6 +4058,7 @@ int RunGame(NativeWindow& window,
     };
     auto removeStaticMeshSpatialEntity = [&](std::uint32_t id) {
         staticMeshSelectedLods.erase(id);
+        gameMeshSelectedLods.erase(id);
         staticMeshLodDispositionStates.erase(id);
         auto physicsIt = editorPhysicsBodies.find(id);
         if (physicsIt != editorPhysicsBodies.end())
@@ -9746,7 +9748,7 @@ int RunGame(NativeWindow& window,
                         : std::vector<MeshSceneEntity::MaterialOverride>{};
                     const auto editorComponents = preserveInstanceOverrides
                         ? mesh.editorComponents
-                        : std::vector<EditorAttachedComponent>{};
+                        : prefabEntity->mesh.editorComponents;
                     const LodComponent lod = preserveInstanceOverrides ? mesh.lod : prefabEntity->mesh.lod;
                     float position[3] = {mesh.position[0], mesh.position[1], mesh.position[2]};
                     float rotation[3] = {mesh.rotation[0], mesh.rotation[1], mesh.rotation[2]};
@@ -10059,6 +10061,14 @@ int RunGame(NativeWindow& window,
                             target.materialOverrides = selectedMesh->materialOverrides;
                             changed = true;
                         }
+                        else if (overrideName == "LOD Group")
+                        {
+                            target.lod = selectedMesh->lod;
+                            std::erase_if(target.editorComponents, [](const auto& c) { return c.type == "rendering.lod"; });
+                            for (const auto& c : selectedMesh->editorComponents)
+                                if (c.type == "rendering.lod") target.editorComponents.push_back(c);
+                            changed = true;
+                        }
                     }
                     else if (selectedPoint && kind == prefab::PrefabTemplate::Kind::PointLight)
                     {
@@ -10275,6 +10285,14 @@ int RunGame(NativeWindow& window,
                         else if (overrideName == "Material overrides")
                         {
                             it->materialOverrides = source.materialOverrides;
+                            changed = true;
+                        }
+                        else if (overrideName == "LOD Group")
+                        {
+                            it->lod = source.lod;
+                            std::erase_if(it->editorComponents, [](const auto& c) { return c.type == "rendering.lod"; });
+                            for (const auto& c : source.editorComponents)
+                                if (c.type == "rendering.lod") it->editorComponents.push_back(c);
                             changed = true;
                         }
                     }
@@ -11608,6 +11626,17 @@ int RunGame(NativeWindow& window,
                         overrides.push_back("Material slots");
                     if (!mesh.materialOverrides.empty())
                         overrides.push_back("Material overrides");
+                    const auto hasLod = [](const MeshSceneEntity& entity) {
+                        return std::any_of(entity.editorComponents.begin(), entity.editorComponents.end(),
+                            [](const auto& c) { return c.type == "rendering.lod"; });
+                    };
+                    if (mesh.lod.enabled != source.lod.enabled || mesh.lod.overrideAssetDefault != source.lod.overrideAssetDefault ||
+                        mesh.lod.config.levelCount != source.lod.config.levelCount ||
+                        std::abs(mesh.lod.config.hysteresisMeters - source.lod.config.hysteresisMeters) > 0.0001f ||
+                        floatArrayDiffers(mesh.lod.config.targetRatios, source.lod.config.targetRatios, LodConfig::MaxLevels) ||
+                        floatArrayDiffers(mesh.lod.config.distances, source.lod.config.distances, LodConfig::MaxLevels) ||
+                        hasLod(mesh) != hasLod(source))
+                        overrides.push_back("LOD Group");
                     return overrides;
                 };
                 auto pointPrefabOverrides = [&](const PointLight& light) {
@@ -11770,6 +11799,40 @@ int RunGame(NativeWindow& window,
                         else if (StaticMeshRenderer* renderer = getStaticMeshRenderer(runtimePath))
                         {
                             meshRendererState.materialSlotCount = std::max<std::uint32_t>(1u, renderer->MaterialSlotCount());
+                            if (meshIt->lod.enabled || std::any_of(meshIt->editorComponents.begin(), meshIt->editorComponents.end(),
+                                [](const auto& c) { return c.type == "rendering.lod"; }))
+                            {
+                                const auto defaultLod = findModelLodDefault(meshIt->meshAssetId);
+                                const LodConfig config = !meshIt->lod.overrideAssetDefault && defaultLod ? *defaultLod : meshIt->lod.config;
+                                const auto configHash = HashLodConfig(config);
+                                if (meshIt->lod.enabled)
+                                    renderer->PrepareLods(config, configHash, meshIt->id);
+                                const auto diag = renderer->GetLodDiagnostics(configHash);
+                                meshRendererState.lodDiagnosticsAvailable = renderer->IsLoaded();
+                                meshRendererState.lodTriangles[0] = renderer->TriangleCount();
+                                meshRendererState.lodTrianglesKnown[0] = renderer->IsLoaded();
+                                meshRendererState.lodSubmeshCount = static_cast<std::uint32_t>(renderer->DrawCount());
+                                meshRendererState.lodBuildPending = diag.pendingUpload;
+                                meshRendererState.lodCpuBuildPending = diag.buildPending;
+                                for (std::uint32_t level = 1; level < LodConfig::MaxLevels; ++level)
+                                {
+                                    meshRendererState.lodTriangles[level] = diag.levelTris[level];
+                                    meshRendererState.lodTrianglesKnown[level] = diag.bufferKnown && level < diag.levelCount;
+                                }
+                                const auto bounds = StaticMeshWorldAabb(*meshIt, *renderer);
+                                meshRendererState.lodObjectSize = std::max({bounds.max.x - bounds.min.x,
+                                    bounds.max.y - bounds.min.y, bounds.max.z - bounds.min.z});
+                                meshRendererState.lodCameraDistance = MeshLodDistance(frameCamera.eye, bounds);
+                                meshRendererState.lodActiveLevel = meshIt->lod.enabled ? SelectLodLevel(config,
+                                    meshRendererState.lodCameraDistance, staticMeshSelectedLods[meshIt->id]) : 0;
+                                if (const auto gameCamera = buildGameCamera(renderSize.width, renderSize.height))
+                                {
+                                    meshRendererState.lodGameDiagnosticsAvailable = true;
+                                    meshRendererState.lodGameCameraDistance = MeshLodDistance(gameCamera->eye, bounds);
+                                    meshRendererState.lodGameActiveLevel = meshIt->lod.enabled ? SelectLodLevel(config,
+                                        meshRendererState.lodGameCameraDistance, gameMeshSelectedLods[meshIt->id]) : 0;
+                                }
+                            }
                         }
                     }
                     meshRendererState.selectedMaterialSlot = std::min(meshRendererState.selectedMaterialSlot,
@@ -13318,7 +13381,7 @@ int RunGame(NativeWindow& window,
                 std::unordered_set<std::uint32_t> meshes;
             };
             // Current-frame occluder depth: terrain + a bounded number of large,
-            // fully opaque meshes. Draw each once, at full geometry quality, then
+            // fully opaque meshes. Draw each once, at its camera-selected LOD, then
             // let Hi-Z compute write indirect commands for all remaining groups.
             const auto prepareOcclusion = [&](OffscreenSceneRenderer& target, const WorldCamera& viewCamera,
                                                std::uint32_t width, std::uint32_t height, std::uint32_t view) {
@@ -13358,18 +13421,36 @@ int RunGame(NativeWindow& window,
                 }
                 std::vector<StaticMeshRenderer::Instance> instances;
                 instances.reserve(candidates.size());
-                std::unordered_map<StaticMeshRenderer*, StaticMeshRenderer::InstanceList> batches;
+                std::unordered_map<StaticMeshLodBatchKey, StaticMeshLodBatch, StaticMeshLodBatchKeyHash> batches;
                 for (const auto& candidate : candidates)
                 {
                     instances.push_back(candidate.record->instance);
                     instances.back().forceFullResolution = true;
-                    batches[candidate.record->renderer].push_back(&instances.back());
+                    // Full resolution here disables impostor substitution only.
+                    // An occluder also supplies the final colour: bypassing mesh
+                    // LOD here made large models stay full-detail in Game View.
+                    LodConfig config{};
+                    std::uint64_t hash = 0;
+                    std::uint32_t level = 0;
+                    if (const auto* mesh = findMeshEntityById(candidate.record->entityId); mesh && mesh->lod.enabled)
+                    {
+                        const auto assetDefault = findModelLodDefault(mesh->meshAssetId);
+                        config = !mesh->lod.overrideAssetDefault && assetDefault ? *assetDefault : mesh->lod.config;
+                        hash = HashLodConfig(config);
+                        auto& levels = view == 0 ? staticMeshSelectedLods : gameMeshSelectedLods;
+                        level = SelectLodLevel(config, MeshLodDistance(viewCamera.eye, candidate.record->worldBounds), levels[mesh->id]);
+                        levels[mesh->id] = level;
+                    }
+                    auto& batch = batches[{candidate.record->renderer, hash, level}];
+                    batch.config = config;
+                    batch.instances.push_back(&instances.back());
                     result.meshes.insert(candidate.record->entityId);
                 }
-                for (auto& [renderer, batch] : batches)
+                for (auto& [key, batch] : batches)
                 {
-                    renderer->SetLightingState(frameLighting);
-                    renderer->RenderBatchInWorld(*frameInfo.commandList, frameInfo, seconds, viewCamera, batch, width, height);
+                    key.renderer->SetLightingState(frameLighting);
+                    key.renderer->RenderLodBatchInWorld(*frameInfo.commandList, frameInfo, seconds, viewCamera,
+                        batch.instances, batch.config, key.configHash, key.lodLevel, width, height);
                 }
                 target.EndMainPass(*frameInfo.commandList);
                 gpuOcclusion.BeginView(*frameInfo.commandList, frameInfo, viewCamera,
@@ -13692,7 +13773,7 @@ int RunGame(NativeWindow& window,
                                     cullLodConfig.targetRatios[0] = 1.0f;
                                     cullLodConfig.distances[0] = 0.0f;
                                     const std::uint64_t cullConfigHash = HashLodConfig(cullLodConfig);
-                                    const float cullDistance = DistanceToAabb(camera.eye, worldBounds);
+                                    const float cullDistance = MeshLodDistance(camera.eye, worldBounds);
                                     const std::uint32_t previousLevel = staticMeshSelectedLods.count(mesh.id) > 0
                                         ? staticMeshSelectedLods[mesh.id]
                                         : 0u;
@@ -13756,7 +13837,7 @@ int RunGame(NativeWindow& window,
                             std::uint32_t lodLevel = 0;
                             bool lodDispositionActive = false;
                             StaticMeshLodBatch::LodDispositionRecord lodDispositionRecord{};
-                            if (mesh.lod.enabled && !selected)
+                            if (mesh.lod.enabled)
                             {
                                 ++frameLodActiveInstances;
                                 const std::optional<LodConfig> assetDefault = findModelLodDefault(mesh.meshAssetId);
@@ -13767,7 +13848,7 @@ int RunGame(NativeWindow& window,
                                 effectiveLodConfig.targetRatios[0] = 1.0f;
                                 effectiveLodConfig.distances[0] = 0.0f;
                                 lodConfigHash = HashLodConfig(effectiveLodConfig);
-                                const float distance = DistanceToAabb(camera.eye, worldBounds);
+                                const float distance = MeshLodDistance(camera.eye, worldBounds);
                                 const std::uint32_t previousLevel = staticMeshSelectedLods.count(mesh.id) > 0
                                     ? staticMeshSelectedLods[mesh.id]
                                     : 0u;
@@ -14393,7 +14474,7 @@ int RunGame(NativeWindow& window,
                             // view) instead of one un-batched RenderInWorld per entity. This
                             // collapses N per-entity draws into one instanced draw per renderer
                             // and skips off-screen meshes — the main per-mesh cost of the Game view.
-                            std::unordered_map<StaticMeshRenderer*, StaticMeshRenderer::InstanceList> gameMeshBatches;
+                            std::unordered_map<StaticMeshLodBatchKey, StaticMeshLodBatch, StaticMeshLodBatchKeyHash> gameMeshBatches;
                             const std::vector<std::uint32_t> gameMeshCandidates =
                                 staticMeshSpatialIndex.QueryFrustum(SpatialFrustumFromCamera(gameCamera));
                             for (std::uint32_t candidateId : gameMeshCandidates)
@@ -14409,18 +14490,39 @@ int RunGame(NativeWindow& window,
                                 if (renderer->HasTransparentDraws(meshRecord.instance))
                                     addTransparentDraw(gameTransparentDraws, renderer, meshRecord.instance,
                                         meshRecord.worldBounds, gameCamera);
-                                gameMeshBatches[renderer].push_back(&meshRecord.instance);
+                                LodConfig config{};
+                                std::uint64_t hash = 0;
+                                std::uint32_t level = 0;
+                                if (mesh->lod.enabled)
+                                {
+                                    const auto assetDefault = findModelLodDefault(mesh->meshAssetId);
+                                    config = !mesh->lod.overrideAssetDefault && assetDefault ? *assetDefault : mesh->lod.config;
+                                    config.levelCount = std::clamp(config.levelCount, 1u, LodConfig::MaxLevels);
+                                    config.targetRatios[0] = 1.0f;
+                                    config.distances[0] = 0.0f;
+                                    hash = HashLodConfig(config);
+                                    level = SelectLodLevel(config, MeshLodDistance(gameCamera.eye, meshRecord.worldBounds),
+                                        gameMeshSelectedLods[mesh->id]);
+                                    gameMeshSelectedLods[mesh->id] = level;
+                                }
+                                else gameMeshSelectedLods.erase(mesh->id);
+                                auto& batch = gameMeshBatches[{renderer, hash, level}];
+                                batch.config = config;
+                                batch.instances.push_back(&meshRecord.instance);
                             }
-                            for (auto& [gameRenderer, gameInstances] : gameMeshBatches)
+                            for (auto& [key, batch] : gameMeshBatches)
                             {
                                 // Set here too: the Scene View pass (which also sets it) may have
                                 // skipped this renderer (culled there) or not run at all (hidden).
-                                gameRenderer->SetLightingState(frameLighting);
-                                gameRenderer->RenderBatchInWorld(*frameInfo.commandList,
+                                key.renderer->SetLightingState(frameLighting);
+                                key.renderer->RenderLodBatchInWorld(*frameInfo.commandList,
                                     frameInfo,
                                     seconds,
                                     gameCamera,
-                                    gameInstances,
+                                    batch.instances,
+                                    batch.config,
+                                    key.configHash,
+                                    key.lodLevel,
                                     gameExtent.width,
                                     gameExtent.height);
                             }

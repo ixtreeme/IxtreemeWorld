@@ -638,6 +638,25 @@ void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::
             << ixtreeme::common::EscapeJson(mesh.animatorControllerId) << "\"";
     WriteMaterials(out, mesh.materialSlots, indent);
     WriteMaterialOverrides(out, mesh.materialOverrides, indent);
+    if (mesh.lod.enabled || std::any_of(mesh.editorComponents.begin(), mesh.editorComponents.end(),
+        [](const auto& component) { return component.type == "rendering.lod"; }))
+    {
+        out << ",\n" << indent << "\"lod_component\": {\n";
+        out << indent << "  \"enabled\": " << (mesh.lod.enabled ? "true" : "false") << ",\n";
+        out << indent << "  \"override_asset_default\": " << (mesh.lod.overrideAssetDefault ? "true" : "false") << ",\n";
+        out << indent << "  \"config\": {\n";
+        const auto& config = mesh.lod.config;
+        out << indent << "    \"level_count\": " << std::clamp(config.levelCount, 1u, LodConfig::MaxLevels) << ",\n";
+        out << indent << "    \"hysteresis_m\": " << std::max(0.0f, config.hysteresisMeters);
+        for (std::uint32_t level = 0; level < LodConfig::MaxLevels; ++level)
+        {
+            out << ",\n" << indent << "    \"target_ratio_" << level << "\": " <<
+                (level == 0 ? 1.0f : std::clamp(config.targetRatios[level], 0.001f, 1.0f));
+            out << ",\n" << indent << "    \"distance_m_" << level << "\": " <<
+                (level == 0 ? 0.0f : std::max(0.0f, config.distances[level]));
+        }
+        out << "\n" << indent << "  }\n" << indent << "}";
+    }
     if (mesh.hasRigidbody)
         WriteRigidbody(out, mesh.rigidbody, indent);
     if (mesh.hasCollider)
@@ -769,6 +788,24 @@ PrefabEntity ParseEntityObject(const std::string& object, const std::string& fal
         entity.mesh.enabled = ixtreeme::common::JsonBoolValue(object, "enabled", true);
         entity.mesh.animatorControllerId = ixtreeme::common::JsonStringValue(object, "animator_controller_id");
         entity.mesh.materialSlots = ixtreeme::common::JsonStringArrayValue(object, "materials");
+        if (const auto lodObject = ExtractNamedObject(object, "lod_component"); !lodObject.empty())
+        {
+            auto& lod = entity.mesh.lod;
+            lod.enabled = ixtreeme::common::JsonBoolValue(lodObject, "enabled", true);
+            lod.overrideAssetDefault = ixtreeme::common::JsonBoolValue(lodObject, "override_asset_default", false);
+            const auto configObject = ExtractNamedObject(lodObject, "config");
+            auto& config = lod.config;
+            config.levelCount = std::clamp(JsonU32Value(configObject, "level_count", config.levelCount), 1u, LodConfig::MaxLevels);
+            config.hysteresisMeters = std::max(0.0f, ixtreeme::common::JsonFloatValue(configObject, "hysteresis_m", config.hysteresisMeters));
+            for (std::uint32_t level = 1; level < LodConfig::MaxLevels; ++level)
+            {
+                config.targetRatios[level] = std::clamp(ixtreeme::common::JsonFloatValue(configObject,
+                    "target_ratio_" + std::to_string(level), config.targetRatios[level]), 0.001f, 1.0f);
+                config.distances[level] = std::max(0.0f, ixtreeme::common::JsonFloatValue(configObject,
+                    "distance_m_" + std::to_string(level), config.distances[level]));
+            }
+            entity.mesh.editorComponents.push_back({"rendering.lod", "LOD Group", "Rendering", {}});
+        }
         const std::vector<std::string> materialOverrides = ExtractNamedArrayObjects(object, "material_overrides");
         for (const std::string& materialOverride : materialOverrides)
             entity.mesh.materialOverrides.push_back(ReadMaterialOverride(materialOverride));

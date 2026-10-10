@@ -205,6 +205,199 @@ void EditorImGui::RenderAddComponentMenu()
     }
 }
 
+bool EditorImGui::RenderLodGroupControls()
+{
+    LodComponent& lod = m_meshRendererState.lod;
+    bool changed = UI::Prop::Checkbox("Enabled", &lod.enabled);
+    const auto assetDefault = FindModelLodDefault(m_meshRendererState.meshAssetId);
+    ImGui::TextDisabled("%s", lod.overrideAssetDefault ? "Instance override" :
+        (assetDefault ? "Model asset default" : "Local settings"));
+    bool overrideEnabled = lod.overrideAssetDefault;
+    if (UI::Prop::Checkbox("Override on this instance", &overrideEnabled))
+    {
+        if (overrideEnabled && assetDefault) lod.config = *assetDefault;
+        lod.overrideAssetDefault = overrideEnabled;
+        changed = true;
+    }
+    LodConfig config = lod.overrideAssetDefault ? lod.config : assetDefault.value_or(lod.config);
+    config.levelCount = std::clamp(config.levelCount, 1u, LodConfig::MaxLevels);
+    const bool editable = lod.overrideAssetDefault || !assetDefault;
+    bool configChanged = false, commit = false;
+    ImGui::TextWrapped("Distance-based LOD. Drag the dividers to move transitions.");
+    if (m_meshRendererState.skinned)
+        ImGui::TextWrapped("Automatic geometry LOD is currently available for static meshes.");
+    const ImU32 colors[] = {IM_COL32(102,126,51,255), IM_COL32(48,112,145,255),
+        IM_COL32(93,85,145,255), IM_COL32(153,104,47,255)};
+    const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const ImGuiID rangeId = ImGui::GetID("##lod_timeline_range");
+    const float desiredRange = std::max(10.0f, config.distances[config.levelCount - 1] * 1.25f);
+    if (!ImGui::IsAnyItemActive()) ImGui::GetStateStorage()->SetFloat(rangeId, desiredRange);
+    const float range = ImGui::GetStateStorage()->GetFloat(rangeId, desiredRange);
+    const ImVec2 bar = ImGui::GetCursorScreenPos();
+    const float barHeight = ImGui::GetTextLineHeight() * 2.0f + 10.0f;
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    for (std::uint32_t level = 0; level < config.levelCount; ++level)
+    {
+        const float from = std::clamp(config.distances[level] / range, 0.0f, 1.0f);
+        const float to = level + 1 < config.levelCount ?
+            std::clamp(config.distances[level + 1] / range, from, 1.0f) : 1.0f;
+        const ImVec2 a(bar.x + from * width, bar.y), b(bar.x + to * width, bar.y + barHeight);
+        draw->AddRectFilled(a, b, colors[level]);
+        char label[64]{};
+        std::snprintf(label, sizeof(label), "LOD %u\n%.0f m%s", level, config.distances[level],
+            level + 1 == config.levelCount ? "+" : "");
+        draw->PushClipRect(a, b, true);
+        draw->AddText(ImVec2(a.x + 5.0f, a.y + 4.0f), IM_COL32_WHITE, label);
+        draw->PopClipRect();
+    }
+    ImGui::BeginDisabled(!editable);
+    for (std::uint32_t level = 1; level < config.levelCount; ++level)
+    {
+        ImGui::PushID(static_cast<int>(level));
+        const float divider = bar.x + std::clamp(config.distances[level] / range, 0.0f, 1.0f) * width;
+        ImGui::SetCursorScreenPos(ImVec2(divider - 4.0f, bar.y));
+        ImGui::InvisibleButton("##transition", ImVec2(8.0f, barHeight));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left) && ImGui::GetIO().MouseDelta.x != 0.0f)
+        {
+            const float low = config.distances[level - 1] + 0.1f;
+            const float high = level + 1 < config.levelCount ? config.distances[level + 1] - 0.1f : 100000.0f;
+            const float distance = std::clamp(config.distances[level] + ImGui::GetIO().MouseDelta.x * range / width,
+                low, std::max(low, high));
+            if (distance != config.distances[level])
+            {
+                config.distances[level] = distance;
+                configChanged = true;
+                ImGui::MarkItemEdited(ImGui::GetItemID());
+            }
+        }
+        commit |= ImGui::IsItemDeactivatedAfterEdit();
+        draw->AddLine(ImVec2(divider, bar.y), ImVec2(divider, bar.y + barHeight), IM_COL32(230,230,230,190));
+        UI::ItemTooltip(("LOD " + std::to_string(level) + " transition: " +
+            std::to_string(config.distances[level]) + " m").c_str());
+        ImGui::PopID();
+    }
+    ImGui::EndDisabled();
+    ImGui::SetCursorScreenPos(ImVec2(bar.x, bar.y + barHeight + ImGui::GetStyle().ItemSpacing.y));
+    if (m_meshRendererState.lodDiagnosticsAvailable)
+    {
+        const float marker = bar.x + std::clamp(m_meshRendererState.lodCameraDistance / range, 0.0f, 1.0f) * width;
+        draw->AddTriangleFilled(ImVec2(marker - 5.0f, bar.y + barHeight),
+            ImVec2(marker + 5.0f, bar.y + barHeight), ImVec2(marker, bar.y + barHeight - 7.0f),
+            IM_COL32(115,211,255,255));
+        ImGui::TextDisabled("Object size: %.2f m | Scene camera: %.1f m (centre)",
+            m_meshRendererState.lodObjectSize, m_meshRendererState.lodCameraDistance);
+        ImGui::TextDisabled("Scene View: LOD %u%s", m_meshRendererState.lodActiveLevel,
+            m_meshRendererState.lodActiveLevel > 0 && (m_meshRendererState.lodBuildPending ||
+                !m_meshRendererState.lodTrianglesKnown[m_meshRendererState.lodActiveLevel]) ?
+            " (building; displaying LOD 0)" : "");
+        if (m_meshRendererState.lodGameDiagnosticsAvailable)
+            ImGui::TextDisabled("Game camera: %.1f m (centre) | LOD %u",
+                m_meshRendererState.lodGameCameraDistance, m_meshRendererState.lodGameActiveLevel);
+    }
+
+    ImGui::BeginDisabled(!editable);
+    for (std::uint32_t level = 0; level < config.levelCount; ++level)
+    {
+        ImGui::PushID(static_cast<int>(level));
+        const bool known = m_meshRendererState.lodTrianglesKnown[level];
+        const auto triangles = m_meshRendererState.lodTriangles[level];
+        char label[160]{};
+        if (known)
+            std::snprintf(label, sizeof(label), "LOD %u   |   %llu tris (%.1f%%)   |   %u submeshes", level,
+                static_cast<unsigned long long>(triangles), m_meshRendererState.lodTriangles[0] ?
+                100.0 * triangles / m_meshRendererState.lodTriangles[0] : 0.0, m_meshRendererState.lodSubmeshCount);
+        else
+            std::snprintf(label, sizeof(label), "LOD %u   |   %s", level,
+                m_meshRendererState.lodCpuBuildPending ? "Building..." : "Not built");
+        ImGui::PushStyleColor(ImGuiCol_Header, ImGui::ColorConvertU32ToFloat4(colors[level]));
+        char compactLabel[96]{};
+        if (known && width < 450.0f)
+            std::snprintf(compactLabel, sizeof(compactLabel), "LOD %u | %llu tris (%.1f%%)", level,
+                static_cast<unsigned long long>(triangles), m_meshRendererState.lodTriangles[0] ?
+                100.0 * triangles / m_meshRendererState.lodTriangles[0] : 0.0);
+        const std::string stableLabel = std::string(compactLabel[0] ? compactLabel : label) + "###lod_level";
+        const bool open = ImGui::CollapsingHeader(stableLabel.c_str());
+        ImGui::PopStyleColor();
+        UI::ItemTooltip(label);
+        if (open)
+        {
+            ImGui::TextWrapped("Model: %s", m_meshRendererState.meshDisplayName.c_str());
+            if (known) ImGui::TextDisabled("%u submeshes", m_meshRendererState.lodSubmeshCount);
+            if (level == 0) ImGui::TextDisabled("Original mesh (100%%)");
+            else
+            {
+                float distance = config.distances[level];
+                if (UI::Prop::DragFloat("Transition (m)", &distance, 0.5f,
+                    config.distances[level - 1] + 0.1f,
+                    level + 1 < config.levelCount ? std::max(config.distances[level - 1] + 0.1f,
+                        config.distances[level + 1] - 0.1f) : 100000.0f, "%.1f m"))
+                {
+                    const float low = config.distances[level - 1] + 0.1f;
+                    const float high = level + 1 < config.levelCount ? config.distances[level + 1] - 0.1f : 100000.0f;
+                    config.distances[level] = std::clamp(distance, low, std::max(low, high));
+                    configChanged = true;
+                }
+                commit |= ImGui::IsItemDeactivatedAfterEdit();
+                float ratio = config.targetRatios[level] * 100.0f;
+                if (UI::Prop::SliderFloat("Target geometry", &ratio, 1.0f, 100.0f, "%.1f%%"))
+                {
+                    config.targetRatios[level] = std::clamp(ratio / 100.0f, 0.01f, 1.0f);
+                    configChanged = true;
+                }
+                commit |= ImGui::IsItemDeactivatedAfterEdit();
+                UI::ItemTooltip("Triangle budget. Low ratios permit stronger deformation and changes at texture seams. The header shows the actual triangle count; each submesh retains geometry.");
+            }
+        }
+        ImGui::PopID();
+    }
+    ImGui::BeginDisabled(config.levelCount >= LodConfig::MaxLevels);
+    if (ImGui::Button("+ Add LOD")) { ++config.levelCount; configChanged = commit = true; }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(config.levelCount <= 1);
+    if (ImGui::Button("- Last LOD")) { --config.levelCount; configChanged = commit = true; }
+    ImGui::EndDisabled();
+    if (ImGui::TreeNode("Advanced"))
+    {
+        if (UI::Prop::DragFloat("Hysteresis (m)", &config.hysteresisMeters, 0.25f, 0.0f, 100.0f, "%.2f m"))
+            configChanged = true;
+        commit |= ImGui::IsItemDeactivatedAfterEdit();
+        ImGui::TextWrapped("Hysteresis prevents rapid switching near a transition. The final LOD remains visible at greater distances.");
+        ImGui::TreePop();
+    }
+    ImGui::EndDisabled();
+    if (m_meshRendererState.lodCpuBuildPending) ImGui::TextDisabled("Generating LOD geometry in the background...");
+    if (m_meshRendererState.lodBuildPending) ImGui::TextDisabled("Generated LODs waiting for GPU upload.");
+    if (configChanged && editable)
+    {
+        config.targetRatios[0] = 1.0f;
+        config.distances[0] = 0.0f;
+        for (std::uint32_t level = 1; level < config.levelCount; ++level)
+            config.distances[level] = std::max(config.distances[level], config.distances[level - 1] + 0.1f);
+        lod.config = config;
+        changed = true;
+    }
+    ImGui::BeginDisabled(m_meshRendererState.skinned);
+    if (UI::IconButton(ICON_FA_ROTATE, "Generate / Rebuild LODs", ImVec2(-1, 0))) commit = true;
+    ImGui::EndDisabled();
+    if (commit && !m_meshRendererState.skinned)
+    {
+        m_commands.lodQualityCommitRequested = true;
+        m_commands.lodQualityCommitEntityId = m_meshRendererState.id;
+        m_commands.lodQualityCommitConfig = config;
+    }
+    if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Set as model asset default", ImVec2(-1, 0)) &&
+        SaveModelLodDefault(m_meshRendererState.meshAssetId, config))
+    {
+        lod.overrideAssetDefault = false;
+        lod.config = config;
+        changed = true;
+    }
+    return changed;
+}
+
 bool EditorImGui::RenderAttachedEditorComponents(std::vector<EditorAttachedComponent>& components)
 {
     bool changed = false;
@@ -231,104 +424,7 @@ bool EditorImGui::RenderAttachedEditorComponents(std::vector<EditorAttachedCompo
         {
             if (isLod)
             {
-                LodComponent& lod = m_meshRendererState.lod;
-                lod.enabled = true;
-                bool lodConfigChanged = false;
-                bool lodCommitRequested = false;
-                const std::optional<LodConfig> assetDefault = FindModelLodDefault(m_meshRendererState.meshAssetId);
-                const char* source = lod.overrideAssetDefault
-                    ? "Entity override"
-                    : (assetDefault ? "Asset default" : "Engine default");
-                ImGui::TextDisabled("Source: %s", source);
-                bool overrideEnabled = lod.overrideAssetDefault;
-                if (UI::Prop::Checkbox("Override on this entity", &overrideEnabled))
-                {
-                    lod.overrideAssetDefault = overrideEnabled;
-                    if (overrideEnabled && assetDefault)
-                        lod.config = *assetDefault;
-                    lodConfigChanged = true;
-                    changed = true;
-                }
-
-                LodConfig displayConfig = lod.overrideAssetDefault
-                    ? lod.config
-                    : (assetDefault ? *assetDefault : LodConfig{});
-                const bool editEnabled = lod.overrideAssetDefault || !assetDefault;
-                if (!editEnabled)
-                    ImGui::BeginDisabled();
-
-                int levelCount = static_cast<int>(std::clamp(displayConfig.levelCount, 1u, LodConfig::MaxLevels));
-                if (UI::Prop::SliderInt("Levels", &levelCount, 1, static_cast<int>(LodConfig::MaxLevels)))
-                {
-                    displayConfig.levelCount = static_cast<std::uint32_t>(levelCount);
-                    lodConfigChanged = true;
-                    changed = true;
-                }
-                lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                float hysteresis = displayConfig.hysteresisMeters;
-                if (UI::Prop::DragFloat("Hysteresis (m)", &hysteresis, 0.25f, 0.0f, 100.0f, "%.2f"))
-                {
-                    displayConfig.hysteresisMeters = std::max(0.0f, hysteresis);
-                    lodConfigChanged = true;
-                    changed = true;
-                }
-                lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                for (std::uint32_t level = 1; level < static_cast<std::uint32_t>(levelCount); ++level)
-                {
-                    ImGui::Separator();
-                    ImGui::Text("LOD%u", level);
-                    float ratioPercent = std::clamp(displayConfig.targetRatios[level], 0.001f, 1.0f) * 100.0f;
-                    std::string ratioLabel = "Target %##ratio" + std::to_string(level);
-                    if (UI::Prop::SliderFloat(ratioLabel.c_str(), &ratioPercent, 1.0f, 100.0f, "%.1f"))
-                    {
-                        displayConfig.targetRatios[level] = std::clamp(ratioPercent / 100.0f, 0.001f, 1.0f);
-                        lodConfigChanged = true;
-                        changed = true;
-                    }
-                    lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                    float distance = displayConfig.distances[level];
-                    std::string distanceLabel = "Distance (m)##distance" + std::to_string(level);
-                    if (UI::Prop::DragFloat(distanceLabel.c_str(), &distance, 1.0f, 0.0f, 100000.0f, "%.1f"))
-                    {
-                        displayConfig.distances[level] = std::max(0.0f, distance);
-                        lodConfigChanged = true;
-                        changed = true;
-                    }
-                    lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                }
-                if (!editEnabled)
-                    ImGui::EndDisabled();
-
-                if (lodConfigChanged && editEnabled)
-                {
-                    displayConfig.levelCount = std::clamp(displayConfig.levelCount, 1u, LodConfig::MaxLevels);
-                    displayConfig.targetRatios[0] = 1.0f;
-                    displayConfig.distances[0] = 0.0f;
-                    lod.config = displayConfig;
-                    if (LodLogsEnabled())
-                    {
-                        Tracenf("[LOD] ui edit entity=%u levels=%u override=%d",
-                            m_meshRendererState.id,
-                            lod.config.levelCount,
-                            lod.overrideAssetDefault ? 1 : 0);
-                    }
-                }
-                if (lodCommitRequested && editEnabled)
-                {
-                    m_commands.lodQualityCommitRequested = true;
-                    m_commands.lodQualityCommitEntityId = m_meshRendererState.id;
-                    m_commands.lodQualityCommitConfig = lod.config;
-                }
-                if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Set as asset default", ImVec2(-1.0f, 0.0f)))
-                {
-                    const LodConfig defaultConfig = lod.overrideAssetDefault ? lod.config : displayConfig;
-                    if (SaveModelLodDefault(m_meshRendererState.meshAssetId, defaultConfig))
-                    {
-                        lod.overrideAssetDefault = false;
-                        lod.config = defaultConfig;
-                        changed = true;
-                    }
-                }
+                changed |= RenderLodGroupControls();
             }
             else
             {
@@ -351,59 +447,94 @@ void EditorImGui::RenderPrefabOverrideControls(const std::string& assetId,
                                                const std::vector<std::string>& overrides)
 {
     const std::string effectiveAssetId = !instance.assetId.empty() ? instance.assetId : assetId;
-    std::string assetLabel = effectiveAssetId.empty() ? std::string("<missing>") : effectiveAssetId;
-    if (m_assetLibrary)
-    {
-        if (const auto entry = m_assetLibrary->FindById(effectiveAssetId))
-            assetLabel = entry->displayName.empty() ? entry->filename : entry->displayName;
-    }
+    std::string assetLabel = "Missing prefab source";
+    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(effectiveAssetId) : std::optional<AssetLibrary::Entry>{};
+    const bool sourceAvailable = entry && entry->category == AssetLibrary::Category::Prefab;
+    if (sourceAvailable) assetLabel = entry->displayName.empty() ? entry->filename : entry->displayName;
 
-    ImGui::TextUnformatted("Linked Prefab Instance");
-    ImGui::TextDisabled("Asset: %s", assetLabel.c_str());
-    ImGui::TextDisabled("Asset ID: %s", effectiveAssetId.c_str());
-    ImGui::TextDisabled("Local ID: %u", instance.localId == 0 ? 1u : instance.localId);
-    ImGui::TextDisabled("Overrides: %zu", overrides.size());
-    ImGui::Separator();
-
-    if (overrides.empty())
+    ImGui::TextWrapped(ICON_FA_LAYER_GROUP " %s", assetLabel.c_str());
+    ImGui::TextDisabled("%s | %zu overrides", instance.linked ? "Linked instance" : "Unlinked instance", overrides.size());
+    if (m_inspectorShowDebugInfo)
     {
-        ImGui::TextDisabled("No instance overrides.");
+        ImGui::TextDisabled("Asset ID: %s", effectiveAssetId.c_str());
+        ImGui::TextDisabled("Local ID: %u", instance.localId == 0 ? 1u : instance.localId);
     }
-    else
+    ImGui::BeginDisabled(!sourceAvailable);
+    if (ImGui::Button("Open"))
     {
-        for (const std::string& overrideName : overrides)
+        m_selectedAssetId = entry->id;
+        m_assetInspectorSelectionActive = true;
+        m_assetStatus = "Editing prefab source: " + assetLabel;
+    }
+    UI::ItemTooltip("Open the prefab source in the Inspector.");
+    ImGui::SameLine();
+    if (ImGui::Button("Select"))
+    {
+        SelectAssetBrowserFolder(entry->subpath);
+        m_assetSearchBuffer[0] = '\0';
+        m_selectedAssetId = entry->id;
+        m_assetBrowserPanelOpen = true;
+        m_assetStatus = "Selected prefab source: " + assetLabel;
+    }
+    UI::ItemTooltip("Reveal the prefab source in the Asset Browser.");
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Overrides")) ImGui::OpenPopup("PrefabOverrides");
+    if (ImGui::BeginPopup("PrefabOverrides"))
+    {
+        ImGui::TextWrapped("Changes on this instance compared with its prefab source.");
+        ImGui::Separator();
+
+        if (overrides.empty())
         {
-            ImGui::PushID(overrideName.c_str());
-            ImGui::BulletText("%s", overrideName.c_str());
-            if (overrideName != "Prefab asset missing")
-            {
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Revert"))
-                {
-                    m_commands.revertSelectedPrefabOverride = true;
-                    m_commands.selectedPrefabOverrideName = overrideName;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Apply"))
-                {
-                    m_commands.applySelectedPrefabOverrideToAsset = true;
-                    m_commands.selectedPrefabOverrideName = overrideName;
-                }
-            }
-            ImGui::PopID();
+            ImGui::TextDisabled("No instance overrides.");
         }
+        else
+        {
+            for (const std::string& overrideName : overrides)
+            {
+                ImGui::PushID(overrideName.c_str());
+                ImGui::BulletText("%s", overrideName.c_str());
+                if (overrideName != "Prefab asset missing")
+                {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Revert"))
+                    {
+                        m_commands.revertSelectedPrefabOverride = true;
+                        m_commands.selectedPrefabOverrideName = overrideName;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Apply"))
+                    {
+                        m_commands.applySelectedPrefabOverrideToAsset = true;
+                        m_commands.selectedPrefabOverrideName = overrideName;
+                    }
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::Separator();
+        ImGui::BeginDisabled(!sourceAvailable || overrides.empty());
+        if (ImGui::Button("Revert All"))
+            m_commands.revertSelectedPrefabInstance = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Apply All"))
+            m_commands.applySelectedPrefabToAsset = true;
+        UI::ItemTooltip("Write all instance overrides back to the prefab source.");
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
     }
-    ImGui::Separator();
-    if (UI::IconButton(ICON_FA_ROTATE, "Refresh Selected Instance", ImVec2(-1.0f, 0.0f)))
-        m_commands.refreshSelectedPrefabInstance = true;
-    if (UI::IconButton(ICON_FA_ROTATE, "Revert All Overrides", ImVec2(-1.0f, 0.0f)))
-        m_commands.revertSelectedPrefabInstance = true;
-    if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Apply All Overrides to Prefab", ImVec2(-1.0f, 0.0f)))
-        m_commands.applySelectedPrefabToAsset = true;
-    if (UI::IconButton(ICON_FA_ROTATE, "Refresh All Prefab Instances", ImVec2(-1.0f, 0.0f)))
-        m_commands.refreshAllPrefabInstances = true;
-    if (UI::IconButton(ICON_FA_LAYER_GROUP, "Unpack Prefab Instance", ImVec2(-1.0f, 0.0f)))
-        m_commands.unpackSelectedPrefabInstance = true;
+    if (ImGui::SmallButton("More...")) ImGui::OpenPopup("PrefabActions");
+    if (ImGui::BeginPopup("PrefabActions"))
+    {
+        ImGui::BeginDisabled(!sourceAvailable);
+        if (ImGui::MenuItem("Refresh this instance")) m_commands.refreshSelectedPrefabInstance = true;
+        if (ImGui::MenuItem("Refresh all linked instances")) m_commands.refreshAllPrefabInstances = true;
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Unpack instance")) m_commands.unpackSelectedPrefabInstance = true;
+        ImGui::EndPopup();
+    }
 }
 
 void EditorImGui::RenderSelectedWaterBodyInspector()

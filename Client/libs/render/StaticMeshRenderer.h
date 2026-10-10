@@ -50,6 +50,7 @@ namespace tree_tool { struct TreeImpostorSettings; }
 class StaticMeshRenderer
 {
     friend struct StaticMeshLeafLodTestAccess;
+    friend struct StaticMeshLodGenerationTestAccess;
 public:
     enum class LoadStatus
     {
@@ -114,6 +115,7 @@ public:
         bool bufferKnown = false;
         bool bufferValid = false;
         bool pendingUpload = false;
+        bool buildPending = false;
         std::uint32_t levelCount = 0;
         std::array<std::size_t, LodConfig::MaxLevels> levelTris{};
         std::array<std::size_t, LodConfig::MaxLevels> levelIndices{};
@@ -233,6 +235,8 @@ public:
         std::uint32_t targetWidth = 0,
         std::uint32_t targetHeight = 0);
     void RequestLodQualityBuild(const LodConfig& lodConfig, std::uint64_t configHash, std::uint32_t entityId);
+    // Render-thread pump: generate/upload all levels, including while drawing LOD 0.
+    bool PrepareLods(const LodConfig& lodConfig, std::uint64_t configHash, std::uint32_t entityId);
     void Destroy();
 
     bool IsLoaded() const { return m_status == LoadStatus::LoadedStatic; }

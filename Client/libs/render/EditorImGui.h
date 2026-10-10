@@ -406,6 +406,7 @@ private:
     // The Inspector's title row: what is selected, with the engine-id (debug info) toggle.
     void RenderInspectorTitle(const char* icon, const char* typeName, std::uint32_t objectId);
     bool RenderAttachedEditorComponents(std::vector<EditorAttachedComponent>& components);
+    bool RenderLodGroupControls();
     // meshScale: a model scale multiplier (fine steps down to 0.001) instead of a size in metres.
     bool RenderTransformComponent(float* position, float* rotation, float* scale, bool meshScale = false);
     bool RenderAxisFloat(const char* axis, float& value, float r, float g, float b, float speed, float minValue, float maxValue,

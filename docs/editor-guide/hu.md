@@ -185,14 +185,15 @@ A prefab újrahasználható objektum-összeállítás; több példány követhet
 1. Edit módban állíts össze egy modellt komponensekkel vagy gyerekobjektumokkal.
 2. A Hierarchy helyi menüjében válaszd a Create Prefab műveletet.
 3. A prefab assetet húzd a jelenetbe többször.
-4. Egy példány módosítása után Apply to Prefab frissíti az alapot; Revert Prefab Overrides visszaállítja a helyi eltéréseket.
-5. Refresh All Prefab Instances újraszinkronizál; Unpack Prefab Instance megszünteti a példány prefab-kapcsolatát.
+4. A példány Inspectorában az Open a prefab forrását nyitja meg, a Select kijelöli azt az Asset Browserben.
+5. Az Overrides menü eltérésenként Apply/Revert, illetve Apply All/Revert All műveletet kínál. A More... menüben a példány vagy az összes kapcsolt példány frissítése és az Unpack található.
 
 #### Eredmény és gyakori hiba
 Közös sablonból több példány készül. Apply előtt ellenőrizd, hogy az összes használóra szánt változtatást adod át. A prefab asset dupla kattintásával az asset saját szerkesztőfelülete nyílik meg.
 
 - A prefab asset Inspectorában a név, entitáshierarchia/transzformáció és materialslotok szerkeszthetők; Add Point Light / Add Spot Light lámpát ad hozzá.
 - Save Prefab Asset menti az asset szerkesztését; Reload Prefab Asset eldobja a még nem mentett változtatásokat. Instantiate Prefab jelenetpéldányt készít. Szülőciklus vagy hiányzó mesh-hivatkozás blokkolja a mentést.
+- A prefab készítése és példányosítása megőrzi a LOD Group beállításait, a kikapcsolt csoportokét is. Az Overrides menü külön is alkalmazhatja vagy visszavonhatja a LOD Group eltéréseit.
 
 <!-- topic: model-export -->
 ### Modell exportálása FBX-be
@@ -633,13 +634,16 @@ A Tools > Tree Generator procedurális fát készít. General/Seed, Trunk and Br
 A LOD távolabb egyszerűsíti a geometriát; a főnézeti levél-LOD ritkítja a lombkártyákat. A GPU takarási szűrés domb/nagy opaque tárgy mögött kihagyhat statikus csoportokat.
 
 #### Rövid tutorial
-1. Egy modellhez add a LOD Group komponenst, és ellenőrizd a szintek távolságait és elérhető újraépítési műveleteit.
-2. Helyezz több fát különböző távolságra; a közeliek maradjanak részletesek.
-3. Építs eléjük dombot vagy nagy tömör takarót, és mozgással ellenőrizd a feltáruló részt.
-4. Azonos kamerából és felbontáson hasonlíts FPS-t / GPU-időt.
+1. Statikus modellhez add a LOD Group komponenst. Az Enabled kapcsolja a csoport használatát; az Override on this instance a modell alapbeállításának helyi felülírását engedi.
+2. A színes sáv métertávolságokat mutat. Húzd a határokat, vagy nyiss le egy LOD-sort a Transition (m) és Target geometry szerkesztéséhez. A sorok a ténylegesen elkészült háromszögszámot és a LOD 0-hoz viszonyított százalékot mutatják; a Not built jelzi, ha még nincs eredmény.
+3. Az Add LOD / Last LOD a szintek számát módosítja (1–4). A bekapcsolt csoport geometriája a háttérben elkészül közeli nézetben és kijelölés mellett is. A Building a CPU-generálást jelzi, a GPU-feltöltés külön állapotot kap. A Generate / Rebuild LODs szintén generálást kér; a Set as model asset default a modell összes használójával megosztja a beállítást.
+   A Scene View és a Game View saját kamerájának távolságát és választott szintjét mutatja. A távolságot az objektum világban számolt határainak középpontjától mérjük; egy nagy befoglaló dobozon belül állva sem lesz automatikusan nulla. A kijelölés és a takarási passz nem kényszerít LOD 0-ra. Távolodj el a váltások ellenőrzéséhez. A határok vagy a hiszterézis módosítása újrahasználja a geometriát; a célarányok vagy a szintek számának módosítása újraépíti azt.
+   Az alacsonyabb háromszögcélarány erősebb egyszerűsítést enged. A generátor először megőrzi a textúravarratokat, majd növeli a geometriai hibatűrést, és szükség esetén submesh-enként csoportosítja a csúcsokat. Nagyon alacsony cél módosíthatja a körvonalat vagy a textúravarratokat; a tényleges szám eltérhet a céltól, és minden submesh megtart geometriát. A LOD a részletességet csökkenti; az utolsó szint látható marad, nem tűnik el.
+4. Az Advanced tartalmazza a hiszterézist, amely a távolsághatár közelében csökkenti az oda-vissza váltást. A legutolsó LOD nagyobb távolságban is látható marad; a panel nem vezet be külön távolsági elrejtést.
+5. Tegyél fákat különböző távolságokra, készíts dombot vagy nagy tömör takarót, majd azonos kamerával/felbontással hasonlítsd össze az FPS/GPU időt.
 
 #### Eredmény és gyakori hiba
-A kijelölt/közeli objektum részletessége védett. Az alapból aktív takarás csak teljesen takart csoportot rejt; karakter, transparent, terrain-chunk és árnyék saját útja megmarad. Nyitott erdőben nincs feltétlenül nyereség. Indítás előtt IX_OCCLUSION_CULLING=0 kikapcsolja az új szűrést; ez nem editorcsúszka.
+A közeli objektum megőrzi a részletességét. Az automatikus geometriai LOD jelenleg statikus modellekhez használható; az alpha-blended materialok rajzolása az eredeti geometriát használja. Az alapból aktív takarás csak teljesen takart csoportot rejt; karakter, transparent, terrain-chunk és árnyék saját útja megmarad. Nyitott erdőben nincs feltétlenül nyereség. Indítás előtt IX_OCCLUSION_CULLING=0 kikapcsolja az új szűrést; ez nem editorcsúszka.
 
 <!-- topic: impostors -->
 ### Impostor: modell, terrain és karakter

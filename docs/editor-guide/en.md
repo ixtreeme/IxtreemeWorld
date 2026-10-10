@@ -185,14 +185,15 @@ A prefab is a reusable object assembly. Several instances can share the same ass
 1. Assemble a model with components or children in Edit mode.
 2. Hierarchy context menu > Create Prefab.
 3. Drag the prefab asset into the scene several times.
-4. Apply to Prefab updates the base asset; Revert Prefab Overrides restores the instance's local changes.
-5. Refresh All Prefab Instances resynchronizes instances; Unpack Prefab Instance removes the prefab connection.
+4. In the instance Inspector, Open edits the prefab source and Select reveals it in Asset Browser.
+5. Overrides lists local changes with Apply/Revert per change and Apply All/Revert All. More... contains instance refresh, refresh of all linked instances and Unpack.
 
 #### Result and common mistake
 Multiple instances come from one template. Before Apply, confirm that your change should affect other users. Double-click the prefab asset to open its asset-editing interface.
 
 - The prefab asset Inspector edits its name, entity hierarchy/transforms and material slots, and can Add Point Light / Add Spot Light.
 - Save Prefab Asset writes asset edits; Reload Prefab Asset discards unsaved asset edits. Instantiate Prefab creates a scene instance. Parent cycles and missing mesh references block saving.
+- LOD Group settings are preserved by prefab creation and instantiation, including disabled groups. The Overrides menu can apply or revert LOD Group changes separately.
 
 <!-- topic: model-export -->
 ### Exporting a model to FBX
@@ -633,13 +634,16 @@ You receive a reusable tree and optional distant atlas. Use clustered leaf cards
 LOD simplifies distant geometry; main-view leaf LOD thins foliage cards. GPU occlusion can skip static groups hidden behind terrain or large opaque objects.
 
 #### Short tutorial
-1. Add LOD Group and inspect level distances and available rebuild actions.
-2. Place trees at different distances; keep nearby trees detailed.
-3. Build a ridge or large solid occluder and check newly revealed objects while moving.
-4. Compare FPS/GPU time using the same camera and resolution.
+1. Add LOD Group to a static mesh. Enabled controls whether the group is used; Override on this instance lets a linked model default be edited locally.
+2. The coloured bar shows distances in metres. Drag a divider or open a LOD row to edit Transition (m) and Target geometry. Headers show actual generated triangles and their percentage of LOD 0; Not built means no generated result is available yet.
+3. Add LOD / Last LOD changes the number of levels (1–4). Enabled groups generate their geometry in the background even when nearby or selected. Building indicates CPU generation; GPU upload has its own status. Generate / Rebuild LODs also requests generation; Set as model asset default shares the configuration across users of that model.
+   Scene View and Game View show their own camera distance and selected level. Distances are measured from the centre of the object's world bounds; standing inside a large bounding box does not pin the distance to zero. Selection and the occluder pass do not force LOD 0. Move away to test transitions. Changing a transition or hysteresis reuses geometry; changing target ratios or the number of levels rebuilds it.
+   Lower triangle targets permit stronger simplification. The generator first preserves seams, then relaxes geometric error and uses submesh-local clustering if seams prevent reaching the budget. Very low targets can change the silhouette or texture seams; the actual count may differ from the target, and each submesh keeps geometry. A LOD reduces detail; the last level remains visible rather than disappearing.
+4. Advanced contains hysteresis, which prevents switching repeatedly around a distance boundary. The final LOD remains visible at larger distances; this panel does not add a separate distance-culling stage.
+5. Place trees at different distances, build a ridge or large solid occluder, then compare FPS/GPU time using the same camera and resolution.
 
 #### Result and common mistake
-Nearby/selected geometry retains detail. Default occlusion only hides fully covered groups; characters, transparent geometry, terrain chunks and shadows keep their existing paths. Open forests may gain little. IX_OCCLUSION_CULLING=0 disables this optimization before launch; it is not an editor slider.
+Nearby geometry retains detail. Automatic geometry LOD currently supports static meshes; alpha-blended material draws keep their original geometry. Default occlusion only hides fully covered groups; characters, transparent geometry, terrain chunks and shadows keep their existing paths. Open forests may gain little. IX_OCCLUSION_CULLING=0 disables this optimization before launch; it is not an editor slider.
 
 <!-- topic: impostors -->
 ### Impostors for models, terrain and characters

@@ -20,6 +20,13 @@ int main()
     root.mesh.skinned = true;
     root.mesh.enabled = false;
     root.mesh.hasCollider = true;
+    root.mesh.lod.enabled = true;
+    root.mesh.lod.overrideAssetDefault = true;
+    root.mesh.lod.config.levelCount = 3;
+    root.mesh.lod.config.distances[1] = 42.5f;
+    root.mesh.lod.config.targetRatios[2] = 0.125f;
+    root.mesh.lod.config.hysteresisMeters = 2.5f;
+    root.mesh.editorComponents.push_back({"rendering.lod", "LOD Group", "Rendering", {}});
     document.entities.push_back(root);
     pf::PrefabEntity child = root;
     child.localId = 3;
@@ -45,6 +52,12 @@ int main()
     auto roundtrip = pf::ParseDocument(output.str(), "fixture");
     check(roundtrip.entities.size() == 4, "multi-entity roundtrip");
     check(!roundtrip.entities[0].mesh.enabled, "prefab local enabled roundtrip");
+    const auto& lod = roundtrip.entities[0].mesh.lod;
+    check(lod.enabled && lod.overrideAssetDefault && lod.config.levelCount == 3 &&
+        lod.config.distances[1] == 42.5f && lod.config.targetRatios[2] == 0.125f && lod.config.hysteresisMeters == 2.5f,
+        "prefab LOD settings survive document roundtrip");
+    check(roundtrip.entities[0].mesh.editorComponents.size() == 1 &&
+        roundtrip.entities[0].mesh.editorComponents[0].type == "rendering.lod", "LOD inspector component restored");
     check(roundtrip.entities[0].mesh.animatorControllerId == root.mesh.animatorControllerId,
         "escaped animator controller roundtrip");
     std::ostringstream legacy;
@@ -54,6 +67,13 @@ int main()
     check(pf::ParseTemplate("{\"type\":\"mesh_entity\"}", "old").mesh.animatorControllerId.empty(),
         "old prefab has no controller");
     check(pf::ParseTemplate("{\"type\":\"mesh_entity\"}", "old").mesh.enabled, "old prefab enabled by default");
+    check(!pf::ParseTemplate("{\"type\":\"mesh_entity\"}", "old").mesh.lod.enabled, "old prefab LOD remains opt-out");
+    auto disabledLod = root.mesh;
+    disabledLod.lod.enabled = false;
+    std::ostringstream disabledLodText; pf::WriteMesh(disabledLodText, disabledLod, "Disabled LOD");
+    const auto disabledLodRead = pf::ParseTemplate(disabledLodText.str(), "fixture").mesh;
+    check(!disabledLodRead.lod.enabled && disabledLodRead.editorComponents.size() == 1 &&
+        disabledLodRead.lod.config.distances[1] == 42.5f, "disabled LOD component and settings survive legacy prefab roundtrip");
     auto captured=document;
     captured.entities[0].mesh.id=900;
     captured.entities[1].mesh.id=901;
@@ -78,6 +98,8 @@ int main()
         check(instance.meshes[1].fixedJoint.connectedEntityId == 100, "joint target remapped");
         check(instance.meshes[0].prefabInstance.linked && instance.meshes[1].prefabInstance.localId == 3,
             "prefab links preserved");
+        check(instance.meshes[0].lod.enabled && instance.meshes[1].lod.config.distances[1] == 42.5f &&
+            instance.meshes[1].editorComponents.size() == 1, "LOD survives runtime prefab instantiation");
         check(instance.meshes[1].renderRecordSlot == 0xffffffffu, "no borrowed render slot");
     }
     else check(false, "all meshes and lights instantiated");
