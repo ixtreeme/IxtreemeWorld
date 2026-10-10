@@ -490,6 +490,7 @@ Füst, szikra és hasonló effektek készíthetők emitterrel. Az Emission, Life
 
 - Duration, Rate (/s), Burst és Max Particles a kibocsátást és korlátját adja; a Min/Max mezők életkort, sebességet és méretet véletlenítenek.
 - Húzd a Size Over Life görbe négy pontját; Color 0–3 az élettartam alatti szín/átlátszóság változása. Gravity, Drag és Spin a mozgást alakítja.
+- A Turbulence sima, kavargó mozgást ad CPU- és GPU-szimulációban is. Az Enable Turbulence kapcsolja be; Strength a gyorsulás erőssége, Scale az örvények térbeli mérete méterben, Speed a sodródási tér időbeli változását állítja (0 = állandó áramlási tér). A beállítások jelenetben, prefabban és effektpresetben is mentődnek.
 - Atlas Columns/Rows élettartam alatt lejátszott flipbookot ad. Shape: Point/Sphere/Box/Circle/Edge; Direction/Cone Angle irányítja a kibocsátást.
 - Local Space mellett a részecskék követik az emittert, de nincs talajütközés. Soft Distance szabályozza a geometria közeli elhalványulást.
 
@@ -502,6 +503,8 @@ Füst, szikra és hasonló effektek készíthetők emitterrel. Az Emission, Life
 
 #### Eredmény és gyakori hiba
 Az emitter Edit módban is előnézhető. Nagy, áttetsző részecskék egymásra rajzolása GPU-költséges; a sok élő részecske számát az élettartam is növeli.
+
+Lebegő porhoz helyezz Box emittert a talaj fölé (az Extents félméreteket jelent), állíts Cone Angle 180°-ot, Gravity 0-t, Speed Min/Max 0.02/0.08-at, Drag 0.3-at és Lifetime 15/25 másodpercet. Kapcsold be a Turbulence-t Strength 0.03, Scale 3 és Speed 0.35 értékekkel. Kis Alpha sprite-okat használj, a Color 0–3 alfaértékei legyenek 0/0.15/0.15/0, a Size Over Life pedig állandó. Az új részecskék a teljes térfogatban születnek, a meglévők kisodródhatnak belőle. Burst 0 és Rate 15 mellett fokozatosan telik meg.
 
 <!-- topic: audio -->
 ### Audio Source, Listener és hangerőbuszok

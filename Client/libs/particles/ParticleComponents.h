@@ -70,7 +70,7 @@ inline ParticleShape ParseShape(const std::string& s)
 }
 
 // One emitter on one entity. Emission is a cone around `direction` (rotated by the entity's
-// rotation), spawned in a sphere of `shapeRadius` at the entity origin. Per particle the sim
+// rotation), spawned inside `shape` at the entity origin. Per particle the sim
 // interpolates size and color from the Start* values to the End* values over its lifetime.
 struct ParticleSystemComponent
 {
@@ -116,6 +116,13 @@ struct ParticleSystemComponent
     float gravity = -1.5f;       // m/s^2 along world Y
     float drag = 0.0f;           // velocity damping per second (0 = none)
     float rotationSpeed = 0.0f;  // deg/s; each particle gets a random +/- spin
+
+    // Smooth, spatially coherent swirling acceleration, in the simulation's coordinate space.
+    // Off by default so existing effects keep their motion. Drag limits the resulting drift.
+    bool turbulenceEnabled = false;
+    float turbulenceStrength = 0.05f;  // acceleration (m/s^2)
+    float turbulenceScale = 4.0f;      // spatial wavelength (m): larger = broader swirls
+    float turbulenceSpeed = 0.35f;     // temporal phase rate (rad/s); 0 = a static flow field
 
     // Soft particles: fade the sprite out as it approaches scene geometry (sampling the scene depth
     // snapshot), so the plume does not cut hard against the terrain/walls. `softDistance` is the
@@ -166,6 +173,9 @@ inline void Sanitize(ParticleSystemComponent& p)
     p.gravity = std::clamp(p.gravity, -500.0f, 500.0f);
     p.drag = std::clamp(p.drag, 0.0f, 100.0f);
     p.rotationSpeed = std::clamp(p.rotationSpeed, -3600.0f, 3600.0f);
+    p.turbulenceStrength = std::clamp(p.turbulenceStrength, 0.0f, 100.0f);
+    p.turbulenceScale = std::clamp(p.turbulenceScale, 0.01f, 1000.0f);
+    p.turbulenceSpeed = std::clamp(p.turbulenceSpeed, 0.0f, 100.0f);
     p.softDistance = std::clamp(p.softDistance, 0.01f, 100.0f);
     p.atlasColumns = std::clamp(p.atlasColumns, 1, 64);
     p.atlasRows = std::clamp(p.atlasRows, 1, 64);

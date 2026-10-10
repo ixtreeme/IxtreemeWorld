@@ -645,6 +645,7 @@ ParticleRenderer::GpuEmitter* ParticleRenderer::EnsureGpuEmitter(ixrhi::IXRHIDev
 
     emitter.maxParticles = static_cast<std::uint32_t>(maxParticles);
     emitter.spawnAccumulator = 0.0f;
+    emitter.simulationTime = 0.0;
     emitter.spawnCursor = 0;
     emitter.frameSeed = 1;
     emitter.pendingBurst = 0;
@@ -723,6 +724,10 @@ bool ParticleRenderer::SimulateGpuEmitter(ixrhi::IXRHICommandList& cmd,
     uniform.params0[1] = params.drag;
     uniform.params0[2] = params.coneAngle * 0.01745329252f;
     uniform.params0[3] = params.rotationSpeed * 0.01745329252f;
+    uniform.turbulence[0] = params.turbulenceEnabled ? params.turbulenceStrength : 0.0f;
+    uniform.turbulence[1] = params.turbulenceScale;
+    uniform.turbulence[2] = params.turbulenceSpeed;
+    uniform.turbulence[3] = static_cast<float>(emitter.simulationTime);
     uniform.params1[0] = params.shapeRadius;
     uniform.params1[1] = params.shapeArc * 0.01745329252f;
     uniform.params1[2] = params.shape;
@@ -772,6 +777,7 @@ bool ParticleRenderer::SimulateGpuEmitter(ixrhi::IXRHICommandList& cmd,
     emitter.clearPending = false;
 
     emitter.spawnCursor = (emitter.spawnCursor + budget) % emitter.maxParticles;
+    emitter.simulationTime += uniform.emitterPos[3];
     ++emitter.frameSeed;
     return true;
 }
@@ -821,6 +827,7 @@ void ParticleRenderer::GpuEmitterRestart(std::uint32_t entityId)
     it->second.started = true;
     it->second.playing = true;
     it->second.spawnAccumulator = 0.0f;
+    it->second.simulationTime = 0.0;
     it->second.pendingBurst = 0;
     it->second.startBurstPending = true;
     it->second.clearPending = true;
@@ -849,6 +856,7 @@ void ParticleRenderer::ResetGpuEmitters()
         emitter.startBurstPending = false;
         emitter.clearPending = true;
         emitter.spawnAccumulator = 0.0f;
+        emitter.simulationTime = 0.0;
         emitter.spawnCursor = 0;
     }
 }

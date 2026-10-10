@@ -67,6 +67,20 @@ void BuildBasis(const float direction[3], float tangent[3], float bitangent[3])
     bitangent[2] = direction[0] * tangent[1] - direction[1] * tangent[0];
 }
 
+// Analytic curl field: each component depends only on the other two spatial axes, so its
+// divergence is zero. Smooth phases create coherent swirls without per-frame random jitter.
+// Keep this field and its phase rates in sync with TurbulenceField in ParticlesSim.hlsl.
+void TurbulenceField(const float position[3], float scale, float phase, float out[3])
+{
+    const float frequency = 6.28318530718f / std::max(scale, 0.01f);
+    const float x = position[0] * frequency;
+    const float y = position[1] * frequency;
+    const float z = position[2] * frequency;
+    out[0] = 0.5f * (std::sin(y + 1.7f + phase) + std::cos(z - 2.3f - phase * 0.7f));
+    out[1] = 0.5f * (std::sin(z + 4.1f + phase * 0.9f) + std::cos(x + 0.6f + phase * 0.8f));
+    out[2] = 0.5f * (std::sin(x - 1.3f - phase * 0.6f) + std::cos(y + 2.9f + phase * 1.1f));
+}
+
 } // namespace
 
 float ParticleSimulator::Random01()
@@ -83,6 +97,7 @@ void ParticleSimulator::Reset(const ParticleSystemComponent& component, std::uin
     m_particles.clear();
     m_rng = seed != 0u ? seed : 1u;
     m_emissionTime = 0.0f;
+    m_simulationTime = 0.0;
     m_emitAccumulator = 0.0f;
     m_pendingBurst = startEmitting ? std::clamp(component.burstCount, 0, 10000) : 0;
     m_emitting = startEmitting;
@@ -180,6 +195,8 @@ void ParticleSimulator::Update(const ParticleSystemComponent& component,
                                const float* emitterAxes)
 {
     const float dt = std::clamp(dtSeconds, 0.0f, kMaxStepSeconds);
+    const float turbulencePhase = static_cast<float>(m_simulationTime) * component.turbulenceSpeed;
+    m_simulationTime += dt;
 
     // Integrate + retire the dead (swap-and-pop keeps the array compact for the renderer).
     for (std::size_t i = 0; i < m_particles.size();)
@@ -194,6 +211,13 @@ void ParticleSimulator::Update(const ParticleSystemComponent& component,
         }
         const float t = std::clamp(particle.age / std::max(particle.lifetime, 1e-4f), 0.0f, 1.0f);
         particle.velocity[1] += component.gravity * dt;
+        if (component.turbulenceEnabled && component.turbulenceStrength > 0.0f)
+        {
+            float flow[3];
+            TurbulenceField(particle.position, component.turbulenceScale, turbulencePhase, flow);
+            for (int c = 0; c < 3; ++c)
+                particle.velocity[c] += flow[c] * component.turbulenceStrength * dt;
+        }
         if (component.drag > 0.0f)
         {
             const float damping = std::max(0.0f, 1.0f - component.drag * dt);

@@ -37,6 +37,7 @@ struct ParticleState
     float4 u_axisX;         // xyz = the emitter's local axes in world space: the spawn shape's orientation
     float4 u_axisY;
     float4 u_axisZ;
+    float4 u_turbulence;    // x strength (0 disabled), y scale (m), z speed, w simulation time
 };
 
 [[vk::binding(1, 0)]] RWStructuredBuffer<ParticleState> u_particles : register(u0);
@@ -91,6 +92,16 @@ void BuildBasis(float3 direction, out float3 tangent, out float3 bitangent)
         up = float3(1.0, 0.0, 0.0);
     tangent = normalize(cross(up, direction));
     bitangent = cross(direction, tangent);
+}
+
+// Smooth divergence-free curl field; keep in sync with ParticleSimulator.cpp.
+float3 TurbulenceField(float3 position, float scale, float phase)
+{
+    const float3 q = position * (6.28318530718 / max(scale, 0.01));
+    return 0.5 * float3(
+        sin(q.y + 1.7 + phase) + cos(q.z - 2.3 - phase * 0.7),
+        sin(q.z + 4.1 + phase * 0.9) + cos(q.x + 0.6 + phase * 0.8),
+        sin(q.x - 1.3 - phase * 0.6) + cos(q.y + 2.9 + phase * 1.1));
 }
 
 // Respawns `slot` as a fresh particle. `salt` decorrelates the per-slot RNG streams.
@@ -152,7 +163,7 @@ void Spawn(uint slot, uint salt)
     const float lifetime = LerpF(u_life.x, u_life.y, r5);
     const float spawnSize = LerpF(u_life.z, u_life.w, Hash01(seed ^ 0x51ed270bu));
     const float angularVelocity = (r1 * 2.0 - 1.0) * u_params0.w;
-    p.positionSize = float4(emitterPosition + offset, spawnSize);
+    p.positionSize.w = spawnSize;
     p.velocityAge = float4(coneDirection * speed, 0.0);
     p.rotation = float4(r0 * 6.28318530718, 0.0, 0.0, 0.0);
     p.lifeSpawn = float4(lifetime, spawnSize, angularVelocity, 0.0);
@@ -207,6 +218,9 @@ void CSMain(uint3 id : SV_DispatchThreadID)
     const float t = saturate(p.velocityAge.w / max(p.lifeSpawn.x, 1e-4));
 
     p.velocityAge.y += u_params0.x * dt;  // gravity (world Y)
+    if (u_turbulence.x > 0.0)
+        p.velocityAge.xyz += TurbulenceField(p.positionSize.xyz, u_turbulence.y,
+            u_turbulence.w * u_turbulence.z) * u_turbulence.x * dt;
     if (u_params0.y > 0.0)
     {
         const float damping = max(0.0, 1.0 - u_params0.y * dt);

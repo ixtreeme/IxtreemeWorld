@@ -490,6 +490,7 @@ Emitters produce smoke, sparks and similar effects. Emission, Lifetime, Speed, S
 
 - Duration, Rate (/s), Burst and Max Particles control emission and its cap; Min/Max fields randomize lifetime, speed and size.
 - Drag Size Over Life's four curve points; Color 0–3 defines lifetime colour/alpha changes. Gravity, Drag and Spin alter movement.
+- Turbulence adds smooth swirling motion on both CPU and GPU. Enable Turbulence turns it on; Strength is acceleration, Scale is the spatial size of the swirls in metres, and Speed controls how quickly the flow changes (0 = static field). Settings are saved in scenes, prefabs and effect presets.
 - Atlas Columns/Rows enables a flipbook over lifetime. Shape supports Point/Sphere/Box/Circle/Edge; Direction/Cone Angle guide emission.
 - Local Space makes particles follow their emitter, but disables ground collision. Soft Distance controls fading near scene geometry.
 
@@ -502,6 +503,8 @@ Emitters produce smoke, sparks and similar effects. Emission, Lifetime, Speed, S
 
 #### Result and common mistake
 Emitters can preview in Edit mode. Large overlapping translucent particles are expensive on the GPU; longer lifetime also increases the number of live particles.
+
+For floating dust, place a Box emitter above the ground (Extents are half-sizes), use Cone Angle 180°, Gravity 0, Speed Min/Max 0.02/0.08, Drag 0.3 and Lifetime 15/25 seconds. Enable Turbulence with Strength 0.03, Scale 3 and Speed 0.35. Use small Alpha sprites with Color 0–3 alpha values 0/0.15/0.15/0 and constant Size Over Life. New particles spawn throughout the volume; existing ones can drift beyond it. Burst 0 and Rate 15 fill it gradually.
 
 <!-- topic: audio -->
 ### Audio Source, Listener and volume buses

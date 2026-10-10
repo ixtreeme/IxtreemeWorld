@@ -20,6 +20,11 @@ int main()
     root.mesh.skinned = true;
     root.mesh.enabled = false;
     root.mesh.hasCollider = true;
+    root.mesh.hasParticleSystem = true;
+    root.mesh.particleSystem.turbulenceEnabled = true;
+    root.mesh.particleSystem.turbulenceStrength = 0.0375f;
+    root.mesh.particleSystem.turbulenceScale = 3.25f;
+    root.mesh.particleSystem.turbulenceSpeed = 0.42f;
     root.mesh.lod.enabled = true;
     root.mesh.lod.overrideAssetDefault = true;
     root.mesh.lod.config.levelCount = 3;
@@ -52,6 +57,10 @@ int main()
     auto roundtrip = pf::ParseDocument(output.str(), "fixture");
     check(roundtrip.entities.size() == 4, "multi-entity roundtrip");
     check(!roundtrip.entities[0].mesh.enabled, "prefab local enabled roundtrip");
+    const auto& turbulence = roundtrip.entities[0].mesh.particleSystem;
+    check(roundtrip.entities[0].mesh.hasParticleSystem && turbulence.turbulenceEnabled &&
+        turbulence.turbulenceStrength == 0.0375f && turbulence.turbulenceScale == 3.25f &&
+        turbulence.turbulenceSpeed == 0.42f, "prefab turbulence survives document roundtrip");
     const auto& lod = roundtrip.entities[0].mesh.lod;
     check(lod.enabled && lod.overrideAssetDefault && lod.config.levelCount == 3 &&
         lod.config.distances[1] == 42.5f && lod.config.targetRatios[2] == 0.125f && lod.config.hysteresisMeters == 2.5f,
@@ -64,6 +73,10 @@ int main()
     pf::WriteMesh(legacy, root.mesh, "Root");
     check(pf::ParseTemplate(legacy.str(), "fixture").mesh.animatorControllerId == root.mesh.animatorControllerId,
         "legacy single-entity animator roundtrip");
+    check(pf::ParseTemplate(legacy.str(), "fixture").mesh.particleSystem.turbulenceEnabled,
+        "single-entity prefab preserves turbulence");
+    check(!pf::ParseTemplate("{\"type\":\"mesh_entity\",\"particle_system\":{}}", "old")
+        .mesh.particleSystem.turbulenceEnabled, "old prefab does not enable turbulence");
     check(pf::ParseTemplate("{\"type\":\"mesh_entity\"}", "old").mesh.animatorControllerId.empty(),
         "old prefab has no controller");
     check(pf::ParseTemplate("{\"type\":\"mesh_entity\"}", "old").mesh.enabled, "old prefab enabled by default");
@@ -101,6 +114,9 @@ int main()
         check(instance.meshes[0].lod.enabled && instance.meshes[1].lod.config.distances[1] == 42.5f &&
             instance.meshes[1].editorComponents.size() == 1, "LOD survives runtime prefab instantiation");
         check(instance.meshes[1].renderRecordSlot == 0xffffffffu, "no borrowed render slot");
+        check(instance.meshes[0].particleSystem.turbulenceEnabled &&
+            instance.meshes[1].particleSystem.turbulenceScale == 3.25f,
+            "turbulence survives runtime prefab instantiation");
     }
     else check(false, "all meshes and lights instantiated");
     const auto expectInvalid = [&](pf::PrefabDocument invalid) {

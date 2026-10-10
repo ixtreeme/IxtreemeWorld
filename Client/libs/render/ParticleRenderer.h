@@ -82,6 +82,10 @@ public:
         float drag = 0.0f;
         float coneAngle = 20.0f;     // degrees
         float rotationSpeed = 0.0f;  // degrees/s
+        bool turbulenceEnabled = false;
+        float turbulenceStrength = 0.05f;
+        float turbulenceScale = 4.0f;
+        float turbulenceSpeed = 0.35f;
         float shapeRadius = 0.15f;
         float shapeArc = 360.0f;     // degrees
         float shape = 1.0f;          // ixparticle::ParticleShape ordinal
@@ -163,6 +167,7 @@ public:
     void Destroy();
 
 private:
+    friend struct ParticleTurbulenceTestAccess;
     static constexpr std::uint32_t kFramesInFlight = 2;
     // Descriptor sets / view uniforms per frame: one per emitter draw (both views). Past the last one
     // a draw is dropped: a set already bound in the frame's commands must not be rewritten.
@@ -185,7 +190,7 @@ private:
     };
 
     // The GPU simulation's per-emitter uniform (must match ParticlesSim.hlsl's SimParams exactly:
-    // 13 float4s).
+    // 17 float4s).
     struct GpuSimUniform
     {
         float emitterPos[4];     // xyz = position, w = dt
@@ -204,8 +209,9 @@ private:
         float axisX[4];          // the emitter's local axes in world space (spawn shape orientation)
         float axisY[4];
         float axisZ[4];
+        float turbulence[4];    // strength (0 when disabled), scale (m), speed, simulation time
     };
-    static_assert(sizeof(GpuSimUniform) == 256, "SimParams layout must stay 16 float4s");
+    static_assert(sizeof(GpuSimUniform) == 272, "SimParams layout must stay 17 float4s");
     static constexpr std::uint64_t kGpuStateBytes = 96;  // ParticlesSim.hlsl ParticleState
 
     struct GpuEmitter
@@ -217,6 +223,7 @@ private:
         std::unique_ptr<ixrhi::IXRHIBindGroup> computeBindGroup;
         std::uint32_t maxParticles = 0;
         float spawnAccumulator = 0.0f;
+        double simulationTime = 0.0;
         std::uint32_t spawnCursor = 0;
         std::uint32_t frameSeed = 1;
         int pendingBurst = 0;

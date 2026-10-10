@@ -1573,6 +1573,10 @@ void WriteParticleSystemComponent(std::ostream& out, const ixparticle::ParticleS
     out << "        \"gravity\": " << p.gravity << ",\n";
     out << "        \"drag\": " << p.drag << ",\n";
     out << "        \"rotation_speed\": " << p.rotationSpeed << ",\n";
+    out << "        \"turbulence_enabled\": " << (p.turbulenceEnabled ? "true" : "false") << ",\n";
+    out << "        \"turbulence_strength\": " << p.turbulenceStrength << ",\n";
+    out << "        \"turbulence_scale\": " << p.turbulenceScale << ",\n";
+    out << "        \"turbulence_speed\": " << p.turbulenceSpeed << ",\n";
     out << "        \"soft_particles\": " << (p.softParticles ? "true" : "false") << ",\n";
     out << "        \"soft_distance\": " << p.softDistance << ",\n";
     out << "        \"atlas_columns\": " << p.atlasColumns << ",\n";
@@ -2076,6 +2080,10 @@ ixparticle::ParticleSystemComponent ReadParticleSystemComponent(const JsonValue&
         p.gravity = ReadFloat(*object, "gravity", p.gravity);
         p.drag = ReadFloat(*object, "drag", p.drag);
         p.rotationSpeed = ReadFloat(*object, "rotation_speed", p.rotationSpeed);
+        p.turbulenceEnabled = ReadBool(*object, "turbulence_enabled", p.turbulenceEnabled);
+        p.turbulenceStrength = ReadFloat(*object, "turbulence_strength", p.turbulenceStrength);
+        p.turbulenceScale = ReadFloat(*object, "turbulence_scale", p.turbulenceScale);
+        p.turbulenceSpeed = ReadFloat(*object, "turbulence_speed", p.turbulenceSpeed);
         p.softParticles = ReadBool(*object, "soft_particles", p.softParticles);
         p.softDistance = ReadFloat(*object, "soft_distance", p.softDistance);
         p.atlasColumns = static_cast<int>(ReadU32(*object, "atlas_columns", static_cast<std::uint32_t>(p.atlasColumns)));

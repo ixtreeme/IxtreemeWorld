@@ -6346,6 +6346,10 @@ int RunGame(NativeWindow& window,
             params.drag = component.drag;
             params.coneAngle = component.coneAngle;
             params.rotationSpeed = component.rotationSpeed;
+            params.turbulenceEnabled = component.turbulenceEnabled;
+            params.turbulenceStrength = component.turbulenceStrength;
+            params.turbulenceScale = component.turbulenceScale;
+            params.turbulenceSpeed = component.turbulenceSpeed;
             params.shapeRadius = component.shapeRadius;
             params.shapeArc = component.shapeArc;
             params.shape = static_cast<float>(static_cast<int>(component.shape));

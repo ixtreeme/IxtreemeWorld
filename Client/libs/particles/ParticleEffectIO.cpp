@@ -65,6 +65,10 @@ std::string WriteParticleEffectJson(const ParticleSystemComponent& e,
     out << "  \"gravity\": " << e.gravity << ",\n";
     out << "  \"drag\": " << e.drag << ",\n";
     out << "  \"rotation_speed\": " << e.rotationSpeed << ",\n";
+    out << "  \"turbulence_enabled\": " << (e.turbulenceEnabled ? "true" : "false") << ",\n";
+    out << "  \"turbulence_strength\": " << e.turbulenceStrength << ",\n";
+    out << "  \"turbulence_scale\": " << e.turbulenceScale << ",\n";
+    out << "  \"turbulence_speed\": " << e.turbulenceSpeed << ",\n";
     out << "  \"soft_particles\": " << (e.softParticles ? "true" : "false") << ",\n";
     out << "  \"soft_distance\": " << e.softDistance << ",\n";
     out << "  \"atlas_columns\": " << e.atlasColumns << ",\n";
@@ -133,6 +137,10 @@ bool ParseParticleEffectJson(const std::string& text, ParticleSystemComponent& o
     out.gravity = ixtreeme::common::JsonFloatValue(text, "gravity", out.gravity);
     out.drag = ixtreeme::common::JsonFloatValue(text, "drag", out.drag);
     out.rotationSpeed = ixtreeme::common::JsonFloatValue(text, "rotation_speed", out.rotationSpeed);
+    out.turbulenceEnabled = ixtreeme::common::JsonBoolValue(text, "turbulence_enabled", false);
+    out.turbulenceStrength = ixtreeme::common::JsonFloatValue(text, "turbulence_strength", out.turbulenceStrength);
+    out.turbulenceScale = ixtreeme::common::JsonFloatValue(text, "turbulence_scale", out.turbulenceScale);
+    out.turbulenceSpeed = ixtreeme::common::JsonFloatValue(text, "turbulence_speed", out.turbulenceSpeed);
     out.softParticles = ixtreeme::common::JsonBoolValue(text, "soft_particles", out.softParticles);
     out.softDistance = ixtreeme::common::JsonFloatValue(text, "soft_distance", out.softDistance);
     out.atlasColumns = static_cast<int>(ixtreeme::common::JsonFloatValue(

@@ -81,6 +81,7 @@ private:
     std::vector<Particle> m_particles;
     std::uint32_t m_rng = 1u;
     float m_emissionTime = 0.0f;
+    double m_simulationTime = 0.0;  // continuous across emission loops and Stop/Play
     float m_emitAccumulator = 0.0f;
     int m_pendingBurst = 0;
     bool m_emitting = false;

@@ -1566,6 +1566,24 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
 
             // The advanced groups live behind collapsed sub-headers: their widgets only render while
             // open, keeping the per-frame inspector cost low (at high frame rates ImGui is the cost).
+            if (ImGui::CollapsingHeader("Turbulence"))
+            {
+                particleChanged |= UI::Prop::Checkbox("Enable Turbulence", &ps.turbulenceEnabled);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Smooth swirling motion shared by nearby particles. Works on CPU and GPU.\n"
+                                      "For floating dust, use zero Gravity and a little Drag.");
+                if (ps.turbulenceEnabled)
+                {
+                    particleChanged |= UI::Prop::DragFloat("Strength (m/s2)", &ps.turbulenceStrength, 0.005f, 0.0f, 100.0f, "%.3f");
+                    particleChanged |= UI::Prop::DragFloat("Scale (m)", &ps.turbulenceScale, 0.05f, 0.01f, 1000.0f);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Spatial size of the swirls. Larger values give broader, gentler motion.");
+                    particleChanged |= UI::Prop::DragFloat("Speed (rad/s)", &ps.turbulenceSpeed, 0.01f, 0.0f, 100.0f);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("How quickly the flow changes over time. Zero keeps the flow field static.");
+                }
+            }
+
             if (ImGui::CollapsingHeader("Shape"))
             {
                 const char* shapes[] = {"Point", "Sphere", "Box", "Circle", "Edge"};

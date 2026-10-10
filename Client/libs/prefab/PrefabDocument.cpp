@@ -420,6 +420,10 @@ ixparticle::ParticleSystemComponent ReadParticleSystem(const std::string& object
     p.gravity = ixtreeme::common::JsonFloatValue(component, "gravity", p.gravity);
     p.drag = ixtreeme::common::JsonFloatValue(component, "drag", p.drag);
     p.rotationSpeed = ixtreeme::common::JsonFloatValue(component, "rotation_speed", p.rotationSpeed);
+    p.turbulenceEnabled = ixtreeme::common::JsonBoolValue(component, "turbulence_enabled", p.turbulenceEnabled);
+    p.turbulenceStrength = ixtreeme::common::JsonFloatValue(component, "turbulence_strength", p.turbulenceStrength);
+    p.turbulenceScale = ixtreeme::common::JsonFloatValue(component, "turbulence_scale", p.turbulenceScale);
+    p.turbulenceSpeed = ixtreeme::common::JsonFloatValue(component, "turbulence_speed", p.turbulenceSpeed);
     p.softParticles = ixtreeme::common::JsonBoolValue(component, "soft_particles", p.softParticles);
     p.softDistance = ixtreeme::common::JsonFloatValue(component, "soft_distance", p.softDistance);
     p.atlasColumns = static_cast<int>(ixtreeme::common::JsonFloatValue(
@@ -711,6 +715,10 @@ void WriteParticleSystem(std::ostream& out, const ixparticle::ParticleSystemComp
     out << indent << "  \"gravity\": " << p.gravity << ",\n";
     out << indent << "  \"drag\": " << p.drag << ",\n";
     out << indent << "  \"rotation_speed\": " << p.rotationSpeed << ",\n";
+    out << indent << "  \"turbulence_enabled\": " << (p.turbulenceEnabled ? "true" : "false") << ",\n";
+    out << indent << "  \"turbulence_strength\": " << p.turbulenceStrength << ",\n";
+    out << indent << "  \"turbulence_scale\": " << p.turbulenceScale << ",\n";
+    out << indent << "  \"turbulence_speed\": " << p.turbulenceSpeed << ",\n";
     out << indent << "  \"soft_particles\": " << (p.softParticles ? "true" : "false") << ",\n";
     out << indent << "  \"soft_distance\": " << p.softDistance << ",\n";
     out << indent << "  \"atlas_columns\": " << p.atlasColumns << ",\n";
