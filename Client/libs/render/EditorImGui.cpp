@@ -467,9 +467,10 @@ void LoadEditorFonts()
 
     ImFont* regular = nullptr;
     ImFont* bold = nullptr;
+    static const ImWchar textRanges[] = {0x0020, 0x00ff, 0x0100, 0x017f, 0x2000, 0x206f, 0};
     if (auto path = FindEditorFont("Inter-Regular.ttf"))
     {
-        regular = io.Fonts->AddFontFromFileTTF(path->generic_string().c_str(), 16.0f);
+        regular = io.Fonts->AddFontFromFileTTF(path->generic_string().c_str(), 16.0f, nullptr, textRanges);
         Tracen("[EDITOR-VISUAL] Loaded font: Inter-Regular.ttf (16px)");
     }
     if (!regular)
@@ -495,7 +496,7 @@ void LoadEditorFonts()
 
     if (auto path = FindEditorFont("Inter-Bold.ttf"))
     {
-        bold = io.Fonts->AddFontFromFileTTF(path->generic_string().c_str(), 18.0f);
+        bold = io.Fonts->AddFontFromFileTTF(path->generic_string().c_str(), 18.0f, nullptr, textRanges);
         Tracen("[EDITOR-VISUAL] Loaded font: Inter-Bold.ttf (18px)");
     }
     if (!bold)

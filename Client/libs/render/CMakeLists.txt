@@ -69,7 +69,18 @@ add_library(IXEngineRender STATIC
 # in the unconditional list because it self-guards (full body under the editor flag, link stubs in the
 # #else branch) so the always-compiled engine can reference EditorImGui symbols in both builds.
 if(IXTREEME_WITH_EDITOR)
+    # Both offline documents are embedded into the editor. The packaged runtime
+    # does not compile this browser or require a documentation directory.
+    set(EDITOR_HELP_ROOT "${CLIENT_ROOT}/../docs/editor-guide")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${EDITOR_HELP_ROOT}/hu.md" "${EDITOR_HELP_ROOT}/en.md")
+    file(READ "${EDITOR_HELP_ROOT}/hu.md" EDITOR_HELP_HU)
+    file(READ "${EDITOR_HELP_ROOT}/en.md" EDITOR_HELP_EN)
+    configure_file(EditorHelpContent.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/EditorHelpContent.h" @ONLY)
+    target_include_directories(IXEngineRender PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
     target_sources(IXEngineRender PRIVATE
+        EditorHelp.cpp
+        EditorHelp.h
         UIHelpers.cpp
         tools/tree/TreeGeneratorPanel.cpp
         tools/tree/TreePreviewRenderer.cpp
@@ -174,6 +185,12 @@ if(BUILD_TESTING AND NOT ANDROID)
     endif()
     add_test(NAME HierarchyCacheTest COMMAND HierarchyCacheTest)
     if(IXTREEME_WITH_EDITOR AND WIN32)
+        add_executable(EditorHelpTest tests/EditorHelpTest.cpp)
+        target_link_libraries(EditorHelpTest PRIVATE IXEngineRender)
+        if(MSVC)
+            set_target_properties(EditorHelpTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+        add_test(NAME EditorHelpTest COMMAND EditorHelpTest)
         add_executable(HierarchyUiTest tests/HierarchyUiTest.cpp)
         target_link_libraries(HierarchyUiTest PRIVATE IXEngineRender)
         if(MSVC)

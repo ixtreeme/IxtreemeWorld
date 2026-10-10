@@ -33,6 +33,7 @@ void EditorImGui::RenderEditorPanels()
     RenderProjectSettingsWindow();
     RenderLayeredWorldWindow();
     RenderShortcutsWindow();
+    m_helpBrowser.Render();
     RenderAboutPopup();
     RenderTreeGeneratorPanel();
     RenderMaterialEditor();

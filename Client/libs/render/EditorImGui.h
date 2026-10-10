@@ -17,6 +17,9 @@
 #include "tools/tree/TreeGeneratorPanel.h"
 
 #include "EditorGraphicsBridge.h"
+#if defined(IXTREEME_WITH_EDITOR)
+#include "EditorHelp.h"
+#endif
 
 #include <cstdint>
 #include <cstddef>
@@ -351,6 +354,9 @@ private:
     void RenderProjectSettingsWindow();
     void RenderLayeredWorldWindow();
     void RenderShortcutsWindow();
+#if defined(IXTREEME_WITH_EDITOR)
+    editor_help::Browser m_helpBrowser;
+#endif
     void RenderAboutPopup();
     void QueueDebugToggleCommands();
     void ResetEditorLayout();

@@ -228,6 +228,12 @@ void EditorImGui::RenderMenuBar()
 
     if (ImGui::BeginMenu("Help"))
     {
+        if (ImGui::MenuItem(ICON_FA_BOOK "  Editor Guide / Súgó"))
+        {
+            m_helpBrowser.Open();
+            m_pendingViewFocusWindow = "Editor Guide / Súgó###EditorGuide";
+        }
+        ImGui::Separator();
         if (ImGui::MenuItem(ICON_FA_KEYBOARD "  Keyboard Shortcuts"))
             m_shortcutsWindowOpen = true;
         if (ImGui::MenuItem(ICON_FA_CIRCLE_INFO "  About IxtreemeEngine"))

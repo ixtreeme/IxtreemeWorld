@@ -1,0 +1,7 @@
+#pragma once
+#include <string_view>
+namespace editor_help::content
+{
+inline constexpr std::string_view hu = R"IXGUIDE(@EDITOR_HELP_HU@)IXGUIDE";
+inline constexpr std::string_view en = R"IXGUIDE(@EDITOR_HELP_EN@)IXGUIDE";
+}
