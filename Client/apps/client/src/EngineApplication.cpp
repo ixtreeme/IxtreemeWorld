@@ -928,6 +928,8 @@ std::vector<std::string> LoadDefaultMaterialSlotGuids(const std::string& meshAss
 
 void EnsureMeshEntityMaterialSlots(MeshSceneEntity& mesh)
 {
+    if (!mesh.HasMeshGeometry())
+        return;
     const std::uint32_t desiredSlotCount = ResolveModelSubmeshCount(mesh.meshAssetPath);
     if (!mesh.materialSlots.empty())
     {
@@ -1920,6 +1922,7 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.buildGameRunWhenDone = source.buildGameRunWhenDone;
     }
     target.addWaterBody = target.addWaterBody || source.addWaterBody;
+    target.addEmptyEntity = target.addEmptyEntity || source.addEmptyEntity;
     if (source.createTerrain)
     {
         target.createTerrain = true;
@@ -5815,14 +5818,15 @@ int RunGame(NativeWindow& window,
                                 else if (editorGizmoMode == EditorGizmoMode::Scale)
                                 {
                                     const float delta = static_cast<float>(dx - dy) * 0.01f * std::max(1.0f, scale);
-                                    it->scale[0] = std::max(0.001f, it->scale[0] + delta);
-                                    it->scale[1] = std::max(0.001f, it->scale[1] + delta);
-                                    it->scale[2] = std::max(0.001f, it->scale[2] + delta);
+                                    const float minimumScale = it->MinimumScale();
+                                    it->scale[0] = std::max(minimumScale, it->scale[0] + delta);
+                                    it->scale[1] = std::max(minimumScale, it->scale[1] + delta);
+                                    it->scale[2] = std::max(minimumScale, it->scale[2] + delta);
                                     if (editorGizmoSnapEnabled)
                                     {
-                                        it->scale[0] = std::max(0.001f, SnapValue(it->scale[0], editorGizmoSnapValue));
-                                        it->scale[1] = std::max(0.001f, SnapValue(it->scale[1], editorGizmoSnapValue));
-                                        it->scale[2] = std::max(0.001f, SnapValue(it->scale[2], editorGizmoSnapValue));
+                                        it->scale[0] = std::max(minimumScale, SnapValue(it->scale[0], editorGizmoSnapValue));
+                                        it->scale[1] = std::max(minimumScale, SnapValue(it->scale[1], editorGizmoSnapValue));
+                                        it->scale[2] = std::max(minimumScale, SnapValue(it->scale[2], editorGizmoSnapValue));
                                     }
                                 }
                                 else if (editorGizmoMode == EditorGizmoMode::Rotate)
@@ -8886,6 +8890,7 @@ int RunGame(NativeWindow& window,
                     commands.addWaterBody = false;
                     commands.createTerrain = false;
                     commands.addMeshEntity = false;
+                    commands.addEmptyEntity = false;
                     commands.addPrimitiveEntity = false;
                     commands.primitiveType.clear();
                     commands.addPrefabInstance = false;
@@ -11010,6 +11015,21 @@ int RunGame(NativeWindow& window,
                         ? spawnAtScreenPosition(commands.prefabDropScreenPosition[0], commands.prefabDropScreenPosition[1])
                         : spawnAtCameraCenter();
                     instantiatePrefabAt(commands.prefabAssetId, spawn);
+                }
+                if (commands.addEmptyEntity)
+                {
+                    const WorldVec3 spawn = spawnAtCameraCenter();
+                    const float position[3] = {spawn.x, spawn.y, spawn.z};
+                    MeshSceneEntity entity = MakeEmptySceneEntity(nextEditorMeshEntityId++,
+                        makeUniqueSceneEntityName("Empty Object"), position);
+                    editorMeshEntities.push_back(entity);
+                    editorMeshEntityLookup[entity.id] = editorMeshEntities.size() - 1u;
+                    selectedEditorObject = {SelectedEditorObjectType::MeshEntity, entity.id};
+                    editorGizmoMode = EditorGizmoMode::Translate;
+                    SceneManager::Instance().MarkDirty();
+                    runtimeSession->SetEditorStatus("Empty object created: " + entity.name);
+                    Tracenf("[EMPTY-OBJECT] Created id=%u position=(%.2f,%.2f,%.2f)",
+                        entity.id, spawn.x, spawn.y, spawn.z);
                 }
                 if (commands.addMeshEntity)
                 {

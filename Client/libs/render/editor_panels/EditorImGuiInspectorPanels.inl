@@ -24,7 +24,8 @@ bool EditorImGui::RenderAxisFloat(const char* axis,
     return changed;
 }
 
-bool EditorImGui::RenderTransformComponent(float* position, float* rotation, float* scale, bool meshScale)
+bool EditorImGui::RenderTransformComponent(float* position, float* rotation, float* scale, bool meshScale,
+                                         bool allowZeroScale)
 {
     bool changed = false;
     // Position, rotation and scale as one row each: X / Y / Z side by side, like every 3D editor.
@@ -57,8 +58,10 @@ bool EditorImGui::RenderTransformComponent(float* position, float* rotation, flo
         // A model scale gets three decimals and a 0.001 floor: models authored in centimetres
         // (Mixamo FBX) need 0.01, which "%.2f" with a 0.1 drag floor could neither show nor reach.
         if (scale && meshScale)
-            vectorRow("Scale", "Scale along X, Y and Z (1 = as imported; 0.01 turns centimetres into metres)",
-                scale, 0.01f, 0.001f, 1000.0f, "%.3f");
+            vectorRow("Scale", allowZeroScale
+                ? "Empty object scale. Zero is allowed; particle size and spawn volume use their own settings."
+                : "Scale along X, Y and Z (1 = as imported; 0.01 turns centimetres into metres)",
+                scale, 0.01f, allowZeroScale ? 0.0f : 0.001f, 1000.0f, "%.3f");
         else if (scale)
             vectorRow("Scale", "Size along X, Y and Z", scale, 0.1f, 0.1f, 200.0f);
     }
@@ -110,7 +113,7 @@ void EditorImGui::RenderAddComponentMenu()
         if (id == "builtin.transform")
             return hasSelection;
         if (id == "builtin.mesh_renderer")
-            return hasMesh;
+            return hasMesh && m_meshRendererState.HasMeshGeometry();
         if (id == "builtin.water_body")
             return hasWater;
         if (id == "builtin.point_light")
@@ -1926,13 +1929,16 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
     if (!m_meshRendererState.selected)
         return;
 
-    RenderInspectorTitle(ICON_FA_CUBE, m_meshRendererState.skinned ? "Animated Mesh" : "Mesh", m_meshRendererState.id);
+    const bool emptyObject = !m_meshRendererState.HasMeshGeometry();
+    RenderInspectorTitle(emptyObject ? ICON_FA_ARROWS_UP_DOWN_LEFT_RIGHT : ICON_FA_CUBE,
+        emptyObject ? "Empty Object" : (m_meshRendererState.skinned ? "Animated Mesh" : "Mesh"), m_meshRendererState.id);
 
     char nameBuffer[96]{};
     std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", m_meshRendererState.name.c_str());
     if (UI::Prop::InputText("Name", nameBuffer, sizeof(nameBuffer)))
     {
-        m_meshRendererState.name = nameBuffer[0] != '\0' ? nameBuffer : ("Mesh Entity " + std::to_string(m_meshRendererState.id));
+        m_meshRendererState.name = nameBuffer[0] != '\0' ? nameBuffer :
+            ((emptyObject ? "Empty Object " : "Mesh Entity ") + std::to_string(m_meshRendererState.id));
         MarkSelectedMeshRendererChanged();
     }
 
@@ -1942,7 +1948,7 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         m_meshRendererState.rotation[1] * 57.2957795f,
         m_meshRendererState.rotation[2] * 57.2957795f};
     float scale[3] = {m_meshRendererState.scale[0], m_meshRendererState.scale[1], m_meshRendererState.scale[2]};
-    if (RenderTransformComponent(position, rotation, scale, /*meshScale=*/true))
+    if (RenderTransformComponent(position, rotation, scale, /*meshScale=*/true, /*allowZeroScale=*/emptyObject))
     {
         m_meshRendererState.position[0] = position[0];
         m_meshRendererState.position[1] = position[1];
@@ -1950,13 +1956,14 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         m_meshRendererState.rotation[0] = rotation[0] / 57.2957795f;
         m_meshRendererState.rotation[1] = rotation[1] / 57.2957795f;
         m_meshRendererState.rotation[2] = rotation[2] / 57.2957795f;
-        m_meshRendererState.scale[0] = std::max(scale[0], 0.001f);
-        m_meshRendererState.scale[1] = std::max(scale[1], 0.001f);
-        m_meshRendererState.scale[2] = std::max(scale[2], 0.001f);
+        const float minimumScale = emptyObject ? 0.0f : 0.001f;
+        m_meshRendererState.scale[0] = std::max(scale[0], minimumScale);
+        m_meshRendererState.scale[1] = std::max(scale[1], minimumScale);
+        m_meshRendererState.scale[2] = std::max(scale[2], minimumScale);
         MarkSelectedMeshRendererChanged();
     }
 
-    if (ImGui::CollapsingHeader(ICON_FA_CUBE "  Mesh Renderer", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
+    if (!emptyObject && ImGui::CollapsingHeader(ICON_FA_CUBE "  Mesh Renderer", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
     {
         std::string meshLabel = m_meshRendererState.meshDisplayName.empty()
             ? (m_meshRendererState.meshAssetId.empty() ? std::string("No model assigned") : m_meshRendererState.meshAssetId)
@@ -2000,7 +2007,8 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
 
     // Collapsed by default: its 13 tag checkboxes would otherwise render every frame (the inspector's
     // cost is proportional to the widgets drawn, which matters at high frame rates).
-    if (ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Layer generation", ImGuiTreeNodeFlags_AllowOverlap))
+    if ((!emptyObject || m_meshRendererState.hasCollider) &&
+        ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Layer generation", ImGuiTreeNodeFlags_AllowOverlap))
     {
         bool changed = UI::Prop::Checkbox("Include collision surfaces", &m_meshRendererState.layerAuthoring.enabled);
         ImGui::TextDisabled("Bounds and floor heights are derived from collision geometry.");
@@ -2041,7 +2049,7 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
             MarkSelectedMeshRendererChanged();
     }
 
-    if (ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Material Slots", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
+    if (!emptyObject && ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Material Slots", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
     {
         m_meshRendererState.materialSlotCount = std::max<std::uint32_t>(
             1u,

@@ -408,7 +408,9 @@ private:
     bool RenderAttachedEditorComponents(std::vector<EditorAttachedComponent>& components);
     bool RenderLodGroupControls();
     // meshScale: a model scale multiplier (fine steps down to 0.001) instead of a size in metres.
-    bool RenderTransformComponent(float* position, float* rotation, float* scale, bool meshScale = false);
+    // allowZeroScale: an empty component host may retain Scale 0/0/0.
+    bool RenderTransformComponent(float* position, float* rotation, float* scale, bool meshScale = false,
+                                  bool allowZeroScale = false);
     bool RenderAxisFloat(const char* axis, float& value, float r, float g, float b, float speed, float minValue, float maxValue,
         const char* format = "%.2f");
     void RenderCreateTerrainModal();

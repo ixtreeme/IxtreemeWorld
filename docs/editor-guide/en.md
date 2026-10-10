@@ -496,6 +496,7 @@ Emitters produce smoke, sparks and similar effects. Emission, Lifetime, Speed, S
 
 #### Short tutorial
 1. Add Particle System to a mesh instance.
+   For an invisible emitter, choose Create > Empty Object (also available from Hierarchy's + and context menus), then Inspector > Add Component > Particle System. Empty objects start with no model, materials or collider and Scale 0/0/0; moving and rotating them preserves that scale. Particle size and spawn volume remain controlled by the Particle System settings.
 2. Choose Texture, moderate emission and a short lifetime; adjust Shape and Color.
 3. Compare GPU Simulation on/off. Collide With Ground enables ground contact; Soft Particles softens surface intersections.
 4. Save As New Effect stores your configured emitter as a reusable asset; choose it under Effect Preset. Re-apply Preset reloads its values.

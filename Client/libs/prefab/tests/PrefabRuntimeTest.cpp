@@ -131,5 +131,23 @@ int main()
     bad = roundtrip; bad.entities[1].localId = 1; expectInvalid(bad);
     bad = roundtrip; bad.entities[1].mesh.fixedJoint.connectedEntityId = 999; expectInvalid(bad);
     bad = roundtrip; bad.entities[0].kind = pf::PrefabTemplate::Kind::PointLight; expectInvalid(bad);
+    auto empty = MakeEmptySceneEntity(55, "Empty emitter", position);
+    empty.hasParticleSystem = true;
+    empty.particleSystem.turbulenceEnabled = true;
+    std::ostringstream emptyText;
+    pf::WriteMesh(emptyText, empty, "Empty emitter");
+    const auto emptyDocument = pf::ParseDocument(emptyText.str(), "empty fixture");
+    check(emptyDocument.entities.size() == 1 &&
+        !emptyDocument.entities[0].mesh.HasMeshGeometry() &&
+        emptyDocument.entities[0].mesh.scale[0] == 0 &&
+        emptyDocument.entities[0].mesh.scale[1] == 0 &&
+        emptyDocument.entities[0].mesh.scale[2] == 0 &&
+        emptyDocument.entities[0].mesh.hasParticleSystem,
+        "empty zero-scale particle host survives prefab roundtrip");
+    check(pf::InstantiateRuntime(emptyDocument, "empty_prefab", 300, position, meshAllocator, lightAllocator,
+        instance, error) && instance.meshes.size() == 1 &&
+        !instance.meshes[0].HasMeshGeometry() && instance.meshes[0].scale[0] == 0 &&
+        instance.meshes[0].particleSystem.turbulenceEnabled,
+        "empty particle prefab instantiates at runtime without a model");
     return failures == 0 ? 0 : 1;
 }

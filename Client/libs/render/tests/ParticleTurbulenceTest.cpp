@@ -170,8 +170,8 @@ void Serialization()
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     if (!fs::create_directory(root)) { Check(false, "temporary scene directory"); return; }
     SceneData scene;
-    MeshSceneEntity mesh;
-    mesh.id = 1; mesh.name = "Dust"; mesh.hasParticleSystem = true; mesh.particleSystem = p;
+    MeshSceneEntity mesh = MakeEmptySceneEntity(1, "Dust", position);
+    mesh.hasParticleSystem = true; mesh.particleSystem = p;
     scene.meshEntities.push_back(mesh);
     auto& manager = SceneManager::Instance();
     manager.RestoreSceneSnapshot(scene, {}, false);
@@ -182,6 +182,13 @@ void Serialization()
     Check(loaded && manager.GetCurrentScene().meshEntities.size() == 1 &&
         matches(manager.GetCurrentScene().meshEntities[0].particleSystem),
         "scene save and reload preserve all turbulence settings");
+    if (loaded && manager.GetCurrentScene().meshEntities.size() == 1)
+    {
+        const auto& empty = manager.GetCurrentScene().meshEntities[0];
+        Check(!empty.HasMeshGeometry() && empty.materialSlots.empty() && !empty.hasCollider &&
+            empty.hasParticleSystem && empty.scale[0] == 0 && empty.scale[1] == 0 && empty.scale[2] == 0,
+            "scene reload preserves a zero-scale empty particle host");
+    }
     manager.CloseScene();
     std::ifstream input(path);
     std::ofstream legacy(root / "legacy.scene");

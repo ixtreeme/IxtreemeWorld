@@ -427,6 +427,8 @@ struct MeshSceneEntity
     SceneParentRef parent;
     std::string meshAssetId;
     std::string meshAssetPath;
+    bool HasMeshGeometry() const { return !meshAssetId.empty() || !meshAssetPath.empty(); }
+    float MinimumScale() const { return HasMeshGeometry() ? 0.001f : 0.0f; }
     float position[3] = {0.0f, 0.0f, 0.0f};
     float rotation[3] = {0.0f, 0.0f, 0.0f};
     float scale[3] = {1.0f, 1.0f, 1.0f};
@@ -481,6 +483,21 @@ struct MeshSceneEntity
     // (animator_controller_id); takes priority over debugAnimationClipId.
     std::string animatorControllerId;
 };
+
+// Component host with no geometry, materials or physics. Particle sizes and spawn volumes use
+// their own settings, so the requested zero object scale does not collapse an attached emitter.
+inline MeshSceneEntity MakeEmptySceneEntity(std::uint32_t id, const std::string& name, const float position[3])
+{
+    MeshSceneEntity entity;
+    entity.id = id;
+    entity.name = name;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        entity.position[axis] = position[axis];
+        entity.scale[axis] = 0.0f;
+    }
+    return entity;
+}
 
 struct TerrainSceneData
 {
@@ -589,6 +606,7 @@ struct MeshRendererEditorState
     std::vector<std::string> prefabOverrides;
     std::string meshAssetId;
     std::string meshAssetPath;
+    bool HasMeshGeometry() const { return !meshAssetId.empty() || !meshAssetPath.empty(); }
     std::string meshDisplayName;
     float position[3] = {0.0f, 0.0f, 0.0f};
     float rotation[3] = {0.0f, 0.0f, 0.0f};
@@ -933,6 +951,7 @@ struct MapEditorCommands
     bool createTerrain = false;
     TerrainSceneData terrainCreate;
     bool addMeshEntity = false;
+    bool addEmptyEntity = false;
     std::string meshAssetId;
     bool meshDropScreenPositionValid = false;
     float meshDropScreenPosition[2] = {0.0f, 0.0f};

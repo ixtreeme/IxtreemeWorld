@@ -413,7 +413,7 @@ bool ApplySceneGizmoToMesh(MeshSceneEntity& mesh,
     std::copy(rotation, rotation + 3, std::begin(updated.rotation));
     std::copy(scale, scale + 3, std::begin(updated.scale));
     for (float& value : updated.scale)
-        value = std::max(0.001f, value);
+        value = std::max(updated.MinimumScale(), value);
     if (renderer && renderer->IsLoaded())
     {
         MeshSceneEntity centerOffsetMesh = updated;

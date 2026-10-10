@@ -91,6 +91,25 @@ int main()
     Check("Selected meshes have no selection box or proxy circle",
         BuildSelectionOutlineLines(selected, meshes, {}, {}, {}, camera, {}).empty());
 
+    const float origin[3] = {2, 3, 4};
+    auto empty = MakeEmptySceneEntity(77, "Dust emitter", origin);
+    Check("Empty objects have no geometry, materials or collider",
+        !empty.HasMeshGeometry() && empty.materialSlots.empty() && !empty.hasCollider && !empty.hasRigidbody);
+    const auto emptyTarget = BuildSceneGizmoTarget({SelectedEditorObjectType::MeshEntity, 77},
+        {empty}, {}, {}, {}, {}, [](const MeshSceneEntity&) -> StaticMeshRenderer* { return nullptr; });
+    Check("Zero-scale empty object has a movable gizmo at its position",
+        emptyTarget.visible && emptyTarget.position[0] == 2 && emptyTarget.position[1] == 3 &&
+        emptyTarget.position[2] == 4 && emptyTarget.scale[0] == 0 && emptyTarget.scale[1] == 0 && emptyTarget.scale[2] == 0);
+    const float movedPosition[3] = {10, 12, 14}, rotated[3] = {0.2f, 0.7f, 0.1f}, zeroScale[3] = {0, 0, 0};
+    Check("Moving and rotating empty objects preserves zero scale",
+        ApplySceneGizmoToMesh(empty, movedPosition, rotated, zeroScale, nullptr) &&
+        empty.position[0] == 10 && empty.rotation[1] == 0.7f &&
+        empty.scale[0] == 0 && empty.scale[1] == 0 && empty.scale[2] == 0);
+    empty.meshAssetPath = "builtin://primitive/cube";
+    Check("Models retain a safe nonzero minimum scale",
+        ApplySceneGizmoToMesh(empty, movedPosition, rotated, zeroScale, nullptr) &&
+        empty.scale[0] == 0.001f && empty.scale[1] == 0.001f && empty.scale[2] == 0.001f);
+
     std::cout << "Mesh selection: " << checks << " checks, " << failures << " failures\n";
     return failures ? 1 : 0;
 }

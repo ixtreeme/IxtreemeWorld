@@ -1,4 +1,5 @@
 #include "EditorImGui.h"
+#include "SceneManager.h"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <cstring>
@@ -6,6 +7,15 @@
 
 struct EditorHierarchyTestAccess
 {
+    static ImVec2 DrawCreateMenu(EditorImGui& editor)
+    {
+        ImGui::SetNextWindowPos({0, 0}); ImGui::SetNextWindowSize({480, 380});
+        ImGui::Begin("Create test", nullptr, ImGuiWindowFlags_NoSavedSettings);
+        const auto position = ImGui::GetCursorScreenPos();
+        editor.RenderHierarchyCreateMenuItems();
+        ImGui::End();
+        return {position.x + 60, position.y + ImGui::GetTextLineHeight() * 0.5f};
+    }
     static int Draw(EditorImGui& editor)
     {
         ImGui::SetNextWindowPos({0, 0}); ImGui::SetNextWindowSize({480, 260});
@@ -95,6 +105,21 @@ int main()
         editor.SetHierarchySceneState(1, "Scene", entities);
         check(EditorHierarchyTestAccess::IsVisible(editor, entities.back().entity),
             "reparenting the selected object reveals its new parent path");
+    }
+    {
+        EditorImGui editor;
+        SceneManager::Instance().NewScene();
+        const auto menuFrame = [&] {
+            ImGui::NewFrame(); const auto firstItem = EditorHierarchyTestAccess::DrawCreateMenu(editor);
+            ImGui::Render(); return firstItem;
+        };
+        menuFrame(); const auto firstItem = menuFrame();
+        io.AddMousePosEvent(firstItem.x, firstItem.y); io.AddMouseButtonEvent(0, true); menuFrame();
+        io.AddMouseButtonEvent(0, false); menuFrame();
+        const auto commands = EditorHierarchyTestAccess::Commands(editor);
+        check(commands.addEmptyEntity && !commands.addMeshEntity && !commands.addPrimitiveEntity,
+            "Create Empty Object queues a component host without a primitive or model");
+        SceneManager::Instance().CloseScene();
     }
     ImGui::DestroyContext();
     std::cout << "Hierarchy UI failures: " << failures << '\n';

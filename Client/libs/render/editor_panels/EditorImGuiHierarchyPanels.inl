@@ -9,6 +9,11 @@ void EditorImGui::RenderHierarchyCreateMenuItems()
     else if (!CanUseEditorTools())
         ImGui::TextDisabled("Stop Play to add objects");
 
+    if (ImGui::MenuItem(ICON_FA_PLUS "  Empty Object", nullptr, false, canCreate))
+        m_commands.addEmptyEntity = true;
+    UI::ItemTooltip("Invisible object with only a Transform. Add particles, audio or scripts in the Inspector.");
+    ImGui::Separator();
+
     const auto primitive = [&](const char* label, const char* type) {
         if (ImGui::MenuItem(label, nullptr, false, canCreate))
         {

@@ -496,6 +496,7 @@ Füst, szikra és hasonló effektek készíthetők emitterrel. Az Emission, Life
 
 #### Rövid tutorial
 1. Adj Particle System komponenst egy mesh-példányhoz.
+   Láthatatlan emitterhez válaszd a Create > Empty Object menüpontot (a Hierarchy + gombjánál és helyi menüjében is elérhető), majd az Inspector > Add Component > Particle System elemet. Az üres objektumnak nincs modellje, materialja vagy collidere, a Scale kezdetben 0/0/0; mozgatás és forgatás közben is megmarad. A részecskék méretét és kibocsátási térfogatát a Particle System beállításai adják.
 2. Válassz Texture-t, mérsékelt kibocsátást és rövid élettartamot; állítsd a Shape és Color részt.
 3. GPU Simulation mellett és nélküle is nézd meg az eredményt. Collide With Ground talajütközést ad; Soft Particles lágyítja a felületmetszést.
 4. Save As New Effect menti a beállított emittert újrahasználható assetként; válaszd az Effect Preset mezőben. Re-apply Preset újratölti az értékeit.

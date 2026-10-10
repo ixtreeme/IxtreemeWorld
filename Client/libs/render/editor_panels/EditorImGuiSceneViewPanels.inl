@@ -368,11 +368,14 @@ void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& ima
         Degrees(m_sceneGizmoRotation[1]),
         Degrees(m_sceneGizmoRotation[2]),
     };
-    float scale[3] = {
-        std::max(0.001f, m_sceneGizmoScale[0]),
-        std::max(0.001f, m_sceneGizmoScale[1]),
-        std::max(0.001f, m_sceneGizmoScale[2]),
-    };
+    const bool emptyObject = m_sceneGizmoEntityType == HierarchyEntityType::MeshEntity &&
+        m_meshRendererState.selected && m_meshRendererState.id == m_sceneGizmoEntityId &&
+        !m_meshRendererState.HasMeshGeometry();
+    // A zero-scale transform cannot be inverted by ImGuizmo. Use unit axes for its display;
+    // moving or rotating the handle must preserve the object's actual zero scale.
+    float scale[3];
+    for (int i = 0; i < 3; ++i)
+        scale[i] = emptyObject && m_sceneGizmoScale[i] == 0.0f ? 1.0f : std::max(0.001f, m_sceneGizmoScale[i]);
     float model[16]{};
     ImGuizmo::RecomposeMatrixFromComponents(translation, rotationDegrees, scale, model);
 
@@ -412,6 +415,7 @@ void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& ima
         m_meshRendererState.id == m_sceneGizmoEntityId &&
         m_meshRendererState.hasCollider;
     if (m_sceneGizmoOperation == MapEditorGizmoOperation::Translate &&
+        !emptyObject &&
         !editingColliderCenter &&
         (m_sceneGizmoEntityType == HierarchyEntityType::MeshEntity ||
             m_sceneGizmoEntityType == HierarchyEntityType::WaterBody))
@@ -464,7 +468,9 @@ void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& ima
     {
         m_commands.sceneGizmoPosition[i] = outTranslation[i];
         m_commands.sceneGizmoRotation[i] = Radians(outRotationDegrees[i]);
-        m_commands.sceneGizmoScale[i] = std::max(0.001f, outScale[i]);
+        m_commands.sceneGizmoScale[i] = emptyObject && !editingColliderCenter &&
+            m_sceneGizmoOperation != MapEditorGizmoOperation::Scale
+            ? m_sceneGizmoScale[i] : std::max(emptyObject ? 0.0f : 0.001f, outScale[i]);
     }
 
     std::copy(std::begin(m_commands.sceneGizmoPosition), std::end(m_commands.sceneGizmoPosition), m_sceneGizmoPosition);

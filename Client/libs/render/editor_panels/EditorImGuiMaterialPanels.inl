@@ -820,8 +820,7 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
             validationErrors.push_back("Entity " + std::to_string(row.localId) + " has a missing parent.");
         if (wouldCreateParentCycle(row.localId, row.parentLocalId))
             validationErrors.push_back("Entity " + std::to_string(row.localId) + " would create a parent cycle.");
-        if (row.type == "mesh_entity" && row.meshAssetId.empty() && row.meshAssetPath.empty())
-            validationErrors.push_back("Mesh entity " + std::to_string(row.localId) + " has no mesh asset.");
+        // A mesh-entity record without a model is a valid empty component host.
     }
     if (!validationErrors.empty())
     {
@@ -928,11 +927,12 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
                         m_prefabInspectorDirty = true;
                     }
                     ImGui::SetNextItemWidth(-1.0f);
-                    if (UI::Prop::DragFloat3("Scale", entity.scale, 0.02f, 0.001f, 0.0f, "%.3f"))
+                    const float minimumScale = entity.meshAssetId.empty() && entity.meshAssetPath.empty() ? 0.0f : 0.001f;
+                    if (UI::Prop::DragFloat3("Scale", entity.scale, 0.02f, minimumScale, 0.0f, "%.3f"))
                     {
-                        entity.scale[0] = std::max(entity.scale[0], 0.001f);
-                        entity.scale[1] = std::max(entity.scale[1], 0.001f);
-                        entity.scale[2] = std::max(entity.scale[2], 0.001f);
+                        entity.scale[0] = std::max(entity.scale[0], minimumScale);
+                        entity.scale[1] = std::max(entity.scale[1], minimumScale);
+                        entity.scale[2] = std::max(entity.scale[2], minimumScale);
                         m_prefabInspectorDirty = true;
                     }
                     if (!entity.meshAssetId.empty())
@@ -941,7 +941,8 @@ bool EditorImGui::RenderSelectedPrefabAssetInspector()
                         ImGui::TextDisabled("Mesh path: %s", entity.meshAssetPath.c_str());
                     if (!entity.prefabAssetId.empty())
                         ImGui::TextDisabled("Nested prefab: %s", entity.prefabAssetId.c_str());
-                    if (ImGui::TreeNodeEx("Material Slots", ImGuiTreeNodeFlags_DefaultOpen))
+                    if ((!entity.meshAssetId.empty() || !entity.meshAssetPath.empty()) &&
+                        ImGui::TreeNodeEx("Material Slots", ImGuiTreeNodeFlags_DefaultOpen))
                     {
                         for (std::size_t slotIndex = 0; slotIndex < entity.materialSlotBuffers.size(); ++slotIndex)
                         {
