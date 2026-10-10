@@ -31,7 +31,7 @@ A későbbi terrain-, objektum- és karakterbővítés, valamint a két rendszer
 - Eltérő példánymaterial vagy aktív material override, nem egyenletes/negatív scale, illetve X/Z irányú döntés esetén az adott példány rendes mesh marad. Y irányú elforgatás és egyenletes scale támogatott.
 - ±45°-nál meredekebb kameranézetben a rendes mesh marad. A magassági nézetek közül a legközelebbi választódik; a sorok között jelenleg nincs folyamatos átkeverés.
 - Blend, unlit és emissive materialnál a bake figyelmeztet, és a modell atlasz nélkül használható. Az atlasz RGBA8: HDR albedók és a teljes fa térbeli mélysége nem reprodukálódnak pontosan.
-- Az árnyékvetés a meglévő mesh/árnyék-LOD/cache útvonalon marad. A közeli fák levélkártyáinak költségét ez a fejlesztés nem csökkenti.
+- Az árnyékvetés a meglévő mesh/árnyék-LOD/cache útvonalon marad. A közeli fák levélkártyáinak költségét ez a fejlesztés nem csökkenti. A közepes távolság fő nézeti levélritkítását a [levél-LOD fejlesztés](hierarchy-and-leaf-lod-20261010.md) írja le.
 
 Az atlasz három tömörítetlen RGBA8 textúrájának alapmérete fa-változatonként 128-as beállítással 4,5 MiB, 256-tal 18 MiB, 512-vel 72 MiB; teljes mip-lánccal nagyjából 6/24/96 MiB. Sok különböző távoli fa esetén a 128-as felbontás csökkenti a memóriaigényt.
 

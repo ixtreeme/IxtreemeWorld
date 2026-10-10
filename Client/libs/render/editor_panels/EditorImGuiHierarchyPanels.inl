@@ -375,11 +375,18 @@ void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
 
     if (hasChildren && open)
     {
-        for (const HierarchySceneEntity& entity : m_hierarchyEntities)
-        {
-            if (entity.parent == m_sceneRootEntity || entity.parent == 0)
-                RenderHierarchyEntityNode(entity.entity);
-        }
+        const auto& rows = m_hierarchyView.Rows();
+        const float rowHeight = ImGui::GetFrameHeight() + ImGui::GetStyle().CellPadding.y * 2.0f;
+        ImGuiListClipper clipper;
+        clipper.Begin(static_cast<int>(rows.size()), rowHeight);
+        if (m_hierarchyScrollToSelection || m_hierarchyRenamingEntity)
+            for (std::size_t i = 0; i < rows.size(); ++i)
+                if (rows[i].entity == m_selectedHierarchyEntity || rows[i].entity == m_hierarchyRenamingEntity)
+                    clipper.IncludeItemByIndex(static_cast<int>(i));
+        while (clipper.Step())
+            for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
+                RenderHierarchyEntityNode(rows[i].entity, rows[i].depth);
+        m_hierarchyScrollToSelection = false;
         ImGui::TreePop();
     }
 
@@ -480,25 +487,26 @@ void EditorImGui::RenderHierarchyContextMenu(const HierarchySceneEntity& entity)
     ImGui::PopStyleColor();
 }
 
-void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
+void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle, std::uint32_t depth)
 {
     const HierarchySceneEntity* entity = FindHierarchyEntity(entityHandle);
     if (!entity)
         return;
-    if (m_hierarchySearchBuffer[0] != '\0' && !HierarchySubtreePassesSearch(entityHandle))
-        return;
 
     const std::vector<std::uint64_t>& children = HierarchyChildren(entityHandle);
 
-    ImGui::TableNextRow();
+    ImGui::TableNextRow(0, ImGui::GetFrameHeight() + ImGui::GetStyle().CellPadding.y * 2.0f);
     ImGui::TableSetColumnIndex(0);
+    const float indentation = static_cast<float>(depth) * ImGui::GetStyle().IndentSpacing;
+    if (indentation > 0) ImGui::Indent(indentation);
     ImGui::PushID(static_cast<int>(entity->entity & 0xffffffffu));
 
     if (entity->editorHidden)
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.60f, 0.60f, 0.60f, 1.0f));
 
     const bool selected = entity->selected || m_selectedHierarchyEntity == entity->entity;
-    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth;
+    ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanFullWidth |
+        ImGuiTreeNodeFlags_NoTreePushOnOpen | ImGuiTreeNodeFlags_FramePadding;
     if (children.empty())
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
     if (selected)
@@ -525,7 +533,7 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
     {
         ImGui::Indent(ImGui::GetTreeNodeToLabelSpacing());
         ImGui::SetNextItemWidth(-1.0f);
-        ImGui::SetKeyboardFocusHere();
+        if (m_hierarchyRenameFocus) { ImGui::SetKeyboardFocusHere(); m_hierarchyRenameFocus = false; }
         if (ImGui::InputText("##rename",
                 m_hierarchyRenameBuffer,
                 sizeof(m_hierarchyRenameBuffer),
@@ -549,7 +557,9 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
     {
         const std::string displayName = entity->prefabRoot ? ("Prefab: " + entity->name) : entity->name;
         const std::string label = std::string(icon) + "  " + displayName + "##" + std::to_string(entity->entity);
+        ImGui::SetNextItemOpen(m_hierarchyView.IsExpanded(entityHandle), ImGuiCond_Always);
         open = ImGui::TreeNodeEx(label.c_str(), flags);
+        if (ImGui::IsItemToggledOpen()) m_hierarchyView.SetExpanded(entityHandle, open);
         if (entity->prefabRoot && ImGui::IsItemHovered())
             ImGui::SetTooltip("Prefab instance\nAsset: %s", entity->prefabAssetId.c_str());
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
@@ -558,9 +568,10 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
                 QueueHierarchyFocus(*entity);
         }
-        if (selected)
-            ImGui::SetScrollHereY(0.5f);
     }
+    if (m_hierarchyScrollToSelection &&
+        (m_hierarchyRenamingEntity ? m_hierarchyRenamingEntity == entity->entity : selected))
+        ImGui::SetScrollHereY(0.5f);
 
     if (m_hierarchyRenamingEntity != entity->entity)
     {
@@ -661,6 +672,7 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
         ImGui::EndPopup();
     }
 
+    if (indentation > 0) ImGui::Unindent(indentation);
     ImGui::TableSetColumnIndex(1);
     const ImVec4 eyeColor = entity->editorHidden ? ImVec4(0.48f, 0.48f, 0.48f, 1.0f) : ImVec4(0.88f, 0.88f, 0.88f, 1.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, eyeColor);
@@ -677,12 +689,6 @@ void EditorImGui::RenderHierarchyEntityNode(std::uint64_t entityHandle)
     }
     ImGui::PopStyleColor();
 
-    if (!children.empty() && open)
-    {
-        for (std::uint64_t child : children)
-            RenderHierarchyEntityNode(child);
-        ImGui::TreePop();
-    }
     ImGui::PopID();
 }
 
@@ -693,6 +699,7 @@ void EditorImGui::RenderHierarchyPanel()
     if (ImGui::Begin(EditorWindow::Hierarchy, &m_hierarchyPanelOpen))
     {
         RenderHierarchyToolbar();
+        m_hierarchyView.SetSearch(m_hierarchySearchBuffer);
         ImGui::Spacing();
 
         const std::vector<ProjectSceneEntry> projectScenes = QueryProjectScenes();

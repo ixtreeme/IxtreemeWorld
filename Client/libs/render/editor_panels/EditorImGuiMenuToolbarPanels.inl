@@ -897,17 +897,12 @@ bool EditorImGui::HierarchyPassesSearch(const std::string& name) const
 
 const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(std::uint64_t entity) const
 {
-    const auto it = m_hierarchyIndexByEntity.find(entity);
-    return it == m_hierarchyIndexByEntity.end() || it->second >= m_hierarchyEntities.size()
-        ? nullptr
-        : &m_hierarchyEntities[it->second];
+    return m_hierarchyView.Find(entity);
 }
 
 const std::vector<std::uint64_t>& EditorImGui::HierarchyChildren(std::uint64_t entity) const
 {
-    static const std::vector<std::uint64_t> kNone;
-    const auto it = m_hierarchyChildren.find(entity);
-    return it == m_hierarchyChildren.end() ? kNone : it->second;
+    return m_hierarchyView.Children(entity);
 }
 
 const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(HierarchyEntityType type, std::uint32_t objectId) const
@@ -921,27 +916,12 @@ const HierarchySceneEntity* EditorImGui::FindHierarchyEntity(HierarchyEntityType
 
 const HierarchySceneEntity* EditorImGui::SelectedHierarchyEntity() const
 {
-    for (const HierarchySceneEntity& entity : m_hierarchyEntities)
-    {
-        if (entity.selected)
-            return &entity;
-    }
     return FindHierarchyEntity(m_selectedHierarchyEntity);
 }
 
 bool EditorImGui::HierarchySubtreePassesSearch(std::uint64_t entity) const
 {
-    const HierarchySceneEntity* node = FindHierarchyEntity(entity);
-    if (!node)
-        return false;
-    if (HierarchyPassesSearch(node->name))
-        return true;
-    for (std::uint64_t child : HierarchyChildren(entity))
-    {
-        if (HierarchySubtreePassesSearch(child))
-            return true;
-    }
-    return false;
+    return m_hierarchyView.Matches(entity);
 }
 
 void EditorImGui::QueueHierarchySelection(const HierarchySceneEntity& entity)
@@ -950,7 +930,7 @@ void EditorImGui::QueueHierarchySelection(const HierarchySceneEntity& entity)
     m_commands.hierarchyEntityType = entity.type;
     m_commands.hierarchyEntityId = entity.objectId;
     m_commands.hierarchyEntityHandle = entity.entity;
-    m_selectedHierarchyEntity = entity.entity;
+    SetHierarchySelection(entity.entity);
     m_assetInspectorSelectionActive = false;
     Tracenf("[HIERARCHY] Selected entity: flecs=%llu object=%u type=%d",
         static_cast<unsigned long long>(entity.entity),
@@ -973,6 +953,9 @@ void EditorImGui::QueueHierarchyFocus(const HierarchySceneEntity& entity)
 void EditorImGui::StartHierarchyRename(const HierarchySceneEntity& entity)
 {
     m_hierarchyRenamingEntity = entity.entity;
+    m_hierarchyRenameFocus = true;
+    m_hierarchyScrollToSelection = true;
+    m_hierarchyView.Reveal(entity.entity);
     std::snprintf(m_hierarchyRenameBuffer, sizeof(m_hierarchyRenameBuffer), "%s", entity.name.c_str());
 }
 

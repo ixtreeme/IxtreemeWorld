@@ -723,18 +723,12 @@ void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
                                          std::vector<HierarchySceneEntity> entities)
 {
     const std::uint64_t previousSelectedEntity = m_selectedHierarchyEntity;
+    const auto* previousNode = m_hierarchyView.Find(previousSelectedEntity);
+    const std::uint64_t previousParent = previousNode ? previousNode->parent : 0;
     m_sceneRootEntity = sceneRootEntity;
     m_sceneRootName = sceneRootName.empty() ? "Untitled" : std::move(sceneRootName);
     m_hierarchyEntities = std::move(entities);
-    m_hierarchyIndexByEntity.clear();
-    for (auto& [parent, children] : m_hierarchyChildren)
-        children.clear();  // the lists keep their storage from frame to frame
-    for (std::size_t i = 0; i < m_hierarchyEntities.size(); ++i)
-    {
-        const HierarchySceneEntity& entity = m_hierarchyEntities[i];
-        m_hierarchyIndexByEntity.emplace(entity.entity, i);
-        m_hierarchyChildren[entity.parent].push_back(entity.entity);
-    }
+    m_hierarchyView.Rebuild(m_hierarchyEntities, sceneRootEntity);
     m_selectedHierarchyEntity = 0;
     for (const HierarchySceneEntity& entity : m_hierarchyEntities)
     {
@@ -744,8 +738,28 @@ void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
             break;
         }
     }
-    if (m_selectedHierarchyEntity != 0 && m_selectedHierarchyEntity != previousSelectedEntity)
-        m_assetInspectorSelectionActive = false;
+    // A selected object stays visible when it or one of its ancestors is reparented.
+    m_hierarchyView.Reveal(m_selectedHierarchyEntity);
+    const auto* selectedNode = m_hierarchyView.Find(m_selectedHierarchyEntity);
+    if (m_selectedHierarchyEntity != previousSelectedEntity ||
+        (selectedNode && selectedNode->parent != previousParent))
+    {
+        m_hierarchyScrollToSelection = m_selectedHierarchyEntity != 0;
+        if (m_selectedHierarchyEntity != 0) m_assetInspectorSelectionActive = false;
+    }
+}
+
+void EditorImGui::SetHierarchySelection(std::uint64_t entity)
+{
+    if (m_selectedHierarchyEntity == entity) return;
+    const auto previous = m_selectedHierarchyEntity;
+    m_selectedHierarchyEntity = entity;
+    for (const auto id : {previous, entity})
+        if (const auto* node = m_hierarchyView.Find(id))
+            m_hierarchyEntities[static_cast<std::size_t>(node - m_hierarchyEntities.data())].selected = id == entity;
+    m_hierarchyScrollToSelection = entity != 0;
+    m_hierarchyView.Reveal(entity);
+    if (entity) m_assetInspectorSelectionActive = false;
 }
 
 void EditorImGui::SetWaterMaterials(std::vector<std::pair<std::string, WaterMaterialData>> materials)
@@ -3302,6 +3316,10 @@ void EditorImGui::SetEngineStats(const EngineStats&)
 }
 
 void EditorImGui::SetHierarchySceneState(std::uint64_t, std::string, std::vector<HierarchySceneEntity>)
+{
+}
+
+void EditorImGui::SetHierarchySelection(std::uint64_t)
 {
 }
 

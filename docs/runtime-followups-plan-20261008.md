@@ -160,6 +160,8 @@ A játék tehát a GPU-n áll. Az editor a stresszprojekttel Scene nézetben ~45
 
 ### 4.1 Editor-hierarchia 10 000 entitásnál (első)
 
+**Elkészült 2026-10-10:** változáshoz kötött újraépítés, látható sorok rajzolása, interakciós próbák és sokobjektumos mérés. A következő fő nézeti levél-LOD is elkészült. A megvalósítás, mérési feltételek és tesztek a [részletes eredményekben](hierarchy-and-leaf-lod-20261010.md) találhatók. Az alábbi leírás az eredeti kiinduló állapotot és tervet rögzíti.
+
 **Probléma:** az editor frame-jének fő tétele.
 
 - A `buildHierarchyEntities` (`Client/apps/client/src/EngineApplication.cpp` ~4617. sor, hívása ~11759. sor)

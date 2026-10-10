@@ -49,6 +49,7 @@ namespace tree_tool { struct TreeImpostorSettings; }
 
 class StaticMeshRenderer
 {
+    friend struct StaticMeshLeafLodTestAccess;
 public:
     enum class LoadStatus
     {
@@ -450,6 +451,11 @@ private:
     static constexpr float kShadowCardKeep = 0.25f;
     static constexpr float kShadowCardCover = 0.7f;
     static constexpr float kViewLodMaxErrorPixels = 0.5f;
+    // Main-view leaf subsets preserve their UVs/normals and compensate for the removed card area.
+    // Their expansion is limited in screen pixels independently from the opaque surface LOD.
+    static constexpr std::array<float, kLodLevels> kViewCardKeep = {0.75f, 0.5f, 0.25f};
+    static constexpr float kViewCardMaxExpansionPixels = 1.5f;
+    std::uint8_t SelectViewCardLevel(float pixelsPerModelUnit, bool selected) const;
     void BuildLods();
     bool UploadDecodedTextures(ixrhi::IXRHIDevice& rhi);
     // staging: when given, the texture is made empty and its texels go there (a deferred upload).
@@ -461,7 +467,7 @@ private:
         std::shared_ptr<ixrhi::IXRHIBuffer> vertexStaging;
         std::shared_ptr<ixrhi::IXRHIBuffer> indexStaging;
         std::shared_ptr<ixrhi::IXRHIBuffer> lodIndexStaging;
-        std::shared_ptr<ixrhi::IXRHIBuffer> shadowCardVertexStaging;
+        std::shared_ptr<ixrhi::IXRHIBuffer> cardLodVertexStaging;
         std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, 3> textureStaging{};  // diffuse, normal, orm
         std::uint64_t recordedFrame = std::numeric_limits<std::uint64_t>::max();
     };
@@ -549,11 +555,13 @@ private:
     std::vector<std::uint32_t> m_lodIndices;
     std::array<std::vector<MeshDraw>, kLodLevels> m_shadowLodDraws;
     std::array<std::vector<MeshDraw>, kLodLevels> m_viewLodDraws;
+    std::array<std::vector<MeshDraw>, kLodLevels> m_viewCardDraws;
+    std::array<float, kLodLevels> m_viewCardExpansion{};
     float m_modelRadius = 0.0f;  // the farthest point of the bounds from the model's origin
-    std::vector<Vertex> m_shadowCardVertices;
+    std::vector<Vertex> m_cardLodVertices;
     std::vector<MeshDraw> m_shadowCardDraws;
     std::shared_ptr<ixrhi::IXRHIBuffer> m_lodIndexBuffer;
-    std::shared_ptr<ixrhi::IXRHIBuffer> m_shadowCardVertexBuffer;
+    std::shared_ptr<ixrhi::IXRHIBuffer> m_cardLodVertexBuffer;
     // Grown when a frame appends more records than it holds. The records a frame wrote before stay
     // in the old buffer, which the sets bound to it keep alive.
     std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_instanceBuffers{};

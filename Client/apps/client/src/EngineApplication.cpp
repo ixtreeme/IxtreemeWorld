@@ -4716,6 +4716,7 @@ int RunGame(NativeWindow& window,
     std::unordered_map<std::uint64_t, std::uint64_t> editorHierarchyParents;
     std::unordered_map<std::uint64_t, bool> editorHierarchyNoteTags;
     std::string editorHierarchyRootName;
+    HierarchyChangeTracker hierarchyChanges;
     auto buildHierarchyEntities = [&]() {
         std::vector<HierarchySceneEntity> entities;
         std::vector<std::uint64_t> liveKeys;
@@ -11992,11 +11993,37 @@ int RunGame(NativeWindow& window,
                 const auto hierarchyBegin = std::chrono::steady_clock::now();
                 if (!debugDisableHierarchyIteration)
                 {
-                    auto hierarchyState = buildHierarchyEntities();
-                    editorImGui.SetHierarchySceneState(
-                        static_cast<std::uint64_t>(editorSceneRootEntity),
-                        std::move(hierarchyState.first),
-                        std::move(hierarchyState.second));
+                    const auto& scenes = SceneManager::Instance();
+                    hierarchyChanges.Begin(scenes.GetCurrentScene().name, scenes.GetCurrentScenePath());
+                    const auto observe = [&](HierarchyEntityType type, const auto& object, bool note = false, bool main = false) {
+                        const auto& prefab = object.prefabInstance.assetId.empty() ? object.prefabAssetId : object.prefabInstance.assetId;
+                        hierarchyChanges.Observe({type, object.id, object.name, object.parent.type, prefab,
+                            object.parent.id, object.editorHidden, note, main});
+                    };
+                    for (const auto& body : editorWaterBodies)
+                        hierarchyChanges.Observe({HierarchyEntityType::WaterBody, body.id, body.name, {}, {}, 0, body.editorHidden});
+                    if (terrainOk && terrain.HasTerrain())
+                    {
+                        const auto info = terrain.GetTerrainSceneInfo();
+                        hierarchyChanges.Observe({HierarchyEntityType::Terrain, 1, info.name, {}, {}, 0, info.editorHidden});
+                    }
+                    for (const auto& mesh : editorMeshEntities)
+                        observe(HierarchyEntityType::MeshEntity, mesh, std::any_of(mesh.editorComponents.begin(), mesh.editorComponents.end(),
+                            [](const auto& component) { return component.type == "editor.note"; }));
+                    for (const auto& light : editorPointLights) observe(HierarchyEntityType::PointLight, light);
+                    for (const auto& light : editorSpotLights) observe(HierarchyEntityType::SpotLight, light);
+                    for (const auto& camera : editorCameras) observe(HierarchyEntityType::Camera, camera, false, camera.id == editorMainCameraId);
+                    if (hierarchyChanges.End())
+                    {
+                        auto hierarchyState = buildHierarchyEntities();
+                        editorImGui.SetHierarchySceneState(
+                            static_cast<std::uint64_t>(editorSceneRootEntity),
+                            std::move(hierarchyState.first), std::move(hierarchyState.second));
+                    }
+                    const auto selectedMirror = editorHierarchyEntities.find(HierarchyObjectKey(
+                        ToHierarchyEntityType(selectedEditorObject.type), selectedEditorObject.id));
+                    selectedEditorObject.flecsEntity = selectedMirror == editorHierarchyEntities.end() ? 0 : selectedMirror->second;
+                    editorImGui.SetHierarchySelection(selectedEditorObject.flecsEntity);
                 }
                 frameProfile.hierarchyIterationMs = MillisecondsBetween(hierarchyBegin, std::chrono::steady_clock::now());
 

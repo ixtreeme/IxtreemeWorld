@@ -11,6 +11,7 @@
 #include "AssetLibrary.h"
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
+#include "HierarchyCache.h"
 #include "WorldCamera.h"
 #include "platform/dynamic_library.h"
 #include "tools/tree/TreeGeneratorPanel.h"
@@ -37,6 +38,7 @@ struct ImVec2;
 
 class EditorImGui
 {
+    friend struct EditorHierarchyTestAccess;
 public:
     struct ViewportInputDiagnostics
     {
@@ -202,7 +204,8 @@ public:
     void SetPhysicsEvents(std::vector<PhysicsEventEditorState> events);
     void SetHierarchySceneState(std::uint64_t sceneRootEntity,
                                 std::string sceneRootName,
-                                std::vector<HierarchySceneEntity> entities);
+                                         std::vector<HierarchySceneEntity> entities);
+    void SetHierarchySelection(std::uint64_t entity);
     std::uint64_t GetSelectedHierarchyEntity() const { return m_selectedHierarchyEntity; }
     void SetWaterMaterials(std::vector<std::pair<std::string, WaterMaterialData>> materials);
     void SetWaterMaterialUsageCounts(std::vector<std::pair<std::string, std::uint32_t>> usageCounts);
@@ -371,7 +374,7 @@ private:
     bool AttachSceneToHierarchy(const AssetLibrary::Entry& entry);
     bool DetachSceneFromHierarchy(const ProjectSceneEntry& scene);
     void RenderProjectSceneNode(const ProjectSceneEntry& scene);
-    void RenderHierarchyEntityNode(std::uint64_t entity);
+    void RenderHierarchyEntityNode(std::uint64_t entity, std::uint32_t depth = 0);
     void RenderHierarchyContextMenu(const HierarchySceneEntity& entity);
     bool HierarchySubtreePassesSearch(std::uint64_t entity) const;
     const HierarchySceneEntity* FindHierarchyEntity(std::uint64_t entity) const;
@@ -780,13 +783,14 @@ private:
     std::vector<HierarchySceneEntity> m_hierarchyEntities;
     // Built with m_hierarchyEntities: each entity's place in it, and each parent's children (in list
     // order). Rows looked children and entities up by a scan of the list: O(n^2) per frame.
-    std::unordered_map<std::uint64_t, std::size_t> m_hierarchyIndexByEntity;
-    std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> m_hierarchyChildren;
+    HierarchyViewCache m_hierarchyView;
+    bool m_hierarchyScrollToSelection = false;
     const std::vector<std::uint64_t>& HierarchyChildren(std::uint64_t entity) const;
     std::vector<std::string> m_attachedScenePaths;
     std::vector<platform::DynamicLibraryHandle> m_loadedGameModules;  // native C++ game-module DLLs
     std::uint64_t m_selectedHierarchyEntity = 0;
     std::uint64_t m_hierarchyRenamingEntity = 0;
+    bool m_hierarchyRenameFocus = false;
     char m_hierarchyRenameBuffer[128]{};
     char m_componentSearchBuffer[128]{};
     bool m_componentRegistryLogged = false;
