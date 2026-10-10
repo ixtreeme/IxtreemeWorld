@@ -187,6 +187,14 @@ void IXVulkanCommandList::Dispatch(std::uint32_t groupsX, std::uint32_t groupsY,
     vkCmdDispatch(m_cmd, groupsX, groupsY, groupsZ);
 }
 
+void IXVulkanCommandList::DrawIndexedIndirect(const ixrhi::IXRHIBuffer& buffer, std::uint64_t offsetBytes)
+{
+    const auto* native = dynamic_cast<const IXVulkanBuffer*>(&buffer);
+    assert(native && ixrhi::HasUsage(buffer.Usage(), ixrhi::IXRHIBufferUsage::Indirect));
+    if (native && offsetBytes % 4 == 0 && offsetBytes + sizeof(VkDrawIndexedIndirectCommand) <= buffer.SizeBytes())
+        vkCmdDrawIndexedIndirect(m_cmd, native->Native(), offsetBytes, 1, sizeof(VkDrawIndexedIndirectCommand));
+}
+
 namespace
 {
 
@@ -210,7 +218,8 @@ void LayoutStageAccess(ixrhi::IXRHIImageLayout layout,
         access = VK_ACCESS_TRANSFER_WRITE_BIT;
         break;
     case L::ShaderReadOnly:
-        stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        stage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT;
         access = VK_ACCESS_SHADER_READ_BIT;
         break;
     // Attachments are read too: a pass that loads them (and depth testing) reads what is there.
@@ -447,7 +456,7 @@ void BufferStageAccess(ixrhi::IXRHIBufferState state,
         break;
     case S::ShaderWrite:
         stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-        access = VK_ACCESS_SHADER_WRITE_BIT;
+        access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         break;
     case S::VertexRead:
         stage = VK_PIPELINE_STAGE_VERTEX_INPUT_BIT;
@@ -469,6 +478,14 @@ void BufferStageAccess(ixrhi::IXRHIBufferState state,
     case S::TransferDst:
         stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
         access = VK_ACCESS_TRANSFER_WRITE_BIT;
+        break;
+    case S::IndirectRead:
+        stage = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+        access = VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        break;
+    case S::HostRead:
+        stage = VK_PIPELINE_STAGE_HOST_BIT;
+        access = VK_ACCESS_HOST_READ_BIT;
         break;
     }
 }

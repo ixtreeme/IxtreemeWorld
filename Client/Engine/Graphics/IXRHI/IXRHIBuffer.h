@@ -35,6 +35,8 @@ enum class IXRHIBufferState : std::uint8_t
     UniformRead,
     TransferSrc,
     TransferDst,
+    IndirectRead,
+    HostRead,
 };
 
 class IXRHIBuffer

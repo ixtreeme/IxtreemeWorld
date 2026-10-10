@@ -80,6 +80,10 @@ public:
                           std::uint32_t groupsY,
                           std::uint32_t groupsZ) = 0;
 
+    // One standard 20-byte indexed indirect command. Buffer must have Indirect usage
+    // and be in IndirectRead; nonzero firstInstance needs supportsIndirectFirstInstance.
+    virtual void DrawIndexedIndirect(const IXRHIBuffer& buffer, std::uint64_t offsetBytes) = 0;
+
     // Explicit layout transition (backend inserts the barrier). The caller
     // tracks states (as the offscreen snapshot flow does); the backend maps
     // (from, to, format) to stages/access uniformly — no per-use barrier DSL.

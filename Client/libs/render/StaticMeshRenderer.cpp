@@ -2,6 +2,7 @@
 #include "StaticMeshRenderer.h"
 #include "MeshSurfaceQuery.h"
 #include "ViewImpostorRenderer.h"
+#include "OcclusionCuller.h"
 
 #include "AssimpImporter.h"
 #include "import_export/tree/TreeImpostor.h"
@@ -32,6 +33,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -2721,7 +2723,7 @@ bool StaticMeshRenderer::PollPendingLodUploads(std::uint64_t configHash)
         if (existing != m_lodBuffers.end())
         {
             // Retain the replaced buffer (shared ownership) so in-flight frames
-            // referencing it stay valid — same as the old retired-buffer list.
+            // referencing it stay valid â€” same as the old retired-buffer list.
             m_retiredLodBuffers.push_back(existing->second.buffer);
             existing->second = std::move(it->lodSet);
         }
@@ -3493,7 +3495,7 @@ bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
 
     // All 5 variants share vertex input/assembly/viewport/raster(base)/
     // multisample/depth(base)/blend/dynamic state; only the fragment shader
-    // (and, for the outline, cull + depth-write/compare) differ — exactly like
+    // (and, for the outline, cull + depth-write/compare) differ â€” exactly like
     // the pre-migration single VkGraphicsPipelineCreateInfo reuse.
     auto createVariant = [&](const char* name,
                              const std::shared_ptr<ixrhi::IXRHIShader>& fragment,
@@ -3681,7 +3683,7 @@ bool StaticMeshRenderer::RenderTreeImpostors(ixrhi::IXRHICommandList& cmd, const
     for (const Instance* source : instances)
     {
         const float scale = source->scale[0];
-        bool eligible = !source->selectedForOutline && scale > 0 &&
+        bool eligible = !source->selectedForOutline && !source->forceFullResolution && scale > 0 &&
             std::abs(source->scale[1]-scale) <= scale*0.001f && std::abs(source->scale[2]-scale) <= scale*0.001f &&
             std::abs(source->rotation[0]) < 0.001f && std::abs(source->rotation[2]) < 0.001f &&
             source->materialSlots.size() == state->data.materials.size() &&
@@ -3788,7 +3790,7 @@ bool StaticMeshRenderer::RenderViewImpostors(ixrhi::IXRHICommandList& cmd, const
         if (!instance)
             continue;
         bool replaced = false;
-        if (instance->entityId && !instance->selectedForOutline && instance->coverageMin == 0 &&
+        if (instance->entityId && !instance->selectedForOutline && !instance->forceFullResolution && instance->coverageMin == 0 &&
             instance->coverageMax == 1)
         {
             const Mat4 model = BuildStaticMeshModelMatrix(*instance);
@@ -3870,6 +3872,121 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
                                                std::uint64_t configHash, std::uint32_t lodLevel,
                                                std::uint32_t targetWidth, std::uint32_t targetHeight)
 {
+    auto* culler = OcclusionCuller::Active();
+    auto* viewCache = ViewImpostorRenderer::Active();
+    const bool capturing = viewCache && viewCache->IsCapturing();
+    if (culler && !capturing && !m_partitioningOcclusion && culler->Group() == OcclusionCuller::kInvalidGroup &&
+        !instancesIn.empty())
+    {
+        struct Group { InstanceList instances; OcclusionCuller::Bounds bounds{{INFINITY, INFINITY, INFINITY}, {-INFINITY, -INFINITY, -INFINITY}}; };
+        std::map<std::array<int, 3>, std::size_t> cells;
+        std::vector<Group> groups;
+        InstanceList direct;
+        for (const Instance* instance : instancesIn)
+        {
+            if (!instance) continue;
+            const WorldVec3 p = instance->position;
+            if (instance->selectedForOutline || instance->forceFullResolution ||
+                !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+                std::max({std::abs(p.x), std::abs(p.y), std::abs(p.z)}) > 16000000)
+            { direct.push_back(instance); continue; }
+            const std::array<int, 3> cell{static_cast<int>(std::floor(p.x / 16)),
+                static_cast<int>(std::floor(p.y / 16)), static_cast<int>(std::floor(p.z / 16))};
+            auto [entry, inserted] = cells.try_emplace(cell, groups.size());
+            if (inserted) groups.emplace_back();
+            Group& group = groups[entry->second];
+            group.instances.push_back(instance);
+            const auto model = PreparedUsable(*instance) && !instance->prepared->slots.empty()
+                ? instance->prepared->slots[0].model : BuildStaticMeshModelMatrix(*instance);
+            for (unsigned corner = 0; corner < 8; ++corner)
+            {
+                const auto point = xm::TransformPoint(model, {corner & 1 ? m_boundsMax[0] : m_boundsMin[0],
+                    corner & 2 ? m_boundsMax[1] : m_boundsMin[1], corner & 4 ? m_boundsMax[2] : m_boundsMin[2]});
+                group.bounds.min.x = std::min(group.bounds.min.x, point.x);
+                group.bounds.min.y = std::min(group.bounds.min.y, point.y);
+                group.bounds.min.z = std::min(group.bounds.min.z, point.z);
+                group.bounds.max.x = std::max(group.bounds.max.x, point.x);
+                group.bounds.max.y = std::max(group.bounds.max.y, point.y);
+                group.bounds.max.z = std::max(group.bounds.max.z, point.z);
+            }
+        }
+        // Leaf LOD grows cards; billboards can rotate beyond the original AABB.
+        // A sphere around each batch is deliberately conservative for both paths.
+        m_partitioningOcclusion = true;
+        std::uint32_t calls = 0, count = 0, indices = 0, impostors = 0, updates = 0, overrides = 0;
+        std::uint64_t triangles = 0;
+        std::size_t bytes = 0;
+        bool rebuilt = false, fallback = false;
+        const auto draw = [&](const InstanceList& list) {
+            if (list.empty()) return;
+            RenderLodBatchInWorld(cmd, frame, timeSeconds, camera, list, lodConfig, configHash, lodLevel, targetWidth, targetHeight);
+            calls += m_lastSubmittedDrawCalls; count += m_lastSubmittedInstances; indices += m_lastSubmittedIndexCount;
+            triangles += m_lastSubmittedTriangles; impostors += m_lastImpostorTrees;
+            updates += m_lastMaterialUniformUpdates; overrides += m_lastOverrideActiveDraws; bytes += m_lastInstanceBufferBytes;
+            rebuilt |= m_lastInstanceBufferRebuilt; fallback |= m_lastUsedFullResFallback;
+        };
+        BeginFrameSlots(frame);
+        const auto bindingBudget = [&](const InstanceList& list) {
+            std::uint64_t slots = 0;
+            for (const auto& meshDraw : m_draws)
+            {
+                std::string_view previous;
+                bool previousFade = false, first = true;
+                std::uint32_t runs = 0;
+                for (const auto* instance : list)
+                {
+                    const std::string_view material = meshDraw.materialSlot < instance->materialSlots.size()
+                        ? std::string_view(instance->materialSlots[meshDraw.materialSlot]) : std::string_view();
+                    const bool fade = instance->coverageMin > 0 || instance->coverageMax < 1;
+                    if (first || material != previous || fade != previousFade) ++runs;
+                    previous = material; previousFade = fade; first = false;
+                }
+                // At most 16 opaque/card level combinations; mask depth/colour
+                // can take two sets. Reserve the unpartitioned fallback FIRST.
+                slots += std::min<std::uint64_t>(list.size(), runs * 16ull) * 2;
+            }
+            return slots;
+        };
+        const auto reserve = bindingBudget(instancesIn);
+        const auto limit = std::min<std::uint64_t>(kMaxBindPages * kUniformSlots,
+            std::max<std::uint64_t>(kMaxBindPages * kUniformSlots / 2, m_worldUniformCursor));
+        if (reserve + m_worldUniformCursor > limit)
+        {
+            draw(instancesIn); // no extra batching when the original path needs the headroom
+            groups.clear();
+        }
+        else
+            draw(direct);
+        for (std::size_t at = 0; at < groups.size(); ++at)
+        {
+            auto& group = groups[at];
+            if (bindingBudget(group.instances) + reserve + m_worldUniformCursor > limit)
+            {
+                // Preserve original order/material runs in the remaining direct batch.
+                std::unordered_set<const Instance*> remaining;
+                for (std::size_t i = at; i < groups.size(); ++i)
+                    remaining.insert(groups[i].instances.begin(), groups[i].instances.end());
+                InstanceList fallbackInstances;
+                for (const auto* instance : instancesIn)
+                    if (remaining.contains(instance)) fallbackInstances.push_back(instance);
+                culler->SetGroup(OcclusionCuller::kInvalidGroup);
+                draw(fallbackInstances);
+                break;
+            }
+            const auto centre = (group.bounds.min + group.bounds.max) * 0.5f;
+            const float radius = xm::Length(group.bounds.max - group.bounds.min) * 1.05f + 0.1f;
+            group.bounds = {centre - WorldVec3{radius, radius, radius}, centre + WorldVec3{radius, radius, radius}};
+            culler->SetGroup(culler->AddGroup(group.bounds, static_cast<std::uint32_t>(group.instances.size())));
+            draw(group.instances);
+        }
+        culler->SetGroup(OcclusionCuller::kInvalidGroup);
+        m_partitioningOcclusion = false;
+        m_lastSubmittedDrawCalls = calls; m_lastSubmittedInstances = count; m_lastSubmittedIndexCount = indices;
+        m_lastSubmittedTriangles = triangles; m_lastImpostorTrees = impostors; m_lastMaterialUniformUpdates = updates;
+        m_lastOverrideActiveDraws = overrides; m_lastInstanceBufferBytes = bytes;
+        m_lastInstanceBufferRebuilt = rebuilt; m_lastUsedFullResFallback = fallback;
+        return;
+    }
     if (RenderTreeImpostors(cmd, frame, timeSeconds, camera, instancesIn, lodConfig, configHash, lodLevel, targetWidth, targetHeight)) return;
     if (!m_treeImpostor || !m_treeImpostor->partitioning) m_lastImpostorTrees = 0;
     m_lastSubmittedDrawCalls = 0;
@@ -3979,7 +4096,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
             const float depth = static_cast<float>(instance.position.x) * vp[3] + static_cast<float>(instance.position.y) * vp[7] +
                 static_cast<float>(instance.position.z) * vp[11] + vp[15] - m_modelRadius * scale;
             std::uint8_t level = 0, leafLevel = 0;
-            if (depth > camera.nearPlane && !instance.selectedForOutline)
+            if (depth > camera.nearPlane && !instance.selectedForOutline && !instance.forceFullResolution)
             {
                 const float pixelsPerModelUnit = pixelsAtUnitDepth * scale / depth;
                 while (!m_viewLodDraws[0].empty() && level < kLodLevels &&
@@ -4347,6 +4464,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
                 if (!kept)
                     continue;
                 cmd.BindGroup(0, *kept->page->group, kept->set);
+                if (!culler || capturing || !culler->Draw(cmd, indexCount, draw.instanceCount, firstIndex, 0, draw.firstInstance))
                 cmd.DrawIndexed(indexCount, draw.instanceCount, firstIndex, 0, draw.firstInstance);
                 ++m_lastSubmittedDrawCalls;
                 m_lastSubmittedIndexCount += indexCount;
@@ -4426,7 +4544,8 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
                     logDrawDiag("[LOD-DRAW-REF]", instances[*refInstanceIndex]->entityId, command, *refInstanceIndex, bindSlot, pipelineForDraw);
                 }
             }
-            cmd.DrawIndexed(indexCount, draw.instanceCount, firstIndex, 0, draw.firstInstance);
+            if (!culler || capturing || !culler->Draw(cmd, indexCount, draw.instanceCount, firstIndex, 0, draw.firstInstance))
+                cmd.DrawIndexed(indexCount, draw.instanceCount, firstIndex, 0, draw.firstInstance);
             ++m_lastSubmittedDrawCalls;
             m_lastSubmittedIndexCount += indexCount;
             if (step != MaskStep::Depth)
@@ -4567,6 +4686,19 @@ void StaticMeshRenderer::FillInstanceBlocks(const WorldMat4& viewProjection,
         if (left[i])
             FillInstanceBlock(viewProjection, *instances[i], materialSlot, out[i]);
     }
+}
+
+bool StaticMeshRenderer::CanOcclude(const Instance& instance) const
+{
+    if (!IsLoaded() || m_isTreeImpostor || !UploadsRecorded() || instance.coverageMin != 0 || instance.coverageMax != 1)
+        return false;
+    PreparedInstance temporary;
+    const PreparedInstance* prepared = instance.prepared;
+    if (!PreparedUsable(instance)) { PrepareInstance(instance, temporary); prepared = &temporary; }
+    if (!prepared || prepared->slots.empty()) return false;
+    return std::all_of(prepared->slots.begin(), prepared->slots.end(), [](const InstanceBlock& block) {
+        return block.materialAlpha[0] < 0.5f;
+    });
 }
 
 bool StaticMeshRenderer::HasTransparentDraws(const Instance& instance) const

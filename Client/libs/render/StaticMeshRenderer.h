@@ -93,6 +93,7 @@ public:
         float scale[3] = {1.0f, 1.0f, 1.0f};
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f};
         bool selectedForOutline = false;
+        bool forceFullResolution = false; // same-frame occluders must keep their drawn surface
         std::vector<std::string> materialSlots;
         std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
         // Optional: what this instance's records hold that no view changes (PrepareInstance), kept
@@ -221,6 +222,7 @@ public:
     // Whether any of the instance's draws has an alpha-blended (Blend) material. The batches above
     // leave those out: RenderTransparentInWorld draws them, in the frame's back-to-front order.
     bool HasTransparentDraws(const Instance& instance) const;
+    bool CanOcclude(const Instance& instance) const;
     // The instance's alpha-blended draws, over what is already drawn: depth tested but not written,
     // back faces before front faces. Call after the opaque scene, the farthest instance first.
     void RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
@@ -287,6 +289,7 @@ private:
     bool m_isTreeImpostor = false;
     std::uint32_t m_lastImpostorTrees = 0;
     bool m_partitioningViewImpostors = false;
+    bool m_partitioningOcclusion = false;
     InstanceList m_viewImpostorNear;
     bool RenderViewImpostors(ixrhi::IXRHICommandList&, const ixrhi::IXRHIFrameInfo&, double,
         const WorldCamera&, const InstanceList&, const LodConfig&, std::uint64_t, std::uint32_t,

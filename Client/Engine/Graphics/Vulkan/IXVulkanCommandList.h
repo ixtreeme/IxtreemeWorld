@@ -55,6 +55,7 @@ public:
                      std::int32_t vertexOffset,
                      std::uint32_t firstInstance) override;
     void Dispatch(std::uint32_t groupsX, std::uint32_t groupsY, std::uint32_t groupsZ) override;
+    void DrawIndexedIndirect(const ixrhi::IXRHIBuffer& buffer, std::uint64_t offsetBytes) override;
     void TransitionTexture(ixrhi::IXRHITexture& texture,
                            ixrhi::IXRHIImageLayout from,
                            ixrhi::IXRHIImageLayout to) override;

@@ -11,6 +11,13 @@
 #include <unordered_set>
 #include <vector>
 
+// Flecs requires sibling identifiers to be unique. User-facing scene labels
+// can repeat (e.g. thousands of "Oak" instances) and stay in HierarchySceneEntity.
+inline std::string HierarchyInternalName(std::uint64_t entity)
+{
+    return "IxtreemeEditorObject_" + std::to_string(entity);
+}
+
 // Exact metadata comparisons: unchanged frames allocate/copy nothing. Transform and selection
 // changes do not affect the hierarchy. Script-created objects use the same observation path.
 class HierarchyChangeTracker

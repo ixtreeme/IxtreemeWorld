@@ -635,7 +635,18 @@ if(WIN32)
             VERBATIM
         )
     endforeach()
+    foreach(_occlusion_stage IN ITEMS "base;BaseCS" "reduce;ReduceCS" "test;TestCS" "command;CommandCS")
+        list(GET _occlusion_stage 0 _occlusion_name)
+        list(GET _occlusion_stage 1 _occlusion_entry)
+        set(_occlusion_spv "${GENERATED_SHADER_DIR}/occlusion_${_occlusion_name}_cs.spv")
+        list(APPEND OCCLUSION_SPV "${_occlusion_spv}")
+        add_custom_command(OUTPUT "${_occlusion_spv}"
+            COMMAND "${DXC_EXECUTABLE}" -spirv -T cs_6_0 -E ${_occlusion_entry}
+                -Fo "${_occlusion_spv}" "${CLIENT_ROOT}/shaders/Occlusion.hlsl"
+            DEPENDS "${CLIENT_ROOT}/shaders/Occlusion.hlsl" VERBATIM)
+    endforeach()
     add_custom_target(IXEngineShaders DEPENDS
+        ${OCCLUSION_SPV}
         "${VIEW_IMPOSTOR_VS_SPV}"
         "${VIEW_IMPOSTOR_PS_SPV}"
         "${SKINNED_MESH_VS_SPV}"

@@ -288,6 +288,7 @@ void IXVulkanDevice::QueryCapabilities()
     m_capabilities.supportsAnisotropy = m_loop->SupportsSamplerAnisotropy();
     m_capabilities.supportsCompute = true; // single universal queue in VulkanDevice
     m_capabilities.supportsIndirectDraw = true; // core drawIndirect
+    m_capabilities.supportsIndirectFirstInstance = m_loop->SupportsIndirectFirstInstance();
     m_capabilities.supportsTimestampQueries = props.limits.timestampComputeAndGraphics != 0;
     m_capabilities.supportsDynamicRendering = false; // VkRenderPass infra (Phase 2)
     m_capabilities.supportsTimelineSemaphores = false; // unused by renderer; enable with use

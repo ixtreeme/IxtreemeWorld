@@ -63,6 +63,7 @@
 #include "TerrainEditorSystem.h"
 #include "TerrainRenderer.h"
 #include "ViewImpostorRenderer.h"
+#include "OcclusionCuller.h"
 #include "ViewportControls.h"
 #include "VulkanDevice.h"
 #include "SkinnedMeshRenderer.h"
@@ -2639,6 +2640,8 @@ int RunGame(NativeWindow& window,
     }
 
     OffscreenSceneRenderer offscreenScene;
+    OcclusionCuller gpuOcclusion;
+    gpuOcclusion.Create(*rhiDevice, assets);
     ViewImpostorRenderer viewImpostors;
     viewImpostors.Create(*rhiDevice, assets);
     // Offscreen targets resolve formats from the live swapchain (as before,
@@ -3534,7 +3537,7 @@ int RunGame(NativeWindow& window,
             ecs_fini(world);
     });
     ecs_entity_t editorSceneRootEntity = ecs_new(editorHierarchyWorld.get());
-    ecs_set_name(editorHierarchyWorld.get(), editorSceneRootEntity, "Untitled");
+    ecs_set_name(editorHierarchyWorld.get(), editorSceneRootEntity, HierarchyInternalName(editorSceneRootEntity).c_str());
     ecs_entity_t editorNoteComponentEntity = ecs_new(editorHierarchyWorld.get());
     ecs_set_name(editorHierarchyWorld.get(), editorNoteComponentEntity, "EditorNoteComponent");
     std::unordered_map<std::uint64_t, ecs_entity_t> editorHierarchyEntities;
@@ -4733,7 +4736,6 @@ int RunGame(NativeWindow& window,
             sceneName = "Untitled";
         if (editorHierarchyRootName != sceneName)
         {
-            ecs_set_name(editorHierarchyWorld.get(), editorSceneRootEntity, sceneName.c_str());
             editorHierarchyRootName = sceneName;
         }
         auto syncEditorComponentTags = [&](ecs_entity_t entity, const std::vector<EditorAttachedComponent>& components) {
@@ -4973,12 +4975,11 @@ int RunGame(NativeWindow& window,
         }
         for (const auto& [namedEntity, name] : pendingNames)
         {
-            std::string& last = editorHierarchyNames[namedEntity];
-            if (last != name)
-            {
-                ecs_set_name(editorHierarchyWorld.get(), namedEntity, name.c_str());
-                last = name;
-            }
+            auto [entry, created] = editorHierarchyNames.try_emplace(namedEntity, name);
+            if (created)
+                ecs_set_name(editorHierarchyWorld.get(), namedEntity, HierarchyInternalName(namedEntity).c_str());
+            else if (entry->second != name)
+                entry->second = name;
         }
 
         for (HierarchySceneEntity& entity : entities)
@@ -12263,6 +12264,7 @@ int RunGame(NativeWindow& window,
         if (rhiFrame)
         {
             const ixrhi::IXRHIFrameInfo& frameInfo = rhiFrame.info;
+            gpuOcclusion.BeginFrame(frameInfo);
             viewImpostors.BeginFrame(frameInfo);
             const uint64_t frameNumber = frameInfo.frameNumber;
             // Per-frame skin-slot allocation over the per-model skinned cache. Each entry owns
@@ -13310,6 +13312,72 @@ int RunGame(NativeWindow& window,
                 for (float value : {light.r, light.g, light.b, light.intensity, light.radius, light.innerConeDegrees, light.outerConeDegrees})
                     hashLightingValue(value);
             }
+            struct OccluderPassResult
+            {
+                bool terrainDrawn = false;
+                std::unordered_set<std::uint32_t> meshes;
+            };
+            // Current-frame occluder depth: terrain + a bounded number of large,
+            // fully opaque meshes. Draw each once, at full geometry quality, then
+            // let Hi-Z compute write indirect commands for all remaining groups.
+            const auto prepareOcclusion = [&](OffscreenSceneRenderer& target, const WorldCamera& viewCamera,
+                                               std::uint32_t width, std::uint32_t height, std::uint32_t view) {
+                OccluderPassResult result;
+                if (!isInWorld || !gpuOcclusion.WantsView(view, frameInfo.frameNumber)) return result;
+                struct Candidate { const StaticMeshRenderRecord* record; float area; float distance; };
+                std::vector<Candidate> candidates;
+                const bool hideHidden = view == 1 || editorPlay.state.mode == EditorPlayMode::Edit;
+                for (auto id : staticMeshSpatialIndex.QueryFrustum(SpatialFrustumFromCamera(viewCamera)))
+                {
+                    const MeshSceneEntity* mesh = findMeshEntityById(id);
+                    if (!mesh || !mesh->effectiveEnabled || (hideHidden && mesh->editorHidden) || mesh->skinned ||
+                        (view == 0 && selectedEditorObject.type == SelectedEditorObjectType::MeshEntity && selectedEditorObject.id == id))
+                        continue;
+                    const auto& record = staticMeshRenderRecord(*mesh, /*recheck=*/true);
+                    if (!record.renderer || !record.renderer->CanOcclude(record.instance)) continue;
+                    OcclusionCuller::Projection projection;
+                    const bool projects = OcclusionCuller::Project(viewCamera,
+                        {record.worldBounds.min, record.worldBounds.max}, width, height, projection);
+                    const float area = projects ? (projection.maxX - projection.minX) * (projection.maxY - projection.minY)
+                        : static_cast<float>(width) * height;
+                    if (area < static_cast<float>(width) * height * 0.025f) continue;
+                    candidates.push_back({&record, area, DistanceToAabb(viewCamera.eye, record.worldBounds)});
+                }
+                std::sort(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+                    if (a.area != b.area) return a.area > b.area;
+                    return a.distance < b.distance;
+                });
+                if (candidates.size() > 64) candidates.resize(64);
+                if (!hasSceneTerrain && candidates.empty()) return result;
+                if (hasSceneTerrain)
+                {
+                    if (view == 0) rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainBegin);
+                    terrain.Render(*frameInfo.commandList, frameInfo, viewCamera, width, height, view, false);
+                    if (view == 0) rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainEnd);
+                    result.terrainDrawn = true;
+                }
+                std::vector<StaticMeshRenderer::Instance> instances;
+                instances.reserve(candidates.size());
+                std::unordered_map<StaticMeshRenderer*, StaticMeshRenderer::InstanceList> batches;
+                for (const auto& candidate : candidates)
+                {
+                    instances.push_back(candidate.record->instance);
+                    instances.back().forceFullResolution = true;
+                    batches[candidate.record->renderer].push_back(&instances.back());
+                    result.meshes.insert(candidate.record->entityId);
+                }
+                for (auto& [renderer, batch] : batches)
+                {
+                    renderer->SetLightingState(frameLighting);
+                    renderer->RenderBatchInWorld(*frameInfo.commandList, frameInfo, seconds, viewCamera, batch, width, height);
+                }
+                target.EndMainPass(*frameInfo.commandList);
+                gpuOcclusion.BeginView(*frameInfo.commandList, frameInfo, viewCamera,
+                    target.ReadableDepth(*frameInfo.commandList, frameInfo), view);
+                target.BeginMainPass(*frameInfo.commandList, frameInfo, false);
+                return result;
+            };
+            OccluderPassResult sceneOccluders;
             auto beginMainPass = [&]() {
                 if (mainPassOpen)
                     return;
@@ -13334,6 +13402,7 @@ int RunGame(NativeWindow& window,
                         offscreenScene.Height());
                 viewImpostors.BeginView(offscreenScene, *frameInfo.commandList, frameInfo, camera, seconds, 0, viewLightingRevision);
                 offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo);
+                sceneOccluders = prepareOcclusion(offscreenScene, camera, renderSize.width, renderSize.height, 0);
             }
             else if (!useOffscreenScene)
                 beginMainPass(); // direct mode renders straight into the swapchain pass
@@ -13352,7 +13421,7 @@ int RunGame(NativeWindow& window,
                         /*viewIndex=*/0, clearDepth);
                     rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::TerrainMainEnd);
                 };
-                if (hasSceneTerrain && !terrainAfterMeshes)
+                if (hasSceneTerrain && !sceneOccluders.terrainDrawn && !terrainAfterMeshes)
                     renderSceneTerrain(true);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::SceneOtherBegin);
 
@@ -13667,6 +13736,7 @@ int RunGame(NativeWindow& window,
                                 }
                                 continue;
                             }
+                            if (sceneOccluders.meshes.contains(mesh.id)) continue;
                             if (litStaticRenderers.insert(renderer).second)
                                 renderer->SetLightingState(frameLighting);
                             // Selection belongs to Scene View only; preserve the shared Game/shadow record.
@@ -13946,7 +14016,7 @@ int RunGame(NativeWindow& window,
                     previousFrameNonLodInitialized = true;
                     previousCulledMeshLogSet = std::move(currentCulledMeshLogSet);
                 }
-                if (hasSceneTerrain && terrainAfterMeshes)
+                if (hasSceneTerrain && !sceneOccluders.terrainDrawn && terrainAfterMeshes)
                     renderSceneTerrain(false);
                 // The sky after the opaque geometry: it sits at the far plane and is depth tested, so
                 // only the pixels nothing covers are shaded.
@@ -14212,6 +14282,7 @@ int RunGame(NativeWindow& window,
                 {
                     viewImpostors.EndView();
                     offscreenScene.EndMainPass(*frameInfo.commandList);
+                    gpuOcclusion.EndView(*frameInfo.commandList);
 #if defined(IXTREEME_WITH_EDITOR)
                     if (runtimeSession->IsMapEditorOpen() && editorImGui.IsSceneViewVisible() &&
                         editorImGui.ShowsSceneViewAsPanel())
@@ -14303,6 +14374,7 @@ int RunGame(NativeWindow& window,
                         const WorldCamera& gameCamera = *gameViewCamera;
                         viewImpostors.BeginView(gameView, *frameInfo.commandList, frameInfo, gameCamera, seconds, 1, viewLightingRevision);
                         gameView.BeginMainPass(*frameInfo.commandList, frameInfo);
+                        const auto gameOccluders = prepareOcclusion(gameView, gameCamera, gameExtent.width, gameExtent.height, 1);
                         // Terrain is drawn from the project Main Camera using the secondary
                         // camera-uniform path (viewIndex=1). That path has its own per-frame
                         // uniform buffer + descriptor set, so this draw no longer clobbers the
@@ -14333,6 +14405,7 @@ int RunGame(NativeWindow& window,
                                 StaticMeshRenderer* renderer = meshRecord.renderer;
                                 if (!renderer)
                                     continue;
+                                if (gameOccluders.meshes.contains(mesh->id)) continue;
                                 if (renderer->HasTransparentDraws(meshRecord.instance))
                                     addTransparentDraw(gameTransparentDraws, renderer, meshRecord.instance,
                                         meshRecord.worldBounds, gameCamera);
@@ -14363,7 +14436,7 @@ int RunGame(NativeWindow& window,
                                     rec.position, rec.yaw, rec.slot, rec.tint, gameExtent.width, gameExtent.height, rec.scale);
                             }
                         }
-                        if (hasSceneTerrain)
+                        if (hasSceneTerrain && !gameOccluders.terrainDrawn)
                         {
                             terrain.Render(*frameInfo.commandList, frameInfo, gameCamera, gameExtent.width, gameExtent.height,
                                 /*viewIndex=*/1, /*clearDepth=*/false);
@@ -14386,6 +14459,7 @@ int RunGame(NativeWindow& window,
                             terrain.SunShadowCascadeViewProj(), TerrainRenderer::kSunShadowDepthBias,
                             TerrainRenderer::SunShadowExtraDepthPaddingMeters()};
                         gameView.EndMainPass(*frameInfo.commandList);
+                        gpuOcclusion.EndView(*frameInfo.commandList);
 #if defined(IXTREEME_WITH_EDITOR)
                         if (runtimeSession->IsMapEditorOpen() && editorImGui.IsGameViewVisible())
                             ++gameViewStatsFrameCount;
@@ -14933,6 +15007,7 @@ int RunGame(NativeWindow& window,
 #endif
 
     device.WaitIdle();
+    gpuOcclusion.Destroy();
     viewImpostors.Destroy();
     if (worldLabelsOk)
         worldLabels.Destroy();

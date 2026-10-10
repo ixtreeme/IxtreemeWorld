@@ -17,6 +17,8 @@ add_library(IXEngineRender STATIC
     ParticleRenderer.h
     OffscreenSceneRenderer.cpp
     OffscreenSceneRenderer.h
+    OcclusionCuller.cpp
+    OcclusionCuller.h
     ViewImpostorRenderer.cpp
     ViewImpostorRenderer.h
     RmlUiLayer.cpp
@@ -147,6 +149,16 @@ endif()
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
 
 if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(OcclusionCullerTest tests/OcclusionCullerTest.cpp)
+    target_link_libraries(OcclusionCullerTest PRIVATE IXEngineRender)
+    if(WIN32)
+        target_link_libraries(OcclusionCullerTest PRIVATE IXEngineVulkan)
+        target_compile_definitions(OcclusionCullerTest PRIVATE IX_OCCLUSION_TEST_ASSETS_ROOT="${CLIENT_ROOT}")
+    endif()
+    if(MSVC)
+        set_target_properties(OcclusionCullerTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME OcclusionCullerTest COMMAND OcclusionCullerTest)
     add_executable(StaticMeshLeafLodTest tests/StaticMeshLeafLodTest.cpp)
     target_link_libraries(StaticMeshLeafLodTest PRIVATE IXEngineRender)
     if(MSVC)

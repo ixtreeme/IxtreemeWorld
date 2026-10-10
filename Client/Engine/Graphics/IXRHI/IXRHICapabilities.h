@@ -30,6 +30,7 @@ struct IXRHICapabilities
     std::uint32_t maxTextureSize = 1;
     bool supportsCompute = false;
     bool supportsIndirectDraw = false;
+    bool supportsIndirectFirstInstance = false;
     bool supportsTimestampQueries = false;
     bool supportsAnisotropy = false;
     bool supportsDynamicRendering = false; // false on the classic render-pass backend

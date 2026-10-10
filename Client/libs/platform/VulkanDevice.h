@@ -45,6 +45,7 @@ public:
     VkSurfaceTransformFlagBitsKHR GetSurfaceTransform() const { return m_currentTransform; }
     uint32_t GetSwapchainImageCount() const { return static_cast<uint32_t>(m_swapchainImages.size()); }
     bool SupportsSamplerAnisotropy() const { return m_samplerAnisotropySupported; }
+    bool SupportsIndirectFirstInstance() const { return m_indirectFirstInstanceSupported; }
     float GetMaxSamplerAnisotropy() const { return m_maxSamplerAnisotropy; }
     uint32_t GetWidth() const { return m_width; }
     uint32_t GetHeight() const { return m_height; }
@@ -112,5 +113,6 @@ private:
     uint32_t m_height = 0;
     bool m_validationEnabled = false;
     bool m_samplerAnisotropySupported = false;
+    bool m_indirectFirstInstanceSupported = false;
     float m_maxSamplerAnisotropy = 1.0f;
 };

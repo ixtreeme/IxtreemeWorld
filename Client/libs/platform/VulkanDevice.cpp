@@ -488,6 +488,8 @@ bool VulkanDevice::CreateLogicalDevice()
     vkGetPhysicalDeviceProperties(m_physicalDevice, &properties);
 
     VkPhysicalDeviceFeatures enabled{};
+    enabled.drawIndirectFirstInstance = supported.drawIndirectFirstInstance;
+    m_indirectFirstInstanceSupported = enabled.drawIndirectFirstInstance != 0;
     if (supported.fillModeNonSolid)
     {
         enabled.fillModeNonSolid = VK_TRUE;

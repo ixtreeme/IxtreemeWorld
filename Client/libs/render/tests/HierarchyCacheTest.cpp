@@ -1,5 +1,6 @@
 #include "HierarchyCache.h"
 #include <iostream>
+#include <flecs.h>
 
 int main()
 {
@@ -8,6 +9,26 @@ int main()
         if (!result) { std::cerr << message << '\n'; ++failures; }
     };
     HierarchyChangeTracker tracker;
+    {
+        flecs::world world;
+        const auto root = ecs_new(world.c_ptr());
+        const auto first = ecs_new(world.c_ptr());
+        const auto second = ecs_new(world.c_ptr());
+        const auto firstName = HierarchyInternalName(first), secondName = HierarchyInternalName(second);
+        ecs_set_name(world.c_ptr(), root, HierarchyInternalName(root).c_str());
+        ecs_set_name(world.c_ptr(), first, firstName.c_str());
+        ecs_set_name(world.c_ptr(), second, secondName.c_str());
+        ecs_add_pair(world.c_ptr(), first, EcsChildOf, root);
+        ecs_add_pair(world.c_ptr(), second, EcsChildOf, root);
+        check(firstName != secondName && ecs_is_alive(world.c_ptr(), first) && ecs_is_alive(world.c_ptr(), second),
+            "duplicate display labels need distinct Flecs identifiers");
+        std::vector<HierarchySceneEntity> duplicateLabels{{first, root, HierarchyEntityType::MeshEntity, 1, "Oak"},
+            {second, root, HierarchyEntityType::MeshEntity, 2, "Oak"}};
+        HierarchyViewCache duplicates;
+        duplicates.Rebuild(duplicateLabels, root); duplicates.SetSearch("Oak");
+        check(duplicates.Rows().size() == 2 && duplicates.Find(first)->name == "Oak" && duplicates.Find(second)->name == "Oak",
+            "duplicate labels stay unchanged and independently searchable");
+    }
     HierarchyChangeTracker::Source source{HierarchyEntityType::MeshEntity, 1, "Oak", {}, {}, 0};
     const auto update = [&] { tracker.Begin("Forest", "Forest.scene"); tracker.Observe(source); return tracker.End(); };
     check(update(), "initial scene needs rebuild");
