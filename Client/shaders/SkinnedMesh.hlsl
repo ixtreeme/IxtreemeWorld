@@ -32,6 +32,7 @@ struct SpotLightUbo
     float4 u_shadowParams;
     float4 u_shadowDepthBias;
     float4 u_shadowNormalOffset;
+    float4 u_outlineParams; // xy: clip-space units per pixel, z: outline width in pixels
 };
 
 [[vk::combinedImageSampler]] [[vk::binding(1, 0)]] Texture2D u_diffuse : register(t0);
@@ -66,8 +67,21 @@ struct VSOutput
 VSOutput VSMain(VSInput input)
 {
     VSOutput output;
-    output.position = mul(float4(input.position, 1.0), u_mvp);
-    const float4 worldPos = mul(float4(input.position, 1.0), u_model);
+    const float3 localPosition = input.position;
+    output.position = mul(float4(localPosition, 1.0), u_mvp);
+#if defined(SKINNED_MESH_OUTLINE)
+    // Expand in screen pixels, not mesh units: import scale and camera distance must not
+    // turn the selection border into a thick shell. The homogeneous derivative also
+    // accounts for the normal's depth component under perspective projection.
+    const float4 clipNormal = mul(float4(input.normal, 0.0), u_mvp);
+    const float2 projectedNormal = clipNormal.xy * output.position.w - output.position.xy * clipNormal.w;
+    const float2 pixelNormal = projectedNormal / max(u_outlineParams.xy, float2(0.000001, 0.000001));
+    const float lengthSq = dot(pixelNormal, pixelNormal);
+    if (lengthSq > 0.000001 && output.position.w > 0.000001)
+        output.position.xy += pixelNormal * rsqrt(lengthSq) * u_outlineParams.xy * u_outlineParams.z * output.position.w;
+    // Retain the original depth so the visible character surface occludes the shell.
+#endif
+    const float4 worldPos = mul(float4(localPosition, 1.0), u_model);
     output.normal = normalize(mul(float4(input.normal, 0.0), u_model).xyz);
     output.uv = input.uv;
     output.worldPos = worldPos.xyz;
@@ -101,6 +115,9 @@ float CausticPattern(float2 uv, float time, float mode)
 
 float4 PSMain(VSOutput input) : SV_Target0
 {
+#if defined(SKINNED_MESH_OUTLINE)
+    return float4(1.0, 0.78, 0.18, 1.0);
+#endif
     if (u_lightPadding.x > 0.5 && input.worldPos.y < u_lightPadding.y)
         discard;
 

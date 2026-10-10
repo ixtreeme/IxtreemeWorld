@@ -1,5 +1,6 @@
 #include "asset/ExrImage.h"
 #include "StaticMeshRenderer.h"
+#include "MeshSurfaceQuery.h"
 #include "ViewImpostorRenderer.h"
 
 #include "AssimpImporter.h"
@@ -1586,6 +1587,18 @@ StaticMeshRenderer::LodDiagnostics StaticMeshRenderer::GetLodDiagnostics(std::ui
     }
 
     return diag;
+}
+
+bool StaticMeshRenderer::RaycastSurface(WorldVec3 origin, WorldVec3 direction,
+    const Instance& instance, float& outDistance) const
+{
+    if (!IsLoaded())
+        return false;
+    return meshquery::RaycastSurface({origin, direction}, BuildStaticMeshModelMatrix(instance), m_indices,
+        [&](std::uint32_t index) {
+            const Vertex& vertex = m_vertices[index];
+            return WorldVec3{vertex.position[0], vertex.position[1], vertex.position[2]};
+        }, outDistance);
 }
 
 bool StaticMeshRenderer::CopyPhysicsMesh(
@@ -3927,7 +3940,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
             const float depth = static_cast<float>(instance.position.x) * vp[3] + static_cast<float>(instance.position.y) * vp[7] +
                 static_cast<float>(instance.position.z) * vp[11] + vp[15] - m_modelRadius * scale;
             std::uint8_t level = 0;
-            if (depth > camera.nearPlane)
+            if (depth > camera.nearPlane && !instance.selectedForOutline)
             {
                 const float pixelsPerModelUnit = pixelsAtUnitDepth * scale / depth;
                 while (level < kLodLevels && kLodErrors[level] * pixelsPerModelUnit <= kViewLodMaxErrorPixels)
@@ -4375,43 +4388,43 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
         drawPass(true, MaskStep::Single);
     }
     m_lastMaterialBindings.resize(materialBindingCount);
-    if (m_outlinePipeline)
-    {
-        std::vector<std::uint32_t> outlinedInstances;
-        outlinedInstances.reserve(instances.size());
-        for (std::uint32_t i = 0; i < instances.size(); ++i)
-        {
-            if (instances[i]->selectedForOutline)
-                outlinedInstances.push_back(i);
-        }
-        const std::optional<BindSlot> slot = outlinedInstances.empty() ? std::nullopt : NextBindSlot(frameIndex);
-        if (slot)
-        {
-            if (currentIndexBuffer != boundIndexBuffer.get())
-                cmd.SetIndexBuffer(*boundIndexBuffer, 0, /*thirtyTwoBit=*/true);
-            cmd.SetGraphicsPipeline(*m_outlinePipeline);
-            const MaterialTextureViews materialTextures =
-                ResolveMaterialTextureViews(*m_rhi, *instances.front(), 0);
-            UpdateWorldUniform(*slot, camera, *instances.front(), timeSeconds, 0);
-            UpdateMaterialTextureDescriptors(*slot, materialTextures);
-            cmd.BindGroup(0, *slot->page->group, slot->set);
-
-            for (const InstancedDrawCommand& draw : drawCommands)
-            {
-                for (std::uint32_t instanceIndex : outlinedInstances)
-                {
-                    if (instanceIndex >= draw.instanceCount)
-                        continue;
-                    cmd.DrawIndexed(draw.indexCount,
-                        1,
-                        draw.firstIndex,
-                        0,
-                        draw.firstInstance + instanceIndex);
-                }
-            }
-        }
-    }
     m_lastSubmittedInstances = static_cast<std::uint32_t>(instances.size());
+}
+
+void StaticMeshRenderer::RenderSelectionOutlineInWorld(ixrhi::IXRHICommandList& cmd,
+    const ixrhi::IXRHIFrameInfo& frame, double timeSeconds, const WorldCamera& camera,
+    const Instance& instance, std::uint32_t targetWidth, std::uint32_t targetHeight)
+{
+    if (!m_outlinePipeline || !m_vertexBuffer || !m_indexBuffer || !m_rhi ||
+        !frame.frameActive || !UploadsRecorded() || !targetWidth || !targetHeight || m_draws.empty())
+        return;
+    BeginFrameSlots(frame);
+    const std::uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
+    const std::uint32_t instanceBase = m_worldInstanceCursor;
+    std::vector<InstanceBlock> blocks(m_draws.size());
+    for (std::size_t i = 0; i < m_draws.size(); ++i)
+        FillInstanceBlock(camera.viewProjection, instance, m_draws[i].materialSlot, blocks[i]);
+    if (!AppendInstanceBlocks(frameIndex, blocks))
+        return;
+    cmd.SetViewport(0, 0, static_cast<float>(targetWidth), static_cast<float>(targetHeight));
+    cmd.SetScissor(0, 0, targetWidth, targetHeight);
+    cmd.SetGraphicsPipeline(*m_outlinePipeline);
+    cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+    cmd.SetIndexBuffer(*m_indexBuffer, 0, true);
+    for (std::size_t i = 0; i < m_draws.size(); ++i)
+    {
+        const MeshDraw& draw = m_draws[i];
+        if (!draw.indexCount)
+            continue;
+        const auto slot = NextBindSlot(frameIndex);
+        if (!slot)
+            continue;
+        const auto textures = ResolveMaterialTextureViews(*m_rhi, instance, draw.materialSlot);
+        UpdateWorldUniform(*slot, camera, instance, timeSeconds, draw.materialSlot);
+        UpdateMaterialTextureDescriptors(*slot, textures);
+        cmd.BindGroup(0, *slot->page->group, slot->set);
+        cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, instanceBase + static_cast<std::uint32_t>(i));
+    }
 }
 
 bool StaticMeshRenderer::PrepareInstance(const Instance& instance, PreparedInstance& out) const

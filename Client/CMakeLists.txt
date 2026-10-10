@@ -277,6 +277,8 @@ if(WIN32)
     set(GENERATED_SHADER_DIR "${CLIENT_ROOT}/assets/shaders")
     set(SKINNED_MESH_VS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_vs.spv")
     set(SKINNED_MESH_PS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_ps.spv")
+    set(SKINNED_MESH_OUTLINE_VS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_outline_vs.spv")
+    set(SKINNED_MESH_OUTLINE_PS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_outline_ps.spv")
     set(SKINNED_MESH_CS_SPV "${GENERATED_SHADER_DIR}/skinned_mesh_cs.spv")
     set(STATIC_MESH_VS_SPV "${GENERATED_SHADER_DIR}/static_mesh_vs.spv")
     set(STATIC_MESH_PS_SPV "${GENERATED_SHADER_DIR}/static_mesh_ps.spv")
@@ -617,11 +619,29 @@ if(WIN32)
             DEPENDS "${CLIENT_ROOT}/shaders/ViewImpostor.hlsl"
             VERBATIM)
     endforeach()
+    foreach(stage IN ITEMS VS PS)
+        if(stage STREQUAL "VS")
+            set(outline_profile vs_6_0)
+            set(outline_entry VSMain)
+        else()
+            set(outline_profile ps_6_0)
+            set(outline_entry PSMain)
+        endif()
+        add_custom_command(
+            OUTPUT "${SKINNED_MESH_OUTLINE_${stage}_SPV}"
+            COMMAND "${DXC_EXECUTABLE}" -spirv -T ${outline_profile} -E ${outline_entry} -D SKINNED_MESH_OUTLINE=1
+                -Fo "${SKINNED_MESH_OUTLINE_${stage}_SPV}" "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl"
+            DEPENDS "${CLIENT_ROOT}/shaders/SkinnedMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+            VERBATIM
+        )
+    endforeach()
     add_custom_target(IXEngineShaders DEPENDS
         "${VIEW_IMPOSTOR_VS_SPV}"
         "${VIEW_IMPOSTOR_PS_SPV}"
         "${SKINNED_MESH_VS_SPV}"
         "${SKINNED_MESH_PS_SPV}"
+        "${SKINNED_MESH_OUTLINE_VS_SPV}"
+        "${SKINNED_MESH_OUTLINE_PS_SPV}"
         "${SKINNED_MESH_CS_SPV}"
         "${STATIC_MESH_VS_SPV}"
         "${STATIC_MESH_PS_SPV}"

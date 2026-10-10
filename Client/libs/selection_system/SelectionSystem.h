@@ -57,7 +57,7 @@ WorldVec3 SelectionScreenRayDirection(const WorldCamera& camera,
                                       int mouseX,
                                       int mouseY);
 
-template <typename ResolveRuntimePath, typename GetStaticRenderer>
+template <typename ResolveRuntimePath, typename GetStaticRenderer, typename PickSkinnedSurface>
 std::optional<std::uint32_t> PickMeshEntity(const std::vector<MeshSceneEntity>& meshes,
                                             const WorldCamera& camera,
                                             std::uint32_t width,
@@ -65,26 +65,20 @@ std::optional<std::uint32_t> PickMeshEntity(const std::vector<MeshSceneEntity>& 
                                             int mouseX,
                                             int mouseY,
                                             ResolveRuntimePath&& resolveRuntimePath,
-                                            GetStaticRenderer&& getStaticRenderer)
+                                            GetStaticRenderer&& getStaticRenderer,
+                                            PickSkinnedSurface&& pickSkinnedSurface)
 {
     const WorldVec3 rayDir = SelectionScreenRayDirection(camera, width, height, mouseX, mouseY);
     std::optional<std::uint32_t> bestId;
     float bestT = std::numeric_limits<float>::max();
     for (const MeshSceneEntity& mesh : meshes)
     {
-        if (mesh.editorHidden)
+        if (mesh.editorHidden || !mesh.effectiveEnabled)
             continue;
         if (mesh.skinned)
         {
-            const WorldVec3 position{mesh.position[0], mesh.position[1], mesh.position[2]};
-            const WorldVec3 toMesh = position - camera.eye;
-            const float t = ixtreeme::math::Dot(toMesh, rayDir);
-            if (t <= 0.0f || t >= bestT)
-                continue;
-            const WorldVec3 closest = camera.eye + rayDir * t;
-            const WorldVec3 delta = position - closest;
-            const float pickRadius = std::max({1.25f, mesh.scale[0], mesh.scale[1], mesh.scale[2]});
-            if (ixtreeme::math::Dot(delta, delta) <= pickRadius * pickRadius)
+            float t = 0.0f;
+            if (pickSkinnedSurface(mesh, camera.eye, rayDir, t) && t >= 0.0f && t < bestT)
             {
                 bestT = t;
                 bestId = mesh.id;
@@ -96,6 +90,15 @@ std::optional<std::uint32_t> PickMeshEntity(const std::vector<MeshSceneEntity>& 
             continue;
         float t = 0.0f;
         if (!RayIntersectsAabb(camera.eye, rayDir, StaticMeshWorldAabb(mesh, *renderer), t))
+            continue;
+        StaticMeshRenderer::Instance instance;
+        instance.position = {mesh.position[0], mesh.position[1], mesh.position[2]};
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            instance.rotation[axis] = mesh.rotation[axis];
+            instance.scale[axis] = mesh.scale[axis];
+        }
+        if (!renderer->RaycastSurface(camera.eye, rayDir, instance, t))
             continue;
         if (t >= 0.0f && t < bestT)
         {

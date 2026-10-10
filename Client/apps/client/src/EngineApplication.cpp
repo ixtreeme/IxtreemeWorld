@@ -1571,7 +1571,7 @@ void AppendColliderLines(
 }
 
 std::vector<SelectionOutlineRenderer::Line> BuildPhysicsColliderLines(
-    const SelectedEditorObject& selected,
+    const SelectedEditorObject&,
     const std::vector<MeshSceneEntity>& meshes,
     bool showAllColliders)
 {
@@ -1581,13 +1581,6 @@ std::vector<SelectionOutlineRenderer::Line> BuildPhysicsColliderLines(
     {
         for (const MeshSceneEntity& mesh : meshes)
             AppendColliderLines(lines, mesh, ColliderDebugColor(mesh));
-    }
-    else if (selected.type == SelectedEditorObjectType::MeshEntity)
-    {
-        auto it = std::find_if(meshes.begin(), meshes.end(),
-            [&](const MeshSceneEntity& mesh) { return mesh.id == selected.id; });
-        if (it != meshes.end())
-            AppendColliderLines(lines, *it, {0.95f, 0.82f, 0.18f, 0.95f});
     }
     return lines;
 }
@@ -2825,7 +2818,10 @@ int RunGame(NativeWindow& window,
         float yaw = 0.0f;
         std::array<float, 4> tint{1.0f, 1.0f, 1.0f, 1.0f};
         std::array<float, 3> scale{1.0f, 1.0f, 1.0f};  // the entity Transform scale
+        std::uint32_t entityId = 0;
     };
+    std::vector<SkinnedDrawRecord> lastSceneSkinnedDraws;
+    std::uint32_t lastSceneSkinFrameIndex = 0;
 
     // Rigged models load the way static ones do (see requestStaticMeshRenderer): request starts the
     // load and gives the renderer once it is finished, get waits for it.
@@ -5084,6 +5080,9 @@ int RunGame(NativeWindow& window,
                              &removeStaticMeshSpatialEntity,
                              &resolveMeshRuntimePath,
                              &getStaticMeshRenderer,
+                             &getSkinnedMeshRenderer,
+                             &lastSceneSkinnedDraws,
+                             &lastSceneSkinFrameIndex,
 #endif
                              &renderSize](const InputEvent& event)
     {
@@ -5687,7 +5686,15 @@ int RunGame(NativeWindow& window,
                                 viewportEvent.x,
                                 viewportEvent.y,
                                 resolveMeshRuntimePath,
-                                getStaticMeshRenderer))
+                                getStaticMeshRenderer,
+                                [&](const MeshSceneEntity& mesh, WorldVec3 origin, WorldVec3 direction, float& distance) {
+                                    const auto record = std::find_if(lastSceneSkinnedDraws.begin(), lastSceneSkinnedDraws.end(),
+                                        [&](const SkinnedDrawRecord& draw) { return draw.entityId == mesh.id; });
+                                    SkinnedMeshRenderer* renderer = getSkinnedMeshRenderer(resolveMeshRuntimePath(mesh));
+                                    return record != lastSceneSkinnedDraws.end() && renderer && record->renderer == renderer &&
+                                        renderer->RaycastSurface(origin, direction, lastSceneSkinFrameIndex, record->slot,
+                                            record->position, record->yaw, record->scale, distance);
+                                }))
                         {
                             selectedEditorObject = {SelectedEditorObjectType::MeshEntity, *meshId};
                             editorObjectDragActive = false;
@@ -7462,7 +7469,7 @@ int RunGame(NativeWindow& window,
                         debugDisableAssetLibraryDiscovery ? "disabled" : "enabled",
                         debugDisableAssetWatcherPoll ? "disabled" : "enabled",
                         debugDisableHierarchyIteration ? "disabled" : "enabled",
-                        debugShowPhysicsColliders ? "shown" : "selected-only",
+                        debugShowPhysicsColliders ? "shown" : "hidden",
                         debugShowPhysicsContacts ? "shown" : "hidden",
                         debugShowPhysicsBodyCenters ? "shown" : "hidden");
                 }
@@ -12384,9 +12391,6 @@ int RunGame(NativeWindow& window,
                         SkinnedMeshRenderer::MotionState editorMeshMotion = SkinnedMeshRenderer::MotionState::Idle;
                         if (auto csIt = editorCharacterStates.find(skinnedEntity.id); csIt != editorCharacterStates.end())
                             editorMeshMotion = ToSkinnedMeshMotion(csIt->second.moveState);
-                        const bool skinnedSelected =
-                            selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
-                            selectedEditorObject.id == skinnedEntity.id;
                         const WorldVec3 skinnedPosition{skinnedEntity.position[0],
                             skinnedEntity.position[1] + skinnedRenderer->GroundOffsetY() * skinnedEntity.scale[1],
                             skinnedEntity.position[2]};
@@ -12514,9 +12518,7 @@ int RunGame(NativeWindow& window,
                         {
                             work.slots[work.slotCount++] = sceneSlot;
                             sceneEditorSkinnedDraws.push_back(SkinnedDrawRecord{skinnedRenderer, sceneSlot, skinnedPosition, skinnedYaw,
-                                skinnedSelected ? std::array<float, 4>{1.25f, 1.15f, 0.65f, 1.0f}
-                                                : std::array<float, 4>{1.0f, 1.0f, 1.0f, 1.0f},
-                                skinnedScale});
+                                {1.0f, 1.0f, 1.0f, 1.0f}, skinnedScale, skinnedEntity.id});
                         }
                         else
                         {
@@ -12686,6 +12688,7 @@ int RunGame(NativeWindow& window,
                 }
             };
             std::vector<TransparentDraw> sceneTransparentDraws;
+            std::deque<StaticMeshRenderer::Instance> sceneSelectedMeshInstances;
             std::vector<TransparentDraw> gameTransparentDraws;
             // Particle emitters join the same sorted queue as the blend meshes: the water pass splits
             // them under/above the surface and they blend back-to-front with the transparent meshes.
@@ -13397,6 +13400,8 @@ int RunGame(NativeWindow& window,
                     // pre-pass (before this render pass began); here we only issue their Scene-view
                     // draws from the recorded (renderer, slot). Per-model cache + per-renderer slots
                     // mean multiple DIFFERENT characters draw at once.
+                    lastSceneSkinnedDraws = sceneEditorSkinnedDraws;
+                    lastSceneSkinFrameIndex = frameInfo.frameIndex;
                     for (const SkinnedDrawRecord& rec : sceneEditorSkinnedDraws)
                     {
                         if (!rec.renderer)
@@ -13411,7 +13416,9 @@ int RunGame(NativeWindow& window,
                             rec.tint,
                             renderSize.width,
                             renderSize.height,
-                            rec.scale);
+                            rec.scale,
+                            selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
+                                selectedEditorObject.id == rec.entityId);
                         ++frameStaticMeshDrawCalls;
                     }
                     auto logLodDisposition = [&](const StaticMeshLodBatch::LodDispositionRecord& record) {
@@ -13635,8 +13642,16 @@ int RunGame(NativeWindow& window,
                             }
                             if (litStaticRenderers.insert(renderer).second)
                                 renderer->SetLightingState(frameLighting);
-                            // The record's instance (untinted, not outlined): drawn from where it is kept.
-                            const StaticMeshRenderer::Instance& instance = meshRecord->instance;
+                            // Selection belongs to Scene View only; preserve the shared Game/shadow record.
+                            const bool selected = selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
+                                selectedEditorObject.id == mesh.id;
+                            if (selected)
+                            {
+                                sceneSelectedMeshInstances.push_back(meshRecord->instance);
+                                sceneSelectedMeshInstances.back().selectedForOutline = true;
+                            }
+                            const StaticMeshRenderer::Instance& instance = selected
+                                ? sceneSelectedMeshInstances.back() : meshRecord->instance;
                             if (renderer->HasTransparentDraws(instance))
                                 addTransparentDraw(sceneTransparentDraws, renderer, instance, worldBounds, camera);
                             LodConfig effectiveLodConfig{};
@@ -13644,7 +13659,7 @@ int RunGame(NativeWindow& window,
                             std::uint32_t lodLevel = 0;
                             bool lodDispositionActive = false;
                             StaticMeshLodBatch::LodDispositionRecord lodDispositionRecord{};
-                            if (mesh.lod.enabled)
+                            if (mesh.lod.enabled && !selected)
                             {
                                 ++frameLodActiveInstances;
                                 const std::optional<LodConfig> assetDefault = findModelLodDefault(mesh.meshAssetId);
@@ -13935,6 +13950,25 @@ int RunGame(NativeWindow& window,
                 drawTransparents(sceneTransparentDraws, /*underWater=*/true, camera, renderSize.width, renderSize.height);
                 if (useOffscreenScene && !sceneSnapshotPass)
                     drawTransparents(sceneTransparentDraws, /*underWater=*/false, camera, renderSize.width, renderSize.height);
+                // Draw silhouettes after the sky/terrain, which would otherwise overwrite their
+                // edge pixels (the outline deliberately does not write into the scene depth buffer).
+                for (const StaticMeshRenderer::Instance& instance : sceneSelectedMeshInstances)
+                {
+                    const auto mesh = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
+                        [&](const MeshSceneEntity& entity) { return entity.id == instance.entityId; });
+                    if (mesh != editorMeshEntities.end())
+                        if (auto* renderer = getStaticMeshRenderer(resolveMeshRuntimePath(*mesh)))
+                            renderer->RenderSelectionOutlineInWorld(*frameInfo.commandList, frameInfo, seconds,
+                                camera, instance, renderSize.width, renderSize.height);
+                }
+                for (const SkinnedDrawRecord& rec : sceneEditorSkinnedDraws)
+                {
+                    if (rec.renderer && selectedEditorObject.type == SelectedEditorObjectType::MeshEntity &&
+                        selectedEditorObject.id == rec.entityId)
+                        rec.renderer->RenderInWorld(*frameInfo.commandList, frameInfo, seconds, camera,
+                            rec.position, rec.yaw, rec.slot, rec.tint, renderSize.width, renderSize.height,
+                            rec.scale, true, true);
+                }
                 if (selectionOutlinesOk)
                 {
                     std::vector<SelectionOutlineRenderer::Line> selectionLines =

@@ -165,6 +165,7 @@ float3 ApplyNormalMap(float3 vertexNormal, float3 worldPos, float2 uv, float str
 float4 PSMain(VSOutput input) : SV_Target0
 {
 #if defined(STATIC_MESH_OUTLINE)
+    ShadowMaskPS(input);
     return float4(1.0, 0.78, 0.18, 1.0);
 #else
     // The opaque draws' variant (STATIC_MESH_OPAQUE) has no discard at all: a shader that can discard

@@ -159,7 +159,9 @@ public:
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f},
         std::uint32_t targetWidth = 0,
         std::uint32_t targetHeight = 0,
-        std::array<float, 3> scale = {1.0f, 1.0f, 1.0f});
+        std::array<float, 3> scale = {1.0f, 1.0f, 1.0f},
+        bool selectedForOutline = false,
+        bool outlineOnly = false);
     void RenderInWorldReflection(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         const WorldCamera& camera,
@@ -188,6 +190,9 @@ public:
         std::array<float, 3> scale);
     void SetMotionState(MotionState state);
     float GroundOffsetY() const;
+    // Query the last Scene View pose on click, without GPU readback or CPU skinning every frame.
+    bool RaycastSurface(WorldVec3 origin, WorldVec3 direction, uint32_t frameIndex, uint32_t skinSlot,
+        WorldVec3 position, float yawRadians, std::array<float, 3> scale, float& outDistance) const;
     std::uint32_t MaterialSlotCount() const { return std::max<std::uint32_t>(1u, static_cast<std::uint32_t>(m_draws.size())); }
     // How many instances of this model a frame can skin (slots past the first page are made on use).
     static constexpr uint32_t MaxSkinSlots() { return kSkinSlots * kMaxSkinPages; }
@@ -373,7 +378,8 @@ private:
         std::array<float, 4> tint,
         std::array<float, 3> scale,
         bool reflectionPass = false,
-        float waterLevelY = 0.0f);
+        float waterLevelY = 0.0f,
+        std::array<float, 4> outlineParams = {});
 
     ixrhi::IXRHIDevice* m_rhi = nullptr;
     const ixrhi::IXRHIRenderPass* m_targetPass = nullptr; // borrowed (frame owner)
@@ -388,6 +394,7 @@ private:
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_reflectionPipeline;
     const ixrhi::IXRHIRenderPass* m_reflectionPass = nullptr; // borrowed (terrain owns)
+    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_outlinePipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;  // sun shadow cascades, depth only
     const ixrhi::IXRHIRenderPass* m_shadowPass = nullptr;             // borrowed (terrain owns)
     bool m_shadowPipelineFailed = false;

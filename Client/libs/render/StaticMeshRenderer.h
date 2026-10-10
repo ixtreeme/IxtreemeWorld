@@ -203,6 +203,10 @@ public:
         const InstanceList& instances,
         std::uint32_t targetWidth = 0,
         std::uint32_t targetHeight = 0);
+    // Call after the opaque geometry and sky, while the Scene View depth buffer is still bound.
+    void RenderSelectionOutlineInWorld(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
+        double timeSeconds, const WorldCamera& camera, const Instance& instance,
+        std::uint32_t targetWidth, std::uint32_t targetHeight);
     void RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds,
@@ -262,6 +266,7 @@ public:
     const std::array<float, 3>& BoundsMax() const { return m_boundsMax; }
     const std::string& TextureName() const { return m_texture.name; }
     bool CopyPhysicsMesh(std::vector<std::array<float, 3>>& outVertices, std::vector<std::uint32_t>& outIndices) const;
+    bool RaycastSurface(WorldVec3 origin, WorldVec3 direction, const Instance& instance, float& outDistance) const;
     // Bake a static model with any number of native default materials, preserving mesh bytes/GUID.
     static bool BakeMeshImpostorAsset(client::asset::IAssetReader& assets, const std::filesystem::path& modelPath,
         const tree_tool::TreeImpostorSettings& settings, std::string& error);

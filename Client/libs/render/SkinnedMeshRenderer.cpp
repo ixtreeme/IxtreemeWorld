@@ -1,5 +1,6 @@
 #include "asset/ExrImage.h"
 #include "SkinnedMeshRenderer.h"
+#include "MeshSurfaceQuery.h"
 #include "ViewImpostorRenderer.h"
 
 #include "JobSystem.h"
@@ -134,6 +135,7 @@ struct UniformBlock
     float shadowParams[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float shadowDepthBias[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float shadowNormalOffset[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float outlineParams[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 };
 
 // Uniform slots' UniformBlocks share a page's buffer this far apart: a multiple of 256 bytes, the
@@ -1071,7 +1073,9 @@ void SkinnedMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     std::array<float, 4> tint,
     std::uint32_t targetWidth,
     std::uint32_t targetHeight,
-    std::array<float, 3> scale)
+    std::array<float, 3> scale,
+    bool selectedForOutline,
+    bool outlineOnly)
 {
     static bool loggedDraw = false;
     static bool loggedNoPipeline = false;
@@ -1100,7 +1104,7 @@ void SkinnedMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     ixrhi::IXRHIBuffer* skinned = SkinnedOutput(frameIndex, skinSlot);
     if (!skinned)
         return;
-    if (auto* cache = ViewImpostorRenderer::Active(); cache && !cache->IsCapturing())
+    if (auto* cache = ViewImpostorRenderer::Active(); cache && !cache->IsCapturing() && !selectedForOutline)
     {
         // A stable padded box avoids making a new crop for each tiny animation movement. Expand it
         // using the actual pose's bone influence boxes, including externally injected/blended poses.
@@ -1164,14 +1168,18 @@ void SkinnedMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     const std::optional<UniformSlot> uniformSlot = NextUniformSlot(frameIndex);
     if (!uniformSlot)
         return;
-    UpdateWorldUniform(*uniformSlot, camera, position, yawRadians, timeSeconds, tint, scale);
+    // The outline has a fixed screen width regardless of the model's authored units.
+    UpdateWorldUniform(*uniformSlot, camera, position, yawRadians, timeSeconds, tint, scale,
+        false, 0.0f, {2.0f / extentWidth, 2.0f / extentHeight, 1.5f, 0.0f});
 
     if (!ViewImpostorRenderer::ApplyCaptureViewport(cmd))
     {
         cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
         cmd.SetScissor(0, 0, extentWidth, extentHeight);
     }
-    cmd.SetGraphicsPipeline(*m_pipeline);
+    if (outlineOnly && !m_outlinePipeline)
+        return;
+    cmd.SetGraphicsPipeline(outlineOnly ? *m_outlinePipeline : *m_pipeline);
 
     cmd.SetVertexBuffer(0, *skinned, 0);
     cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
@@ -1862,6 +1870,33 @@ void SkinnedMeshRenderer::SetMotionState(MotionState state)
 float SkinnedMeshRenderer::GroundOffsetY() const
 {
     return -m_bounds.min[1];
+}
+
+bool SkinnedMeshRenderer::RaycastSurface(WorldVec3 origin, WorldVec3 direction,
+    uint32_t frameIndex, uint32_t skinSlot, WorldVec3 position, float yawRadians,
+    std::array<float, 3> scale, float& outDistance) const
+{
+    auto* buffer = BonePalette(frameIndex % kFramesInFlight, skinSlot);
+    const auto* bones = buffer ? static_cast<const Mat4*>(buffer->HostAddress()) : nullptr;
+    if (!bones || m_indices.empty())
+        return false;
+    const Mat4 model = Multiply(Multiply(xm::Scale({scale[0], scale[1], scale[2]}), RotationY(-yawRadians)),
+        Translation(position.x, position.y, position.z));
+    std::vector<WorldVec3> vertices;
+    vertices.reserve(m_restVerticesGpu.size());
+    xm::Aabb bounds = xm::EmptyAabb();
+    for (const RestVertexGpu& vertex : m_restVerticesGpu)
+    {
+        const WorldVec3 skinned = meshquery::SkinPosition({vertex.position[0], vertex.position[1], vertex.position[2]},
+            vertex.packedWeights, vertex.packedBones, {bones, m_boneCount});
+        vertices.push_back(skinned);
+        bounds = xm::Expand(bounds, skinned);
+    }
+    float broadDistance = 0.0f;
+    if (!xm::IntersectRayAabb({origin, direction}, xm::TransformAabb(bounds, model), broadDistance))
+        return false;
+    return meshquery::RaycastSurface({origin, direction}, model, m_indices,
+        [&](std::uint32_t index) { return vertices[index]; }, outDistance);
 }
 
 bool SkinnedMeshRenderer::SamplePoseFromState(float animTimeSeconds, MotionState state,
@@ -2945,6 +2980,20 @@ bool SkinnedMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
     if (!m_pipeline)
         return false;
 
+    desc.vertexShader = LoadShader(rhi, *m_assets, "assets/shaders/skinned_mesh_outline_vs.spv",
+        ixrhi::IXRHIShaderStage::Vertex, "VSMain");
+    desc.fragmentShader = LoadShader(rhi, *m_assets, "assets/shaders/skinned_mesh_outline_ps.spv",
+        ixrhi::IXRHIShaderStage::Fragment, "PSMain");
+    if (!desc.vertexShader || !desc.fragmentShader)
+        return false;
+    desc.cullMode = ixrhi::IXRHICullMode::Front;
+    desc.depthWriteEnable = false;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.debugName = "SkinnedMesh:Outline";
+    m_outlinePipeline = rhi.CreateGraphicsPipeline(desc);
+    if (!m_outlinePipeline)
+        return false;
+
     LogFormat("[MESH] skinned graphics pipeline OK, pipeline=%s", m_pipeline->DebugName().c_str());
     return true;
 }
@@ -3013,6 +3062,7 @@ void SkinnedMeshRenderer::DestroyPipeline()
 {
     DestroyReflectionPipeline();
     m_pipeline.reset();
+    m_outlinePipeline.reset();
     m_shadowPipeline.reset();
     m_shadowPass = nullptr;
     m_shadowPipelineFailed = false;
@@ -3088,7 +3138,8 @@ void SkinnedMeshRenderer::UpdateWorldUniform(const UniformSlot& slot,
     std::array<float, 4> tint,
     std::array<float, 3> scale,
     bool reflectionPass,
-    float waterLevelY)
+    float waterLevelY,
+    std::array<float, 4> outlineParams)
 {
     static bool loggedMvp = false;
 
@@ -3106,6 +3157,7 @@ void SkinnedMeshRenderer::UpdateWorldUniform(const UniformSlot& slot,
     }
 
     UniformBlock uniform{mvp, model, {tint[0], tint[1], tint[2], tint[3]}};
+    std::copy(outlineParams.begin(), outlineParams.end(), uniform.outlineParams);
     if (reflectionPass)
     {
         LightingState reflectionLighting = m_lightingState;

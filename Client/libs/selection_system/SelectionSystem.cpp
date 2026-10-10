@@ -160,12 +160,12 @@ std::optional<std::uint32_t> PickWaterBody(const std::vector<WaterBody>& bodies,
 
 std::vector<SelectionOutlineRenderer::Line> BuildSelectionOutlineLines(
     const SelectedEditorObject& selected,
-    const std::vector<MeshSceneEntity>& meshes,
+    const std::vector<MeshSceneEntity>&,
     const std::vector<PointLight>& pointLights,
     const std::vector<SpotLight>& spotLights,
     const std::vector<WaterBody>& waterBodies,
     const WorldCamera& camera,
-    const StaticMeshResolver& resolveStaticMesh)
+    const StaticMeshResolver&)
 {
     std::vector<SelectionOutlineRenderer::Line> lines;
     constexpr std::array<float, 4> kOutlineColor{1.0f, 0.61f, 0.07f, 1.0f};
@@ -193,35 +193,7 @@ std::vector<SelectionOutlineRenderer::Line> BuildSelectionOutlineLines(
             addLine(previous, first);
     };
 
-    if (selected.type == SelectedEditorObjectType::MeshEntity)
-    {
-        auto it = std::find_if(meshes.begin(), meshes.end(),
-            [&](const MeshSceneEntity& mesh) { return mesh.id == selected.id; });
-        if (it != meshes.end())
-        {
-            if (it->skinned)
-            {
-                const float radius = std::max({1.25f, it->scale[0], it->scale[1], it->scale[2]});
-                addCircle({it->position[0], it->position[1] + radius, it->position[2]}, radius);
-            }
-            else if (StaticMeshRenderer* renderer = resolveStaticMesh(*it))
-            {
-                if (renderer->IsLoaded())
-                {
-                    const auto corners = BuildStaticMeshWorldAabbCorners(*it, *renderer);
-                    constexpr std::array<std::array<int, 2>, 12> kBoxEdges{{
-                        {{0, 1}}, {{0, 2}}, {{1, 3}}, {{2, 3}},
-                        {{4, 5}}, {{4, 6}}, {{5, 7}}, {{6, 7}},
-                        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
-                    }};
-                    lines.reserve(kBoxEdges.size());
-                    for (const auto& edge : kBoxEdges)
-                        addLine(corners[edge[0]], corners[edge[1]]);
-                }
-            }
-        }
-    }
-    else if (selected.type == SelectedEditorObjectType::PointLight)
+    if (selected.type == SelectedEditorObjectType::PointLight)
     {
         auto it = std::find_if(pointLights.begin(), pointLights.end(),
             [&](const PointLight& light) { return light.id == selected.id; });

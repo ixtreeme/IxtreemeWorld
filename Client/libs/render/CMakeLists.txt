@@ -47,6 +47,7 @@ add_library(IXEngineRender STATIC
     WaterBodyIO.h
     StaticMeshRenderer.cpp
     StaticMeshRenderer.h
+    MeshSurfaceQuery.h
     SkinnedMeshRenderer.cpp
     SkinnedMeshRenderer.h
     SkyRenderer.cpp
