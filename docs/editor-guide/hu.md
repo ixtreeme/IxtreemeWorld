@@ -173,6 +173,8 @@ A közös Material Editor Material és Water fület tartalmaz. A PBR material k�
 #### Eredmény és gyakori hiba
 A közös material szerkesztése minden használóján változtat; az override csak a példányon. Az Inspector slotjára dupla kattintás közvetlenül megnyitja a materialt.
 
+A Material Slots kisebb kártyákat mutat az Inspector szélességéhez igazodó rácsban, a material nevével és albedo-előnézetével; albedotextúra nélkül az alapszín látszik. Az egérrel rámutatva a teljes nevet és a submesh sorszámát is láthatod. GUID-sor nincs itt. Materialt az előnézetre vagy névre húzva rendelhetsz hozzá; az X kiüríti a slotot.
+
 <!-- topic: prefabs -->
 ### Prefab készítése és frissítése
 

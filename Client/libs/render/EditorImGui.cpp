@@ -1459,6 +1459,7 @@ void EditorImGui::ValidateAssetBrowserCache() const
         if (cache.materialRevision != materialRevision)
         {
             cache.modelContents.clear();
+            cache.materialSlots.clear();
             cache.materialRevision = materialRevision;
         }
         cache.validatedFrame = frame;
@@ -2497,11 +2498,14 @@ bool EditorImGui::OpenWaterMaterialEditor(const std::string& materialId)
     return true;
 }
 
-bool EditorImGui::OpenPbrMaterialEditor(const std::string& materialId)
+const EditorImGui::MaterialSlotPresentation& EditorImGui::QueryMaterialSlot(const std::string& materialId) const
 {
-    if (!m_assetLibrary)
-        return false;
-
+    ValidateAssetBrowserCache();
+    auto [cached, inserted] = m_assetBrowserCache.materialSlots.try_emplace(materialId);
+    if (!inserted) return cached->second;
+    auto& result = cached->second;
+    result.name = materialId.empty() ? "(Drop Material here)" : "Missing Material";
+    if (!m_assetLibrary || materialId.empty()) return result;
     auto entry = m_assetLibrary->FindById(materialId);
     // Mesh material slots store AssetDatabase GUIDs, whereas the browser/editor uses library IDs.
     // Resolve the actual asset identity, never its display name (names may repeat across folders).
@@ -2529,6 +2533,35 @@ bool EditorImGui::OpenPbrMaterialEditor(const std::string& materialId)
             }
         }
     }
+    if (entry && entry->category == AssetLibrary::Category::Material)
+    {
+        result.material = entry;
+        result.name = entry->displayName.empty() ? std::filesystem::path(entry->filename).stem().string() : entry->displayName;
+        // Native .material entries can contain only discovery metadata. Read their cached PBR
+        // asset for the actual albedo and tint, including edits made since the last library refresh.
+        if (ToLowerAscii(m_assetLibrary->AbsolutePath(*entry).extension().string()) == ".material")
+        {
+            const Guid guid = AssetDatabase::Instance().getOrCreateGuid(m_assetLibrary->AbsolutePath(*entry));
+            if (const auto* material = MaterialAssetManager::Instance().getOrLoad(guid))
+            {
+                if (!material->name.empty()) result.name = material->name;
+                for (std::size_t c = 0; c < 4; ++c)
+                    result.material->material.colorTint[c] = material->baseColor[c];
+                result.material->material.diffuseTextureId = TextureEntryIdForGuid(material->baseColorTexture);
+            }
+        }
+        // Only albedo represents appearance; a normal or roughness map is not a material preview.
+        const auto diffuse = m_assetLibrary->FindById(result.material->material.diffuseTextureId);
+        if (diffuse && diffuse->category == AssetLibrary::Category::Texture) result.diffuse = diffuse;
+    }
+    return result;
+}
+
+bool EditorImGui::OpenPbrMaterialEditor(const std::string& materialId)
+{
+    if (!m_assetLibrary)
+        return false;
+    const auto entry = QueryMaterialSlot(materialId).material;
     if (!entry || entry->category != AssetLibrary::Category::Material)
     {
         m_assetStatus = "PBR material not found: " + materialId;

@@ -460,6 +460,12 @@ private:
     std::optional<std::filesystem::path> AssetPreviewPathFor(const AssetLibrary::Entry& entry) const;
     std::optional<std::filesystem::path> ResolveAssetPreviewPath(const AssetLibrary::Entry& entry) const;
     AssetPreviewTexture* GetAssetPreviewTexture(const AssetLibrary::Entry& entry);
+    struct MaterialSlotPresentation
+    {
+        std::optional<AssetLibrary::Entry> material, diffuse;
+        std::string name;
+    };
+    const MaterialSlotPresentation& QueryMaterialSlot(const std::string& materialId) const;
     void RenderMaterialTexturePreview(const AssetLibrary::Entry* entry);
     bool LoadAssetPreviewTexture(const std::filesystem::path& path, AssetPreviewTexture& outTexture);
     void OpenImportAssetDialog(const std::string& targetSubpath);
@@ -818,6 +824,7 @@ private:
         std::unordered_map<std::string, AssetLibrary::ModelContents> modelContents;
         std::optional<std::vector<AssetLibrary::Entry>> sceneAssets;
         std::unordered_map<std::string, std::optional<std::filesystem::path>> previewPaths;
+        std::unordered_map<std::string, MaterialSlotPresentation> materialSlots;
         // Scripts panel: native C++ sources (absolute path, path shown relative to the scripts dir).
         std::optional<std::vector<std::pair<std::filesystem::path, std::string>>> nativeScriptSources;
         // ComparablePath (absolute + weakly_canonical: filesystem calls) of the Hierarchy's scene paths.

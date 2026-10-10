@@ -173,6 +173,8 @@ The shared Material Editor has Material and Water tabs. A PBR material is a shar
 #### Result and common mistake
 Editing a shared material changes all its users; an override changes only its instance. Double-clicking an Inspector material slot opens the material directly.
 
+Material Slots shows compact cards in a grid that adapts to the Inspector width, with the material name and its albedo preview (or base-colour swatch if it has no albedo texture). Hover to see the full name and submesh index. GUIDs are omitted here. Drop onto the preview or name to assign a material; the X clears that slot.
+
 <!-- topic: prefabs -->
 ### Creating and updating prefabs
 

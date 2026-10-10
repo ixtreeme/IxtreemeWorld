@@ -1901,74 +1901,121 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         if (m_meshRendererState.materialSlots.size() < m_meshRendererState.materialSlotCount)
             m_meshRendererState.materialSlots.resize(m_meshRendererState.materialSlotCount);
 
-        auto materialLabelForGuid = [](const std::string& guidText) {
-            if (guidText.empty())
-                return std::string("(Drop Material here)");
-            const std::optional<Guid> guid = Guid::fromString(guidText);
-            if (!guid)
-                return std::string("Invalid material GUID");
-            const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*guid);
-            if (!path)
-                return std::string("Missing Material");
-            return path->filename().generic_string();
-        };
-
-        for (std::uint32_t slot = 0; slot < m_meshRendererState.materialSlotCount; ++slot)
+        const float gridWidth = ImGui::GetContentRegionAvail().x;
+        const int columns = std::max(1, static_cast<int>(gridWidth / 120.0f));
+        if (ImGui::BeginTable("##material_slots_grid", columns,
+            ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings))
         {
-            ImGui::PushID(static_cast<int>(slot));
-            ImGui::Text("[%u] Submesh %u", slot, slot);
-            ImGui::SameLine();
-            if (UI::IconButton(ICON_FA_XMARK, "Clear Material Slot", ImVec2(28.0f, 0.0f)))
+            for (std::uint32_t slot = 0; slot < m_meshRendererState.materialSlotCount; ++slot)
             {
-                m_meshRendererState.materialSlots[slot].clear();
-                MarkSelectedMeshRendererChanged();
-                Tracenf("[MATERIAL-SLOTS] clear entity=%u slot=%u",
-                    m_meshRendererState.id,
-                    slot);
-            }
-            const std::string label = materialLabelForGuid(m_meshRendererState.materialSlots[slot]);
-            const bool emptySlot = m_meshRendererState.materialSlots[slot].empty();
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                emptySlot ? ImVec4(0.22f, 0.22f, 0.25f, 1.0f) : ImVec4(0.34f, 0.42f, 0.34f, 1.0f));
-            ImGui::Button(label.c_str(), ImVec2(-1.0f, 42.0f));
-            ImGui::PopStyleColor();
-            if (!emptySlot && ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
-                OpenPbrMaterialEditor(m_meshRendererState.materialSlots[slot]);
-            if (!emptySlot)
-                UI::ItemTooltip("Double-click to edit this material. Drop a material here to replace it.");
-            if (ImGui::BeginDragDropTarget())
-            {
-                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+                ImGui::TableNextColumn();
+                ImGui::PushID(static_cast<int>(slot));
+                const float headerX = ImGui::GetCursorPosX();
+                const float headerWidth = ImGui::GetContentRegionAvail().x;
+                ImGui::TextDisabled("Slot %u", slot);
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(headerX + std::max(0.0f, headerWidth - 22.0f));
+                if (UI::IconButton(ICON_FA_XMARK, "Clear Material Slot", ImVec2(22.0f, 0.0f)))
                 {
-                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-                    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
-                    if (entry && entry->category == AssetLibrary::Category::Material)
-                    {
-                        std::filesystem::path materialPath =
-                            entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
-                        if (materialPath.is_relative())
-                            materialPath = m_assetLibrary->AbsolutePath(*entry);
-                        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
-                        m_meshRendererState.materialSlots[slot] = guid.toString();
-                        m_assetStatus = "Material slot <- " + entry->displayName;
-                        MarkSelectedMeshRendererChanged();
-                        Tracenf("[MATERIAL-SLOTS] assign entity=%u slot=%u material=%s guid=%s",
-                            m_meshRendererState.id,
-                            slot,
-                            entry->displayName.c_str(),
-                            guid.toString().c_str());
-                    }
-                    else
-                    {
-                        m_assetStatus = "Material Slots accept Material assets";
-                    }
+                    m_meshRendererState.materialSlots[slot].clear();
+                    MarkSelectedMeshRendererChanged();
+                    Tracenf("[MATERIAL-SLOTS] clear entity=%u slot=%u",
+                        m_meshRendererState.id,
+                        slot);
                 }
-                ImGui::EndDragDropTarget();
+                const auto& presentation = QueryMaterialSlot(m_meshRendererState.materialSlots[slot]);
+                AssetPreviewTexture* preview = presentation.diffuse ? GetAssetPreviewTexture(*presentation.diffuse) : nullptr;
+                void* textureId = preview && m_textureProvider ? m_textureProvider->GetPreviewTexture(preview->handle) : nullptr;
+                const bool emptySlot = m_meshRendererState.materialSlots[slot].empty();
+                const float rowWidth = ImGui::GetContentRegionAvail().x;
+                const float previewSize = std::min(48.0f, std::max(1.0f, rowWidth - 12.0f));
+                const float textWidth = std::max(1.0f, rowWidth - 12.0f);
+                const float nameHeight = ImGui::GetTextLineHeight() * 2.0f;
+                std::string visibleName = emptySlot ? "Empty" : presentation.name;
+                if (ImGui::CalcTextSize(visibleName.c_str(), nullptr, false, textWidth).y > nameHeight)
+                {
+                    // Keep UTF-8 characters intact when fitting a long name into the two-line caption.
+                    do
+                    {
+                        std::size_t end = visibleName.size() - 1;
+                        while (end > 0 && (static_cast<unsigned char>(visibleName[end]) & 0xc0) == 0x80) --end;
+                        visibleName.resize(end);
+                    } while (!visibleName.empty() &&
+                        ImGui::CalcTextSize((visibleName + "...").c_str(), nullptr, false, textWidth).y > nameHeight);
+                    visibleName += "...";
+                }
+                const ImVec2 textSize = ImGui::CalcTextSize(visibleName.c_str(), nullptr, false, textWidth);
+                const float rowHeight = previewSize + nameHeight + 18.0f;
+                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+                ImGui::Button("##material_slot", ImVec2(rowWidth, rowHeight));
+                ImGui::PopStyleColor();
+                const auto min = ImGui::GetItemRectMin();
+                const ImVec2 imageMin(min.x + (rowWidth - previewSize) * 0.5f, min.y + 6.0f);
+                const ImVec2 imageMax(imageMin.x + previewSize, imageMin.y + previewSize);
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                const auto* tint = presentation.material ? presentation.material->material.colorTint : nullptr;
+                const ImU32 color = tint ? ImGui::ColorConvertFloat4ToU32(ImVec4(
+                    std::clamp(tint[0], 0.0f, 1.0f), std::clamp(tint[1], 0.0f, 1.0f),
+                    std::clamp(tint[2], 0.0f, 1.0f), 1.0f)) : ImGui::GetColorU32(ImGuiCol_Button);
+                draw->AddRectFilled(imageMin, imageMax, textureId ? ImGui::GetColorU32(ImGuiCol_WindowBg) : color, 4.0f);
+                if (textureId)
+                {
+                    const float previewScale = std::min(previewSize / preview->width, previewSize / preview->height);
+                    const ImVec2 size(preview->width * previewScale, preview->height * previewScale);
+                    const ImVec2 at(imageMin.x + (previewSize - size.x) * 0.5f, imageMin.y + (previewSize - size.y) * 0.5f);
+                    draw->AddImageRounded(reinterpret_cast<ImTextureID>(textureId), at,
+                        ImVec2(at.x + size.x, at.y + size.y), ImVec2(0, 0), ImVec2(1, 1), color, 4.0f);
+                }
+                else if (!presentation.material)
+                {
+                    const char* icon = emptySlot ? "+" : ICON_FA_PALETTE;
+                    const auto size = ImGui::CalcTextSize(icon);
+                    draw->AddText(ImVec2(imageMin.x + (previewSize - size.x) * 0.5f,
+                        imageMin.y + (previewSize - size.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_TextDisabled), icon);
+                }
+                draw->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImVec2(min.x + std::max(6.0f, (rowWidth - textSize.x) * 0.5f), imageMax.y + 6.0f),
+                    ImGui::GetColorU32(ImGuiCol_Text), visibleName.c_str(), nullptr, textWidth);
+                if (!emptySlot && ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    OpenPbrMaterialEditor(m_meshRendererState.materialSlots[slot]);
+                if (!emptySlot)
+                    UI::ItemTooltip((presentation.name + "\nSubmesh " + std::to_string(slot) +
+                        "\nDouble-click to edit. Drop a material here to replace it.").c_str());
+                else
+                    UI::ItemTooltip("Drop a material here to assign it.");
+                if (ImGui::BeginDragDropTarget())
+                {
+                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+                    {
+                        const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+                        const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
+                        if (entry && entry->category == AssetLibrary::Category::Material)
+                        {
+                            std::filesystem::path materialPath =
+                                entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
+                            if (materialPath.is_relative())
+                                materialPath = m_assetLibrary->AbsolutePath(*entry);
+                            const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
+                            m_meshRendererState.materialSlots[slot] = guid.toString();
+                            m_assetStatus = "Material slot <- " + entry->displayName;
+                            MarkSelectedMeshRendererChanged();
+                            Tracenf("[MATERIAL-SLOTS] assign entity=%u slot=%u material=%s guid=%s",
+                                m_meshRendererState.id,
+                                slot,
+                                entry->displayName.c_str(),
+                                guid.toString().c_str());
+                        }
+                        else
+                        {
+                            m_assetStatus = "Material Slots accept Material assets";
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+                ImGui::Spacing();
+                ImGui::PopID();
             }
-            if (!m_meshRendererState.materialSlots[slot].empty())
-                ImGui::TextDisabled("guid: %s", m_meshRendererState.materialSlots[slot].c_str());
-            ImGui::Spacing();
-            ImGui::PopID();
+            ImGui::EndTable();
         }
     }
 
