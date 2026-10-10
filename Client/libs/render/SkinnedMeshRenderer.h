@@ -408,6 +408,9 @@ private:
     bool m_deferUploads = false;
     uint32_t m_indexCount = 0;
     MeshBounds m_bounds{};
+    // Per-bone rest-vertex boxes, plus one box for vertices without weights. The live host-side
+    // palette transforms these for a conservative bound of any injected/blended animation pose.
+    std::vector<MeshBounds> m_impostorBoneBounds;
     std::unique_ptr<OzzRuntime> m_ozz;
     std::unique_ptr<DecodedTextures> m_decodedTextures;
     std::string m_loadedModelPath;

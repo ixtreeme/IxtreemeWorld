@@ -49,6 +49,8 @@ public:
     virtual std::uint32_t ArrayLayers() const = 0;
     virtual IXRHIFormat Format() const = 0;
     virtual const std::string& DebugName() const = 0;
+    // Dedicated image allocation, including backend alignment; zero when unavailable or borrowed.
+    virtual std::uint64_t AllocatedBytes() const { return 0; }
 };
 
 struct IXRHISamplerDesc

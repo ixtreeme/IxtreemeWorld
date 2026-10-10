@@ -1,5 +1,6 @@
 #include "asset/ExrImage.h"
 #include "TerrainRenderer.h"
+#include "ViewImpostorRenderer.h"
 
 #include "JobSystem.h"
 #include "SceneClearColor.h"
@@ -1892,6 +1893,7 @@ void TerrainRenderer::GetTerrainSceneData(TerrainSceneData& out) const
 
 void TerrainRenderer::SetTerrainSceneData(const TerrainSceneData& terrain)
 {
+    ++m_visualRevision;
     if (!m_sceneTerrainActive)
         return;
     m_sceneTerrain = terrain;
@@ -2054,6 +2056,7 @@ void TerrainRenderer::UploadEditedTerrain(ixrhi::IXRHICommandList& cmd, const ix
     {
         m_vertexBufferUploadPending = false;
         ++m_terrainGeometryRevision;  // the sun shadow map must be drawn again
+        ++m_visualRevision;
         // Whole-buffer copy (the backend copies from offset 0): only on frames with a sculpt edit. The
         // barriers order it after earlier frames' vertex reads and before this frame's draws.
         cmd.TransitionBuffer(*m_vertexBuffer, ixrhi::IXRHIBufferState::VertexRead, ixrhi::IXRHIBufferState::TransferDst);
@@ -2068,6 +2071,7 @@ void TerrainRenderer::UploadEditedSplat(ixrhi::IXRHICommandList& cmd, uint32_t f
     if (!m_editorSplatGpuDirty || !m_splatDirtyRect.Valid() || !m_rhi || !m_splatA.image || !m_splatB.image)
         return;
     const SplatDirtyRect rect = m_splatDirtyRect;
+    ++m_visualRevision;
     m_splatDirtyRect = {};
     m_editorSplatGpuDirty = false;
 
@@ -3081,17 +3085,88 @@ void TerrainRenderer::Render(ixrhi::IXRHICommandList& cmd,
             ++terrainStats.drawCalls;
             return;
         }
-        for (uint32_t chunkIndex : m_visibleTerrainChunksScratch)
+        auto* impostors = ViewImpostorRenderer::Active();
+        const bool allowImpostors = impostors && !impostors->IsCapturing() && !m_editorBrushVisible &&
+                                    !m_waterSculptBrushVisible && !m_walkabilityDebug;
+        const auto bindTerrain = [&] {
+            if (!ViewImpostorRenderer::ApplyCaptureViewport(cmd))
+            {
+                cmd.SetViewport(0, 0, float(extentWidth), float(extentHeight));
+                cmd.SetScissor(0, 0, extentWidth, extentHeight);
+            }
+            cmd.SetGraphicsPipeline(*m_pipeline);
+            cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
+            cmd.SetIndexBuffer(*m_indexBuffer, 0, true);
+            cmd.BindGroup(0, *m_bindGroup, viewIndex * kFramesInFlight + frameIndex);
+            const TerrainPushConstants base{{1, 1, 0, 0}};
+            cmd.PushConstants(&base, sizeof(base));
+        };
+        m_impostorTerrainFarScratch.clear();
+        m_impostorTerrainNearScratch.clear();
+        ViewImpostorRenderer::Rect strip{};
+        std::uint64_t stripTriangles = 0, stripRevision = m_visualRevision;
+        if (allowImpostors)
         {
-            const TerrainChunkDraw& chunk = m_terrainChunks[chunkIndex];
+            for (uint32_t chunkIndex : m_visibleTerrainChunksScratch)
+            {
+                const auto& chunk = m_terrainChunks[chunkIndex];
+                const auto rectangle = ViewImpostorRenderer::ProjectBounds(camera, chunk.worldMin, chunk.worldMax,
+                                                                           extentWidth, extentHeight, 180, 256);
+                if (!rectangle)
+                {
+                    m_impostorTerrainNearScratch.push_back(chunkIndex);
+                    continue;
+                }
+                if (m_impostorTerrainFarScratch.empty())
+                    strip = *rectangle;
+                else
+                {
+                    const auto right = std::max(strip.x + strip.width, rectangle->x + rectangle->width);
+                    const auto bottom = std::max(strip.y + strip.height, rectangle->y + rectangle->height);
+                    strip.x = std::min(strip.x, rectangle->x);
+                    strip.y = std::min(strip.y, rectangle->y);
+                    strip.width = right - strip.x;
+                    strip.height = bottom - strip.y;
+                }
+                m_impostorTerrainFarScratch.push_back(chunkIndex);
+                stripTriangles += chunk.indexCount / 3;
+                stripRevision = (stripRevision ^ (static_cast<std::uint64_t>(chunkIndex) + 1)) * 1099511628211ull;
+            }
+        }
+        const bool stripDrawn =
+            allowImpostors && !m_impostorTerrainFarScratch.empty() &&
+            impostors->TryDrawTerrainRegion(this, 1, stripRevision, strip, stripTriangles,
+                                            static_cast<std::uint32_t>(m_impostorTerrainFarScratch.size()), [&] {
+                                                bindTerrain();
+                                                // Capture a continuous surface across the cached/native seam.
+                                                // Reprojection samples discrete pixels: capturing only far
+                                                // chunks can expose a one-pixel crack along that seam after a
+                                                // camera turn. Native chunks still draw in the main pass; the
+                                                // capture's viewport/scissor limits their extra pixel work.
+                                                for (uint32_t chunkIndex : m_visibleTerrainChunksScratch)
+                                                {
+                                                    const auto& chunk = m_terrainChunks[chunkIndex];
+                                                    cmd.DrawIndexed(chunk.indexCount, 1, chunk.indexOffset, 0, 0);
+                                                    ++terrainStats.drawCalls;
+                                                }
+                                                return stripTriangles;
+                                            });
+        if (stripDrawn)
+        {
+            ++terrainStats.drawCalls;
+            bindTerrain();
+        }
+        const auto& geometry = stripDrawn ? m_impostorTerrainNearScratch : m_visibleTerrainChunksScratch;
+        for (uint32_t chunkIndex : geometry)
+        {
+            const auto& chunk = m_terrainChunks[chunkIndex];
             cmd.DrawIndexed(chunk.indexCount, 1, chunk.indexOffset, 0, 0);
             ++terrainStats.drawCalls;
         }
     };
     terrainStats.executed = true;
-    terrainStats.chunksDrawn = m_terrainChunks.empty()
-        ? (m_indexCount > 0 ? 1u : 0u)
-        : static_cast<uint32_t>(m_visibleTerrainChunksScratch.size());
+    terrainStats.chunksDrawn = m_terrainChunks.empty() ? (m_indexCount > 0 ? 1u : 0u)
+                                                       : static_cast<uint32_t>(m_visibleTerrainChunksScratch.size());
     terrainStats.chunksCulled = m_terrainChunks.empty() ? 0u : culledChunks;
 
     TerrainPushConstants push{{1.0f, 1.0f, 0.0f, 0.0f}};
@@ -3636,6 +3711,7 @@ bool TerrainRenderer::RebuildSelectedWaterBodyHighlight(ixrhi::IXRHIDevice& rhi,
 
 void TerrainRenderer::SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots)
 {
+    ++m_visualRevision;
     m_paletteSlots = slots;
     m_materialParamsDirty = true;
 }
@@ -4147,6 +4223,7 @@ void TerrainRenderer::ExpandTerrainChunkBounds(const Vertex* vertices, std::size
 
 void TerrainRenderer::BuildTerrainChunkDraws(const std::vector<Vertex>& vertices, std::vector<uint32_t>& indices)
 {
+    ++m_visualRevision;
     m_terrainChunks.clear();
     indices.clear();
     if (m_mapSizeX == 0 || m_mapSizeY == 0 || m_heightGridWidth < 2 || m_heightGridHeight < 2 ||
@@ -5163,6 +5240,7 @@ uint32_t TerrainRenderer::ActiveSplatLayerSpan()
 
 void TerrainRenderer::MarkSplatDirty(size_t splatIndex)
 {
+    ++m_visualRevision;
     // Every per-texel splat write (paint, undo) comes through here, after the write. Grow the cached
     // active layer span by this texel's layers instead of dropping it: a span that only grows stays
     // correct (the shader skips zero weights), and a full rescan per painted frame cost ~1 ms.
@@ -7280,11 +7358,13 @@ void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& came
     targetBuffers[frameIndex]->Write(0, &uniform, sizeof(uniform));
     if (m_materialParamsDirty)
     {
+        ++m_visualRevision;
         Tracen("[TMAT] params buffer updated (live, no reload, no remesh)");
         m_materialParamsDirty = false;
     }
     if (m_triplanarParamsDirty)
     {
+        ++m_visualRevision;
         Tracenf("[TRIPLANAR] enabled=%s scope=terrain sharpness=%.2f slopeThreshold=%.3f transition=%.3f",
             m_sceneTerrain.triplanarEnabled ? "yes" : "no",
             std::clamp(m_sceneTerrain.triplanarSharpness, 1.0f, 16.0f),

@@ -1,5 +1,6 @@
 #include "asset/ExrImage.h"
 #include "StaticMeshRenderer.h"
+#include "ViewImpostorRenderer.h"
 
 #include "AssimpImporter.h"
 #include "import_export/tree/TreeImpostor.h"
@@ -1604,31 +1605,49 @@ bool StaticMeshRenderer::CopyPhysicsMesh(
 }
 
 bool StaticMeshRenderer::BakeTreeImpostorAsset(client::asset::IAssetReader& assets,
-    const std::filesystem::path& modelPath, const tree_tool::TreeImpostorSettings& settings, std::string& error)
+                                               const std::filesystem::path& modelPath,
+                                               const tree_tool::TreeImpostorSettings& settings, std::string& error)
+{
+    return BakeMeshImpostorAsset(assets, modelPath, settings, error);
+}
+bool StaticMeshRenderer::BakeMeshImpostorAsset(client::asset::IAssetReader& assets,
+                                               const std::filesystem::path& modelPath,
+                                               const tree_tool::TreeImpostorSettings& settings, std::string& error)
 {
     const auto materials = AssetDatabase::Instance().loadDefaultMaterials(modelPath);
     StaticMeshRenderer source;
-    source.m_isTreeImpostor = true; // Load just the original geometry, regardless of an earlier bake.
-    if (materials.size() != 2 || !source.LoadCpu(assets, modelPath.generic_string()) ||
-        source.m_draws.empty() || std::any_of(source.m_draws.begin(), source.m_draws.end(), [](const auto& draw) { return draw.materialSlot >= 2; }))
-    { error = "A static tree with two default materials (bark/leaves) is required"; return false; }
-    ixtreemetree::TreeMesh mesh;
-    mesh.bboxMin = {source.m_boundsMin[0], source.m_boundsMin[1], source.m_boundsMin[2]};
-    mesh.bboxMax = {source.m_boundsMax[0], source.m_boundsMax[1], source.m_boundsMax[2]};
+    source.m_isTreeImpostor = true;
+    if (materials.empty() || materials.size() > 128 || !source.LoadCpu(assets, modelPath.generic_string()) ||
+        source.m_draws.empty() || std::any_of(source.m_draws.begin(), source.m_draws.end(), [&](const auto& draw) {
+            return draw.materialSlot >= materials.size();
+        }))
+    {
+        error = "A static model with native default materials is required (animated models use runtime impostors)";
+        return false;
+    }
+    std::vector<ixtreemetree::Vertex> vertices;
+    vertices.reserve(source.m_vertices.size());
     for (const auto& vertex : source.m_vertices)
     {
         const ixtreemetree::Vertex treeVertex{{vertex.position[0], vertex.position[1], vertex.position[2]},
-            {vertex.normal[0], vertex.normal[1], vertex.normal[2]}, {vertex.uv[0], vertex.uv[1]}};
-        mesh.bark.vertices.push_back(treeVertex); mesh.leaves.vertices.push_back(treeVertex);
+                                              {vertex.normal[0], vertex.normal[1], vertex.normal[2]},
+                                              {vertex.uv[0], vertex.uv[1]}};
+        vertices.push_back(treeVertex);
     }
+    std::vector<std::vector<std::uint32_t>> slotIndices(materials.size());
     for (const auto& draw : source.m_draws)
     {
-        auto& indices = draw.materialSlot == 0 ? mesh.bark.indices : mesh.leaves.indices;
+        auto& indices = slotIndices[draw.materialSlot];
         indices.insert(indices.end(), source.m_indices.begin() + draw.firstIndex,
-            source.m_indices.begin() + draw.firstIndex + draw.indexCount);
+                       source.m_indices.begin() + draw.firstIndex + draw.indexCount);
     }
+    std::vector<tree_tool::MeshImpostorPart> parts;
+    parts.reserve(materials.size());
+    for (const auto& indices : slotIndices)
+        parts.push_back({vertices, indices});
     auto dependencies = AssetDatabase::Instance().loadDependencies(modelPath);
-    if (!tree_tool::BakeTreeImpostor(mesh, modelPath, materials, settings, dependencies, error)) return false;
+    if (!tree_tool::BakeMeshImpostor(parts, modelPath, materials, settings, dependencies, error))
+        return false;
     return AssetDatabase::Instance().writeDependencies(modelPath, dependencies);
 }
 
@@ -3706,16 +3725,104 @@ bool StaticMeshRenderer::RenderTreeImpostors(ixrhi::IXRHICommandList& cmd, const
     return true;
 }
 
-void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
-    const ixrhi::IXRHIFrameInfo& frame,
-    double timeSeconds,
-    const WorldCamera& camera,
-    const InstanceList& instancesIn,
-    const LodConfig& lodConfig,
-    std::uint64_t configHash,
-    std::uint32_t lodLevel,
-    std::uint32_t targetWidth,
-    std::uint32_t targetHeight)
+bool StaticMeshRenderer::RenderViewImpostors(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
+                                             double seconds, const WorldCamera& camera, const InstanceList& instances,
+                                             const LodConfig& config, std::uint64_t configHash, std::uint32_t level,
+                                             std::uint32_t width, std::uint32_t height)
+{
+    auto* cache = ViewImpostorRenderer::Active();
+    if (!cache || cache->IsCapturing() || m_partitioningViewImpostors || m_isTreeImpostor || m_indices.size() < 384)
+        return false;
+    m_partitioningViewImpostors = true;
+    m_viewImpostorNear.clear();
+    std::uint32_t proxies = 0, captureCalls = 0, captureIndices = 0;
+    std::uint64_t captureTriangles = 0;
+    for (const Instance* instance : instances)
+    {
+        if (!instance)
+            continue;
+        bool replaced = false;
+        if (instance->entityId && !instance->selectedForOutline && instance->coverageMin == 0 &&
+            instance->coverageMax == 1)
+        {
+            const Mat4 model = BuildStaticMeshModelMatrix(*instance);
+            WorldVec3 minimum{INFINITY, INFINITY, INFINITY}, maximum{-INFINITY, -INFINITY, -INFINITY};
+            for (int corner = 0; corner < 8; ++corner)
+            {
+                const WorldVec3 point = xm::TransformPoint(model, {corner & 1 ? m_boundsMax[0] : m_boundsMin[0],
+                                                                   corner & 2 ? m_boundsMax[1] : m_boundsMin[1],
+                                                                   corner & 4 ? m_boundsMax[2] : m_boundsMin[2]});
+                minimum.x = std::min(minimum.x, point.x);
+                minimum.y = std::min(minimum.y, point.y);
+                minimum.z = std::min(minimum.z, point.z);
+                maximum.x = std::max(maximum.x, point.x);
+                maximum.y = std::max(maximum.y, point.y);
+                maximum.z = std::max(maximum.z, point.z);
+            }
+            if (!ViewImpostorRenderer::ProjectBounds(camera, minimum, maximum, width, height, 180, 256) ||
+                HasTransparentDraws(*instance))
+            {
+                m_viewImpostorNear.push_back(instance);
+                continue;
+            }
+            PreparedInstance temporary;
+            const PreparedInstance* prepared = instance->prepared;
+            if (!prepared || prepared->renderer != this ||
+                prepared->materialRevision != MaterialAssetManager::Instance().Revision())
+            {
+                PrepareInstance(*instance, temporary);
+                prepared = &temporary;
+            }
+            std::uint64_t revision = 1469598103934665603ull;
+            const auto hash = [&](const void* data, std::size_t size) {
+                const auto* bytes = static_cast<const unsigned char*>(data);
+                for (std::size_t i = 0; i < size; ++i)
+                    revision = (revision ^ bytes[i]) * 1099511628211ull;
+            };
+            hash(model.m, sizeof(model.m));
+            hash(instance->tint.data(), sizeof(instance->tint));
+            hash(&instance->coverageMin, sizeof(float));
+            hash(&instance->coverageMax, sizeof(float));
+            hash(&configHash, sizeof(configHash));
+            hash(&level, sizeof(level));
+            for (const auto& slot : prepared->slots)
+                hash(&slot, sizeof(slot));
+            for (const auto& material : instance->materialSlots)
+                hash(material.data(), material.size());
+            const auto capture = [&] {
+                const InstanceList one{instance};
+                RenderLodBatchInWorld(cmd, frame, seconds, camera, one, config, configHash, level, width, height);
+                captureCalls += m_lastSubmittedDrawCalls;
+                captureIndices += m_lastSubmittedIndexCount;
+                captureTriangles += m_lastSubmittedTriangles;
+                return m_lastSubmittedTriangles;
+            };
+            replaced = cache->TryDraw(this, instance->entityId, revision, ViewImpostorRenderer::Kind::Object, minimum,
+                                      maximum, m_indices.size() / 3, std::cref(capture));
+        }
+        if (replaced)
+            ++proxies;
+        else
+            m_viewImpostorNear.push_back(instance);
+    }
+    if (proxies)
+    {
+        RenderLodBatchInWorld(cmd, frame, seconds, camera, m_viewImpostorNear, config, configHash, level, width,
+                              height);
+        m_lastSubmittedDrawCalls += proxies + captureCalls;
+        m_lastSubmittedInstances += proxies;
+        m_lastSubmittedIndexCount += proxies * 6 + captureIndices;
+        m_lastSubmittedTriangles += proxies * 2 + captureTriangles;
+    }
+    m_partitioningViewImpostors = false;
+    return proxies != 0;
+}
+
+void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
+                                               double timeSeconds, const WorldCamera& camera,
+                                               const InstanceList& instancesIn, const LodConfig& lodConfig,
+                                               std::uint64_t configHash, std::uint32_t lodLevel,
+                                               std::uint32_t targetWidth, std::uint32_t targetHeight)
 {
     if (RenderTreeImpostors(cmd, frame, timeSeconds, camera, instancesIn, lodConfig, configHash, lodLevel, targetWidth, targetHeight)) return;
     if (!m_treeImpostor || !m_treeImpostor->partitioning) m_lastImpostorTrees = 0;
@@ -3745,6 +3852,9 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
     const std::uint32_t extentWidth = targetWidth > 0 ? targetWidth : frame.targetWidth;
     const std::uint32_t extentHeight = targetHeight > 0 ? targetHeight : frame.targetHeight;
     if (extentWidth == 0 || extentHeight == 0)
+        return;
+
+    if (RenderViewImpostors(cmd, frame, timeSeconds, camera, instancesIn, lodConfig, configHash, lodLevel, extentWidth, extentHeight))
         return;
 
     const std::uint32_t diagnosticEntityId = instancesIn.empty() ? 0u : instancesIn.front()->entityId;
@@ -3927,11 +4037,11 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd,
         return;
     m_lastInstanceBufferBytes = instanceBlocks.size() * sizeof(InstanceBlock);
 
-    cmd.SetViewport(0.0f,
-        0.0f,
-        static_cast<float>(extentWidth),
-        static_cast<float>(extentHeight));
-    cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    if (!ViewImpostorRenderer::ApplyCaptureViewport(cmd))
+    {
+        cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
+        cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    }
     cmd.SetVertexBuffer(0, *m_vertexBuffer, 0);
     const std::shared_ptr<ixrhi::IXRHIBuffer>& boundIndexBuffer =
         lodSet && lodSet->buffer ? lodSet->buffer : m_indexBuffer;

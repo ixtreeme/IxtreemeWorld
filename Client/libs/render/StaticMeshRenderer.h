@@ -262,7 +262,10 @@ public:
     const std::array<float, 3>& BoundsMax() const { return m_boundsMax; }
     const std::string& TextureName() const { return m_texture.name; }
     bool CopyPhysicsMesh(std::vector<std::array<float, 3>>& outVertices, std::vector<std::uint32_t>& outIndices) const;
-    // Bake an existing two-material tree without changing its mesh or GUID (editor/offline utility).
+    // Bake a static model with any number of native default materials, preserving mesh bytes/GUID.
+    static bool BakeMeshImpostorAsset(client::asset::IAssetReader& assets, const std::filesystem::path& modelPath,
+        const tree_tool::TreeImpostorSettings& settings, std::string& error);
+    // Backward-compatible name used by the tree generator and existing callers.
     static bool BakeTreeImpostorAsset(client::asset::IAssetReader& assets, const std::filesystem::path& modelPath,
         const tree_tool::TreeImpostorSettings& settings, std::string& error);
 
@@ -277,6 +280,11 @@ private:
     std::unique_ptr<TreeImpostorState> m_treeImpostor;
     bool m_isTreeImpostor = false;
     std::uint32_t m_lastImpostorTrees = 0;
+    bool m_partitioningViewImpostors = false;
+    InstanceList m_viewImpostorNear;
+    bool RenderViewImpostors(ixrhi::IXRHICommandList&, const ixrhi::IXRHIFrameInfo&, double,
+        const WorldCamera&, const InstanceList&, const LodConfig&, std::uint64_t, std::uint32_t,
+        std::uint32_t, std::uint32_t);
     bool RenderTreeImpostors(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
         double timeSeconds, const WorldCamera& camera, const InstanceList& instances,
         const LodConfig& config, std::uint64_t configHash, std::uint32_t lodLevel,

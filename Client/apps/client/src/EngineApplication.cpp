@@ -62,6 +62,7 @@
 #include "StaticMeshRenderer.h"
 #include "TerrainEditorSystem.h"
 #include "TerrainRenderer.h"
+#include "ViewImpostorRenderer.h"
 #include "ViewportControls.h"
 #include "VulkanDevice.h"
 #include "SkinnedMeshRenderer.h"
@@ -2645,14 +2646,23 @@ int RunGame(NativeWindow& window,
     }
 
     OffscreenSceneRenderer offscreenScene;
+    ViewImpostorRenderer viewImpostors;
+    viewImpostors.Create(*rhiDevice, assets);
     // Offscreen targets resolve formats from the live swapchain (as before,
     // when the renderer queried them internally). Refreshed on every
     // (re)creation because a swapchain recreate may re-pick formats.
     ixrhi::IXRHIFormat offscreenColorFormat = ixrhi::IXRHIFormat::Undefined;
     ixrhi::IXRHIFormat offscreenDepthFormat = ixrhi::IXRHIFormat::Undefined;
     auto refreshOffscreenFormats = [&]() {
-        offscreenColorFormat = rhiDevice->GetMainSwapchain().ColorFormat();
-        offscreenDepthFormat = rhiDevice->GetMainSwapchain().DepthFormat();
+        const auto color = rhiDevice->GetMainSwapchain().ColorFormat();
+        const auto depth = rhiDevice->GetMainSwapchain().DepthFormat();
+        if (offscreenDepthFormat != ixrhi::IXRHIFormat::Undefined && offscreenDepthFormat != depth)
+        {
+            rhiDevice->WaitIdle();
+            viewImpostors.Create(*rhiDevice, assets);
+        }
+        offscreenColorFormat = color;
+        offscreenDepthFormat = depth;
     };
     refreshOffscreenFormats();
     bool offscreenSceneOk = offscreenScene.Create(*rhiDevice,
@@ -12219,6 +12229,7 @@ int RunGame(NativeWindow& window,
         if (rhiFrame)
         {
             const ixrhi::IXRHIFrameInfo& frameInfo = rhiFrame.info;
+            viewImpostors.BeginFrame(frameInfo);
             const uint64_t frameNumber = frameInfo.frameNumber;
             // Per-frame skin-slot allocation over the per-model skinned cache. Each entry owns
             // its own MaxSkinSlots() pool; the Scene view (+ water reflection) and the Game view
@@ -13239,6 +13250,36 @@ int RunGame(NativeWindow& window,
             // Main-window pass ownership (Phase 3C): exactly one Begin/End per
             // frame around ALL swapchain rendering (direct or composite + UI).
             bool mainPassOpen = false;
+            // Only render-affecting light values go into the key (names/strings and struct padding
+            // do not). Mesh transforms/material overrides have their own per-entry revisions.
+            std::uint64_t viewLightingRevision = 1469598103934665603ull;
+            const auto hashLightingValue = [&](const auto& value) {
+                const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
+                for (std::size_t i = 0; i < sizeof(value); ++i)
+                    viewLightingRevision = (viewLightingRevision ^ bytes[i]) * 1099511628211ull;
+            };
+            // Hash independently: simultaneous model/material revision increments must not cancel.
+            hashLightingValue(staticModelRevision);
+            hashLightingValue(MaterialAssetManager::Instance().Revision());
+            const auto& sun = frameLighting.directional;
+            for (float value : {sun.azimuthDegrees, sun.elevationDegrees, sun.intensity, sun.r, sun.g, sun.b,
+                               frameLighting.ambient.r, frameLighting.ambient.g, frameLighting.ambient.b, frameLighting.ambient.intensity})
+                hashLightingValue(value);
+            hashLightingValue(sun.enabled); hashLightingValue(frameLighting.sunShadowsEnabled);
+            hashLightingValue(frameLighting.numPointLights); hashLightingValue(frameLighting.numSpotLights);
+            for (std::uint32_t i = 0; i < frameLighting.numPointLights; ++i)
+            {
+                const auto& light = frameLighting.pointLights[i];
+                hashLightingValue(light.position);
+                for (float value : {light.r, light.g, light.b, light.intensity, light.radius}) hashLightingValue(value);
+            }
+            for (std::uint32_t i = 0; i < frameLighting.numSpotLights; ++i)
+            {
+                const auto& light = frameLighting.spotLights[i];
+                hashLightingValue(light.position); hashLightingValue(light.rotation);
+                for (float value : {light.r, light.g, light.b, light.intensity, light.radius, light.innerConeDegrees, light.outerConeDegrees})
+                    hashLightingValue(value);
+            }
             auto beginMainPass = [&]() {
                 if (mainPassOpen)
                     return;
@@ -13261,6 +13302,7 @@ int RunGame(NativeWindow& window,
                         offscreenScene.GetSampler(),
                         offscreenScene.Width(),
                         offscreenScene.Height());
+                viewImpostors.BeginView(offscreenScene, *frameInfo.commandList, frameInfo, camera, seconds, 0, viewLightingRevision);
                 offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo);
             }
             else if (!useOffscreenScene)
@@ -14107,6 +14149,7 @@ int RunGame(NativeWindow& window,
                 // (the panel keeps its last image); the Game view and the window pass below still run.
                 if (drawSceneView)
                 {
+                    viewImpostors.EndView();
                     offscreenScene.EndMainPass(*frameInfo.commandList);
 #if defined(IXTREEME_WITH_EDITOR)
                     if (runtimeSession->IsMapEditorOpen() && editorImGui.IsSceneViewVisible() &&
@@ -14197,6 +14240,7 @@ int RunGame(NativeWindow& window,
                     {
                         const VkExtent2D gameExtent{gameView.Width(), gameView.Height()};
                         const WorldCamera& gameCamera = *gameViewCamera;
+                        viewImpostors.BeginView(gameView, *frameInfo.commandList, frameInfo, gameCamera, seconds, 1, viewLightingRevision);
                         gameView.BeginMainPass(*frameInfo.commandList, frameInfo);
                         // Terrain is drawn from the project Main Camera using the secondary
                         // camera-uniform path (viewIndex=1). That path has its own per-frame
@@ -14268,6 +14312,7 @@ int RunGame(NativeWindow& window,
                             skyRenderer.Render(*frameInfo.commandList, frameInfo, gameCamera,
                                 gameExtent.width, gameExtent.height);
                         // Transparent draws: those under water, the water, then the rest over it.
+                        viewImpostors.EndView();
                         collectParticleDraws(gameTransparentDraws, gameCamera, /*allowSoftParticles=*/false);
                         sortTransparentDraws(gameTransparentDraws);
                         drawTransparents(gameTransparentDraws, /*underWater=*/true, gameCamera, gameExtent.width, gameExtent.height);
@@ -14335,6 +14380,14 @@ int RunGame(NativeWindow& window,
                     worldLabels.Render(*frameInfo.commandList, frameInfo, camera, plates);
             }
             frameProfile.sceneRenderMs = MillisecondsBetween(sceneRenderBegin, std::chrono::steady_clock::now());
+            if (frameInfo.frameNumber % 60u == 0u)
+            {
+                const auto& stats = viewImpostors.GetStats();
+                if (stats.draws[0] || stats.draws[1] || stats.draws[2])
+                    Tracenf("[VIEW-IMPOSTOR] objects=%u terrain=%u characters=%u captures=%u reprojected=%u fallback=%u saved_triangles=%llu memory_kib=%llu",
+                        stats.draws[0], stats.draws[1], stats.draws[2], stats.captures[0] + stats.captures[1] + stats.captures[2],
+                        stats.reprojected, stats.fallbacks, static_cast<unsigned long long>(stats.savedSourceTriangles), static_cast<unsigned long long>(stats.bytes / 1024));
+            }
             const auto editorUiBegin = std::chrono::steady_clock::now();
             frameRmlUiRenderCalled = true;
             rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::RmlUiBegin);
@@ -14352,6 +14405,12 @@ int RunGame(NativeWindow& window,
             engineStats.sceneEntityCount = frameSceneEntityCount;
             engineStats.staticMeshSubmitted = frameStaticMeshSubmitted;
             engineStats.staticMeshDrawCalls = frameStaticMeshDrawCalls;
+            const auto& impostorStats = viewImpostors.GetStats();
+            engineStats.impostorObjects = impostorStats.draws[0];
+            engineStats.impostorTerrainChunks = impostorStats.draws[1];
+            engineStats.impostorCharacters = impostorStats.draws[2];
+            engineStats.impostorReprojected = impostorStats.reprojected;
+            engineStats.impostorCacheMb = static_cast<double>(impostorStats.bytes) / (1024.0 * 1024.0);
             editorImGui.ClearSceneViewGizmo();
             editorImGui.SetSceneViewSelectionOutline({});
             if (runtimeSession->IsMapEditorOpen() && editorPlay.state.mode == EditorPlayMode::Edit)
@@ -14813,6 +14872,7 @@ int RunGame(NativeWindow& window,
 #endif
 
     device.WaitIdle();
+    viewImpostors.Destroy();
     if (worldLabelsOk)
         worldLabels.Destroy();
     if (particleRendererOk)

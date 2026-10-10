@@ -6,6 +6,7 @@
 #include <array>
 #include <filesystem>
 #include <optional>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,11 @@ struct MaterialAsset;
 
 namespace tree_tool
 {
+struct MeshImpostorPart
+{
+    std::span<const ixtreemetree::Vertex> vertices;
+    std::span<const std::uint32_t> indices;
+};
 struct TreeImpostorSettings
 {
     bool enabled = true;
@@ -53,4 +59,7 @@ std::string TreeImpostorMaterialSignature(const MaterialAsset& material);
 bool BakeTreeImpostor(const ixtreemetree::TreeMesh& mesh, const std::filesystem::path& modelPath,
                       const std::vector<Guid>& materials, const TreeImpostorSettings& settings,
                       std::vector<Guid>& dependencies, std::string& error);
+bool BakeMeshImpostor(std::span<const MeshImpostorPart> parts, const std::filesystem::path& modelPath,
+    const std::vector<Guid>& materials, const TreeImpostorSettings& settings,
+    std::vector<Guid>& dependencies, std::string& error);
 } // namespace tree_tool

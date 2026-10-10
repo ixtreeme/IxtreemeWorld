@@ -432,6 +432,10 @@ void EditorImGui::RenderStatisticsWindow()
     UI::SectionHeader("Scene");
     UI::Prop::Text("Entities", "%zu", m_engineStats.sceneEntityCount);
     UI::Prop::Text("Static meshes", "%zu submitted, %zu draw calls", m_engineStats.staticMeshSubmitted, m_engineStats.staticMeshDrawCalls);
+    UI::Prop::Text("Runtime impostors", "%u objects, %u terrain chunks, %u characters",
+        m_engineStats.impostorObjects, m_engineStats.impostorTerrainChunks, m_engineStats.impostorCharacters);
+    UI::Prop::Text("Reprojected impostors", "%u during camera rotation", m_engineStats.impostorReprojected);
+    UI::Prop::Text("Impostor image cache", "%.1f / 64 MB (static 10 Hz / animated 60 Hz)", m_engineStats.impostorCacheMb);
     UI::Prop::Text("Frame #", "%llu", static_cast<unsigned long long>(m_engineStats.frameNumber));
 
     if (ImGui::CollapsingHeader("Math library"))

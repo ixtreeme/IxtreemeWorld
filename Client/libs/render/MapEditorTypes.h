@@ -819,6 +819,11 @@ struct EngineStats
     std::size_t sceneEntityCount = 0;
     std::size_t staticMeshSubmitted = 0;
     std::size_t staticMeshDrawCalls = 0;
+    std::uint32_t impostorObjects = 0;
+    std::uint32_t impostorTerrainChunks = 0;
+    std::uint32_t impostorCharacters = 0;
+    std::uint32_t impostorReprojected = 0;
+    double impostorCacheMb = 0;
     // Frame timing breakdown (previous frame's CPU profile + present mode), for the
     // Performance panel so the cost source is visible without a debug-logs build.
     bool presentUncapped = true;

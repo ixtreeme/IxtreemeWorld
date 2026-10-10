@@ -700,6 +700,7 @@ private:
     // What each static cache layer was drawn from (the terrain and the static casters only).
     std::array<std::optional<ShadowCascadeInputs>, kShadowCascadeCount> m_staticShadowInputs;
     std::uint64_t m_terrainGeometryRevision = 0;  // bumped by every vertex upload (sculpting)
+    std::uint64_t m_visualRevision = 0; // colour/splat/palette/geometry invalidate runtime impostors
     float m_shadowCascadeSplits[kShadowCascadeCount] = {5.0f, 15.0f, 50.0f, 200.0f};
     Texture m_baseTexture;
     Texture m_normalTexture;
@@ -817,6 +818,7 @@ private:
     std::vector<uint32_t> m_dirtyChunkTexels;
     std::vector<TerrainChunkDraw> m_terrainChunks;
     std::vector<uint32_t> m_visibleTerrainChunksScratch;
+    std::vector<uint32_t> m_impostorTerrainFarScratch, m_impostorTerrainNearScratch;
     FrameDrawStats m_frameDrawStats{};
 
     struct HeightUndo

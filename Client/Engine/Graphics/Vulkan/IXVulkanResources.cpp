@@ -87,6 +87,12 @@ IXVulkanTexture::IXVulkanTexture(IXVulkanDevice& device,
     , m_format(format)
     , m_debugName(std::move(debugName))
 {
+    if (memory != VK_NULL_HANDLE)
+    {
+        VkMemoryRequirements requirements{};
+        vkGetImageMemoryRequirements(device.NativeDevice(), image, &requirements);
+        m_allocatedBytes = requirements.size;
+    }
 }
 
 IXVulkanTexture::~IXVulkanTexture()

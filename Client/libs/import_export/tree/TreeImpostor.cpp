@@ -353,8 +353,8 @@ std::optional<TreeImpostorData> LoadTreeImpostor(const client::asset::IAssetRead
     if (JsonFloatValue(*text, "version", 0) != 1 || relative.empty() || relative.has_root_path() || data.azimuths < 4 ||
         data.azimuths > 16 || data.elevations != 3 || data.resolution < 64 || data.resolution > 512 ||
         !(data.radius > 0 && std::isfinite(data.radius)) || !(data.distance >= 10 && std::isfinite(data.distance)) ||
-        !(data.transition >= 1 && std::isfinite(data.transition)) || data.materials.size() != 2 ||
-        data.materialSignatures.size() != 2 ||
+        !(data.transition >= 1 && std::isfinite(data.transition)) || data.materials.empty() || data.materials.size() > 128 ||
+        data.materialSignatures.size() != data.materials.size() ||
         !std::all_of(data.center.begin(), data.center.end(), [](float x) { return std::isfinite(x); }))
     {
         error = "Invalid tree impostor metadata";
@@ -392,11 +392,17 @@ bool ValidateTreeImpostor(const client::asset::IAssetReader& assets, const TreeI
 bool BakeTreeImpostor(const ixtreemetree::TreeMesh& mesh, const fs::path& modelPath, const std::vector<Guid>& materials,
                       const TreeImpostorSettings& settings, std::vector<Guid>& dependencies, std::string& error)
 {
+    const std::array<MeshImpostorPart, 2> parts{{{mesh.bark.vertices, mesh.bark.indices}, {mesh.leaves.vertices, mesh.leaves.indices}}};
+    return BakeMeshImpostor(parts, modelPath, materials, settings, dependencies, error);
+}
+bool BakeMeshImpostor(std::span<const MeshImpostorPart> parts, const fs::path& modelPath, const std::vector<Guid>& materials,
+                      const TreeImpostorSettings& settings, std::vector<Guid>& dependencies, std::string& error)
+{
     if (!settings.enabled)
         return true;
-    if (materials.size() != 2)
+    if (materials.empty() || materials.size() > 128 || materials.size() != parts.size())
     {
-        error = "Tree impostor needs bark and leaf materials";
+        error = "Mesh impostor needs one material per source part (1-128)";
         return false;
     }
     if (!std::isfinite(settings.distance) || !std::isfinite(settings.transition))
@@ -415,8 +421,8 @@ bool BakeTreeImpostor(const ixtreemetree::TreeMesh& mesh, const fs::path& modelP
                           std::isfinite(vertex.uv.x) && std::isfinite(vertex.uv.y);
                });
     };
-    if (!validMesh(mesh.bark) || !validMesh(mesh.leaves) ||
-        (mesh.bark.vertices.empty() && mesh.leaves.vertices.empty()))
+    if (!std::all_of(parts.begin(), parts.end(), validMesh) ||
+        std::all_of(parts.begin(), parts.end(), [](const auto& part) { return part.indices.empty(); }))
     {
         error = "Invalid impostor source geometry";
         return false;
@@ -426,16 +432,26 @@ bool BakeTreeImpostor(const ixtreemetree::TreeMesh& mesh, const fs::path& modelP
     data.resolution = std::clamp(settings.resolution, 64, 512);
     data.distance = std::clamp(settings.distance, 10.0f, 2000.0f);
     data.transition = std::clamp(settings.transition, 1.0f, 200.0f);
-    data.center = {(mesh.bboxMin.x + mesh.bboxMax.x) * 0.5f, (mesh.bboxMin.y + mesh.bboxMax.y) * 0.5f,
-                   (mesh.bboxMin.z + mesh.bboxMax.z) * 0.5f};
+    Vec3 minimum{INFINITY, INFINITY, INFINITY}, maximum{-INFINITY, -INFINITY, -INFINITY};
+    for (const auto& part : parts)
+        for (const auto& vertex : part.vertices)
+        {
+            minimum.x = std::min(minimum.x, vertex.position.x);
+            minimum.y = std::min(minimum.y, vertex.position.y);
+            minimum.z = std::min(minimum.z, vertex.position.z);
+            maximum.x = std::max(maximum.x, vertex.position.x);
+            maximum.y = std::max(maximum.y, vertex.position.y);
+            maximum.z = std::max(maximum.z, vertex.position.z);
+        }
+    data.center = {(minimum.x + maximum.x) * .5f, (minimum.y + maximum.y) * .5f, (minimum.z + maximum.z) * .5f};
     if (!std::all_of(data.center.begin(), data.center.end(), [](float value) { return std::isfinite(value); }))
     {
         error = "Invalid tree bounds";
         return false;
     }
     const Vec3 center{data.center[0], data.center[1], data.center[2]};
-    for (const auto* vertices : {&mesh.bark.vertices, &mesh.leaves.vertices})
-        for (const auto& vertex : *vertices)
+    for (const auto& part : parts)
+        for (const auto& vertex : part.vertices)
             data.radius = std::max(
                 data.radius, std::sqrt(VDot(VSub({vertex.position.x, vertex.position.y, vertex.position.z}, center),
                                             VSub({vertex.position.x, vertex.position.y, vertex.position.z}, center))));
@@ -446,10 +462,10 @@ bool BakeTreeImpostor(const ixtreemetree::TreeMesh& mesh, const fs::path& modelP
         return false;
     }
     const auto folder = modelPath.parent_path();
-    std::array<Surface, 2> surfaces;
+    std::vector<Surface> surfaces(parts.size());
     data.sourcePaths.push_back(modelPath.filename().generic_string());
     data.sourceHashes.push_back(Hash(Read(modelPath)));
-    for (int i = 0; i < 2; ++i)
+    for (std::size_t i = 0; i < parts.size(); ++i)
     {
         const auto* material = MaterialAssetManager::Instance().getOrLoad(materials[i]);
         if (!material)
@@ -499,10 +515,9 @@ bool BakeTreeImpostor(const ixtreemetree::TreeMesh& mesh, const fs::path& modelP
             const Vec3 right{std::cos(yaw), 0, -std::sin(yaw)}, up = VCross(direction, right);
             std::vector<float> depth(static_cast<std::size_t>(data.resolution) * data.resolution,
                                      -std::numeric_limits<float>::infinity());
-            Raster(mesh.bark, surfaces[0], center, data.radius, right, up, direction, data.resolution, col, row, width,
-                   color, normals, orm, depth);
-            Raster(mesh.leaves, surfaces[1], center, data.radius, right, up, direction, data.resolution, col, row,
-                   width, color, normals, orm, depth);
+            for (std::size_t i = 0; i < parts.size(); ++i)
+                Raster(parts[i], surfaces[i], center, data.radius, right, up, direction, data.resolution, col, row, width,
+                       color, normals, orm, depth);
         }
     Dilate(color, normals, orm, data.resolution, data.azimuths, 3);
     const auto directory = folder / (modelPath.stem().string() + "_impostor");

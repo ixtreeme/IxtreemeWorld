@@ -17,6 +17,8 @@ add_library(IXEngineRender STATIC
     ParticleRenderer.h
     OffscreenSceneRenderer.cpp
     OffscreenSceneRenderer.h
+    ViewImpostorRenderer.cpp
+    ViewImpostorRenderer.h
     RmlUiLayer.cpp
     RmlUiLayer.h
     RuntimeSession.cpp
@@ -142,6 +144,16 @@ endif()
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
 
 if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(ViewImpostorTest tests/ViewImpostorTest.cpp)
+    target_link_libraries(ViewImpostorTest PRIVATE IXEngineRender)
+    target_compile_features(ViewImpostorTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(ViewImpostorTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME ViewImpostorTest COMMAND ViewImpostorTest)
+    set_tests_properties(ViewImpostorTest PROPERTIES TIMEOUT 30)
+
     add_executable(TreeImpostorTest tests/TreeImpostorTest.cpp)
     target_link_libraries(TreeImpostorTest PRIVATE IXEngineRender)
     target_compile_features(TreeImpostorTest PRIVATE cxx_std_20)

@@ -218,6 +218,26 @@ void Test()
           assets.ReadAll(disabled.modelPath.generic_string()) == beforeBake);
     Check("existing-tree bake loads valid metadata",
           LoadTreeImpostor(assets, disabled.modelPath.generic_string(), error).has_value());
+    const auto defaults = AssetDatabase::Instance().loadDefaultMaterials(disabled.modelPath);
+    const std::array<MeshImpostorPart, 1> single{{{mesh.bark.vertices, mesh.bark.indices}}};
+    std::vector<Guid> genericDependencies;
+    Check("one-material ordinary model atlas",
+          BakeMeshImpostor(single, disabled.modelPath, {defaults[0]}, binding.impostor, genericDependencies, error));
+    auto genericData = LoadTreeImpostor(assets, disabled.modelPath.generic_string(), error);
+    Check("one-material atlas metadata and source validation",
+          genericData && genericData->materials.size() == 1 && ValidateTreeImpostor(assets, *genericData));
+    auto thirdPart = mesh.bark;
+    for (auto& vertex : thirdPart.vertices) vertex.position.x += 3;
+    const std::array<MeshImpostorPart, 3> three{{{mesh.bark.vertices, mesh.bark.indices},
+        {mesh.leaves.vertices, mesh.leaves.indices}, {thirdPart.vertices, thirdPart.indices}}};
+    Check("multi-material ordinary model atlas",
+          BakeMeshImpostor(three, disabled.modelPath, {defaults[0], defaults[1], defaults[0]}, binding.impostor, genericDependencies, error));
+    genericData = LoadTreeImpostor(assets, disabled.modelPath.generic_string(), error);
+    Check("multi-material atlas retains every material and full bounds",
+          genericData && genericData->materials.size() == 3 && genericData->center[0] > 1 && ValidateTreeImpostor(assets, *genericData));
+    Check("material/part mismatch is rejected",
+          !BakeMeshImpostor(three, disabled.modelPath, {defaults[0]}, binding.impostor, genericDependencies, error));
+    Check("generic bake preserves source model bytes", assets.ReadAll(disabled.modelPath.generic_string()) == beforeBake);
     binding.impostor.enabled = true;
     modified = *material;
     modified.alphaMode = MaterialAsset::AlphaMode::Blend;

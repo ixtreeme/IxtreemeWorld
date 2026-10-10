@@ -1,5 +1,6 @@
 #include "asset/ExrImage.h"
 #include "SkinnedMeshRenderer.h"
+#include "ViewImpostorRenderer.h"
 
 #include "JobSystem.h"
 
@@ -733,6 +734,41 @@ bool SkinnedMeshRenderer::LoadCpu(client::asset::IAssetReader& assets, const std
         LogFormat("[MESH] Create: loaded=0 model=%s", modelPath.c_str());
         return false;
     }
+    m_impostorBoneBounds.assign(static_cast<std::size_t>(m_boneCount) + 1, MeshBounds{});
+    for (auto& bounds : m_impostorBoneBounds)
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            bounds.min[axis] = INFINITY;
+            bounds.max[axis] = -INFINITY;
+        }
+    for (const auto& vertex : m_restVerticesGpu)
+    {
+        bool weighted = false;
+        for (unsigned influence = 0; influence < 4; ++influence)
+        {
+            if (((vertex.packedWeights >> (influence * 8)) & 255) == 0)
+                continue;
+            weighted = true;
+            const auto bone = (vertex.packedBones >> (influence * 8)) & 255;
+            if (bone >= m_boneCount)
+                continue;
+            auto& bounds = m_impostorBoneBounds[bone];
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                bounds.min[axis] = std::min(bounds.min[axis], vertex.position[axis]);
+                bounds.max[axis] = std::max(bounds.max[axis], vertex.position[axis]);
+            }
+        }
+        if (!weighted)
+        {
+            auto& bounds = m_impostorBoneBounds.back();
+            for (int axis = 0; axis < 3; ++axis)
+            {
+                bounds.min[axis] = std::min(bounds.min[axis], vertex.position[axis]);
+                bounds.max[axis] = std::max(bounds.max[axis], vertex.position[axis]);
+            }
+        }
+    }
     DecodeTextures(modelPath);
     return true;
 }
@@ -1064,14 +1100,77 @@ void SkinnedMeshRenderer::RenderInWorld(ixrhi::IXRHICommandList& cmd,
     ixrhi::IXRHIBuffer* skinned = SkinnedOutput(frameIndex, skinSlot);
     if (!skinned)
         return;
+    if (auto* cache = ViewImpostorRenderer::Active(); cache && !cache->IsCapturing())
+    {
+        // A stable padded box avoids making a new crop for each tiny animation movement. Expand it
+        // using the actual pose's bone influence boxes, including externally injected/blended poses.
+        const float padding = LocalExtent() * std::max({std::abs(scale[0]), std::abs(scale[1]), std::abs(scale[2])});
+        WorldVec3 minimum{position.x - padding, position.y - padding, position.z - padding};
+        WorldVec3 maximum{position.x + padding, position.y + padding, position.z + padding};
+        if (ViewImpostorRenderer::ProjectBounds(camera, minimum, maximum, extentWidth, extentHeight, 80, 256))
+        {
+            auto* buffer = BonePalette(frameIndex, skinSlot);
+            const auto* palette = buffer ? static_cast<const Mat4*>(buffer->HostAddress()) : nullptr;
+            if (palette && m_impostorBoneBounds.size() == static_cast<std::size_t>(m_boneCount) + 1)
+            {
+                const Mat4 model = Multiply(Multiply(xm::Scale({scale[0], scale[1], scale[2]}), RotationY(-yawRadians)),
+                                            Translation(position.x, position.y, position.z));
+                for (std::size_t bone = 0; bone < m_impostorBoneBounds.size(); ++bone)
+                {
+                    const auto& bounds = m_impostorBoneBounds[bone];
+                    if (bounds.min[0] > bounds.max[0])
+                        continue;
+                    const Mat4 transform = bone < m_boneCount ? Multiply(palette[bone], model) : model;
+                    const WorldVec3 center{(bounds.min[0] + bounds.max[0]) * .5f, (bounds.min[1] + bounds.max[1]) * .5f,
+                                           (bounds.min[2] + bounds.max[2]) * .5f};
+                    const float extent[] = {(bounds.max[0] - bounds.min[0]) * .5f,
+                                            (bounds.max[1] - bounds.min[1]) * .5f,
+                                            (bounds.max[2] - bounds.min[2]) * .5f};
+                    const WorldVec3 transformed = xm::TransformPoint(transform, center);
+                    float reach[3]{};
+                    for (int column = 0; column < 3; ++column)
+                        for (int row = 0; row < 3; ++row)
+                            reach[column] += std::abs(transform.m[row * 4 + column]) * extent[row];
+                    minimum.x = std::min(minimum.x, transformed.x - reach[0]);
+                    minimum.y = std::min(minimum.y, transformed.y - reach[1]);
+                    minimum.z = std::min(minimum.z, transformed.z - reach[2]);
+                    maximum.x = std::max(maximum.x, transformed.x + reach[0]);
+                    maximum.y = std::max(maximum.y, transformed.y + reach[1]);
+                    maximum.z = std::max(maximum.z, transformed.z + reach[2]);
+                }
+                std::uint64_t revision = 1469598103934665603ull;
+                const auto hash = [&](const void* data, std::size_t size) {
+                    const auto* bytes = static_cast<const unsigned char*>(data);
+                    for (std::size_t i = 0; i < size; ++i)
+                        revision = (revision ^ bytes[i]) * 1099511628211ull;
+                };
+                hash(&position, sizeof(position));
+                hash(&yawRadians, sizeof(yawRadians));
+                hash(scale.data(), sizeof(scale));
+                hash(tint.data(), sizeof(tint));
+                const auto capture = [&] {
+                    RenderInWorld(cmd, frame, timeSeconds, camera, position, yawRadians, skinSlot, tint,
+                                  extentWidth, extentHeight, scale);
+                    return static_cast<std::uint64_t>(m_indexCount / 3);
+                };
+                if (cache->TryDraw(this, static_cast<std::uint64_t>(skinSlot) + 1, revision,
+                                   ViewImpostorRenderer::Kind::Character, minimum, maximum, m_indexCount / 3,
+                                   std::cref(capture)))
+                    return;
+            }
+        }
+    }
     BeginFrameSlots(frame);
     const std::optional<UniformSlot> uniformSlot = NextUniformSlot(frameIndex);
     if (!uniformSlot)
         return;
     UpdateWorldUniform(*uniformSlot, camera, position, yawRadians, timeSeconds, tint, scale);
 
-    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
-    cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    if (!ViewImpostorRenderer::ApplyCaptureViewport(cmd))
+    {
+        cmd.SetViewport(0.0f, 0.0f, static_cast<float>(extentWidth), static_cast<float>(extentHeight));
+        cmd.SetScissor(0, 0, extentWidth, extentHeight);
+    }
     cmd.SetGraphicsPipeline(*m_pipeline);
 
     cmd.SetVertexBuffer(0, *skinned, 0);

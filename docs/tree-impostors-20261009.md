@@ -5,8 +5,8 @@ A Tree Generator által mentett fák távoli példányai több irányból kész�
 ## Használat
 
 - Új fa: a Tree Generatorban alapból bekapcsolt **Bake distant-tree impostor** opcióval válaszd a **Save as Asset** műveletet.
-- Meglévő fa: az Asset Browserben a GLB modell jobb kattintásos menüjéből válaszd a **Bake tree impostor** műveletet. Két alapértelmezett materiallal rendelkező statikus modell szükséges. A mesh és a GUID megmarad; az atlasz és a függőségek kerülnek mellé. A betöltött renderer következő frame előtt frissül.
-- Egy fa kikapcsolása: **Disable tree impostor** ugyanebben a menüben. Az atlaszfájlok megmaradnak, így később újra elkészíthető. A renderer visszatér a rendes modellhez.
+- Meglévő fa vagy más statikus modell: az Asset Browser modellmenüjéből válaszd a **Bake model impostor** műveletet. 1–128 natív alapértelmezett materialslot támogatott. A mesh és a GUID megmarad; az atlasz és a függőségek kerülnek mellé. A betöltött renderer következő frame előtt frissül.
+- Egy modellatlasz kikapcsolása: **Disable model impostor** ugyanebben a menüben. Az atlaszfájlok megmaradnak, így később újra elkészíthető. A renderer a modellatlasz helyett visszatér a forráshoz; a külön GPU-s nézeti rendszer ettől még működhet.
 - Összehasonlító mérés: indítás előtt `IX_TREE_IMPOSTORS=0` kikapcsolja a használatukat. Alapból bekapcsoltak; a változó csak az adott folyamatot érinti.
 
 A generátorban az **Impostor distance**, **Transition range** és **Atlas view size** állítható. Alapérték: 180 m, 30 m átmenet, 256 pixel nézetenként. A váltás a fa középpontjától mért távolságot használja, és az egyenletes példányméretezéssel együtt skálázódik. Egy kétszeres méretű fa alapbeállításokkal 360–420 m között vált.
@@ -24,6 +24,8 @@ Egy `Oak.glb` modell mellé az `Oak.glb.impostor.json` és az `Oak_impostor/` k�
 Betöltéskor a forrásmodell, materialok, textúrák és az atlaszkimenetek tartalomlenyomata ellenőrződik. Menet közben az élő materialértékek változása és a fájlok módosítási ideje is érvényteleníti az atlaszt. A nagy atlaszok nem olvasódnak újra minden frame-ben. Új bake után a betöltött impostor is újratöltődik, a GPU befejezett munkája után.
 
 ## Korlátok
+
+A későbbi terrain-, objektum- és karakterbővítés, valamint a két rendszer külön kikapcsolása a [jelenetszintű impostor dokumentumban](scene-impostors-20261009.md) szerepel.
 
 - Hiányzó vagy módosított forrás/atlasz esetén a rendes mesh rajzolódik. Material vagy textúra változtatása után új bake szükséges.
 - Eltérő példánymaterial vagy aktív material override, nem egyenletes/negatív scale, illetve X/Z irányú döntés esetén az adott példány rendes mesh marad. Y irányú elforgatás és egyenletes scale támogatott.

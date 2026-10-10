@@ -291,6 +291,8 @@ if(WIN32)
     set(WATER_PS_SPV "${GENERATED_SHADER_DIR}/water_ps.spv")
     set(COMPOSITE_VS_SPV "${GENERATED_SHADER_DIR}/composite_vs.spv")
     set(COMPOSITE_PS_SPV "${GENERATED_SHADER_DIR}/composite_ps.spv")
+    set(VIEW_IMPOSTOR_VS_SPV "${GENERATED_SHADER_DIR}/view_impostor_vs.spv")
+    set(VIEW_IMPOSTOR_PS_SPV "${GENERATED_SHADER_DIR}/view_impostor_ps.spv")
     set(SHADOW_DEPTH_VS_SPV "${GENERATED_SHADER_DIR}/shadow_depth_vs.spv")
     set(SELECTION_OUTLINE_VS_SPV "${GENERATED_SHADER_DIR}/selection_outline_vs.spv")
     set(SELECTION_OUTLINE_PS_SPV "${GENERATED_SHADER_DIR}/selection_outline_ps.spv")
@@ -601,7 +603,23 @@ if(WIN32)
         DEPENDS "${CLIENT_ROOT}/shaders/ParticlesSim.hlsl"
         VERBATIM
     )
+    foreach(_VIEW_STAGE vs ps)
+        if(_VIEW_STAGE STREQUAL "vs")
+            set(_VIEW_ENTRY VSMain)
+        else()
+            set(_VIEW_ENTRY PSMain)
+        endif()
+        add_custom_command(
+            OUTPUT "${GENERATED_SHADER_DIR}/view_impostor_${_VIEW_STAGE}.spv"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
+            COMMAND "${DXC_EXECUTABLE}" -spirv -T ${_VIEW_STAGE}_6_0 -E ${_VIEW_ENTRY}
+                -Fo "${GENERATED_SHADER_DIR}/view_impostor_${_VIEW_STAGE}.spv" "${CLIENT_ROOT}/shaders/ViewImpostor.hlsl"
+            DEPENDS "${CLIENT_ROOT}/shaders/ViewImpostor.hlsl"
+            VERBATIM)
+    endforeach()
     add_custom_target(IXEngineShaders DEPENDS
+        "${VIEW_IMPOSTOR_VS_SPV}"
+        "${VIEW_IMPOSTOR_PS_SPV}"
         "${SKINNED_MESH_VS_SPV}"
         "${SKINNED_MESH_PS_SPV}"
         "${SKINNED_MESH_CS_SPV}"
