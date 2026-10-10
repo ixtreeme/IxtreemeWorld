@@ -412,7 +412,7 @@ private:
     void RenderWaterSculptTool();
     void RenderTerrainSculptTool();
     void RenderTerrainPaintTool();
-    void RenderSplatLayerSlot(std::uint32_t slotIndex);
+    void RenderSplatLayerSlot(std::uint32_t slotIndex, float slotWidth);
     void RenderMaterialEditor();
     // Type-specific controls rendered inside the shared Material Editor window.
     void RenderWaterMaterialEditor();

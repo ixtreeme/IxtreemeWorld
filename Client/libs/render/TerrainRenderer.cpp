@@ -1,5 +1,6 @@
 #include "asset/ExrImage.h"
 #include "TerrainRenderer.h"
+#include "TerrainSplatPaint.h"
 #include "ViewImpostorRenderer.h"
 
 #include "JobSystem.h"
@@ -3391,6 +3392,12 @@ void TerrainRenderer::SetMapEditorSettings(const MapEditorSettings& settings)
 {
     const MapEditorToolMode previousMode = m_editorToolMode;
     const MapEditorTool previousTool = m_editorTool;
+    if (m_editorStrokeActive && (settings.toolMode != m_editorToolMode || settings.tool != m_editorTool ||
+        settings.textureSlot != m_editorTextureSlot ||
+        std::clamp(settings.brushRadiusMeters, 0.5f, 50.0f) != m_editorBrushRadiusMeters ||
+        std::clamp(settings.paintEdgeSmoothing, 0.0f, 1.0f) != m_editorPaintEdgeSmoothing ||
+        std::clamp(settings.paintCoverage, 0.0f, 1.0f) != m_editorPaintCoverage))
+        EndEditorStroke();
     m_editorToolMode = settings.toolMode;
     m_editorTerrainToolActive =
         settings.toolMode == MapEditorToolMode::Heightmap ||
@@ -3398,8 +3405,9 @@ void TerrainRenderer::SetMapEditorSettings(const MapEditorSettings& settings)
     m_editorTool = settings.tool;
     m_editorBrushRadiusMeters = std::clamp(settings.brushRadiusMeters, 0.5f, 50.0f);
     m_editorBrushStrength = std::clamp(settings.brushStrength, 0.1f, 5.0f);
+    m_editorPaintEdgeSmoothing = std::clamp(settings.paintEdgeSmoothing, 0.0f, 1.0f);
+    m_editorPaintCoverage = std::clamp(settings.paintCoverage, 0.0f, 1.0f);
     m_editorTextureSlot = std::min<std::uint32_t>(settings.textureSlot, 7u);
-    m_editorPaintMode = settings.paintMode;
     if ((previousMode != m_editorToolMode || previousTool != m_editorTool) &&
         (m_editorToolMode == MapEditorToolMode::Heightmap ||
          m_editorToolMode == MapEditorToolMode::SplatPaint))
@@ -3949,6 +3957,8 @@ void TerrainRenderer::UpdateEditor(ixrhi::IXRHIDevice& rhi,
         if (m_editorStrokeActive)
             EndEditorStroke();
     }
+    if (!m_editorBrushVisible)
+        m_editorHasPaintAnchor = false;
 
     if (m_editorReloadRequested)
     {
@@ -5162,6 +5172,7 @@ void TerrainRenderer::BeginEditorStroke()
         return;
 
     m_editorStrokeActive = true;
+    m_editorHasPaintAnchor = false;
     m_editorHasFlattenTarget = false;
     m_currentUndo = {};
     std::fill(m_heightUndoRecorded.begin(), m_heightUndoRecorded.end(), 0);
@@ -5174,6 +5185,7 @@ void TerrainRenderer::EndEditorStroke()
         return;
 
     m_editorStrokeActive = false;
+    m_editorHasPaintAnchor = false;
     m_editorHasFlattenTarget = false;
     if (m_currentUndo.heights.empty() && m_currentUndo.splats.empty())
         return;
@@ -5289,6 +5301,7 @@ void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeco
     if (!m_editorBrushVisible || m_heightCmGrid.empty() || !m_vertexBuffer ||
         m_heightGridWidth < 2 || m_heightGridHeight < 2 || m_chunkSizeCells == 0)
     {
+        m_editorHasPaintAnchor = false;
         if (m_editorLmbHeld && m_editorTerrainToolActive)
         {
             Tracenf("[TEDIT-DIAG] %s apply skipped terrainId=%p brushVisible=%d vertexBuffer=%p heightGrid=%ux%u chunkCells=%u",
@@ -5312,7 +5325,10 @@ void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeco
     if (centerGridX < 0.0f || centerGridY < 0.0f ||
         centerGridX > static_cast<float>(m_heightGridWidth - 1u) ||
         centerGridY > static_cast<float>(m_heightGridHeight - 1u))
+    {
+        m_editorHasPaintAnchor = false;
         return;
+    }
 
     const uint32_t chunksX = (m_mapSizeX + m_chunkSizeCells - 1u) / m_chunkSizeCells;
     const uint32_t chunksY = (m_mapSizeY + m_chunkSizeCells - 1u) / m_chunkSizeCells;
@@ -5323,6 +5339,7 @@ void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeco
     {
         if (m_splatABytes.empty() || m_splatBBytes.empty() || m_splatWidth == 0 || m_splatHeight == 0)
         {
+            m_editorHasPaintAnchor = false;
             Tracenf("[TEDIT-DIAG] splat apply skipped terrainId=%p splatTarget=%p/%p splatSize=%ux%u layer=%u",
                 m_sceneTerrainActive ? static_cast<void*>(this) : nullptr,
                 m_splatABytes.empty() ? nullptr : static_cast<void*>(m_splatABytes.data()),
@@ -5336,14 +5353,25 @@ void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeco
         const float mapCellsY = std::max(static_cast<float>(m_mapSizeY), 1.0f);
         const float splatScaleX = static_cast<float>(m_splatWidth) / mapCellsX;
         const float splatScaleY = static_cast<float>(m_splatHeight) / mapCellsY;
-        const float centerSplatX = std::clamp(centerGridX * splatScaleX, 0.0f, static_cast<float>(m_splatWidth - 1u));
-        const float centerSplatY = std::clamp(centerGridY * splatScaleY, 0.0f, static_cast<float>(m_splatHeight - 1u));
-        const float radiusSplatX = std::max(radiusCells * splatScaleX, 1.0f);
-        const float radiusSplatY = std::max(radiusCells * splatScaleY, 1.0f);
-        const uint32_t minX = static_cast<uint32_t>(std::max(0.0f, xm::Floor(centerSplatX - radiusSplatX)));
-        const uint32_t minY = static_cast<uint32_t>(std::max(0.0f, xm::Floor(centerSplatY - radiusSplatY)));
-        const uint32_t maxX = std::min(m_splatWidth - 1u, static_cast<uint32_t>(xm::Ceil(centerSplatX + radiusSplatX)));
-        const uint32_t maxY = std::min(m_splatHeight - 1u, static_cast<uint32_t>(xm::Ceil(centerSplatY + radiusSplatY)));
+        const terrainpaint::Point end{centerGridX * m_cellScaleMeters, centerGridY * m_cellScaleMeters};
+        const terrainpaint::Point start = m_editorHasPaintAnchor
+            ? terrainpaint::Point{m_editorPaintAnchorGridX * m_cellScaleMeters, m_editorPaintAnchorGridY * m_cellScaleMeters}
+            : end;
+        const terrainpaint::Stroke stroke{start, end, m_editorBrushRadiusMeters,
+            m_cellScaleMeters / splatScaleX, m_cellScaleMeters / splatScaleY};
+        m_editorHasPaintAnchor = true;
+        m_editorPaintAnchorGridX = centerGridX;
+        m_editorPaintAnchorGridY = centerGridY;
+        const float padding = 0.5f * std::hypot(stroke.texelSizeX, stroke.texelSizeY);
+        // UV sampling addresses texel centers, so painting must evaluate (index + 0.5), too.
+        const uint32_t minX = static_cast<uint32_t>(std::max(0.0f,
+            xm::Floor((std::min(start.x, end.x) - stroke.radius - padding) / stroke.texelSizeX - 0.5f)));
+        const uint32_t minY = static_cast<uint32_t>(std::max(0.0f,
+            xm::Floor((std::min(start.y, end.y) - stroke.radius - padding) / stroke.texelSizeY - 0.5f)));
+        const uint32_t maxX = std::min(m_splatWidth - 1u, static_cast<uint32_t>(std::max(0.0f,
+            xm::Ceil((std::max(start.x, end.x) + stroke.radius + padding) / stroke.texelSizeX - 0.5f))));
+        const uint32_t maxY = std::min(m_splatHeight - 1u, static_cast<uint32_t>(std::max(0.0f,
+            xm::Ceil((std::max(start.y, end.y) + stroke.radius + padding) / stroke.texelSizeY - 0.5f))));
         bool changed = false;
         std::uint32_t changedCells = 0;
         std::unordered_set<std::uint32_t> touchedChunks;
@@ -5351,72 +5379,25 @@ void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeco
         {
             for (uint32_t sx = minX; sx <= maxX; ++sx)
             {
-                const float dx = (static_cast<float>(sx) - centerSplatX) / std::max(splatScaleX, 0.001f) * m_cellScaleMeters;
-                const float dy = (static_cast<float>(sy) - centerSplatY) / std::max(splatScaleY, 0.001f) * m_cellScaleMeters;
-                const float dist = xm::Sqrt(dx * dx + dy * dy);
-                if (dist > m_editorBrushRadiusMeters)
-                    continue;
-
-                const float t = 1.0f - dist / std::max(m_editorBrushRadiusMeters, 0.001f);
-                const float alpha = std::clamp(alphaCenter * t * t, 0.0f, 1.0f);
-                if (alpha <= 0.0001f)
+                const terrainpaint::Point sample{(static_cast<float>(sx) + 0.5f) * stroke.texelSizeX,
+                    (static_cast<float>(sy) + 0.5f) * stroke.texelSizeY};
+                const float coverage = terrainpaint::StrokeCoverage(sample, stroke,
+                    m_editorPaintEdgeSmoothing, m_editorPaintCoverage);
+                if (coverage <= 0.0f)
                     continue;
 
                 const size_t index = static_cast<size_t>(sy) * m_splatWidth + sx;
                 const size_t byte = index * 4u;
+                terrainpaint::Weights previous{};
+                for (int i = 0; i < 4; ++i)
+                    previous[i] = m_splatABytes[byte + i];
+                for (int i = 0; i < 4; ++i)
+                    previous[4 + i] = m_splatBBytes[byte + i];
+                const auto quantized = terrainpaint::Paint(previous, m_editorTextureSlot, coverage);
+                if (quantized == previous)
+                    continue;
+
                 RecordSplatUndo(index);
-
-                float weights[8];
-                for (int i = 0; i < 4; ++i)
-                    weights[i] = static_cast<float>(m_splatABytes[byte + i]) / 255.0f;
-                for (int i = 0; i < 4; ++i)
-                    weights[4 + i] = static_cast<float>(m_splatBBytes[byte + i]) / 255.0f;
-
-                const uint32_t slot = std::min<std::uint32_t>(m_editorTextureSlot, 7u);
-                if (m_editorPaintMode == MapEditorPaintMode::Replace)
-                {
-                    for (uint32_t i = 0; i < 8; ++i)
-                    {
-                        const float target = i == slot ? 1.0f : 0.0f;
-                        weights[i] += (target - weights[i]) * alpha;
-                    }
-                }
-                else
-                {
-                    weights[slot] += alpha;
-                    float total = 0.0f;
-                    for (float weight : weights)
-                        total += weight;
-                    if (total > 0.0001f)
-                    {
-                        for (float& weight : weights)
-                            weight /= total;
-                    }
-                }
-
-                float total = 0.0f;
-                for (float weight : weights)
-                    total += weight;
-                if (total > 0.0001f)
-                {
-                    for (float& weight : weights)
-                        weight = std::clamp(weight / total, 0.0f, 1.0f);
-                }
-
-                std::array<uint8_t, 8> quantized{};
-                int quantizedTotal = 0;
-                uint32_t strongest = 0;
-                for (uint32_t i = 0; i < 8; ++i)
-                {
-                    quantized[i] = static_cast<uint8_t>(std::clamp(std::lround(weights[i] * 255.0f), 0l, 255l));
-                    quantizedTotal += quantized[i];
-                    if (quantized[i] > quantized[strongest])
-                        strongest = i;
-                }
-                const int correction = 255 - quantizedTotal;
-                quantized[strongest] = static_cast<uint8_t>(
-                    std::clamp(static_cast<int>(quantized[strongest]) + correction, 0, 255));
-
                 for (int i = 0; i < 4; ++i)
                     m_splatABytes[byte + i] = quantized[i];
                 for (int i = 0; i < 4; ++i)

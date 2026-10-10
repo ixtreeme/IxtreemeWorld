@@ -22,12 +22,6 @@ enum class MapEditorTool
     Paint
 };
 
-enum class MapEditorPaintMode
-{
-    Replace,
-    Mix
-};
-
 enum class MapEditorToolMode
 {
     None,
@@ -59,7 +53,8 @@ struct MapEditorSettings
     float brushFalloff = 1.0f;
     float flattenTargetY = 0.0f;
     std::uint32_t textureSlot = 4;
-    MapEditorPaintMode paintMode = MapEditorPaintMode::Replace;
+    float paintEdgeSmoothing = 0.5f;
+    float paintCoverage = 1.0f;
     bool waterSculptActive = false;
     bool waterSculptAdd = true;
     float waterSculptRadiusMeters = 3.0f;

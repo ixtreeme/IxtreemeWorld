@@ -39,6 +39,8 @@ add_library(IXEngineRender STATIC
     SpatialIndex.h
     TerrainRenderer.cpp
     TerrainRenderer.h
+    TerrainSplatPaint.cpp
+    TerrainSplatPaint.h
     IconsFontAwesome6.h
     UIHelpers.h
     WaterBodyIO.cpp
@@ -144,6 +146,15 @@ endif()
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
 
 if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(TerrainSplatPaintTest tests/TerrainSplatPaintTest.cpp)
+    target_link_libraries(TerrainSplatPaintTest PRIVATE IXEngineRender)
+    target_compile_features(TerrainSplatPaintTest PRIVATE cxx_std_20)
+    if(MSVC)
+        set_target_properties(TerrainSplatPaintTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME TerrainSplatPaintTest COMMAND TerrainSplatPaintTest)
+
     add_executable(ViewImpostorTest tests/ViewImpostorTest.cpp)
     target_link_libraries(ViewImpostorTest PRIVATE IXEngineRender)
     target_compile_features(ViewImpostorTest PRIVATE cxx_std_20)

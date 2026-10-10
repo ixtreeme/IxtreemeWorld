@@ -2623,7 +2623,7 @@ void EditorImGui::RenderTerrainSculptTool()
         "Pick a tool, then sculpt in the Scene View.");
 }
 
-void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
+void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex, float slotWidth)
 {
     if (slotIndex >= m_paletteSlots.size())
         return;
@@ -2631,32 +2631,67 @@ void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
     MapEditorPaletteSlot& slot = m_paletteSlots[slotIndex];
     ImGui::PushID(static_cast<int>(slotIndex));
     const bool selected = m_editorSettings.textureSlot == slotIndex;
-    const float slotWidth = std::max(52.0f, (ImGui::GetContentRegionAvail().x - 3.0f * ImGui::GetStyle().ItemSpacing.x) / 4.0f);
     ImGui::BeginGroup();
-    if (selected)
+    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(slot.assetId) : std::optional<AssetLibrary::Entry>{};
+    AssetPreviewTexture* preview = nullptr;
+    if (entry)
     {
-        ImGui::PushStyleColor(ImGuiCol_Button, UI::Theme::Accent);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UI::Theme::AccentHovered);
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, UI::Theme::AccentActive);
+        if (entry->category == AssetLibrary::Category::Material)
+        {
+            // Show the material's base color, never a normal/roughness map as its appearance.
+            const auto diffuse = m_assetLibrary->FindById(entry->material.diffuseTextureId);
+            if (diffuse)
+                preview = GetAssetPreviewTexture(*diffuse);
+        }
+        else if (entry->category == AssetLibrary::Category::Texture)
+            preview = GetAssetPreviewTexture(*entry);
     }
-    const std::string label = std::to_string(slotIndex + 1u) + "##splat_slot";
-    if (ImGui::Button(label.c_str(), ImVec2(slotWidth, 36.0f)))
+    const ImVec2 previewMin = ImGui::GetCursorScreenPos();
+    const ImVec2 previewMax(previewMin.x + slotWidth, previewMin.y + slotWidth);
+    if (ImGui::InvisibleButton("##splat_slot", ImVec2(slotWidth, slotWidth)))
     {
         m_editorSettings.textureSlot = slotIndex;
         m_editorSettings.tool = MapEditorTool::Paint;
         SetToolMode(MapEditorToolMode::SplatPaint);
     }
-    if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && m_assetLibrary)
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const bool occupied = entry.has_value() || !slot.texturePath.empty();
+    const ImU32 tint = ImGui::ColorConvertFloat4ToU32(ImVec4(
+        std::clamp(slot.colorTint[0], 0.0f, 1.0f),
+        std::clamp(slot.colorTint[1], 0.0f, 1.0f),
+        std::clamp(slot.colorTint[2], 0.0f, 1.0f), 1.0f));
+    void* textureId = preview && m_textureProvider ? m_textureProvider->GetPreviewTexture(preview->handle) : nullptr;
+    drawList->AddRectFilled(previewMin, previewMax,
+        occupied && !textureId ? tint : ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
+    if (textureId)
+        drawList->AddImageRounded(reinterpret_cast<ImTextureID>(textureId), previewMin, previewMax,
+            ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), tint, 4.0f);
+    else if (!occupied)
     {
-        const auto entry = m_assetLibrary->FindById(slot.assetId);
-        if (entry && entry->category == AssetLibrary::Category::Material)
+        const ImVec2 iconSize = ImGui::CalcTextSize("+");
+        drawList->AddText(ImVec2(previewMin.x + (slotWidth - iconSize.x) * 0.5f,
+            previewMin.y + (slotWidth - iconSize.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_TextDisabled), "+");
+    }
+    drawList->AddRect(previewMin, previewMax,
+        ImGui::ColorConvertFloat4ToU32(selected ? UI::Theme::Accent :
+            (hovered ? UI::Theme::AccentHovered : ImGui::GetStyleColorVec4(ImGuiCol_Border))),
+        4.0f, 0, selected ? 3.0f : (hovered ? 2.0f : 1.0f));
+    if (selected)
+    {
+        const float badgeSize = ImGui::GetFontSize() + 6.0f;
+        drawList->AddRectFilled(previewMin, ImVec2(previewMin.x + badgeSize, previewMin.y + badgeSize),
+            ImGui::ColorConvertFloat4ToU32(UI::Theme::Accent), 3.0f);
+        drawList->AddText(ImVec2(previewMin.x + 3.0f, previewMin.y + 3.0f), IM_COL32_WHITE, ICON_FA_CHECK);
+    }
+    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && entry)
+    {
+        if (entry->category == AssetLibrary::Category::Material)
         {
             OpenPbrMaterialEditor(entry->id);
             SetToolMode(MapEditorToolMode::None);
         }
     }
-    if (selected)
-        ImGui::PopStyleColor(3);
 
     if (ImGui::BeginDragDropTarget())
     {
@@ -2705,9 +2740,11 @@ void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
 void EditorImGui::RenderTerrainPaintTool()
 {
     const bool active = m_editorSettings.toolMode == MapEditorToolMode::SplatPaint;
+    const float slotWidth = std::max(24.0f,
+        (ImGui::GetContentRegionAvail().x - 3.0f * ImGui::GetStyle().ItemSpacing.x) / 4.0f);
     for (std::uint32_t i = 0; i < m_paletteSlots.size(); ++i)
     {
-        RenderSplatLayerSlot(i);
+        RenderSplatLayerSlot(i, slotWidth);
         if (i % 4 != 3)
             ImGui::SameLine();
     }
@@ -2718,13 +2755,18 @@ void EditorImGui::RenderTerrainPaintTool()
         SetToolMode(MapEditorToolMode::None);
 
     ImGui::SeparatorText("Brush");
-    int paintMode = m_editorSettings.paintMode == MapEditorPaintMode::Mix ? 1 : 0;
-    const char* modes[] = {"Replace", "Mix"};
-    if (UI::Prop::Combo("Blend", &paintMode, modes, IM_ARRAYSIZE(modes)))
-        m_editorSettings.paintMode = paintMode == 1 ? MapEditorPaintMode::Mix : MapEditorPaintMode::Replace;
-    UI::Prop::SliderFloat("Brush radius", &m_editorSettings.brushRadiusMeters, 1.0f, 100.0f, "%.1f m");
-    UI::Prop::SliderFloat("Strength", &m_editorSettings.brushStrength, 0.1f, 1.0f, "%.2f");
-    UI::Prop::SliderFloat("Falloff", &m_editorSettings.brushFalloff, 0.0f, 1.0f, "%.2f");
+    float diameter = 2.0f * m_editorSettings.brushRadiusMeters;
+    if (UI::Prop::SliderFloat("Diameter", &diameter, 1.0f, 100.0f, "%.1f m"))
+        m_editorSettings.brushRadiusMeters = 0.5f * std::clamp(diameter, 1.0f, 100.0f);
+    UI::ItemTooltip("The full width of the paint brush, in meters.");
+    float edgeSmoothing = 100.0f * m_editorSettings.paintEdgeSmoothing;
+    if (UI::Prop::SliderFloat("Edge smoothing", &edgeSmoothing, 0.0f, 100.0f, "%.0f%%"))
+        m_editorSettings.paintEdgeSmoothing = std::clamp(edgeSmoothing * 0.01f, 0.0f, 1.0f);
+    UI::ItemTooltip("0%: crisp contour with minimal antialiasing. 100%: a wide, smooth transition toward the edge. The center keeps the chosen coverage.");
+    float coverage = 100.0f * m_editorSettings.paintCoverage;
+    if (UI::Prop::SliderFloat("Overall coverage", &coverage, 0.0f, 100.0f, "%.0f%%"))
+        m_editorSettings.paintCoverage = std::clamp(coverage * 0.01f, 0.0f, 1.0f);
+    UI::ItemTooltip("100%: fully cover the previous texture in the brush interior. Lower values blend with it. Holding the brush does not accumulate coverage; existing stronger coverage is preserved.");
 
     const std::uint32_t selectedSlot = std::min<std::uint32_t>(m_editorSettings.textureSlot, 7u);
     MapEditorPaletteSlot& materialSlot = m_paletteSlots[selectedSlot];

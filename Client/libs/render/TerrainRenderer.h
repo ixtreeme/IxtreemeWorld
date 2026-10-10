@@ -755,6 +755,9 @@ private:
     std::uint32_t m_brushDiagApplications = 0;
     bool BrushDiagLogs() const { return m_brushDiagApplications < 2; }
     bool m_editorStrokeActive = false;
+    bool m_editorHasPaintAnchor = false;
+    float m_editorPaintAnchorGridX = 0.0f;
+    float m_editorPaintAnchorGridY = 0.0f;
     bool m_editorCtrlHeld = false;
     bool m_editorBrushVisible = false;
     bool m_editorTerrainToolActive = false;
@@ -783,6 +786,8 @@ private:
     int m_editorCursorY = 0;
     float m_editorBrushRadiusMeters = 5.0f;
     float m_editorBrushStrength = 1.0f;
+    float m_editorPaintEdgeSmoothing = 0.5f;
+    float m_editorPaintCoverage = 1.0f;
     float m_editorBrushLocalX = 0.0f;
     float m_editorBrushLocalZ = 0.0f;
     float m_waterSculptBrushWorldX = 0.0f;
@@ -792,7 +797,6 @@ private:
     bool m_editorHasFlattenTarget = false;
     MapEditorTool m_editorTool = MapEditorTool::Raise;
     MapEditorToolMode m_editorToolMode = MapEditorToolMode::None;
-    MapEditorPaintMode m_editorPaintMode = MapEditorPaintMode::Replace;
     std::uint32_t m_editorTextureSlot = 4;
     LightingState m_lightingState;
     float m_reflectionClipWaterLevelY = std::numeric_limits<float>::quiet_NaN();
