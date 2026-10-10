@@ -451,6 +451,7 @@ private:
     std::optional<std::filesystem::path> AssetPreviewPathFor(const AssetLibrary::Entry& entry) const;
     std::optional<std::filesystem::path> ResolveAssetPreviewPath(const AssetLibrary::Entry& entry) const;
     AssetPreviewTexture* GetAssetPreviewTexture(const AssetLibrary::Entry& entry);
+    void RenderMaterialTexturePreview(const AssetLibrary::Entry* entry);
     bool LoadAssetPreviewTexture(const std::filesystem::path& path, AssetPreviewTexture& outTexture);
     void OpenImportAssetDialog(const std::string& targetSubpath);
     void ImportAssetFromPath(const std::filesystem::path& sourcePath,

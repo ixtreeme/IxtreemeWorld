@@ -190,12 +190,33 @@ void EditorImGui::RenderWaterMaterialEdgeFadeSection(WaterMaterialData& material
     }
 }
 
+void EditorImGui::RenderMaterialTexturePreview(const AssetLibrary::Entry* entry)
+{
+    AssetPreviewTexture* preview = entry ? GetAssetPreviewTexture(*entry) : nullptr;
+    void* textureId = preview && m_textureProvider ? m_textureProvider->GetPreviewTexture(preview->handle) : nullptr;
+    ImGui::Button(entry ? "##texture_preview" : "+##texture_preview", ImVec2(70.0f, 70.0f));
+    if (!textureId)
+        return;
+
+    // Draw within the button so its hover frame and drag/drop hit area remain intact.
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    const float scale = std::min((max.x - min.x - 6.0f) / preview->width,
+        (max.y - min.y - 6.0f) / preview->height);
+    const ImVec2 size(preview->width * scale, preview->height * scale);
+    const ImVec2 imageMin(min.x + (max.x - min.x - size.x) * 0.5f,
+        min.y + (max.y - min.y - size.y) * 0.5f);
+    ImGui::GetWindowDrawList()->AddImage(reinterpret_cast<ImTextureID>(textureId), imageMin,
+        ImVec2(imageMin.x + size.x, imageMin.y + size.y));
+}
+
 void EditorImGui::RenderWaterTextureSlot(const char* label, std::string& texturePath, bool& changed)
 {
     ImGui::PushID(label);
     ImGui::TextUnformatted(label);
 
     std::string display = texturePath.empty() ? std::string("empty") : texturePath;
+    const AssetLibrary::Entry* textureEntry = nullptr;
     if (m_assetLibrary)
     {
         for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
@@ -203,12 +224,13 @@ void EditorImGui::RenderWaterTextureSlot(const char* label, std::string& texture
             if (entry.category == AssetLibrary::Category::Texture && m_assetLibrary->AssetRelativePath(entry) == texturePath)
             {
                 display = entry.displayName;
+                textureEntry = &entry;
                 break;
             }
         }
     }
 
-    ImGui::Button("##texture_slot", ImVec2(70.0f, 70.0f));
+    RenderMaterialTexturePreview(textureEntry);
     if (ImGui::BeginDragDropTarget())
     {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
@@ -357,14 +379,15 @@ void EditorImGui::RenderPbrTextureSlot(const char* label, std::string& textureId
     ImGui::PushID(label);
     ImGui::TextUnformatted(label);
     std::string display = "(empty)";
+    std::optional<AssetLibrary::Entry> textureEntry;
     if (m_assetLibrary && !textureId.empty())
     {
-        auto entry = m_assetLibrary->FindById(textureId);
-        if (entry)
-            display = entry->displayName;
+        textureEntry = m_assetLibrary->FindById(textureId);
+        if (textureEntry)
+            display = textureEntry->displayName;
     }
 
-    ImGui::Button("##pbr_texture_slot", ImVec2(70.0f, 70.0f));
+    RenderMaterialTexturePreview(textureEntry ? &*textureEntry : nullptr);
     if (ImGui::BeginDragDropTarget())
     {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
