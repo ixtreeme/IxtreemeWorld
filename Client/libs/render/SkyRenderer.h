@@ -50,7 +50,7 @@ public:
                 const WorldCamera& camera,
                 std::uint32_t targetWidth,
                 std::uint32_t targetHeight,
-                const ixrhi::IXRHIRenderPass* renderPass = nullptr);
+                const ixrhi::IXRHIRenderPass* renderPass = nullptr, uint32_t viewIndex = 0);
     // The sky's average colour (linear, exposure and tint included) — for "ambient from sky".
     std::array<float, 3> AverageColor() const { return m_averageColor; }
     // Empty while the sky draws as set; otherwise why it cannot (a missing or unreadable image).
@@ -82,9 +82,9 @@ private:
     client::asset::IAssetReader* m_assets = nullptr;
     const ixrhi::IXRHIRenderPass* m_targetPass = nullptr;  // borrowed (frame owner)
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
-    // A second pipeline for the one other pass the sky is drawn in (the water reflection).
-    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_extraPipeline;
-    const ixrhi::IXRHIRenderPass* m_extraPass = nullptr;
+    // Both water views may record reflections before the frame is submitted.
+    std::array<std::unique_ptr<ixrhi::IXRHIGraphicsPipeline>, 2> m_extraPipelines{};
+    std::array<const ixrhi::IXRHIRenderPass*, 2> m_extraPasses{};
     std::shared_ptr<ixrhi::IXRHIShader> m_vertexShader;
     std::shared_ptr<ixrhi::IXRHIShader> m_fragmentShader;
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;

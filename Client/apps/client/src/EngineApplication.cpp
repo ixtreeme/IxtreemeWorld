@@ -6520,6 +6520,7 @@ int RunGame(NativeWindow& window,
                     terrain.SetMapEditorOpen(true);
                 // Reads the manifest the editor wrote (no folder scan, nothing written in the game folder).
                 editorImGui.InitializeProjectAssetLibrary(projects.ProjectRoot(), projects.AssetRootPath());
+                terrain.SetWaterMaterials(editorImGui.GetWaterMaterialsSnapshot());
                 editorImGui.LoadProjectGameModules(projects.ProjectRoot());  // native C++ game-module DLLs
                 const std::string startupScene = projects.CurrentProject().startupScene;
                 if (!startupScene.empty() && SceneManager::Instance().LoadScene(startupScene))
@@ -13345,18 +13346,18 @@ int RunGame(NativeWindow& window,
                 terrain.BeginWaterVisibility(*frameInfo.commandList, frameInfo);
             // The reflection follows the camera the shadows do; a Scene view whose water is hidden
             // behind the scene needs none.
-            if (isInWorld && hasSceneTerrain && hasFrameCamera && !debugDisableWaterReflectionPass &&
-                !(sceneWaterQuery && shadowCamera == &frameCamera && !terrain.WaterMayBeVisible(frameInfo.frameNumber)))
-            {
+            auto renderWaterReflectionView = [&](const WorldCamera& waterCamera,
+                std::uint32_t width, std::uint32_t height, std::uint32_t viewIndex) {
+                if (!isInWorld || !hasSceneTerrain || !hasFrameCamera || debugDisableWaterReflectionPass)
+                    return;
+                if (viewIndex == 0 && sceneWaterQuery && !terrain.WaterMayBeVisible(frameInfo.frameNumber))
+                    return;
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionBegin);
-                // One reflection per frame, mirrored for the view actually drawn (as the shadow map):
-                // the water samples it at its own screen position, so it must match that camera.
-                const bool reflectionForSceneView = shadowCamera == &frameCamera;
+                // Each camera owns its reflection target and uniforms: a different view cannot
+                // sample this camera's image at its own screen coordinates.
                 terrain.RenderWaterReflection(*frameInfo.commandList,
                     frameInfo,
-                    *shadowCamera,
-                    reflectionForSceneView ? renderSize.width : gameView.Width(),
-                    reflectionForSceneView ? renderSize.height : gameView.Height(),
+                    waterCamera, width, height,
                     seconds,
                     [&](const WorldCamera& mirrorCamera,
                         std::uint32_t reflectionWidth,
@@ -13383,19 +13384,25 @@ int RunGame(NativeWindow& window,
                                 rec.yaw,
                                 rec.slot,
                                 rec.tint,
-                                rec.scale);
+                                rec.scale, viewIndex);
                         }
 
                         // The mirrored sky last: it fills only what no reflected geometry covered.
                         if (skyOk)
                             skyRenderer.Render(*frameInfo.commandList, frameInfo, mirrorCamera,
-                                reflectionWidth, reflectionHeight, reflectionPass);
+                                reflectionWidth, reflectionHeight, reflectionPass, viewIndex);
 
                         // (Editor lights are not drawn as the skinned character model in the
                         // water reflection either — removed old debug visualization.)
-                    });
+                    }, viewIndex);
                 rhiDevice->WriteTimestamp(ixrhi::IXRHITimestampPoint::WaterReflectionEnd);
-            }
+            };
+            if (drawSceneView)
+                renderWaterReflectionView(frameCamera, renderSize.width, renderSize.height, 0);
+#if defined(IXTREEME_WITH_EDITOR)
+            if (gameViewCamera)
+                renderWaterReflectionView(*gameViewCamera, gameView.Width(), gameView.Height(), 1);
+#endif
 
             // Main-window pass ownership (Phase 3C): exactly one Begin/End per
             // frame around ALL swapchain rendering (direct or composite + UI).
@@ -14520,10 +14527,8 @@ int RunGame(NativeWindow& window,
                         // Scene View's free-fly terrain (viewIndex=0, recorded earlier this
                         // frame into the same command buffer). Static meshes already use
                         // per-draw uniforms and are safe.
-                        // Water uses the secondary per-water-body uniform/descriptor path
-                        // (viewIndex=1) so it can be drawn from the Main Camera without
-                        // clobbering the Scene View's water; reflection/refraction reuse this
-                        // frame's Scene-view textures (acceptable; per-view RTs are a refinement).
+                        // Water reflection and refraction use this camera's own targets and
+                        // the secondary per-frame descriptor/uniform bank.
                         // The terrain is drawn after the opaque meshes (see the Scene View): the
                         // Game view pass clears depth, so the terrain needs no clear of its own.
                         if (isInWorld)
@@ -14605,13 +14610,24 @@ int RunGame(NativeWindow& window,
                         if (skyOk && isInWorld)
                             skyRenderer.Render(*frameInfo.commandList, frameInfo, gameCamera,
                                 gameExtent.width, gameExtent.height);
-                        // Transparent draws: those under water, the water, then the rest over it.
+                        // Snapshot this camera's opaque image before water samples it. Never use
+                        // the Scene camera's color/depth (which may also be stale when its tab is hidden).
                         viewImpostors.EndView();
                         collectParticleDraws(gameTransparentDraws, gameCamera, /*allowSoftParticles=*/false);
                         sortTransparentDraws(gameTransparentDraws);
                         drawTransparents(gameTransparentDraws, /*underWater=*/true, gameCamera, gameExtent.width, gameExtent.height);
-                        if (hasSceneTerrain)
-                            terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds, gameExtent.width, gameExtent.height, /*viewIndex=*/1);
+                        const bool gameWaterVisible = hasSceneTerrain && terrain.AnyWaterBodyInView(gameCamera);
+                        if (gameWaterVisible)
+                        {
+                            gameView.EndMainPass(*frameInfo.commandList);
+                            gameView.SnapshotScene(*frameInfo.commandList, frameInfo);
+                            terrain.SetWaterRefractionInputs(gameView.GetColorSnapshotTexture(),
+                                gameView.GetDepthSnapshotTexture(), gameView.GetSampler(),
+                                gameExtent.width, gameExtent.height, 1);
+                            gameView.BeginMainPass(*frameInfo.commandList, frameInfo, false);
+                            terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds,
+                                gameExtent.width, gameExtent.height, 1);
+                        }
                         drawTransparents(gameTransparentDraws, /*underWater=*/false, gameCamera, gameExtent.width, gameExtent.height);
                         // God rays over the game image, under the game's UI: after the pass, from its depth;
                         // the game view's tone-map draw adds them.

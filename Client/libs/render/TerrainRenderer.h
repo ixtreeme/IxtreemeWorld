@@ -132,7 +132,8 @@ public:
                                   std::shared_ptr<ixrhi::IXRHITexture> depthSnapshot,
                                   std::shared_ptr<ixrhi::IXRHISampler> sampler,
                                   std::uint32_t width,
-                                  std::uint32_t height);
+                                  std::uint32_t height,
+                                  uint32_t viewIndex = 0);
     // Whether any enabled water body is inside the camera's view (its water pass would draw).
     bool AnyWaterBodyInView(const WorldCamera& camera) const;
     // Whether the Scene view's water is seen past the opaque scene, by an occlusion query of the
@@ -167,7 +168,8 @@ public:
                                                         std::uint32_t,
                                                         std::uint32_t,
                                                         const ixrhi::IXRHIRenderPass*,
-                                                        float)>& renderEntities = {});
+                                                        float)>& renderEntities = {},
+                               uint32_t viewIndex = 0);
     // viewIndex selects which camera-uniform path to use: 0 = primary (editor Scene
     // View / free-fly), 1 = secondary (Game view / project Main Camera). Each view has
     // its own per-frame uniform buffer + descriptor set so the terrain can be drawn from
@@ -519,10 +521,11 @@ private:
                                                   bool force,
                                                   WaterConfig::ReflectionQuality quality,
                                                   std::uint32_t viewWidth = 0,
-                                                  std::uint32_t viewHeight = 0);
-    bool CreateWaterReflectionPipeline(ixrhi::IXRHIDevice& rhi);
-    void DestroyWaterReflectionResources();
-    void DestroyWaterReflectionPipeline();
+                                                  std::uint32_t viewHeight = 0,
+                                                  uint32_t viewIndex = 0);
+    bool CreateWaterReflectionPipeline(ixrhi::IXRHIDevice& rhi, uint32_t viewIndex = 0);
+    void DestroyWaterReflectionResources(uint32_t viewIndex = 0);
+    void DestroyWaterReflectionPipeline(uint32_t viewIndex = 0);
     WorldCamera ComputeMirrorCamera(const WorldCamera& camera,
                                     std::uint32_t targetWidth,
                                     std::uint32_t targetHeight,
@@ -551,7 +554,8 @@ private:
                                         double timeSeconds,
                                         const WaterConfig& water,
                                         float waterLevelY,
-                                        bool reflectionTarget) const;
+                                        bool reflectionTarget,
+                                        uint32_t viewIndex) const;
     void UploadWaterUniform(const std::shared_ptr<ixrhi::IXRHIBuffer>& buffer, const WaterUniformBlock& uniform);
     void DestroyTerrainLayers();
     void UpdateUniform(uint32_t frameIndex, const WorldCamera& camera, bool reflectionPass = false, uint32_t viewIndex = 0);
@@ -611,6 +615,7 @@ private:
     // whichever camera was written last (the unmirrored Scene View, without the water-level clip).
     static constexpr uint32_t kReflectionUniformView = 2;
     std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_uniformBuffersReflection{};
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> m_uniformBuffersReflectionSecondary{};
     // One bind-group layout (UBO + 9 combined samplers) with a slot per
     // (view, frame): slot = viewIndex * kFramesInFlight + frameIndex.
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_bindLayout;
@@ -631,13 +636,19 @@ private:
     // Refraction inputs are IXRHI-owned (shared lifetime: recreating the
     // offscreen target cannot dangle these). Native handles resolve locally
     // at descriptor-write time (backend bridge, transition-only).
-    std::shared_ptr<ixrhi::IXRHITexture> m_waterSceneColor;
-    std::shared_ptr<ixrhi::IXRHITexture> m_waterSceneDepth;
-    std::shared_ptr<ixrhi::IXRHISampler> m_waterSceneSampler;
-    std::uint32_t m_waterSceneWidth = 0;
-    std::uint32_t m_waterSceneHeight = 0;
-    WaterReflectionResources m_waterReflection;
-    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_reflectionPipeline;
+    struct WaterViewResources
+    {
+        std::shared_ptr<ixrhi::IXRHITexture> sceneColor;
+        std::shared_ptr<ixrhi::IXRHITexture> sceneDepth;
+        std::shared_ptr<ixrhi::IXRHISampler> sceneSampler;
+        std::uint32_t sceneWidth = 0;
+        std::uint32_t sceneHeight = 0;
+        WaterReflectionResources reflection;
+        std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> reflectionPipeline;
+        std::uint64_t reflectionFrame = ~std::uint64_t{0};
+        std::uint32_t reflectionBodyId = 0;
+    };
+    std::array<WaterViewResources, 2> m_waterViews{};
     bool m_waterReflectionDescriptorsDirty = true;
     // 4-cascade depth array + comparison sampler + one depth-only target per
     // cascade slice. Sampled by the main pass (binding 9) after an explicit

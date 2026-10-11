@@ -173,7 +173,7 @@ public:
         float yawRadians,
         uint32_t skinSlot = 0,
         std::array<float, 4> tint = {1.0f, 1.0f, 1.0f, 1.0f},
-        std::array<float, 3> scale = {1.0f, 1.0f, 1.0f});
+        std::array<float, 3> scale = {1.0f, 1.0f, 1.0f}, uint32_t viewIndex = 0);
     void SetLightingState(const LightingState& lighting) { m_lightingState = lighting; }
     // The sun shadow cascades the draws sample. Set before the first draw (the map is bound in every
     // draw) and each frame (cascades follow the camera).
@@ -335,7 +335,7 @@ private:
     ixrhi::IXRHIBuffer* SkinnedOutput(uint32_t frameIndex, uint32_t skinSlot) const;
     ixrhi::IXRHIBuffer* BonePalette(uint32_t frameIndex, uint32_t skinSlot) const;
     bool CreatePipeline(ixrhi::IXRHIDevice& rhi);
-    bool CreateReflectionPipeline(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* renderPass);
+    bool CreateReflectionPipeline(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* renderPass, uint32_t viewIndex);
     bool CreateShadowPipeline(ixrhi::IXRHIDevice& rhi, const ixrhi::IXRHIRenderPass* shadowPass);
     // Whether the draws' descriptors are complete (the sun shadow map is bound); logs once if not.
     bool SunShadowBound() const;
@@ -392,8 +392,8 @@ private:
     bool m_loggedUniformPagesFull = false;
     bool m_loggedSkinPagesFull = false;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_pipeline;
-    std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_reflectionPipeline;
-    const ixrhi::IXRHIRenderPass* m_reflectionPass = nullptr; // borrowed (terrain owns)
+    std::array<std::unique_ptr<ixrhi::IXRHIGraphicsPipeline>, 2> m_reflectionPipelines{};
+    std::array<const ixrhi::IXRHIRenderPass*, 2> m_reflectionPasses{}; // borrowed (terrain owns)
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_outlinePipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_shadowPipeline;  // sun shadow cascades, depth only
     const ixrhi::IXRHIRenderPass* m_shadowPass = nullptr;             // borrowed (terrain owns)

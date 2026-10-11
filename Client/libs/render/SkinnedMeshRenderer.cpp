@@ -1218,8 +1218,10 @@ void SkinnedMeshRenderer::RenderInWorldReflection(ixrhi::IXRHICommandList& cmd,
     float yawRadians,
     uint32_t skinSlot,
     std::array<float, 4> tint,
-    std::array<float, 3> scale)
+    std::array<float, 3> scale, uint32_t viewIndex)
 {
+    auto& reflectionPipeline = m_reflectionPipelines[viewIndex == 0 ? 0 : 1];
+    auto& reflectionPass = m_reflectionPasses[viewIndex == 0 ? 0 : 1];
     // Reflection draws run inside the terrain-owned native reflection pass.
     // That pass uses the swapchain color/depth formats (same as the backend
     // main pass and the offscreen scene pass), so a pipeline baked against
@@ -1236,10 +1238,11 @@ void SkinnedMeshRenderer::RenderInWorldReflection(ixrhi::IXRHICommandList& cmd,
     // null). Comparing the EFFECTIVE token also catches m_targetPass swaps
     // while the caller passes null.
     const ixrhi::IXRHIRenderPass* effectivePass = renderPass != nullptr ? renderPass : m_targetPass;
-    if (!m_reflectionPipeline || m_reflectionPass != effectivePass)
+    if (!reflectionPipeline || reflectionPass != effectivePass)
     {
-        DestroyReflectionPipeline();
-        if (!CreateReflectionPipeline(*m_rhi, effectivePass))
+        reflectionPipeline.reset();
+        reflectionPass = nullptr;
+        if (!CreateReflectionPipeline(*m_rhi, effectivePass, viewIndex))
             return;
     }
 
@@ -1258,7 +1261,7 @@ void SkinnedMeshRenderer::RenderInWorldReflection(ixrhi::IXRHICommandList& cmd,
 
     cmd.SetViewport(0.0f, 0.0f, static_cast<float>(targetWidth), static_cast<float>(targetHeight));
     cmd.SetScissor(0, 0, targetWidth, targetHeight);
-    cmd.SetGraphicsPipeline(*m_reflectionPipeline);
+    cmd.SetGraphicsPipeline(*reflectionPipeline);
 
     cmd.SetVertexBuffer(0, *skinned, 0);
     cmd.SetIndexBuffer(*m_indexBuffer, 0, /*thirtyTwoBit=*/true);
@@ -2999,7 +3002,7 @@ bool SkinnedMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
 }
 
 bool SkinnedMeshRenderer::CreateReflectionPipeline(ixrhi::IXRHIDevice& rhi,
-    const ixrhi::IXRHIRenderPass* renderPass)
+    const ixrhi::IXRHIRenderPass* renderPass, uint32_t viewIndex)
 {
     if (!m_assets || !m_bindLayout)
         return false;
@@ -3049,10 +3052,12 @@ bool SkinnedMeshRenderer::CreateReflectionPipeline(ixrhi::IXRHIDevice& rhi,
     desc.sampleCount = 1;
     desc.targetRenderPass = effectivePass;
     desc.debugName = "SkinnedMesh:Reflection";
-    m_reflectionPipeline = rhi.CreateGraphicsPipeline(desc);
-    if (!m_reflectionPipeline)
+    auto& reflectionPipeline = m_reflectionPipelines[viewIndex == 0 ? 0 : 1];
+    auto& reflectionPass = m_reflectionPasses[viewIndex == 0 ? 0 : 1];
+    reflectionPipeline = rhi.CreateGraphicsPipeline(desc);
+    if (!reflectionPipeline)
         return false;
-    m_reflectionPass = effectivePass;
+    reflectionPass = effectivePass;
 
     Log("[WATER-3] Skinned mesh reflection pipeline created");
     return true;
@@ -3070,8 +3075,8 @@ void SkinnedMeshRenderer::DestroyPipeline()
 
 void SkinnedMeshRenderer::DestroyReflectionPipeline()
 {
-    m_reflectionPipeline.reset();
-    m_reflectionPass = nullptr;
+    m_reflectionPipelines = {};
+    m_reflectionPasses = {};
 }
 
 void SkinnedMeshRenderer::DestroyComputeResources()

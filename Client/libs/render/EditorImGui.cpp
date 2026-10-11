@@ -782,55 +782,6 @@ void EditorImGui::SetWaterMaterialUsageCounts(std::vector<std::pair<std::string,
         m_waterMaterialUsageCounts[usage.first] = usage.second;
 }
 
-std::vector<std::pair<std::string, WaterMaterialData>> EditorImGui::GetWaterMaterialsSnapshot() const
-{
-    std::vector<std::pair<std::string, WaterMaterialData>> materials;
-    if (!m_assetLibrary)
-        return m_waterMaterials;
-
-    auto texturePathForId = [this](const std::string& textureId) -> std::string {
-        if (textureId.empty() || !m_assetLibrary)
-            return {};
-        auto texture = m_assetLibrary->FindById(textureId);
-        if (!texture || texture->category != AssetLibrary::Category::Texture)
-            return {};
-        return m_assetLibrary->AssetRelativePath(*texture);
-    };
-
-    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
-    {
-        if (entry.category == AssetLibrary::Category::WaterMaterial && !entry.id.empty())
-        {
-            WaterMaterialData material = entry.waterMaterial;
-            if (m_materialEditor.windowOpen &&
-                m_waterMaterialEditor.materialId == entry.id &&
-                m_waterMaterialEditor.dirty)
-            {
-                material = m_waterMaterialEditor.draft;
-            }
-            materials.push_back({entry.id, material});
-        }
-        else if (entry.category == AssetLibrary::Category::Material && !entry.id.empty())
-        {
-            const AssetLibrary::MaterialData& source =
-                (m_materialEditor.windowOpen && m_pbrMaterialEditor.materialId == entry.id && m_pbrMaterialEditor.dirty)
-                    ? m_pbrMaterialEditor.draft
-                    : entry.material;
-            WaterMaterialData converted{};
-            converted.diffuseMap = texturePathForId(source.diffuseTextureId);
-            converted.normalMapA = texturePathForId(source.normalTextureId);
-            converted.normalMapB = converted.normalMapA;
-            converted.normalTiling = std::clamp((source.tilingScaleX + source.tilingScaleY) * 0.5f, 0.001f, 100.0f);
-            converted.scrollSpeedA[0] = 0.03f;
-            converted.scrollSpeedA[1] = 0.014f;
-            converted.scrollSpeedB[0] = -0.015f;
-            converted.scrollSpeedB[1] = 0.02f;
-            converted.config.normalStrength = std::clamp(source.normalStrength, 0.0f, 2.0f);
-            materials.push_back({entry.id, converted});
-        }
-    }
-    return materials;
-}
 
 void EditorImGui::SyncWaterMaterialSnapshot()
 {
@@ -3370,10 +3321,6 @@ void EditorImGui::SetWaterMaterialUsageCounts(std::vector<std::pair<std::string,
 {
 }
 
-std::vector<std::pair<std::string, WaterMaterialData>> EditorImGui::GetWaterMaterialsSnapshot() const
-{
-    return {};
-}
 
 std::uint64_t EditorImGui::WaterMaterialsRevision() const
 {
@@ -3592,4 +3539,59 @@ std::vector<EditorImGui::ScriptPromptAnswer> EditorImGui::TakeScriptPromptAnswer
     std::vector<ScriptPromptAnswer> answers;
     answers.swap(m_scriptPromptAnswers);
     return answers;
+}
+
+// Runtime and editor resolve the same project water assets.
+std::vector<std::pair<std::string, WaterMaterialData>> EditorImGui::GetWaterMaterialsSnapshot() const
+{
+    std::vector<std::pair<std::string, WaterMaterialData>> materials;
+    if (!m_assetLibrary)
+        return m_waterMaterials;
+
+    auto texturePathForId = [this](const std::string& textureId) -> std::string {
+        if (textureId.empty() || !m_assetLibrary)
+            return {};
+        auto texture = m_assetLibrary->FindById(textureId);
+        if (!texture || texture->category != AssetLibrary::Category::Texture)
+            return {};
+        return m_assetLibrary->AssetRelativePath(*texture);
+    };
+
+    for (const AssetLibrary::Entry& entry : m_assetLibrary->Entries())
+    {
+        if (entry.category == AssetLibrary::Category::WaterMaterial && !entry.id.empty())
+        {
+            WaterMaterialData material = entry.waterMaterial;
+#if defined(IXTREEME_WITH_EDITOR) && defined(_WIN32)
+            if (m_materialEditor.windowOpen &&
+                m_waterMaterialEditor.materialId == entry.id &&
+                m_waterMaterialEditor.dirty)
+            {
+                material = m_waterMaterialEditor.draft;
+            }
+#endif
+            materials.push_back({entry.id, material});
+        }
+        else if (entry.category == AssetLibrary::Category::Material && !entry.id.empty())
+        {
+            const AssetLibrary::MaterialData& source =
+#if defined(IXTREEME_WITH_EDITOR) && defined(_WIN32)
+                (m_materialEditor.windowOpen && m_pbrMaterialEditor.materialId == entry.id && m_pbrMaterialEditor.dirty)
+                    ? m_pbrMaterialEditor.draft :
+#endif
+                    entry.material;
+            WaterMaterialData converted{};
+            converted.diffuseMap = texturePathForId(source.diffuseTextureId);
+            converted.normalMapA = texturePathForId(source.normalTextureId);
+            converted.normalMapB = converted.normalMapA;
+            converted.normalTiling = std::clamp((source.tilingScaleX + source.tilingScaleY) * 0.5f, 0.001f, 100.0f);
+            converted.scrollSpeedA[0] = 0.03f;
+            converted.scrollSpeedA[1] = 0.014f;
+            converted.scrollSpeedB[0] = -0.015f;
+            converted.scrollSpeedB[1] = 0.02f;
+            converted.config.normalStrength = std::clamp(source.normalStrength, 0.0f, 2.0f);
+            materials.push_back({entry.id, converted});
+        }
+    }
+    return materials;
 }

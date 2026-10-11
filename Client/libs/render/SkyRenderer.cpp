@@ -324,8 +324,8 @@ bool SkyRenderer::RecreatePipeline(ixrhi::IXRHIDevice& rhi)
         return true;
     m_rhi = &rhi;
     m_pipeline.reset();
-    m_extraPipeline.reset();
-    m_extraPass = nullptr;
+    m_extraPipelines = {};
+    m_extraPasses = {};
     // Null while the target pass is torn down: retried on the next RecreatePipeline.
     m_pipeline = BuildPipeline(rhi, m_targetPass);
     return true;
@@ -637,8 +637,10 @@ void SkyRenderer::Render(ixrhi::IXRHICommandList& cmd,
                          const WorldCamera& camera,
                          std::uint32_t targetWidth,
                          std::uint32_t targetHeight,
-                         const ixrhi::IXRHIRenderPass* renderPass)
+                         const ixrhi::IXRHIRenderPass* renderPass, uint32_t viewIndex)
 {
+    auto& extraPipeline = m_extraPipelines[viewIndex == 0 ? 0 : 1];
+    auto& extraPass = m_extraPasses[viewIndex == 0 ? 0 : 1];
     if (!m_rhi || !m_bindGroup || !frame.frameActive)
         return;
     const std::uint32_t width = targetWidth > 0 ? targetWidth : frame.targetWidth;
@@ -649,13 +651,13 @@ void SkyRenderer::Render(ixrhi::IXRHICommandList& cmd,
     const ixrhi::IXRHIGraphicsPipeline* pipeline = m_pipeline.get();
     if (renderPass != nullptr && renderPass != m_targetPass)
     {
-        if (!m_extraPipeline || m_extraPass != renderPass)
+        if (!extraPipeline || extraPass != renderPass)
         {
-            m_extraPipeline = BuildPipeline(*m_rhi, renderPass);
-            m_extraPass = m_extraPipeline ? renderPass : nullptr;
-            Tracenf("[SKY] pipeline for an extra pass (water reflection): %s", m_extraPipeline ? "ok" : "FAILED");
+            extraPipeline = BuildPipeline(*m_rhi, renderPass);
+            extraPass = extraPipeline ? renderPass : nullptr;
+            Tracenf("[SKY] pipeline for an extra pass (water reflection): %s", extraPipeline ? "ok" : "FAILED");
         }
-        pipeline = m_extraPipeline.get();
+        pipeline = extraPipeline.get();
     }
     if (!pipeline)
         return;
@@ -676,8 +678,8 @@ void SkyRenderer::Render(ixrhi::IXRHICommandList& cmd,
 void SkyRenderer::Destroy()
 {
     m_pipeline.reset();
-    m_extraPipeline.reset();
-    m_extraPass = nullptr;
+    m_extraPipelines = {};
+    m_extraPasses = {};
     m_bindGroup.reset();
     m_bindLayout.reset();
     for (auto& buffer : m_uniformBuffers)

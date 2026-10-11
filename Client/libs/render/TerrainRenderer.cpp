@@ -1937,21 +1937,26 @@ void TerrainRenderer::SetWaterRefractionInputs(std::shared_ptr<ixrhi::IXRHITextu
                                                std::shared_ptr<ixrhi::IXRHITexture> depthSnapshot,
                                                std::shared_ptr<ixrhi::IXRHISampler> sampler,
                                                std::uint32_t width,
-                                               std::uint32_t height)
+                                               std::uint32_t height, uint32_t viewIndex)
 {
-    if (m_waterSceneColor == colorSnapshot && m_waterSceneDepth == depthSnapshot &&
-        m_waterSceneSampler == sampler && m_waterSceneWidth == width &&
-        m_waterSceneHeight == height)
+    auto& sceneColor = m_waterViews[viewIndex == 0 ? 0 : 1].sceneColor;
+    auto& sceneDepth = m_waterViews[viewIndex == 0 ? 0 : 1].sceneDepth;
+    auto& sceneSampler = m_waterViews[viewIndex == 0 ? 0 : 1].sceneSampler;
+    auto& sceneWidth = m_waterViews[viewIndex == 0 ? 0 : 1].sceneWidth;
+    auto& sceneHeight = m_waterViews[viewIndex == 0 ? 0 : 1].sceneHeight;
+    if (sceneColor == colorSnapshot && sceneDepth == depthSnapshot &&
+        sceneSampler == sampler && sceneWidth == width &&
+        sceneHeight == height)
     {
         return;
     }
 
-    m_waterSceneColor = std::move(colorSnapshot);
-    m_waterSceneDepth = std::move(depthSnapshot);
-    m_waterSceneSampler = std::move(sampler);
-    m_waterSceneWidth = width;
-    m_waterSceneHeight = height;
-    UpdateWaterBindGroup();
+    sceneColor = std::move(colorSnapshot);
+    sceneDepth = std::move(depthSnapshot);
+    sceneSampler = std::move(sampler);
+    sceneWidth = width;
+    sceneHeight = height;
+    // The acquired frame slot is updated in RenderWater; other slots may still be in flight.
 }
 
 namespace
@@ -2840,11 +2845,14 @@ void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
                                                                        std::uint32_t,
                                                                        std::uint32_t,
                                                                        const ixrhi::IXRHIRenderPass*,
-                                                                       float)>& renderEntities)
+                                                                       float)>& renderEntities, uint32_t viewIndex)
 {
+    auto& reflection = m_waterViews[viewIndex == 0 ? 0 : 1].reflection;
+    auto& reflectionPipeline = m_waterViews[viewIndex == 0 ? 0 : 1].reflectionPipeline;
     PassDrawStats& reflectionStats = m_frameDrawStats.waterReflection;
     auto skipReflection = [&]() {
-        reflectionStats.skipped = true;
+        if (!reflectionStats.executed)
+            reflectionStats.skipped = true;
     };
     const WaterBodyGpu* reflectionBody = nullptr;
     float reflectionDistanceMeters = 0.0f;
@@ -2879,8 +2887,8 @@ void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
 
     const WaterConfig& reflectionConfig = ResolveWaterConfig(reflectionBody->body);
     const float reflectionWaterLevelY = reflectionBody->body.waterLevelY;
-    if (!m_rhi || !reflectionConfig.enabled || !reflectionConfig.reflectionEnabled || !m_reflectionPipeline ||
-        !m_bindGroup || !m_waterReflection.target || !m_indexBuffer || !m_vertexBuffer || m_indexCount == 0 ||
+    if (!m_rhi || !reflectionConfig.enabled || !reflectionConfig.reflectionEnabled ||
+        !m_bindGroup || !m_indexBuffer || !m_vertexBuffer || m_indexCount == 0 ||
         !frame.frameActive)
     {
         skipReflection();
@@ -2900,34 +2908,33 @@ void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
     const std::uint32_t reflectionDivisor = WaterReflectionDivisor(reflectionConfig.reflectionQuality);
     const std::uint32_t wantedWidth = std::max(1u, baseWidth / reflectionDivisor);
     const std::uint32_t wantedHeight = std::max(1u, baseHeight / reflectionDivisor);
-    if (m_waterReflection.quality != reflectionConfig.reflectionQuality ||
-        m_waterReflection.width != wantedWidth || m_waterReflection.height != wantedHeight)
+    if (!reflection.target || !reflectionPipeline || reflection.quality != reflectionConfig.reflectionQuality ||
+        reflection.width != wantedWidth || reflection.height != wantedHeight)
     {
-        CreateOrRecreateWaterReflectionResources(*m_rhi, true, reflectionConfig.reflectionQuality, baseWidth, baseHeight);
-        CreateWaterReflectionPipeline(*m_rhi);
-        UpdateWaterBindGroup();
+        CreateOrRecreateWaterReflectionResources(*m_rhi, true, reflectionConfig.reflectionQuality, baseWidth, baseHeight, viewIndex);
+        CreateWaterReflectionPipeline(*m_rhi, viewIndex);
     }
 
-    if (!m_waterReflection.target || !m_reflectionPipeline)
+    if (!reflection.target || !reflectionPipeline)
     {
         skipReflection();
         return;
     }
 
     const uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
-    const WorldCamera mirror = ComputeMirrorCamera(camera, m_waterReflection.width, m_waterReflection.height, reflectionWaterLevelY);
+    const WorldCamera mirror = ComputeMirrorCamera(camera, reflection.width, reflection.height, reflectionWaterLevelY);
     m_reflectionClipWaterLevelY = reflectionWaterLevelY;
-    UpdateUniform(frameIndex, mirror, true, kReflectionUniformView);
+    UpdateUniform(frameIndex, mirror, true, kReflectionUniformView + (viewIndex == 0 ? 0u : 1u));
 
-    m_waterReflection.target->Begin(cmd);
-    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(m_waterReflection.width), static_cast<float>(m_waterReflection.height));
-    cmd.SetScissor(0, 0, m_waterReflection.width, m_waterReflection.height);
-    cmd.SetGraphicsPipeline(*m_reflectionPipeline);
+    reflection.target->Begin(cmd);
+    cmd.SetViewport(0.0f, 0.0f, static_cast<float>(reflection.width), static_cast<float>(reflection.height));
+    cmd.SetScissor(0, 0, reflection.width, reflection.height);
+    cmd.SetGraphicsPipeline(*reflectionPipeline);
     if (m_sceneTerrain.triplanarEnabled && !m_triPerfReflectionPassLogged)
     {
         TraceDiagf("[TRI-PERF] terrain pipeline bound in pass=water-reflection triplanar=yes extent=%ux%u shader=terrain_ps",
-            m_waterReflection.width,
-            m_waterReflection.height);
+            reflection.width,
+            reflection.height);
         m_triPerfReflectionPassLogged = true;
     }
 
@@ -2941,7 +2948,7 @@ void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
 
     TerrainPushConstants push{{1.0f, 1.0f, 0.0f, 0.0f}};
     cmd.PushConstants(&push, sizeof(push));
-    cmd.BindGroup(0, *m_bindGroup, kReflectionUniformView * kFramesInFlight + frameIndex);
+    cmd.BindGroup(0, *m_bindGroup, (kReflectionUniformView + (viewIndex == 0 ? 0u : 1u)) * kFramesInFlight + frameIndex);
     if (m_terrainChunks.empty())
     {
         cmd.DrawIndexed(m_indexCount, 1, 0, 0, 0);
@@ -2982,21 +2989,20 @@ void TerrainRenderer::RenderWaterReflection(ixrhi::IXRHICommandList& cmd,
         flushRun();
     }
     reflectionStats.executed = true;
+    reflectionStats.skipped = false;
 
     if (renderEntities)
         renderEntities(mirror,
-            m_waterReflection.width,
-            m_waterReflection.height,
-            m_waterReflection.target->GetPass(),
+            reflection.width,
+            reflection.height,
+            reflection.target->GetPass(),
             reflectionWaterLevelY);
 
-    m_waterReflection.target->End(cmd);
-    if (!m_waterReflection.readable)
-    {
-        m_waterReflection.readable = true;
-        UpdateWaterBindGroup();
-    }
+    reflection.target->End(cmd);
+    reflection.readable = true;
 
+    m_waterViews[viewIndex == 0 ? 0 : 1].reflectionFrame = frame.frameNumber;
+    m_waterViews[viewIndex == 0 ? 0 : 1].reflectionBodyId = reflectionBody->body.id;
     m_reflectionClipWaterLevelY = std::numeric_limits<float>::quiet_NaN();
 }
 
@@ -3353,8 +3359,11 @@ void TerrainRenderer::RenderWater(ixrhi::IXRHICommandList& cmd,
         {
             continue;
         }
-        const bool isReflectionTarget = (&waterBody == reflectionTarget);
+        const auto& view = m_waterViews[viewIndex == 0 ? 0 : 1];
+        const bool isReflectionTarget = (&waterBody == reflectionTarget) &&
+            view.reflectionFrame == frame.frameNumber && view.reflectionBodyId == waterBody.body.id;
         UpdateWaterBodyUniform(frameIndex, camera, timeSeconds, waterBody, isReflectionTarget, viewIndex);
+        WriteWaterBindGroupSets(bodyIndex, viewIndex, frameIndex, ResolveWaterMaterialTextures(waterBody.body));
         cmd.SetVertexBuffer(0, *waterBody.vertexBuffer, 0);
         cmd.SetIndexBuffer(*waterBody.indexBuffer, 0, /*thirtyTwoBit=*/true);
         // Slot = (bodyIndex * 2 + viewIndex) * kFramesInFlight + frameIndex.
@@ -4061,11 +4070,8 @@ void TerrainRenderer::Destroy()
     // Refraction inputs share ownership with OffscreenSceneRenderer. Release
     // our copies during explicit teardown while the device is still alive;
     // leaving them for member destruction would outlive device shutdown.
-    m_waterSceneColor.reset();
-    m_waterSceneDepth.reset();
-    m_waterSceneSampler.reset();
-    m_waterSceneWidth = 0;
-    m_waterSceneHeight = 0;
+    for (auto& view : m_waterViews)
+        view = {};
 
     m_vertexBuffer.reset();
     m_vertexEditBuffer.reset();
@@ -4083,6 +4089,8 @@ void TerrainRenderer::Destroy()
     for (auto& buffer : m_uniformBuffersSecondary)
         buffer.reset();
     for (auto& buffer : m_uniformBuffersReflection)
+        buffer.reset();
+    for (auto& buffer : m_uniformBuffersReflectionSecondary)
         buffer.reset();
     DestroyTerrainLayers();
     m_baseTexture = {};
@@ -4181,6 +4189,7 @@ bool TerrainRenderer::EnsureUniformBuffers(ixrhi::IXRHIDevice& rhi)
     ensure(m_uniformBuffers, "Terrain:UBO");
     ensure(m_uniformBuffersSecondary, "Terrain:UBO secondary");
     ensure(m_uniformBuffersReflection, "Terrain:UBO reflection");
+    ensure(m_uniformBuffersReflectionSecondary, "Terrain:UBO game reflection");
 
     for (const auto& buffer : m_uniformBuffers)
     {
@@ -4199,6 +4208,14 @@ bool TerrainRenderer::EnsureUniformBuffers(ixrhi::IXRHIDevice& rhi)
         }
     }
     for (const auto& buffer : m_uniformBuffersReflection)
+    {
+        if (!buffer)
+        {
+            Tracen("[TERRAIN] reflection uniform buffer creation failed");
+            return false;
+        }
+    }
+    for (const auto& buffer : m_uniformBuffersReflectionSecondary)
     {
         if (!buffer)
         {
@@ -6341,6 +6358,14 @@ bool TerrainRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
             return false;
         }
     }
+    for (const auto& buffer : m_uniformBuffersReflectionSecondary)
+    {
+        if (!buffer)
+        {
+            Tracen("[TERRAIN] CreateBindGroup skipped: reflection uniform buffer is not ready");
+            return false;
+        }
+    }
 
     if (!m_bindLayout)
     {
@@ -6370,7 +6395,7 @@ bool TerrainRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
     // / Main Camera), plus the water reflection's mirrored camera, each with one slot per
     // frame-in-flight. Recreating the group retires the old sets (RAII); in-flight frames keep
     // theirs alive through the group's shared keeps.
-    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kFramesInFlight * (kReflectionUniformView + 1u));
+    m_bindGroup = rhi.CreateBindGroup(*m_bindLayout, kFramesInFlight * (kReflectionUniformView + 2u));
     if (!m_bindGroup)
         return false;
 
@@ -6478,6 +6503,7 @@ void TerrainRenderer::UpdateBindGroup()
         writeSlot(frame, m_uniformBuffers[frame]);
         writeSlot(kFramesInFlight + frame, m_uniformBuffersSecondary[frame]);
         writeSlot(kReflectionUniformView * kFramesInFlight + frame, m_uniformBuffersReflection[frame]);
+        writeSlot((kReflectionUniformView + 1u) * kFramesInFlight + frame, m_uniformBuffersReflectionSecondary[frame]);
     }
 }
 
@@ -6724,6 +6750,10 @@ void TerrainRenderer::WriteWaterBindGroupSets(std::uint32_t bodyIndex,
                                                 uint32_t frameIndex,
                                                 const WaterMaterialTextureSet* materialTextures)
 {
+    auto& reflection = m_waterViews[viewIndex == 0 ? 0 : 1].reflection;
+    auto& sceneColor = m_waterViews[viewIndex == 0 ? 0 : 1].sceneColor;
+    auto& sceneDepth = m_waterViews[viewIndex == 0 ? 0 : 1].sceneDepth;
+    auto& sceneSampler = m_waterViews[viewIndex == 0 ? 0 : 1].sceneSampler;
     if (!m_waterBindGroup || bodyIndex >= m_waterBodies.size() || frameIndex >= kFramesInFlight)
         return;
     const WaterBodyGpu& waterBody = m_waterBodies[bodyIndex];
@@ -6739,7 +6769,7 @@ void TerrainRenderer::WriteWaterBindGroupSets(std::uint32_t bodyIndex,
     const Texture* diffuse = materialTextures && materialTextures->diffuse.image ? &materialTextures->diffuse : &m_waterNormalSmall;
     const Texture* normalBSafe = (normalB->image && normalB->sampler) ? normalB : &m_waterNormalLarge;
     if (!normalA->image || !normalA->sampler || !normalBSafe->image || !normalBSafe->sampler ||
-        !m_waterReflection.color || !m_waterReflection.sampler || !diffuse->image || !diffuse->sampler)
+        !diffuse->image || !diffuse->sampler)
         return;
 
     const std::uint32_t slot = (bodyIndex * 2u + (viewIndex == 0 ? 0u : 1u)) * kFramesInFlight + frameIndex;
@@ -6749,25 +6779,25 @@ void TerrainRenderer::WriteWaterBindGroupSets(std::uint32_t bodyIndex,
     // Even a shader branch that skips reflection needs valid descriptor layouts.
     // A newly created target becomes readable only after its first completed pass.
     m_waterBindGroup->UpdateTexture(slot, 3,
-        m_waterReflection.readable ? m_waterReflection.color : m_waterNormalSmall.image,
-        m_waterReflection.readable ? m_waterReflection.sampler : m_waterNormalSmall.sampler);
+        reflection.readable ? reflection.color : m_waterNormalSmall.image,
+        reflection.readable ? reflection.sampler : m_waterNormalSmall.sampler);
     // Refraction snapshots are IXRHI-owned (shared lifetime); sampler and
     // view resolve independently with wave-normal fallbacks, exactly like
     // the old null-view path.
     m_waterBindGroup->UpdateTexture(slot,
         4,
-        m_waterSceneColor ? m_waterSceneColor : m_waterNormalSmall.image,
-        m_waterSceneSampler ? m_waterSceneSampler : m_waterNormalSmall.sampler);
+        sceneColor ? sceneColor : m_waterNormalSmall.image,
+        sceneSampler ? sceneSampler : m_waterNormalSmall.sampler);
     m_waterBindGroup->UpdateTexture(slot,
         5,
-        m_waterSceneDepth ? m_waterSceneDepth : m_waterNormalLarge.image,
-        m_waterSceneSampler ? m_waterSceneSampler : m_waterNormalLarge.sampler);
+        sceneDepth ? sceneDepth : m_waterNormalLarge.image,
+        sceneSampler ? sceneSampler : m_waterNormalLarge.sampler);
     m_waterBindGroup->UpdateTexture(slot, 6, diffuse->image, diffuse->sampler);
 }
 
 void TerrainRenderer::UpdateWaterBindGroup()
 {
-    if (!m_waterBindGroup || !m_waterNormalSmall.image || !m_waterNormalLarge.image || !m_waterReflection.color)
+    if (!m_waterBindGroup || !m_waterNormalSmall.image || !m_waterNormalLarge.image)
         return;
     // Every frame slot's sets are rewritten: the GPU must be done with the frames still using them
     // (rare: refraction inputs or reflection target replaced, water materials changed).
@@ -6794,8 +6824,9 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
                                                                bool force,
                                                                WaterConfig::ReflectionQuality quality,
                                                                std::uint32_t viewWidth,
-                                                               std::uint32_t viewHeight)
+                                                               std::uint32_t viewHeight, uint32_t viewIndex)
 {
+    auto& reflection = m_waterViews[viewIndex == 0 ? 0 : 1].reflection;
     m_rhi = &rhi;
     const std::uint32_t baseWidth = viewWidth > 0 ? viewWidth : rhi.GetMainSwapchain().Width();
     const std::uint32_t baseHeight = viewHeight > 0 ? viewHeight : rhi.GetMainSwapchain().Height();
@@ -6809,29 +6840,29 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
     const ixrhi::IXRHIFormat colorFormat = ixrhi::IXRHIFormat::R16G16B16A16Float;
     const ixrhi::IXRHIFormat depthFormat = rhi.GetMainSwapchain().DepthFormat();
 
-    if (!force && m_waterReflection.color && m_waterReflection.depth &&
-        m_waterReflection.width == width && m_waterReflection.height == height &&
-        m_waterReflection.quality == quality &&
-        m_waterReflection.colorFormat == colorFormat && m_waterReflection.depthFormat == depthFormat)
+    if (!force && reflection.color && reflection.depth &&
+        reflection.width == width && reflection.height == height &&
+        reflection.quality == quality &&
+        reflection.colorFormat == colorFormat && reflection.depthFormat == depthFormat)
     {
         return true;
     }
 
-    const bool hadResources = m_waterReflection.color != nullptr || m_waterReflection.depth != nullptr ||
-        m_waterReflection.target != nullptr;
+    const bool hadResources = reflection.color != nullptr || reflection.depth != nullptr ||
+        reflection.target != nullptr;
     if (hadResources)
     {
         rhi.WaitIdle();
         Tracen("[WATER-2] Re-creating reflection resources");
     }
-    DestroyWaterReflectionPipeline();
-    DestroyWaterReflectionResources();
+    DestroyWaterReflectionPipeline(viewIndex);
+    DestroyWaterReflectionResources(viewIndex);
 
-    m_waterReflection.width = width;
-    m_waterReflection.height = height;
-    m_waterReflection.quality = quality;
-    m_waterReflection.colorFormat = colorFormat;
-    m_waterReflection.depthFormat = depthFormat;
+    reflection.width = width;
+    reflection.height = height;
+    reflection.quality = quality;
+    reflection.colorFormat = colorFormat;
+    reflection.depthFormat = depthFormat;
 
     ixrhi::IXRHITextureDesc colorDesc;
     colorDesc.width = width;
@@ -6839,10 +6870,10 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
     colorDesc.format = colorFormat;
     colorDesc.usage = ixrhi::IXRHITextureUsage::ColorAttachment | ixrhi::IXRHITextureUsage::Sampled;
     colorDesc.debugName = "Terrain:ReflectionColor";
-    m_waterReflection.color = rhi.CreateTexture(colorDesc, nullptr, 0);
-    if (!m_waterReflection.color)
+    reflection.color = rhi.CreateTexture(colorDesc, nullptr, 0);
+    if (!reflection.color)
     {
-        DestroyWaterReflectionResources();
+        DestroyWaterReflectionResources(viewIndex);
         return false;
     }
 
@@ -6852,10 +6883,10 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
     depthDesc.format = depthFormat;
     depthDesc.usage = ixrhi::IXRHITextureUsage::DepthStencilAttachment;
     depthDesc.debugName = "Terrain:ReflectionDepth";
-    m_waterReflection.depth = rhi.CreateTexture(depthDesc, nullptr, 0);
-    if (!m_waterReflection.depth)
+    reflection.depth = rhi.CreateTexture(depthDesc, nullptr, 0);
+    if (!reflection.depth)
     {
-        DestroyWaterReflectionResources();
+        DestroyWaterReflectionResources(viewIndex);
         return false;
     }
 
@@ -6863,8 +6894,8 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
     // water dark at every grazing view), depth to 1.0; depth is not stored (DONT_CARE) since only
     // the color is sampled afterwards.
     ixrhi::IXRHIRenderTargetDesc targetDesc;
-    targetDesc.color = m_waterReflection.color;
-    targetDesc.depth = m_waterReflection.depth;
+    targetDesc.color = reflection.color;
+    targetDesc.depth = reflection.depth;
     targetDesc.colorLoad = ixrhi::IXRHILoadOp::Clear;
     targetDesc.colorStore = ixrhi::IXRHIStoreOp::Store;
     targetDesc.depthLoad = ixrhi::IXRHILoadOp::Clear;
@@ -6875,10 +6906,10 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
     targetDesc.clearColor[3] = kSceneClearColor[3];
     targetDesc.clearDepth = 1.0f;
     targetDesc.debugName = "Terrain:Reflection";
-    m_waterReflection.target = rhi.CreateRenderTarget(targetDesc);
-    if (!m_waterReflection.target)
+    reflection.target = rhi.CreateRenderTarget(targetDesc);
+    if (!reflection.target)
     {
-        DestroyWaterReflectionResources();
+        DestroyWaterReflectionResources(viewIndex);
         return false;
     }
 
@@ -6891,10 +6922,10 @@ bool TerrainRenderer::CreateOrRecreateWaterReflectionResources(ixrhi::IXRHIDevic
     samplerDesc.addressW = ixrhi::IXRHISamplerAddress::ClampToEdge;
     samplerDesc.maxLod = 1.0f;
     samplerDesc.debugName = "Terrain:ReflectionSampler";
-    m_waterReflection.sampler = rhi.CreateSampler(samplerDesc);
-    if (!m_waterReflection.sampler)
+    reflection.sampler = rhi.CreateSampler(samplerDesc);
+    if (!reflection.sampler)
     {
-        DestroyWaterReflectionResources();
+        DestroyWaterReflectionResources(viewIndex);
         return false;
     }
 
@@ -6953,12 +6984,14 @@ bool TerrainRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
     return m_pipeline != nullptr;
 }
 
-bool TerrainRenderer::CreateWaterReflectionPipeline(ixrhi::IXRHIDevice& rhi)
+bool TerrainRenderer::CreateWaterReflectionPipeline(ixrhi::IXRHIDevice& rhi, uint32_t viewIndex)
 {
-    if (!m_assets || !m_bindLayout || !m_waterReflection.target)
+    auto& reflection = m_waterViews[viewIndex == 0 ? 0 : 1].reflection;
+    auto& reflectionPipeline = m_waterViews[viewIndex == 0 ? 0 : 1].reflectionPipeline;
+    if (!m_assets || !m_bindLayout || !reflection.target)
         return false;
 
-    DestroyWaterReflectionPipeline();
+    DestroyWaterReflectionPipeline(viewIndex);
 
     auto vs = LoadShader(rhi, *m_assets, "assets/shaders/terrain_vs.spv",
         ixrhi::IXRHIShaderStage::Vertex, "VSMain");
@@ -6995,10 +7028,10 @@ bool TerrainRenderer::CreateWaterReflectionPipeline(ixrhi::IXRHIDevice& rhi)
         ixrhi::IXRHIBlendFactor::Zero,
         ixrhi::IXRHIBlendOp::Add}};
     desc.sampleCount = 1;
-    desc.targetRenderPass = m_waterReflection.target->GetPass();
+    desc.targetRenderPass = reflection.target->GetPass();
     desc.debugName = "Terrain:Reflection";
-    m_reflectionPipeline = rhi.CreateGraphicsPipeline(desc);
-    return m_reflectionPipeline != nullptr;
+    reflectionPipeline = rhi.CreateGraphicsPipeline(desc);
+    return reflectionPipeline != nullptr;
 }
 
 bool TerrainRenderer::CreateWaterPipeline(ixrhi::IXRHIDevice& rhi)
@@ -7127,21 +7160,25 @@ void TerrainRenderer::DestroyWaterPipeline()
     m_waterOcclusionPipeline.reset();
 }
 
-void TerrainRenderer::DestroyWaterReflectionPipeline()
+void TerrainRenderer::DestroyWaterReflectionPipeline(uint32_t viewIndex)
 {
-    m_reflectionPipeline.reset();
+    m_waterViews[viewIndex == 0 ? 0 : 1].reflectionPipeline.reset();
 }
 
-void TerrainRenderer::DestroyWaterReflectionResources()
+void TerrainRenderer::DestroyWaterReflectionResources(uint32_t viewIndex)
 {
-    m_waterReflection = {};
+    m_waterViews[viewIndex == 0 ? 0 : 1].reflection = {};
+    m_waterViews[viewIndex == 0 ? 0 : 1].reflectionFrame = ~std::uint64_t{0};
 }
 
 void TerrainRenderer::DestroyWaterResources()
 {
     DestroyWaterPipeline();
-    DestroyWaterReflectionPipeline();
-    DestroyWaterReflectionResources();
+    for (uint32_t viewIndex = 0; viewIndex < 2; ++viewIndex)
+    {
+        DestroyWaterReflectionPipeline(viewIndex);
+        DestroyWaterReflectionResources(viewIndex);
+    }
     m_waterBindGroup.reset();
     m_waterBindLayout.reset();
     DestroyWaterBodyResources();
@@ -7199,7 +7236,8 @@ void TerrainRenderer::DestroyTerrainLayers()
 void TerrainRenderer::UpdateUniform(uint32_t frameIndex, const WorldCamera& camera, bool reflectionPass, uint32_t viewIndex)
 {
     const std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight>& targetBuffers =
-        viewIndex == kReflectionUniformView ? m_uniformBuffersReflection
+        viewIndex == kReflectionUniformView + 1u ? m_uniformBuffersReflectionSecondary
+        : viewIndex == kReflectionUniformView ? m_uniformBuffersReflection
         : viewIndex == 0                    ? m_uniformBuffers
                                             : m_uniformBuffersSecondary;
     if (frameIndex >= kFramesInFlight || !targetBuffers[frameIndex])
@@ -7400,8 +7438,13 @@ TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const Worl
                                                                        double timeSeconds,
                                                                        const WaterConfig& water,
                                                                        float waterLevelY,
-                                                                       bool reflectionTarget) const
+                                                                       bool reflectionTarget, uint32_t viewIndex) const
 {
+    auto& reflection = m_waterViews[viewIndex == 0 ? 0 : 1].reflection;
+    auto& sceneColor = m_waterViews[viewIndex == 0 ? 0 : 1].sceneColor;
+    auto& sceneDepth = m_waterViews[viewIndex == 0 ? 0 : 1].sceneDepth;
+    auto& sceneWidth = m_waterViews[viewIndex == 0 ? 0 : 1].sceneWidth;
+    auto& sceneHeight = m_waterViews[viewIndex == 0 ? 0 : 1].sceneHeight;
     WaterUniformBlock uniform{};
     uniform.mvp = camera.viewProjection;
     uniform.cameraPos[0] = camera.eye.x;
@@ -7450,14 +7493,14 @@ TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const Worl
     uniform.levelTimeEnabled[1] = static_cast<float>(timeSeconds);
     uniform.levelTimeEnabled[2] = water.enabled ? 1.0f : 0.0f;
     uniform.levelTimeEnabled[3] = 0.0f;
-    uniform.reflectionParams[0] = (reflectionTarget && water.reflectionEnabled && m_waterReflection.readable) ? 1.0f : 0.0f;
+    uniform.reflectionParams[0] = (reflectionTarget && water.reflectionEnabled && reflection.readable) ? 1.0f : 0.0f;
     uniform.reflectionParams[1] = std::clamp(water.reflectionDistortionStrength, 0.0f, 0.2f);
-    uniform.reflectionParams[2] = m_waterReflection.width > 0 ? static_cast<float>(m_waterReflection.width) : 1.0f;
-    uniform.reflectionParams[3] = m_waterReflection.height > 0 ? static_cast<float>(m_waterReflection.height) : 1.0f;
-    uniform.refractionParams[0] = (water.refractionEnabled && m_waterSceneColor && m_waterSceneDepth) ? 1.0f : 0.0f;
+    uniform.reflectionParams[2] = reflection.width > 0 ? static_cast<float>(reflection.width) : 1.0f;
+    uniform.reflectionParams[3] = reflection.height > 0 ? static_cast<float>(reflection.height) : 1.0f;
+    uniform.refractionParams[0] = (water.refractionEnabled && sceneColor && sceneDepth) ? 1.0f : 0.0f;
     uniform.refractionParams[1] = std::clamp(water.refractionStrength, 0.0f, 0.1f);
     uniform.refractionParams[2] = std::clamp(water.refractionDepthStrength, 0.0f, 2.0f);
-    uniform.refractionParams[3] = m_waterSceneWidth > 0 ? static_cast<float>(m_waterSceneWidth) : 1.0f;
+    uniform.refractionParams[3] = sceneWidth > 0 ? static_cast<float>(sceneWidth) : 1.0f;
     uniform.shallowColor[0] = std::clamp(water.shallowColor[0], 0.0f, 2.0f);
     uniform.shallowColor[1] = std::clamp(water.shallowColor[1], 0.0f, 2.0f);
     uniform.shallowColor[2] = std::clamp(water.shallowColor[2], 0.0f, 2.0f);
@@ -7469,7 +7512,7 @@ TerrainRenderer::WaterUniformBlock TerrainRenderer::BuildWaterUniform(const Worl
     uniform.depthParams[0] = std::clamp(water.depthColorMin, 0.0f, 50.0f);
     uniform.depthParams[1] = std::max(uniform.depthParams[0] + 0.001f, std::clamp(water.depthColorMax, 0.001f, 50.0f));
     uniform.depthParams[2] = std::clamp(water.depthFadeDistance, 0.001f, 50.0f);
-    uniform.depthParams[3] = m_waterSceneHeight > 0 ? static_cast<float>(m_waterSceneHeight) : 1.0f;
+    uniform.depthParams[3] = sceneHeight > 0 ? static_cast<float>(sceneHeight) : 1.0f;
     uniform.foamParams[0] = water.foamEnabled ? 1.0f : 0.0f;
     uniform.foamParams[1] = std::clamp(water.foamScale, 0.05f, 2.0f);
     uniform.foamParams[2] = std::clamp(water.foamScrollSpeed, 0.0f, 0.1f);
@@ -7531,7 +7574,7 @@ void TerrainRenderer::UpdateWaterBodyUniform(uint32_t frameIndex,
     if (frameIndex >= kFramesInFlight)
         return;
     WaterUniformBlock uniform =
-        BuildWaterUniform(camera, timeSeconds, ResolveWaterConfig(waterBody.body), waterBody.body.waterLevelY, reflectionTarget);
+        BuildWaterUniform(camera, timeSeconds, ResolveWaterConfig(waterBody.body), waterBody.body.waterLevelY, reflectionTarget, viewIndex);
     const WaterMaterialTextureSet* textures = ResolveWaterMaterialTextures(waterBody.body);
     const WaterMaterialData* material = nullptr;
     if (!waterBody.body.materialId.empty())
