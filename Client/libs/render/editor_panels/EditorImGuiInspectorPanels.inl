@@ -2653,13 +2653,15 @@ void EditorImGui::RenderGodRaysPanel()
         UI::ItemTooltip("How far across the screen the shafts reach");
         changed |= UI::Prop::SliderFloat("Falloff##god_rays", &sky.godRayFalloff, 0.85f, 1.0f, "%.3f");
         UI::ItemTooltip("How quickly the shafts fade along their length (closer to 1: they fade later)");
-        const char* qualities[] = {"Low (32 samples)", "Medium (64 samples)", "High (96 samples)"};
+        const char* qualities[] = {"Low (32 samples)", "Medium (64 samples)", "High (128 samples)"};
         int quality = std::clamp(static_cast<int>(sky.godRayQuality), 0, 2);
         if (UI::Prop::Combo("Quality##god_rays", &quality, qualities, IM_ARRAYSIZE(qualities)))
         {
             sky.godRayQuality = quality;
             changed = true;
         }
+        UI::ItemTooltip("Filtered leaf/sky coverage at every quality. High also uses half-resolution shafts.\n"
+                        "Quality changes detail and smoothness; falloff stays consistent.");
     }
     if (sky.godRayTechnique != 0)
     {
@@ -2679,6 +2681,7 @@ void EditorImGui::RenderGodRaysPanel()
             sky.volumetricQuality = quality;
             changed = true;
         }
+        UI::ItemTooltip("Filtered sun shadows with smooth cascade transitions. High uses half-resolution light.");
         ImGui::TextDisabled("Shafts come from the sun shadow (Environment > Sun > Casts shadows).");
     }
     ImGui::EndDisabled();

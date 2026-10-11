@@ -164,6 +164,25 @@ endif()
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
 
 if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(GodRayQualityTest tests/GodRayQualityTest.cpp)
+    target_link_libraries(GodRayQualityTest PRIVATE IXEngineRender)
+    if(WIN32)
+        target_link_libraries(GodRayQualityTest PRIVATE IXEngineVulkan)
+        target_compile_definitions(GodRayQualityTest PRIVATE IX_RAYS_TEST_ASSETS_ROOT="${CLIENT_ROOT}"
+            IX_RAYS_TEST_SHADER_ROOT="${CMAKE_CURRENT_BINARY_DIR}")
+        set(_ray_test_output "${CMAKE_CURRENT_BINARY_DIR}/god_ray_quality_test.spv")
+        add_custom_command(OUTPUT "${_ray_test_output}"
+            COMMAND "${DXC_EXECUTABLE}" -spirv -T cs_6_0 -E CSMain
+                -Fo "${_ray_test_output}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/GodRayQualityTest.hlsl"
+            DEPENDS tests/GodRayQualityTest.hlsl VERBATIM)
+        target_sources(GodRayQualityTest PRIVATE "${_ray_test_output}")
+        add_dependencies(GodRayQualityTest IXEngineShaders)
+    endif()
+    if(MSVC)
+        set_target_properties(GodRayQualityTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME GodRayQualityTest COMMAND GodRayQualityTest)
+
     add_executable(WaterViewTest tests/WaterViewTest.cpp)
     target_link_libraries(WaterViewTest PRIVATE IXEngineRender)
     if(WIN32)

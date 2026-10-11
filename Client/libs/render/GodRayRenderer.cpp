@@ -71,7 +71,7 @@ std::unique_ptr<ixrhi::IXRHIRenderTarget> CreateRayTarget(ixrhi::IXRHIDevice& rh
 
 int SamplesForQuality(std::int32_t quality)
 {
-    return quality <= 0 ? 32 : quality == 1 ? 64 : 96;
+    return quality <= 0 ? 32 : quality == 1 ? 64 : 128;
 }
 
 int StepsForQuality(std::int32_t quality)
@@ -130,6 +130,7 @@ bool GodRayRenderer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader
     if (m_bindLayout)
     {
         m_maskBindings = rhi.CreateBindGroup(*m_bindLayout, sets);
+        m_filterMaskBindings = rhi.CreateBindGroup(*m_bindLayout, sets);
         m_blurBindings = rhi.CreateBindGroup(*m_bindLayout, sets);
         m_volumeBlurBindings = rhi.CreateBindGroup(*m_bindLayout, sets);
     }
@@ -151,7 +152,7 @@ bool GodRayRenderer::Create(ixrhi::IXRHIDevice& rhi, client::asset::IAssetReader
         m_prototypeTarget = CreateRayTarget(rhi, m_prototypeTexture, "GodRays:Prototype");
 
     const bool resources = m_vs && m_maskPs && m_blurPs && m_volumeBlurPs && m_marchPs &&
-        m_sampler && m_shadowSampler && m_bindLayout && m_marchLayout && m_maskBindings && m_blurBindings &&
+        m_sampler && m_shadowSampler && m_bindLayout && m_marchLayout && m_maskBindings && m_filterMaskBindings && m_blurBindings &&
         m_volumeBlurBindings && m_marchBindings && buffers &&
         m_prototypeTarget;
     if (resources)
@@ -286,7 +287,7 @@ const char* GodRayRenderer::BuildVolumetricPush(const SkySettings& sky,
     out.params[0] = static_cast<float>(StepsForQuality(sky.volumetricQuality));
     out.params[1] = shadow.depthBias;
     out.params[2] = shadow.depthBias * shadow.extraDepthPaddingMeters;
-    out.params[3] = 0.0f;
+    out.params[3] = sky.volumetricQuality <= 0 ? 0.75f : 1.25f; // shadow filter radius in texels
     return nullptr;
 }
 
@@ -303,12 +304,18 @@ bool GodRayRenderer::IsVisible(const SkySettings& sky,
         BuildVolumetricPush(sky, lighting, camera, shadow, volumetric) == nullptr;
 }
 
-bool GodRayRenderer::EnsureViewTargets(ViewTargets& targets, std::uint32_t width, std::uint32_t height)
+bool GodRayRenderer::EnsureViewTargets(ViewTargets& targets, std::uint32_t width, std::uint32_t height,
+                                      std::int32_t screenQuality, std::int32_t volumeQuality)
 {
-    const std::uint32_t rayWidth = std::max(1u, width / 4u);
-    const std::uint32_t rayHeight = std::max(1u, height / 4u);
-    if (targets.maskTarget && targets.blurTarget && targets.volumeTarget && targets.volumeBlurTarget &&
-        targets.width == rayWidth && targets.height == rayHeight)
+    const std::uint32_t screenDivisor = screenQuality >= 2 ? 2u : 4u;
+    const std::uint32_t volumeDivisor = volumeQuality >= 2 ? 2u : 4u;
+    const std::uint32_t rayWidth = std::max(1u, (width + screenDivisor - 1u) / screenDivisor);
+    const std::uint32_t rayHeight = std::max(1u, (height + screenDivisor - 1u) / screenDivisor);
+    const std::uint32_t volumeWidth = std::max(1u, (width + volumeDivisor - 1u) / volumeDivisor);
+    const std::uint32_t volumeHeight = std::max(1u, (height + volumeDivisor - 1u) / volumeDivisor);
+    if (targets.maskTarget && targets.filteredMaskTarget && targets.blurTarget && targets.volumeTarget && targets.volumeBlurTarget &&
+        targets.width == rayWidth && targets.height == rayHeight &&
+        targets.volumeWidth == volumeWidth && targets.volumeHeight == volumeHeight)
         return true;
     // The old targets may still be read by frames in flight.
     if (targets.maskTarget || targets.blurTarget || targets.volumeTarget || targets.volumeBlurTarget)
@@ -319,18 +326,21 @@ bool GodRayRenderer::EnsureViewTargets(ViewTargets& targets, std::uint32_t width
     targets.lastScreenSpaceState = lastScreenSpaceState;
     targets.lastVolumetricState = lastVolumetricState;
     targets.mask = CreateRayTexture(*m_rhi, rayWidth, rayHeight, "GodRays:Mask");
+    targets.filteredMask = CreateRayTexture(*m_rhi, rayWidth, rayHeight, "GodRays:FilteredMask");
     targets.blur = CreateRayTexture(*m_rhi, rayWidth, rayHeight, "GodRays:Blur");
-    targets.volume = CreateRayTexture(*m_rhi, rayWidth, rayHeight, "GodRays:Volume");
-    targets.volumeBlur = CreateRayTexture(*m_rhi, rayWidth, rayHeight, "GodRays:VolumeBlur");
+    targets.volume = CreateRayTexture(*m_rhi, volumeWidth, volumeHeight, "GodRays:Volume");
+    targets.volumeBlur = CreateRayTexture(*m_rhi, volumeWidth, volumeHeight, "GodRays:VolumeBlur");
     if (targets.mask)
         targets.maskTarget = CreateRayTarget(*m_rhi, targets.mask, "GodRays:Mask");
+    if (targets.filteredMask)
+        targets.filteredMaskTarget = CreateRayTarget(*m_rhi, targets.filteredMask, "GodRays:FilteredMask");
     if (targets.blur)
         targets.blurTarget = CreateRayTarget(*m_rhi, targets.blur, "GodRays:Blur");
     if (targets.volume)
         targets.volumeTarget = CreateRayTarget(*m_rhi, targets.volume, "GodRays:Volume");
     if (targets.volumeBlur)
         targets.volumeBlurTarget = CreateRayTarget(*m_rhi, targets.volumeBlur, "GodRays:VolumeBlur");
-    if (!targets.maskTarget || !targets.blurTarget || !targets.volumeTarget || !targets.volumeBlurTarget)
+    if (!targets.maskTarget || !targets.filteredMaskTarget || !targets.blurTarget || !targets.volumeTarget || !targets.volumeBlurTarget)
     {
         targets = ViewTargets{};
         targets.lastScreenSpaceState = lastScreenSpaceState;
@@ -339,6 +349,8 @@ bool GodRayRenderer::EnsureViewTargets(ViewTargets& targets, std::uint32_t width
     }
     targets.width = rayWidth;
     targets.height = rayHeight;
+    targets.volumeWidth = volumeWidth;
+    targets.volumeHeight = volumeHeight;
     return true;
 }
 
@@ -400,7 +412,7 @@ bool GodRayRenderer::RenderRays(ixrhi::IXRHICommandList& cmd,
     report(targets.lastScreenSpaceState, "screen-space", screenSpaceState ? screenSpaceState : "drawing");
     if (screenSpaceState && volumetricState)
         return false;
-    if (!EnsureViewTargets(targets, width, height))
+    if (!EnsureViewTargets(targets, width, height, sky.godRayQuality, sky.volumetricQuality))
     {
         report(targets.lastScreenSpaceState, "screen-space", "skipped: render targets could not be created");
         return false;
@@ -411,10 +423,18 @@ bool GodRayRenderer::RenderRays(ixrhi::IXRHICommandList& cmd,
     if (!screenSpaceState)
     {
         m_maskBindings->UpdateTexture(set, 0, depth, m_sampler);
-        m_blurBindings->UpdateTexture(set, 0, targets.mask, m_sampler);
-        // The mask: the sun where the sky shows. The shafts: the mask blurred towards the sun.
+        m_filterMaskBindings->UpdateTexture(set, 0, targets.mask, m_sampler);
+        m_blurBindings->UpdateTexture(set, 0, targets.filteredMask, m_sampler);
+        push.composite[2] = 1.0f / static_cast<float>(targets.width);
+        push.composite[3] = 1.0f / static_cast<float>(targets.height);
+        // Resolve leaf/sky coverage and soften it before integrating along the light shafts.
         DrawFullscreen(cmd, *targets.maskTarget, targets.width, targets.height, *m_maskPipeline,
             *m_maskBindings, set, &push, sizeof(push));
+        Push filter{};
+        filter.rayParams[0] = push.composite[2];
+        filter.rayParams[1] = push.composite[3];
+        DrawFullscreen(cmd, *targets.filteredMaskTarget, targets.width, targets.height, *m_volumeBlurPipeline,
+            *m_filterMaskBindings, set, &filter, sizeof(filter));
         DrawFullscreen(cmd, *targets.blurTarget, targets.width, targets.height, *m_blurPipeline,
             *m_blurBindings, set, &push, sizeof(push));
         targets.push = push;
@@ -428,12 +448,12 @@ bool GodRayRenderer::RenderRays(ixrhi::IXRHICommandList& cmd,
         m_marchBindings->UpdateTexture(set, 1, shadow.texture, m_shadowSampler);
         m_marchBindings->UpdateBuffer(set, 2, m_cascadeBuffers[frameIndex], 0, kCascadeBufferBytes);
         m_volumeBlurBindings->UpdateTexture(set, 0, targets.volume, m_sampler);
-        DrawFullscreen(cmd, *targets.volumeTarget, targets.width, targets.height, *m_marchPipeline,
+        DrawFullscreen(cmd, *targets.volumeTarget, targets.volumeWidth, targets.volumeHeight, *m_marchPipeline,
             *m_marchBindings, set, &volumetric, sizeof(volumetric));
         Push blur{};
-        blur.rayParams[0] = 1.0f / static_cast<float>(targets.width);
-        blur.rayParams[1] = 1.0f / static_cast<float>(targets.height);
-        DrawFullscreen(cmd, *targets.volumeBlurTarget, targets.width, targets.height, *m_volumeBlurPipeline,
+        blur.rayParams[0] = 1.0f / static_cast<float>(targets.volumeWidth);
+        blur.rayParams[1] = 1.0f / static_cast<float>(targets.volumeHeight);
+        DrawFullscreen(cmd, *targets.volumeBlurTarget, targets.volumeWidth, targets.volumeHeight, *m_volumeBlurPipeline,
             *m_volumeBlurBindings, set, &blur, sizeof(blur));
         targets.volumetricReady = true;
     }
@@ -477,6 +497,7 @@ void GodRayRenderer::Destroy()
     for (auto& buffer : m_cascadeBuffers)
         buffer.reset();
     m_maskBindings.reset();
+    m_filterMaskBindings.reset();
     m_blurBindings.reset();
     m_marchBindings.reset();
     m_volumeBlurBindings.reset();

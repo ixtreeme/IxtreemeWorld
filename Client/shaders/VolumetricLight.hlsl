@@ -3,7 +3,7 @@
 // Volumetric light: the sunlight the air scatters towards the camera along each view ray. The sun
 // shadow cascades decide which parts of the ray the sun reaches, so shadowed air stays dark and lit
 // air between the shadows shows as shafts — seen from the side too, wherever the sun is. Rendered at
-// quarter size; a per-pixel offset of the march steps turns banding into fine noise that the blur pass
+// quarter size (half at high quality); a per-pixel offset turns march banding into noise that the blur pass
 // (GodRays.hlsl VolBlurPS) removes. The vertex stage is GodRays.hlsl VSMain (same interface).
 
 [[vk::combinedImageSampler]] [[vk::binding(0, 0)]] Texture2D u_depth : register(t0);
@@ -22,7 +22,7 @@ struct VolumetricPush
     float4 cameraPos;            // xyz; w = how far along the ray light is gathered (m)
     float4 sunDir;               // xyz towards the sun; w = scattering per metre
     float4 sunColor;             // rgb linear (colour x intensity); w = forward-scattering g
-    float4 params;               // x = steps; y = depth-unit bias; z = bias correction in metres
+    float4 params;               // x = steps; y = depth-unit bias; z = bias correction in metres; w = shadow filter radius
 };
 [[vk::push_constant]] VolumetricPush u_push;
 
@@ -35,14 +35,45 @@ struct VSOutput
 
 // 1 where the sun reaches a point, 0 in its shadow, from the point's position in each cascade's
 // light space (x/y: shadow map uv, z: depth); the finest cascade that contains it decides.
-float SunVisibility(float3 lightSpace[4], float compareBias[4])
+float FilterShadow(float3 p, int cascade, float bias, float2 shadowTexel)
+{
+    // Four bilinear comparison taps soften the binary leaf shadows before ray integration.
+    const float2 radius = shadowTexel * u_push.params.w;
+    float visibility = 0.0;
+    [unroll]
+    for (int y = -1; y <= 1; y += 2)
+    {
+        [unroll]
+        for (int x = -1; x <= 1; x += 2)
+            visibility += u_shadow.SampleCmpLevelZero(u_shadowSampler,
+                float3(clamp(p.xy + float2(x, y) * radius, shadowTexel * 0.5, 1.0 - shadowTexel * 0.5),
+                    (float)cascade), p.z - bias);
+    }
+    return visibility * 0.25;
+}
+
+float CascadeVisibility(float3 p, float3 nextPoint, int cascade, float bias, float nextBias, float2 shadowTexel)
+{
+    const float visibility = FilterShadow(p, cascade, bias, shadowTexel);
+    const float edge = min(min(p.x, 1.0 - p.x), min(p.y, 1.0 - p.y));
+    const float weight = smoothstep(0.0, 0.06, edge);
+    if (weight >= 1.0)
+        return visibility;
+    float nextVisibility = 1.0;
+    if (cascade < 3 && all(nextPoint > 0.0) && all(nextPoint < 1.0))
+        nextVisibility = FilterShadow(nextPoint, cascade + 1, nextBias, shadowTexel);
+    return lerp(nextVisibility, visibility, weight);
+}
+
+float SunVisibility(float3 lightSpace[4], float compareBias[4], float2 shadowTexel)
 {
     [unroll]
     for (int cascade = 0; cascade < 4; ++cascade)
     {
         const float3 p = lightSpace[cascade];
         if (all(p > 0.0) && all(p < 1.0))
-            return u_shadow.SampleCmpLevelZero(u_shadowSampler, float3(p.xy, (float)cascade), p.z - compareBias[cascade]);
+            return CascadeVisibility(p, lightSpace[min(cascade + 1, 3)], cascade,
+                compareBias[cascade], compareBias[min(cascade + 1, 3)], shadowTexel);
     }
     return 1.0;  // past the last cascade there is no shadow information: the air there is lit
 }
@@ -67,17 +98,57 @@ float InterleavedGradientNoise(float2 pixel)
     return frac(52.9829189 * frac(dot(pixel, float2(0.06711056, 0.00583715))));
 }
 
+float RayCoverage(int stepIndex, float stepLength, float nearLength, float farWeight)
+{
+    return lerp(farWeight, 1.0, saturate(nearLength / max(stepLength, 1e-5) - stepIndex));
+}
+
+float GeometricSum(float transmittance, int steps)
+{
+    const float oneMinus = 1.0 - transmittance;
+    return oneMinus > 1e-5 ? (1.0 - pow(transmittance, (float)steps)) / oneMinus : (float)steps;
+}
+
 float4 MarchPS(VSOutput input) : SV_Target
 {
-    const float depth = u_depth.SampleLevel(u_depthSampler, input.uv, 0.0).r;
+    uint depthWidth, depthHeight, shadowWidth, shadowHeight, shadowLayers;
+    u_depth.GetDimensions(depthWidth, depthHeight);
+    u_shadow.GetDimensions(shadowWidth, shadowHeight, shadowLayers);
+    const float2 shadowTexel = 1.0 / float2(shadowWidth, shadowHeight);
     const float3 camera = u_push.cameraPos.xyz;
-    // The point the pixel shows (the far plane for the sky).
-    const float4 hit = mul(float4(input.ndc, depth >= 0.99999 ? 1.0 : depth, 1.0), u_push.invViewProjection);
-    const float3 ray = hit.xyz / hit.w - camera;
+    const float4 farHit = mul(float4(input.ndc, 1.0, 1.0), u_push.invViewProjection);
+    const float3 ray = farHit.xyz / farHit.w - camera;
     const float distance = length(ray);
     const float3 dir = ray / max(distance, 1e-4);
 
-    const float rayLength = min(distance, u_push.cameraPos.w);
+    // A low-resolution pixel may cover both a leaf and sky. March once to the farthest
+    // surface, then weight the air beyond the nearest surface by the remaining coverage.
+    // This preserves partial light through small gaps without marching four/sixteen rays.
+    const float2 footprint = float2(abs(ddx(input.uv.x)), abs(ddy(input.uv.y)));
+    const float2 depthSize = float2(depthWidth, depthHeight);
+    const int2 coverageSamples = clamp(int2(ceil(footprint * depthSize - 1e-3)), 1, 4);
+    const float4 nearHit = mul(float4(input.ndc, 0.0, 1.0), u_push.invViewProjection);
+    const float4 depthAxis = mul(float4(0.0, 0.0, 1.0, 0.0), u_push.invViewProjection);
+    float nearRayLength = u_push.cameraPos.w;
+    float rayLength = 0.0;
+    float meanLength = 0.0;
+    for (int y = 0; y < coverageSamples.y; ++y)
+    {
+        for (int x = 0; x < coverageSamples.x; ++x)
+        {
+            const float2 offset = (float2(x + 0.5, y + 0.5) / coverageSamples - 0.5) * footprint;
+            const int2 pixel = clamp(int2((input.uv + offset) * depthSize), int2(0, 0), int2(depthWidth, depthHeight) - 1);
+            const float depth = u_depth.Load(int3(pixel, 0)).r;
+            const float4 hit = nearHit + depth * depthAxis;
+            const float lengthToSurface = min(length(hit.xyz / hit.w - camera), u_push.cameraPos.w);
+            nearRayLength = min(nearRayLength, lengthToSurface);
+            rayLength = max(rayLength, lengthToSurface);
+            meanLength += lengthToSurface;
+        }
+    }
+    meanLength /= coverageSamples.x * coverageSamples.y;
+    const float span = rayLength - nearRayLength;
+    const float farWeight = span > 1e-4 ? saturate((meanLength - nearRayLength) / span) : 1.0;
     // Steps of (at most) the same length on every ray: a ray that ends on nearby ground takes a few
     // of them, not the full count a ray into the sky needs.
     const int maxSteps = clamp((int)(u_push.params.x + 0.5), 4, 128);
@@ -129,12 +200,15 @@ float4 MarchPS(VSOutput input) : SV_Target
         {
             const int end = min(lastInside[c] + 1, steps);
             float3 p = lightSpace[c] + lightSpaceStep[c] * (float)cursor;
+            const int next = min(c + 1, 3);
+            float3 nextPoint = lightSpace[next] + lightSpaceStep[next] * (float)cursor;
             for (int i = cursor; i < end; ++i)
             {
-                lit += u_shadow.SampleCmpLevelZero(u_shadowSampler, float3(p.xy, (float)c), p.z - compareBias[c]) *
-                    transmittance;
+                lit += CascadeVisibility(p, nextPoint, c, compareBias[c], compareBias[next], shadowTexel) *
+                    transmittance * RayCoverage(i, stepLength, nearRayLength, farWeight);
                 transmittance *= stepTransmittance;
                 p += lightSpaceStep[c];
+                nextPoint += lightSpaceStep[next];
             }
             cursor = max(cursor, end);
         }
@@ -143,8 +217,11 @@ float4 MarchPS(VSOutput input) : SV_Target
         const int rest = steps - cursor;
         if (rest > 0)
         {
-            const float oneMinus = 1.0 - stepTransmittance;
-            lit += transmittance * (oneMinus > 1e-5 ? (1.0 - pow(stepTransmittance, (float)rest)) / oneMinus : (float)rest);
+            const float nearSteps = nearRayLength / max(stepLength, 1e-5) - cursor;
+            const int full = clamp((int)floor(nearSteps), 0, rest);
+            const float partial = full < rest ? saturate(nearSteps - full) : 0.0;
+            lit += transmittance * (farWeight * GeometricSum(stepTransmittance, rest) +
+                (1.0 - farWeight) * (GeometricSum(stepTransmittance, full) + partial * pow(stepTransmittance, (float)full)));
         }
     }
     else
@@ -153,7 +230,8 @@ float4 MarchPS(VSOutput input) : SV_Target
         // drives them): the finest cascade holding each step, step by step.
         for (int i = 0; i < steps; ++i)
         {
-            lit += SunVisibility(lightSpace, compareBias) * transmittance;
+            lit += SunVisibility(lightSpace, compareBias, shadowTexel) *
+                transmittance * RayCoverage(i, stepLength, nearRayLength, farWeight);
             transmittance *= stepTransmittance;
             [unroll]
             for (int c = 0; c < 4; ++c)

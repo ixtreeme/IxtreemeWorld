@@ -1,7 +1,7 @@
 #pragma once
 
 // GodRayRenderer — light shafts from the Sun (SkySettings::godRays), two techniques:
-//   screen space — a quarter-size occlusion mask (the sun where the sky shows past the geometry)
+//   screen space — a coverage-filtered occlusion mask (the sun where the sky shows past the geometry)
 //                  blurred radially towards the sun's screen position: shafts around the sun when
 //                  it is on the screen;
 //   volumetric   — the sunlight the air scatters towards the camera along every view ray, shadowed
@@ -10,7 +10,7 @@
 //
 // Per view (0 = the Scene view and the built game, 1 = the editor Game view), after the scene is in
 // its offscreen target and a depth snapshot was taken:
-//   RenderRays  — outside any render pass, into the view's own quarter-size targets (both effects are soft);
+//   RenderRays  — outside any render pass, into the view's own quality-sized targets;
 //   TakeAddedLight — the two results for the view's scene, which adds them in its tone-map draw
 //                    (OffscreenSceneRenderer::SetAddedLight): no pass of their own over the image.
 // Every pass takes its per-view data as push constants, so the two views never share per-frame data;
@@ -80,6 +80,7 @@ public:
     void Destroy();
 
 private:
+    friend struct GodRayQualityTestAccess;
     static constexpr std::uint32_t kFramesInFlight = 2;
 
     // Screen-space passes (GodRays.hlsl); the volumetric blur uses it too.
@@ -103,13 +104,17 @@ private:
 
     struct ViewTargets
     {
-        std::uint32_t width = 0;  // a quarter of the view size
+        std::uint32_t width = 0;  // screen-space size: quarter, or half at high quality
         std::uint32_t height = 0;
+        std::uint32_t volumeWidth = 0;
+        std::uint32_t volumeHeight = 0;
         std::shared_ptr<ixrhi::IXRHITexture> mask;
+        std::shared_ptr<ixrhi::IXRHITexture> filteredMask;
         std::shared_ptr<ixrhi::IXRHITexture> blur;
         std::shared_ptr<ixrhi::IXRHITexture> volume;
         std::shared_ptr<ixrhi::IXRHITexture> volumeBlur;
         std::unique_ptr<ixrhi::IXRHIRenderTarget> maskTarget;
+        std::unique_ptr<ixrhi::IXRHIRenderTarget> filteredMaskTarget;
         std::unique_ptr<ixrhi::IXRHIRenderTarget> blurTarget;
         std::unique_ptr<ixrhi::IXRHIRenderTarget> volumeTarget;
         std::unique_ptr<ixrhi::IXRHIRenderTarget> volumeBlurTarget;
@@ -124,7 +129,8 @@ private:
     const char* BuildPush(const SkySettings& sky, const LightingState& lighting, const WorldCamera& camera, Push& out) const;
     const char* BuildVolumetricPush(const SkySettings& sky, const LightingState& lighting, const WorldCamera& camera,
                                     const SunShadow& shadow, VolumetricPush& out) const;
-    bool EnsureViewTargets(ViewTargets& targets, std::uint32_t width, std::uint32_t height);
+    bool EnsureViewTargets(ViewTargets& targets, std::uint32_t width, std::uint32_t height,
+                           std::int32_t screenQuality, std::int32_t volumeQuality);
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> BuildPipeline(const std::shared_ptr<ixrhi::IXRHIShader>& ps,
                                                                 const ixrhi::IXRHIBindGroupLayout& layout,
                                                                 std::uint32_t pushBytes,
@@ -153,6 +159,7 @@ private:
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> m_marchLayout;  // depth, shadow cascades, cascade matrices
     // One set per (view, frame in flight) for each pass: rewritten just before its use.
     std::unique_ptr<ixrhi::IXRHIBindGroup> m_maskBindings;
+    std::unique_ptr<ixrhi::IXRHIBindGroup> m_filterMaskBindings;
     std::unique_ptr<ixrhi::IXRHIBindGroup> m_blurBindings;
     std::unique_ptr<ixrhi::IXRHIBindGroup> m_marchBindings;
     std::unique_ptr<ixrhi::IXRHIBindGroup> m_volumeBlurBindings;

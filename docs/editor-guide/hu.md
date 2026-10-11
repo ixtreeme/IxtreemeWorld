@@ -751,6 +751,8 @@ A sűrűség távolságonként halmozódik: 0.01 mellett 100 méteren kb. 37% ma
 #### Mire jó?
 A God rays a naphoz kötött fénysugarakat ad, a Tone mapping a HDR jelenet megjelenített fényességét/színeit alakítja. Az exposure nem változtatja meg a lámpák fizikai intenzitását.
 
+Minden minőség szűri a lomb és az ég takarási arányát, valamint a volumetrikus árnyékokat, hogy lágyabb legyen a levelek közötti átmenet. High mellett az adott technika fél felbontáson működik: 128 screen-space mintával, illetve 64 volumetrikus lépéssel. Low és Medium mellett negyed felbontást használ. A screen-space Falloff hatása minőségváltáskor megmarad; a két technika minősége külön állítható.
+
 #### Rövid tutorial
 1. Scene Settings > Environment alatt állíts jól látható napot.
 2. God rays > Enabled: a megjelenő erősség, sűrűség és volumetric mezőket fokozatosan hangold.

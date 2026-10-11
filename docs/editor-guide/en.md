@@ -751,6 +751,8 @@ Density accumulates along distance: at 0.01, about 37% is transmitted over 100 m
 #### Purpose
 God rays creates sun-related light shafts; Tone mapping maps the HDR scene into displayed colours/brightness. Exposure does not change physical light intensity.
 
+Every quality filters leaf/sky coverage and volumetric shadows to soften foliage transitions. High renders each technique at half resolution: 128 screen-space samples or 64 volumetric steps. Low and Medium use quarter resolution. Screen-space falloff stays consistent when quality changes; the two quality controls are independent.
+
 #### Short tutorial
 1. Position a visible sun in Scene Settings > Environment.
 2. Enable God rays and gradually tune its strength, density and volumetric fields.
