@@ -22,6 +22,7 @@ void EditorImGui::RenderEditorPanels()
         m_uiSelectionActive = false;
     RenderGameViewPanel();
     RenderAnimatorPanel();
+    RenderMaterialGraphPanel();
     RenderInspector();
     RenderSceneSettingsPanel();
     RenderAssetBrowser();
@@ -86,6 +87,34 @@ void EditorImGui::RenderEditorPanels()
         --m_startupViewFocusFrames;
         ImGui::SetWindowFocus(EditorWindow::SceneView);
     }
+}
+
+void EditorImGui::RenderMaterialGraphPanel()
+{
+    if (!m_materialGraphPanelOpen) return;
+    if (!m_materialGraphPanel) m_materialGraphPanel = std::make_unique<material_tool::MaterialGraphPanel>();
+    if (const auto* scene = ImGui::FindWindowByName(EditorWindow::SceneView); scene && scene->DockId)
+        ImGui::SetNextWindowDockID(scene->DockId, ImGuiCond_FirstUseEver);
+    m_materialGraphPanel->SetServices(m_assetLibrary.get(),m_textureProvider);
+    m_materialGraphPanel->RenderView(m_materialGraphPanelOpen);
+    InspectorShowsMaterialGraph();
+}
+
+bool EditorImGui::InspectorShowsMaterialGraph()
+{
+    if (!m_materialGraphPanelOpen || !m_materialGraphPanel)
+    {
+        m_inspectorShowsMaterialGraph = false;
+        return false;
+    }
+    if (m_materialGraphPanel->TakeInspectorRequest())
+        m_inspectorShowsMaterialGraph = true;
+    else if (const auto* focused = ImGui::GetCurrentContext()->NavWindow)
+    {
+        for (const char* name : {EditorWindow::SceneView, EditorWindow::Game, EditorWindow::Hierarchy, EditorWindow::Animator, "Tree Generator"})
+            if (focused->RootWindow == ImGui::FindWindowByName(name)) m_inspectorShowsMaterialGraph = false;
+    }
+    return m_inspectorShowsMaterialGraph;
 }
 
 void EditorImGui::RenderTreeGeneratorPanel()

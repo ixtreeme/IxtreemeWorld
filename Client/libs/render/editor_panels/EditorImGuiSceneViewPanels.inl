@@ -75,6 +75,7 @@ void EditorImGui::RenderDockSpace()
         ImGui::DockBuilderDockWindow(EditorWindow::SceneView, mainId);
         ImGui::DockBuilderDockWindow(EditorWindow::Game, mainId);
         ImGui::DockBuilderDockWindow(EditorWindow::Animator, mainId);
+        ImGui::DockBuilderDockWindow(EditorWindow::MaterialGraph, mainId);
         ImGui::DockBuilderFinish(dockspaceId);
         m_defaultLayoutTabSelectFrames = 3;
         Tracen("[EDITOR-LAYOUT] Default dock layout applied");

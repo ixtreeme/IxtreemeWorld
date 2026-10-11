@@ -93,4 +93,12 @@ if(WIN32)
             "${CLIENT_ROOT}/assets"
             "$<TARGET_FILE_DIR:IxtreemeEngine>/assets"
     )
+    # Runtime uses the vendored MIT JSON component of the graph library too.
+    add_custom_command(TARGET IxtreemeEngine POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory
+            "$<TARGET_FILE_DIR:IxtreemeEngine>/third_party_licenses"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CLIENT_ROOT}/third_party/imgui-node-editor/LICENSE"
+            "$<TARGET_FILE_DIR:IxtreemeEngine>/third_party_licenses/imgui-node-editor.txt"
+        VERBATIM)
 endif()

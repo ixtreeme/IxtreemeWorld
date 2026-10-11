@@ -3548,6 +3548,12 @@ bool AssetLibrary::Import(Category category,
         std::string importedText((std::istreambuf_iterator<char>(importedFile)), std::istreambuf_iterator<char>());
         entry.physicsMaterial = ReadPhysicsMaterialJson(importedText);
     }
+    // Texture import must publish its GUID immediately: material/instance bindings can
+    // be created before a filesystem watcher or library refresh runs.
+    if (category == Category::Texture) {
+        const auto guid = AssetDatabase::Instance().getOrCreateGuid(destination);
+        if (!IsEmptyGuid(guid)) entry.guid = guid.toString();
+    }
     m_entries.push_back(entry);
 
     if (!SaveManifest(error))
@@ -3557,6 +3563,10 @@ bool AssetLibrary::Import(Category category,
             std::filesystem::remove(dependency, ec);
         if (category == Category::Texture && !entry.thumbnail.empty())
             std::filesystem::remove(m_libraryRoot / entry.thumbnail, ec);
+        if (category == Category::Texture) {
+            AssetDatabase::Instance().runtimeRemove(destination);
+            auto meta = destination; meta += L".meta"; std::filesystem::remove(meta, ec);
+        }
         m_entries.pop_back();
         return false;
     }
@@ -3677,6 +3687,10 @@ bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
     }
 
     const std::string destinationCanonical = CanonicalPathString(destination);
+    if (*category == Category::Texture) {
+        const auto guid = AssetDatabase::Instance().getOrCreateGuid(destination);
+        if (!IsEmptyGuid(guid)) entry.guid = guid.toString();
+    }
     m_entries.erase(std::remove_if(m_entries.begin(), m_entries.end(), [&](const Entry& existing) {
         return CanonicalPathString(AbsolutePath(existing)) == destinationCanonical;
     }), m_entries.end());
@@ -3691,6 +3705,7 @@ bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
         if (!sameFile)
         {
             std::filesystem::remove(destination, ec);
+            if (*category == Category::Texture) AssetDatabase::Instance().runtimeRemove(destination);
             for (const auto& dependency : copiedDependencyFiles)
                 std::filesystem::remove(dependency, ec);
         }

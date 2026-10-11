@@ -55,7 +55,9 @@ enum class AssetType
     AudioClip,
     Script,
     UiDocument,  // game UI (RmlUi): .rml / .rcss
-    Unknown
+    Unknown,
+    MaterialGraph,
+    MaterialInstance
 };
 
 AssetType detectAssetType(const std::filesystem::path& filePath);

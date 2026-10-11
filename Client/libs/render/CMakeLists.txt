@@ -71,11 +71,32 @@ add_library(IXEngineRender STATIC
     WorldComponents.h
 )
 
+# UI-independent graph serialization, evaluation and shader generation are shared with runtime.
+add_library(IXMaterialGraph STATIC
+    tools/material/MaterialGraphDocument.cpp
+    tools/material/MaterialLayers.cpp
+    tools/material/SmartMaterialPresets.cpp
+    tools/material/MaterialGraphCompiler.cpp
+    tools/material/MaterialGraphImages.cpp
+    tools/material/MaterialGraphIO.cpp
+    tools/material/MaterialInstance.cpp
+    "${CLIENT_ROOT}/third_party/imgui-node-editor/crude_json.cpp")
+target_include_directories(IXMaterialGraph PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_include_directories(IXMaterialGraph SYSTEM PRIVATE "${CLIENT_ROOT}/third_party/imgui-node-editor")
+target_compile_features(IXMaterialGraph PUBLIC cxx_std_20)
+if(MSVC)
+    set_target_properties(IXMaterialGraph PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+target_link_libraries(IXEngineRender PUBLIC IXMaterialGraph)
+
 # Editor-only translation units. These pull in ImGui/ImGuizmo (only fetched when the editor is on),
 # so they must NOT be compiled into a runtime (IXTREEME_WITH_EDITOR=OFF) build. EditorImGui.cpp stays
 # in the unconditional list because it self-guards (full body under the editor flag, link stubs in the
 # #else branch) so the always-compiled engine can reference EditorImGui symbols in both builds.
 if(IXTREEME_WITH_EDITOR)
+    add_subdirectory("${CLIENT_ROOT}/third_party/imgui-node-editor"
+        "${CMAKE_CURRENT_BINARY_DIR}/imgui-node-editor")
+    target_link_libraries(IXEngineRender PRIVATE IXImGuiNodeEditor)
     # Both offline documents are embedded into the editor. The packaged runtime
     # does not compile this browser or require a documentation directory.
     set(EDITOR_HELP_ROOT "${CLIENT_ROOT}/../docs/editor-guide")
@@ -89,6 +110,9 @@ if(IXTREEME_WITH_EDITOR)
         EditorHelp.cpp
         EditorHelp.h
         UIHelpers.cpp
+        tools/material/MaterialGraphPanel.cpp
+        tools/material/MaterialGraphPanel.h
+        tools/material/MaterialGraphAssets.cpp
         tools/tree/TreeGeneratorPanel.cpp
         tools/tree/TreePreviewRenderer.cpp
     )
@@ -302,7 +326,42 @@ if(BUILD_TESTING AND NOT ANDROID)
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
     add_test(NAME HierarchyCacheTest COMMAND HierarchyCacheTest)
+    add_executable(MaterialGraphCompilerTest tests/MaterialGraphCompilerTest.cpp)
+    add_executable(SmartMaterialCoreTest tests/SmartMaterialCoreTest.cpp)
+    target_link_libraries(SmartMaterialCoreTest PRIVATE IXMaterialGraph)
+    if(MSVC)
+        set_target_properties(SmartMaterialCoreTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME SmartMaterialCoreTest COMMAND SmartMaterialCoreTest)
+    set_tests_properties(SmartMaterialCoreTest PROPERTIES TIMEOUT 30)
+    target_link_libraries(MaterialGraphCompilerTest PRIVATE IXMaterialGraph)
+    target_compile_definitions(MaterialGraphCompilerTest PRIVATE
+        IX_GRAPH_SHADER_OUTPUT="${CMAKE_CURRENT_BINARY_DIR}/graph-shader-tests")
+    if(WIN32 AND DXC_EXECUTABLE)
+        target_compile_definitions(MaterialGraphCompilerTest PRIVATE IX_GRAPH_DXC="${DXC_EXECUTABLE}")
+    endif()
+    if(MSVC)
+        set_target_properties(MaterialGraphCompilerTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME MaterialGraphCompilerTest COMMAND MaterialGraphCompilerTest)
+    set_tests_properties(MaterialGraphCompilerTest PROPERTIES TIMEOUT 120)
+
     if(IXTREEME_WITH_EDITOR AND WIN32)
+        add_executable(MaterialGraphBakingTest tests/MaterialGraphBakingTest.cpp)
+        target_link_libraries(MaterialGraphBakingTest PRIVATE IXEngineRender)
+        if(MSVC)
+            set_target_properties(MaterialGraphBakingTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+        add_test(NAME MaterialGraphBakingTest COMMAND MaterialGraphBakingTest)
+        set_tests_properties(MaterialGraphBakingTest PROPERTIES TIMEOUT 30)
+        add_executable(MaterialGraphEditorTest tests/MaterialGraphEditorTest.cpp)
+        target_link_libraries(MaterialGraphEditorTest PRIVATE IXEngineRender IXImGuiNodeEditor)
+        target_compile_definitions(MaterialGraphEditorTest PRIVATE IX_GRAPH_TEST_OUTPUT="${CMAKE_CURRENT_BINARY_DIR}")
+        if(MSVC)
+            set_target_properties(MaterialGraphEditorTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+        add_test(NAME MaterialGraphEditorTest COMMAND MaterialGraphEditorTest)
+        set_tests_properties(MaterialGraphEditorTest PROPERTIES TIMEOUT 30)
         add_executable(EditorHelpTest tests/EditorHelpTest.cpp)
         target_link_libraries(EditorHelpTest PRIVATE IXEngineRender)
         if(MSVC)

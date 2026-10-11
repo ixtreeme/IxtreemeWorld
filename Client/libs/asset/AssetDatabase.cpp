@@ -125,6 +125,10 @@ std::optional<AssetType> ParseAssetType(const std::string& value)
         return AssetType::Texture;
     if (value == "Material")
         return AssetType::Material;
+    if (value == "MaterialGraph")
+        return AssetType::MaterialGraph;
+    if (value == "MaterialInstance")
+        return AssetType::MaterialInstance;
     if (value == "Animation")
         return AssetType::Animation;
     if (value == "AnimationClip")
@@ -483,6 +487,10 @@ AssetType detectAssetType(const std::filesystem::path& filePath)
         return AssetType::Texture;
     if (ext == ".material" || ext == ".physmat")
         return AssetType::Material;
+    if (ext == ".materialgraph" || ext == ".ixsmartmaterial")
+        return AssetType::MaterialGraph;
+    if (ext == ".ixmaterialinstance")
+        return AssetType::MaterialInstance;
     if (ext == ".anim" || ext == ".ozz")
         return AssetType::Animation;
     if (ext == ".ixclip")
@@ -513,6 +521,8 @@ const char* AssetTypeName(AssetType type)
     case AssetType::Model: return "Model";
     case AssetType::Texture: return "Texture";
     case AssetType::Material: return "Material";
+    case AssetType::MaterialGraph: return "MaterialGraph";
+    case AssetType::MaterialInstance: return "MaterialInstance";
     case AssetType::Animation: return "Animation";
     case AssetType::AnimationClip: return "AnimationClip";
     case AssetType::AnimatorController: return "AnimatorController";
@@ -887,8 +897,14 @@ Guid AssetDatabase::getOrCreateGuid(const std::filesystem::path& absPath)
     {
         if (const std::optional<MetaRecord> meta = loadMeta(metaPath, assetPath, error))
         {
-            registerAsset(assetPath, meta->guid);
-            return meta->guid;
+            const auto collision = guidToPath_.find(meta->guid);
+            if (meta->assetType == assetType &&
+                (collision == guidToPath_.end() || canonicalPath(collision->second) == assetPath))
+            {
+                registerAsset(assetPath, meta->guid);
+                return meta->guid;
+            }
+            error = meta->assetType != assetType ? "asset_type_mismatch" : "duplicate_guid";
         }
         TraceError("[ASSET-DB] error path=%s reason=%s regenerating=yes",
             displayPath(metaPath).c_str(),

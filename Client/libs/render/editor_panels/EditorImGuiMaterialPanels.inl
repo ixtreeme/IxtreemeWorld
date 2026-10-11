@@ -1108,7 +1108,9 @@ void EditorImGui::RenderInspector()
     EnsureUiCanvasState();
     if (ImGui::Begin(EditorWindow::Inspector, &m_inspectorPanelOpen))
     {
-        if (m_uiSelectionActive && SelectedUiCanvas())
+        if (InspectorShowsMaterialGraph())
+            m_materialGraphPanel->RenderInspector();
+        else if (m_uiSelectionActive && SelectedUiCanvas())
             RenderUiCanvasInspector();
         else if (InspectorShowsTreeGenerator())
         {

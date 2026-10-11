@@ -119,14 +119,21 @@ void EditorImGui::RenderMenuBar()
     if (ImGui::BeginMenu("Edit"))
     {
         const HierarchySceneEntity* selected = SelectedHierarchyEntity();
-        const bool canEditSelection = editing && selected != nullptr && !m_uiSelectionActive;
-        if (m_uiSelectionActive)
+        const bool graphEditing = m_materialGraphPanelOpen && m_inspectorShowsMaterialGraph && m_materialGraphPanel;
+        const bool canEditSelection = editing && selected != nullptr && !m_uiSelectionActive && !graphEditing;
+        if (graphEditing)
+        {
+            if (ImGui::MenuItem("Undo graph edit", "Ctrl+Z", false, m_materialGraphPanel->CanUndo())) m_materialGraphPanel->Undo();
+            if (ImGui::MenuItem("Redo graph edit", "Ctrl+Y", false, m_materialGraphPanel->CanRedo())) m_materialGraphPanel->Undo(true);
+            ImGui::Separator();
+        }
+        else if (m_uiSelectionActive)
         {
             if (ImGui::MenuItem("Undo UI edit", "Ctrl+Z", false, editing && !m_uiUndo.empty())) UiCanvasUndo(false);
             if (ImGui::MenuItem("Redo UI edit", "Ctrl+Y", false, editing && !m_uiRedo.empty())) UiCanvasUndo(true);
             ImGui::Separator();
         }
-        if (ImGui::MenuItem(ICON_FA_BULLSEYE "  Frame Selection", "F", false, selected != nullptr && !m_uiSelectionActive))
+        if (ImGui::MenuItem(ICON_FA_BULLSEYE "  Frame Selection", "F", false, selected != nullptr && !m_uiSelectionActive && !graphEditing))
             QueueHierarchyFocus(*selected);
         if (ImGui::MenuItem(ICON_FA_PEN "  Rename", nullptr, false, canEditSelection))
             StartHierarchyRename(*selected);
@@ -175,6 +182,7 @@ void EditorImGui::RenderMenuBar()
         panelItem(ICON_FA_TERMINAL "  Console", m_consolePanelOpen, EditorWindow::Console);
         panelItem(ICON_FA_HAMMER "  Build Output", m_buildOutputPanelOpen, EditorWindow::BuildOutput);
         panelItem(ICON_FA_PERSON_RUNNING "  Animator", m_animatorPanelOpen, EditorWindow::Animator);
+        panelItem(ICON_FA_LAYER_GROUP "  Material Graph", m_materialGraphPanelOpen, EditorWindow::MaterialGraph);
         if (ImGui::MenuItem("Scene View 2D / Canvas", nullptr, m_sceneView2D))
         { SetSceneView2D(!m_sceneView2D); m_pendingViewFocusWindow = EditorWindow::SceneView; }
         ImGui::Separator();
@@ -510,6 +518,11 @@ void EditorImGui::HandleEditorHotkeys()
         return;
 
     ImGuiIO& io = ImGui::GetIO();
+    if (m_materialGraphPanelOpen && m_materialGraphPanel && m_materialGraphPanel->OwnsKeyboard(m_inspectorShowsMaterialGraph))
+    {
+        m_materialGraphPanel->HandleHotkeys();
+        return;
+    }
     HandleUiCanvasHotkeys();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false))
     {

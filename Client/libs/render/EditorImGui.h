@@ -20,6 +20,7 @@
 #include "EditorGraphicsBridge.h"
 #if defined(IXTREEME_WITH_EDITOR)
 #include "EditorHelp.h"
+#include "tools/material/MaterialGraphPanel.h"
 #endif
 
 #include <cstdint>
@@ -312,6 +313,8 @@ private:
     void RenderSceneViewDropTarget();
     void RenderGameViewPanel();
     void RenderAnimatorPanel();
+    void RenderMaterialGraphPanel();
+    bool InspectorShowsMaterialGraph();
     void RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& imageSize);
     void RenderMenuBar();
     bool SaveProjectAndCurrentScene(bool automatic = false);
@@ -881,6 +884,11 @@ private:
     std::uint32_t m_gameViewPanelPixels[2] = {0u, 0u};
     bool m_animatorGraphVisible = false;
     bool m_animatorPanelOpen = true;
+#if defined(IXTREEME_WITH_EDITOR)
+    std::unique_ptr<material_tool::MaterialGraphPanel> m_materialGraphPanel;
+    bool m_materialGraphPanelOpen = false;
+    bool m_inspectorShowsMaterialGraph = false;
+#endif
     float m_animatorPan[2] = {0.0f, 0.0f};
     float m_animatorZoom = 1.0f;
     std::uint32_t m_animatorSelectedStateId = 0;

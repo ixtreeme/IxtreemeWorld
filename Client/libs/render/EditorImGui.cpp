@@ -64,6 +64,7 @@ namespace EditorWindow
 constexpr const char* SceneView = ICON_FA_CUBES "  Scene View###SceneView";
 constexpr const char* Game = ICON_FA_GAMEPAD "  Game###Game";
 constexpr const char* Animator = ICON_FA_PERSON_RUNNING "  Animator###Animator";
+constexpr const char* MaterialGraph = material_tool::MaterialGraphPanel::WindowName;
 constexpr const char* Hierarchy = ICON_FA_LIST_TREE "  Hierarchy###Hierarchy";
 constexpr const char* Inspector = ICON_FA_CIRCLE_INFO "  Inspector###Inspector";
 constexpr const char* SceneSettings = ICON_FA_SLIDERS "  Scene Settings###SceneSettings";
@@ -3249,6 +3250,8 @@ void EditorImGui::SetSceneViewKeyboardFocus(bool focused)
 
 void EditorImGui::Destroy()
 {
+    // Release node editor contexts before the backend destroys the ImGui context.
+    m_materialGraphPanel.reset();
     // Generic teardown only: preview UI registrations release through the
     // provider (backend stays alive for pool/descriptor teardown, which the
     // frame owner performs through the backend adapter afterwards).

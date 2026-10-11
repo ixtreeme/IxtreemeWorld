@@ -209,8 +209,10 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         // Double-click still opens the asset Inspector as usual.
         if (!(m_sceneView2D && m_uiSelectionActive && entry.category == AssetLibrary::Category::Texture && !doubleClicked))
             m_uiSelectionActive = false;
+        const bool keepMaterialGraph = m_materialGraphPanelOpen && m_inspectorShowsMaterialGraph && entry.category == AssetLibrary::Category::Texture && !doubleClicked;
+        if (!keepMaterialGraph) m_inspectorShowsMaterialGraph = false;
         m_selectedAssetId = entry.id;
-        m_assetInspectorSelectionActive = !m_uiSelectionActive;
+        m_assetInspectorSelectionActive = !m_uiSelectionActive && !keepMaterialGraph;
         m_assetStatus = "Selected: " + entry.displayName;
         if (doubleClicked && entry.category == AssetLibrary::Category::WaterMaterial)
         {
