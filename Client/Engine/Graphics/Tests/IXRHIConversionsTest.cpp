@@ -107,6 +107,8 @@ void RunConversionChecks()
         "conv format R8 size 1");
     CheckConv(ixrhi::IXRHIFormatByteSize(ixrhi::IXRHIFormat::R32Float) == 4,
         "conv format R32 size 4");
+    CheckConv(ixrhi::IXRHIFormatByteSize(ixrhi::IXRHIFormat::D32Float) == sizeof(float),
+        "conv depth upload uses one float per texel");
     CheckConv(ixvulkan::ToVkAddressMode(ixrhi::IXRHISamplerAddress::ClampToBorder) ==
             VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER,
         "conv address border");

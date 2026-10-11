@@ -41,13 +41,13 @@ inline std::uint32_t IXRHIFormatByteSize(IXRHIFormat format)
     case IXRHIFormat::B8G8R8A8Unorm:
     case IXRHIFormat::B8G8R8A8Srgb:
     case IXRHIFormat::D24UnormS8Uint: return 4;
-    case IXRHIFormat::R32Float: return 4;
+    case IXRHIFormat::R32Float:
+    case IXRHIFormat::D32Float: return 4;
     case IXRHIFormat::R32G32Float:
     case IXRHIFormat::R16G16B16A16Float:
     case IXRHIFormat::D32FloatS8Uint: return 8;
     case IXRHIFormat::R32G32B32Float: return 12;
-    case IXRHIFormat::R32G32B32A32Float:
-    case IXRHIFormat::D32Float: return 16;
+    case IXRHIFormat::R32G32B32A32Float: return 16;
     case IXRHIFormat::Undefined: break;
     }
     return 0;
