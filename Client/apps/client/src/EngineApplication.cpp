@@ -6567,6 +6567,10 @@ int RunGame(NativeWindow& window,
     std::uint64_t syncedWaterMaterialsRevision = 0;
     bool waterMaterialsSynced = false;
 #endif
+#if defined(IXTREEME_WITH_EDITOR)
+    double nextBackgroundSceneRefresh = 0.0;
+    std::uint32_t backgroundSceneWidth = 0, backgroundSceneHeight = 0;
+#endif
     bool running = true;
     while (running)
     {
@@ -12938,7 +12942,26 @@ int RunGame(NativeWindow& window,
                     return std::nullopt;
                 return buildGameCamera(gameView.Width(), gameView.Height());
             }();
-            if (!drawSceneView && gameViewCamera)
+            const bool gamePlaying = gameViewCamera && editorPlay.state.mode == EditorPlayMode::Play;
+            const auto sceneInput = editorImGui.GetViewportInputDiagnostics();
+            const bool backgroundScene = gamePlaying && drawSceneView &&
+                !sceneInput.sceneViewHovered && !sceneInput.sceneViewFocused && !editorImGui.IsSceneGizmoInputActive();
+            if (backgroundScene)
+            {
+                const bool resized = backgroundSceneWidth != renderSize.width || backgroundSceneHeight != renderSize.height;
+                if (!resized && seconds < nextBackgroundSceneRefresh)
+                    drawSceneView = false;
+                else
+                {
+                    nextBackgroundSceneRefresh = seconds + 1.0 / 15.0;
+                    backgroundSceneWidth = renderSize.width;
+                    backgroundSceneHeight = renderSize.height;
+                }
+            }
+            else
+                nextBackgroundSceneRefresh = 0.0;
+            // Keep the game's cascades stable while the inactive authoring preview refreshes.
+            if (gameViewCamera && (!drawSceneView || gamePlaying))
                 shadowCamera = &*gameViewCamera;
 #endif
             // Particles preview in Edit: keep the emitters simulating while authoring, so the effect
@@ -14538,6 +14561,7 @@ int RunGame(NativeWindow& window,
                             // collapses N per-entity draws into one instanced draw per renderer
                             // and skips off-screen meshes — the main per-mesh cost of the Game view.
                             std::unordered_map<StaticMeshLodBatchKey, StaticMeshLodBatch, StaticMeshLodBatchKeyHash> gameMeshBatches;
+                            const xm::Frustum gameFrustum = xm::ExtractFrustumVulkan(gameCamera.viewProjection);
                             const std::vector<std::uint32_t> gameMeshCandidates =
                                 staticMeshSpatialIndex.QueryFrustum(SpatialFrustumFromCamera(gameCamera));
                             for (std::uint32_t candidateId : gameMeshCandidates)
@@ -14548,6 +14572,10 @@ int RunGame(NativeWindow& window,
                                 const StaticMeshRenderRecord& meshRecord = staticMeshRenderRecord(*mesh);
                                 StaticMeshRenderer* renderer = meshRecord.renderer;
                                 if (!renderer)
+                                    continue;
+                                // The spatial index returns candidate cells. Their individual bounds
+                                // still need testing, as in Scene View, before LODs or draws are built.
+                                if (!xm::Intersects(gameFrustum, meshRecord.worldBounds))
                                     continue;
                                 if (gameOccluders.meshes.contains(mesh->id)) continue;
                                 if (renderer->HasTransparentDraws(meshRecord.instance))

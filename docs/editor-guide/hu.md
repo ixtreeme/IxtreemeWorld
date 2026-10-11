@@ -105,6 +105,8 @@ A Scene View szerkesztőkamerája és a Game View játék-kamerája külön néz
 #### Eredmény és gyakori hiba
 A játék ideiglenes állapotát teszteled. **A Play közbeni változtatások Stop után eldobódnak.** A Game a projekt Main Camera nézetét használja, illetve aktív játékos Character Controller mellett annak kameráját. A Scene View szabadkamerájának mozgatása önmagában nem állítja át a játék kameráját.
 
+Play közben, ha a Game View is látható, a háttérben levő Scene View legfeljebb 15 képkockával frissül másodpercenként. Amint a Scene View fölé viszed az egeret vagy ott dolgozol, minden képkockában frissül. A víz mindkét nézetben a saját kamera képét és mélységét használja.
+
 ## Assetek és materialok
 
 <!-- topic: asset-browser -->

@@ -105,6 +105,8 @@ Scene View's editor camera and Game View's game camera are independent. Physics,
 #### Result and common mistake
 You test a temporary game state. **Changes made during Play are discarded on Stop.** Game uses the project's Main Camera, or an active player Character Controller camera. Moving Scene View's free camera does not reposition the game camera.
 
+During Play, when Game View is also visible, an inactive Scene View refreshes at up to 15 frames per second. Hovering or working in Scene View restores rendering every frame. Water uses each view's own camera image and depth.
+
 ## Assets and materials
 
 <!-- topic: asset-browser -->
