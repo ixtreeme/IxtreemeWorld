@@ -17,7 +17,7 @@
 namespace ph = ixtreeme::physics;
 int main()
 {
-    static_assert(IXTREEME_MODULE_API_VERSION == 7);
+    static_assert(IXTREEME_MODULE_API_VERSION == 8);
     static_assert(sizeof(ixscript::QueryFilter) == 16 && sizeof(ixscript::SphereOverlapHit) == 8);
     static_assert(std::is_trivially_copyable_v<ixscript::QueryFilter>);
     int errors=0;

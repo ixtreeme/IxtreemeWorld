@@ -164,7 +164,17 @@ void EditorImGui::RenderSceneViewDropTarget()
         ImGui::End();
         return;
     }
-    m_sceneViewVisible = true;
+    RenderSceneViewToolbar();
+    m_sceneViewVisible = !m_sceneView2D;
+    if (m_sceneView2D)
+    {
+        m_viewportInputDiagnostics.sceneViewRectValid = false;
+        m_sceneViewKeyboardFocus = false;
+        m_sceneGizmoInputActive = false;
+        RenderUiCanvasSceneView();
+        ImGui::End();
+        return;
+    }
 
     const ImVec2 sceneMin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();
@@ -504,11 +514,13 @@ void EditorImGui::RenderGameViewPanel()
         // Window collapsed or its dock tab is inactive — not visible, so the engine can
         // skip rendering the Game view this frame.
         m_gameViewVisible = false;
+        m_gameViewFocused = false;
         m_gameViewRect.valid = false;
         ImGui::End();
         return;
     }
     m_gameViewVisible = true;
+    m_gameViewFocused = ImGui::IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows);
 
     const ImVec2 regionMin = ImGui::GetCursorScreenPos();
     const ImVec2 avail = ImGui::GetContentRegionAvail();

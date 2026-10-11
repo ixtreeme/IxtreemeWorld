@@ -27,6 +27,7 @@ void EditorSceneRuntime::BuildSceneSnapshot(SceneData& scene, bool includeTerrai
     TerrainSceneData terrainBuffers = std::move(scene.terrain);  // keeps the grid capacity
     scene = SceneData{};
     scene.physics = SceneManager::Instance().GetCurrentScene().physics;
+    scene.uiCanvases = SceneManager::Instance().GetCurrentScene().uiCanvases;
     if (m_context.editorImGui)
         scene.lighting = m_context.editorImGui->GetLightingState();
     if (m_context.sky)

@@ -9,6 +9,7 @@
 #include "IXRHIShader.h"
 #include "IXRHITexture.h"
 #include "asset/IAssetReader.h"
+#include <stb_image.h>
 #include <RmlUi/Core.h>
 #include <RmlUi/Core/Event.h>
 #include <RmlUi/Core/EventListener.h>
@@ -19,9 +20,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <charconv>
 #include <memory>
 #include <optional>
@@ -557,8 +561,18 @@ public:
     Rml::TextureHandle LoadTexture(Rml::Vector2i& texture_dimensions, const Rml::String& source) override
     {
         texture_dimensions = {};
-        Tracenf("[RMLUI] Texture load skipped (no image decoder in RMLUI-1): %s", source.c_str());
-        return 0;
+        const auto bytes = m_assets ? m_assets->ReadAll(source) : std::nullopt;
+        if (!bytes || bytes->empty() || bytes->size() > static_cast<std::size_t>(INT_MAX)) return 0;
+        int width = 0, height = 0, channels = 0;
+        auto* pixels = stbi_load_from_memory(bytes->data(), static_cast<int>(bytes->size()), &width, &height, &channels, 4);
+        if (!pixels) { Tracenf("[RMLUI] Image failed to decode: %s", source.c_str()); return 0; }
+        // RmlUi's renderer blends premultiplied alpha, including image pixels.
+        for (std::size_t i = 0; i < static_cast<std::size_t>(width) * height * 4; i += 4)
+            for (int c = 0; c < 3; ++c) pixels[i + c] = static_cast<unsigned char>((static_cast<unsigned>(pixels[i + c]) * pixels[i + 3] + 127) / 255);
+        const auto handle = GenerateTexture(Rml::Span<const Rml::byte>(pixels, static_cast<std::size_t>(width) * height * 4), {width, height});
+        stbi_image_free(pixels);
+        if (handle) texture_dimensions = {width, height};
+        return handle;
     }
 
     Rml::TextureHandle GenerateTexture(Rml::Span<const Rml::byte> source, Rml::Vector2i dimensions) override
@@ -996,6 +1010,58 @@ struct RmlUiLayer::Impl
     };
     std::map<std::uint32_t, GameDocument> gameDocuments;
     std::uint32_t nextGameDocument = 1;
+    std::map<std::uint32_t, std::uint32_t> sceneCanvasHandles;
+    std::vector<UiCanvas> sceneCanvases;
+    std::uint64_t sceneCanvasRevision = 0;
+    std::string sceneCanvasAssetRoot;
+
+    void ResizeCanvases()
+    {
+        for (const auto& canvas : sceneCanvases)
+        {
+            const auto it = sceneCanvasHandles.find(canvas.id);
+            auto* game = it == sceneCanvasHandles.end() ? nullptr : FindGameDocument(it->second);
+            if (!game) continue;
+            const auto layout = BuildUiCanvasLayout(canvas, static_cast<float>(viewportWidth), static_cast<float>(viewportHeight));
+            const float scale = UiCanvasScale(canvas, static_cast<float>(viewportWidth), static_cast<float>(viewportHeight));
+            for (const auto& e : canvas.elements)
+                if (auto* element = game->document->GetElementById(e.scriptId))
+                {
+                    // Update owned layout properties without reloading the document: runtime text,
+                    // input values, clicks and script-applied classes survive a viewport resize.
+                    const auto style = UiElementStyle(canvas, e, layout, scale);
+                    std::size_t start = 0;
+                    while (start < style.size())
+                    {
+                        const auto end = style.find(';', start), colon = style.find(':', start);
+                        if (colon == std::string::npos || end == std::string::npos) break;
+                        const auto property = style.substr(start, colon - start);
+                        if (property == "left" || property == "top" || property == "width" || property == "height" ||
+                            property == "font-size" || property == "line-height" || property == "border-radius")
+                            element->SetProperty(property, style.substr(colon + 1, end - colon - 1));
+                        start = end + 1;
+                    }
+                    if (e.type == UiElementType::Slider)
+                        if (auto* input = game->document->GetElementById(e.scriptId + "__control"))
+                        {
+                            const auto bounds = std::find_if(layout.begin(), layout.end(), [&](const auto& r) { return r.id == e.id; });
+                            if (bounds == layout.end()) continue;
+                            const auto parts = BuildUiSliderLayout(e, *bounds, scale);
+                            for (int child = 0; child < input->GetNumChildren(true); ++child)
+                            {
+                                auto* part = input->GetChild(child);
+                                const bool track = part->GetTagName() == "slidertrack", handle = part->GetTagName() == "sliderbar";
+                                if (!track && !handle) continue;
+                                const auto& rect = track ? parts.track : parts.handle;
+                                part->SetProperty("height", std::to_string(rect.height) + "px");
+                                part->SetProperty("margin-top", std::to_string(rect.y - bounds->y) + "px");
+                                part->SetProperty("border-radius", std::to_string(e.cornerRadius * scale) + "px");
+                                if (handle) part->SetProperty("width", std::to_string(rect.width) + "px");
+                            }
+                        }
+                }
+        }
+    }
 
     GameDocument* FindGameDocument(std::uint32_t handle)
     {
@@ -1678,6 +1744,7 @@ void RmlUiLayer::Resize(uint32_t width, uint32_t height)
     SetFullscreenDocumentSize(m_impl->characterCreationDocument, width, height);
     for (auto& [handle, game] : m_impl->gameDocuments)
         SetFullscreenDocumentSize(game.document, width, height);
+    m_impl->ResizeCanvases();
 }
 
 void RmlUiLayer::SetTargetPass(const ixrhi::IXRHIRenderPass* pass)
@@ -1709,6 +1776,7 @@ bool RmlUiLayer::OnInput(const InputEvent& event)
     // A game document takes the clicks that land on its elements (buttons), not those on its empty
     // body: the world under a HUD stays playable.
     const auto capturesPointer = [&]() { return capturesInput || IsPointerOverGameUi(); };
+    const bool capturesKeyboard = capturesInput || HasGameUiTextFocus();
     switch (event.type)
     {
     case InputEvent::MouseMove:
@@ -1731,13 +1799,13 @@ bool RmlUiLayer::OnInput(const InputEvent& event)
             return true;
         }
         m_impl->context->ProcessKeyDown(ToRmlKey(event.key), 0);
-        return capturesInput;
+        return capturesKeyboard;
     case InputEvent::KeyUp:
         m_impl->context->ProcessKeyUp(ToRmlKey(event.key), 0);
-        return capturesInput;
+        return capturesKeyboard;
     case InputEvent::Char:
         m_impl->context->ProcessTextInput(CodepointToUtf8(event.codepoint));
-        return capturesInput;
+        return capturesKeyboard;
     default:
         return false;
     }
@@ -2237,6 +2305,38 @@ std::uint32_t RmlUiLayer::OpenGameDocument(const std::string& path)
     return handle;
 }
 
+void RmlUiLayer::SyncSceneCanvases(const std::vector<UiCanvas>& canvases, std::uint64_t revision, const std::string& assetRoot)
+{
+    if (!m_impl || !m_impl->context || (m_impl->sceneCanvasRevision == revision && m_impl->sceneCanvasAssetRoot == assetRoot)) return;
+    for (const auto& [id, handle] : m_impl->sceneCanvasHandles) CloseGameDocument(handle);
+    m_impl->sceneCanvasHandles.clear();
+    m_impl->sceneCanvases = canvases;
+    m_impl->sceneCanvasRevision = revision; m_impl->sceneCanvasAssetRoot = assetRoot;
+    std::vector<const UiCanvas*> ordered;
+    for (const auto& canvas : canvases) if (canvas.enabled) ordered.push_back(&canvas);
+    std::stable_sort(ordered.begin(), ordered.end(), [](const auto* a, const auto* b) { return a->sortingOrder < b->sortingOrder; });
+    for (const auto* canvas : ordered)
+    {
+        const auto content = BuildUiCanvasRml(*canvas, static_cast<float>(m_impl->viewportWidth), static_cast<float>(m_impl->viewportHeight),
+            [&](const std::string& path) { const std::filesystem::path p(path); return p.is_absolute() ? p.generic_string() : (std::filesystem::path(assetRoot) / p).generic_string(); });
+        auto* document = m_impl->context->LoadDocumentFromMemory(content);
+        if (!document) continue;
+        SetFullscreenDocumentSize(document, m_impl->viewportWidth, m_impl->viewportHeight);
+        Impl::GameDocument game; game.document = document; game.clicks = std::make_unique<GameClickRecorder>();
+        document->AddEventListener(Rml::EventId::Click, game.clicks.get()); document->Show();
+        const auto handle = m_impl->nextGameDocument++;
+        m_impl->gameDocuments.emplace(handle, std::move(game)); m_impl->sceneCanvasHandles[canvas->id] = handle;
+    }
+}
+
+std::uint32_t RmlUiLayer::FindSceneCanvas(const std::string& name) const
+{
+    if (!m_impl) return 0;
+    for (const auto& canvas : m_impl->sceneCanvases) if (canvas.name == name)
+        if (const auto it = m_impl->sceneCanvasHandles.find(canvas.id); it != m_impl->sceneCanvasHandles.end() && m_impl->gameDocuments.contains(it->second)) return it->second;
+    return 0;
+}
+
 void RmlUiLayer::CloseGameDocument(std::uint32_t handle)
 {
     if (!m_impl)
@@ -2258,6 +2358,7 @@ void RmlUiLayer::CloseAllGameDocuments()
         return;
     while (!m_impl->gameDocuments.empty())
         CloseGameDocument(m_impl->gameDocuments.begin()->first);
+    m_impl->sceneCanvasHandles.clear(); m_impl->sceneCanvasRevision = 0;
 }
 
 void RmlUiLayer::SetGameDocumentVisible(std::uint32_t handle, bool visible)
@@ -2277,7 +2378,10 @@ bool RmlUiLayer::SetGameElementText(std::uint32_t handle, const std::string& ele
     Rml::Element* element = m_impl ? m_impl->FindGameElement(handle, elementId) : nullptr;
     if (!element)
         return false;
+    if (auto* input = m_impl->FindGameElement(handle, elementId + "__control"))
+        if (auto* control = dynamic_cast<Rml::ElementFormControlInput*>(input)) { control->SetValue(text); return true; }
     const std::string rml = EscapeRmlText(text);
+    if (auto* label = m_impl->FindGameElement(handle, elementId + "__label")) element = label;
     if (element->GetInnerRML() != rml)
         element->SetInnerRML(rml);
     return true;
@@ -2289,7 +2393,25 @@ bool RmlUiLayer::SetGameElementProperty(std::uint32_t handle,
                                         const std::string& value)
 {
     Rml::Element* element = m_impl ? m_impl->FindGameElement(handle, elementId) : nullptr;
-    return element != nullptr && element->SetProperty(property, value);
+    if (!element) return false;
+    if (property == "value" || property == "checked")
+    {
+        auto* input = m_impl->FindGameElement(handle, elementId + "__control");
+        if (!input) input = element;
+        if (property == "value")
+        {
+            if (auto* control = dynamic_cast<Rml::ElementFormControlInput*>(input)) { control->SetValue(value); return true; }
+            if (auto* fill = m_impl->FindGameElement(handle, elementId + "__fill"))
+            {
+                float progress = 0; const auto parsed = std::from_chars(value.data(), value.data() + value.size(), progress);
+                if (parsed.ec != std::errc{} || !std::isfinite(progress)) return false;
+                element->SetAttribute("value", std::to_string(std::clamp(progress, 0.0f, 1.0f)));
+                return fill->SetProperty("width", std::to_string(std::clamp(progress, 0.0f, 1.0f) * 100) + "%");
+            }
+        }
+        if (property == "checked") { if (value == "true" || value == "1") input->SetAttribute("checked", "checked"); else input->RemoveAttribute("checked"); return true; }
+    }
+    return element->SetProperty(property, value);
 }
 
 bool RmlUiLayer::SetGameElementClass(std::uint32_t handle,
@@ -2309,6 +2431,23 @@ bool RmlUiLayer::ConsumeGameElementClick(std::uint32_t handle, const std::string
 {
     Impl::GameDocument* game = m_impl ? m_impl->FindGameDocument(handle) : nullptr;
     return game != nullptr && game->clicks->clicked.erase(elementId) > 0;
+}
+
+std::string RmlUiLayer::GetGameElementValue(std::uint32_t handle, const std::string& id) const
+{
+    if (!m_impl) return {};
+    auto* element = m_impl->FindGameElement(handle, id + "__control");
+    if (!element) element = m_impl->FindGameElement(handle, id);
+    if (auto* input = dynamic_cast<Rml::ElementFormControlInput*>(element)) return input->GetValue();
+    return element ? element->GetAttribute<Rml::String>("value", "") : std::string{};
+}
+
+bool RmlUiLayer::IsGameElementChecked(std::uint32_t handle, const std::string& id) const
+{
+    if (!m_impl) return false;
+    auto* element = m_impl->FindGameElement(handle, id + "__control");
+    if (!element) element = m_impl->FindGameElement(handle, id);
+    return element && element->HasAttribute("checked");
 }
 
 bool RmlUiLayer::HasVisibleGameDocuments() const
@@ -2350,6 +2489,19 @@ bool RmlUiLayer::IsPointerOverGameUi() const
     Rml::ElementDocument* owner = hover->GetOwnerDocument();
     if (hover == owner)
         return false;  // the empty body of a full-window HUD
+    return std::any_of(m_impl->gameDocuments.begin(), m_impl->gameDocuments.end(), [owner](const auto& entry) {
+        return entry.second.document == owner && entry.second.visible;
+    });
+}
+
+bool RmlUiLayer::HasGameUiTextFocus() const
+{
+    if (!m_impl || !m_impl->context) return false;
+    auto* focus = m_impl->context->GetFocusElement();
+    if (!focus || focus->HasAttribute("disabled")) return false;
+    const auto type = focus->GetAttribute<Rml::String>("type", "text");
+    if (focus->GetTagName() != "textarea" && (focus->GetTagName() != "input" || (type != "text" && type != "password"))) return false;
+    const auto* owner = focus->GetOwnerDocument();
     return std::any_of(m_impl->gameDocuments.begin(), m_impl->gameDocuments.end(), [owner](const auto& entry) {
         return entry.second.document == owner && entry.second.visible;
     });

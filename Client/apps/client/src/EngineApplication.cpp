@@ -5129,7 +5129,25 @@ int RunGame(NativeWindow& window,
                 overGameImage = editorImGui.MapInputToGameView(event, uiEvent);
 #endif
                 if (overGameImage && rmlUi.OnInput(uiEvent) && event.type != InputEvent::MouseMove)
+                {
+                    if (rmlUi.HasGameUiTextFocus()) { movement.Clear(); editorScriptInput = {}; }
                     return;
+                }
+            }
+        }
+
+        const bool canvasKeyboardEvent = event.type == InputEvent::KeyDown || event.type == InputEvent::KeyUp || event.type == InputEvent::Char;
+        if (editorPlay.state.mode == EditorPlayMode::Play && canvasKeyboardEvent && rmlUi.HasGameUiTextFocus())
+        {
+            InputEvent uiEvent = event;
+            bool gameHasFocus = true;
+#if defined(IXTREEME_WITH_EDITOR)
+            gameHasFocus = editorImGui.MapInputToGameView(event, uiEvent);
+#endif
+            if (gameHasFocus && rmlUi.OnInput(uiEvent))
+            {
+                movement.Clear(); editorScriptInput = {};
+                return;
             }
         }
 
@@ -5234,6 +5252,30 @@ int RunGame(NativeWindow& window,
             editorImGui.SetSceneViewKeyboardFocus(sceneViewInputTarget);
         if (sceneViewInputTarget)
             viewportEvent = editorImGui.MapInputToSceneView(event);
+        const bool pointerEvent = event.type == InputEvent::MouseMove || event.type == InputEvent::MouseDown ||
+            event.type == InputEvent::MouseUp || event.type == InputEvent::MouseWheel;
+        if (runtimeSession->IsMapEditorOpen() && editorPlay.state.mode == EditorPlayMode::Edit &&
+            (editorImGui.IsSceneView2D() || (pointerEvent && !sceneViewInputTarget)))
+        {
+            // ImGui receives the event through the window backend. Only the unobstructed 3D image
+            // may also edit the world; Canvas authoring and covering panels keep their input.
+            editorObjectDragActive = false;
+            editorFlyMovement.Clear();
+            movement.Clear();
+            if (terrainOk)
+            {
+                InputEvent release = viewportEvent;
+                release.type = InputEvent::MouseUp; release.button = MouseButton_Left;
+                terrain.HandleEditorInput(release);  // finish any brush stroke before UI takes over
+                terrain.SetWaterSculptBrush(false,0,0,0,true);
+            }
+            if (waterSculptStrokeActive)
+            {
+                if (waterSculptStrokeModifiedCells) { editorWaterBodiesDirty = true; waterSculptMeshRegenPending = true; }
+                waterSculptStrokeActive = false; waterSculptStrokeBodyId = waterSculptStrokeModifiedCells = 0;
+            }
+            return;
+        }
         if (runtimeSession->IsMapEditorOpen() &&
             sceneViewInputTarget &&
             editorImGui.IsSceneGizmoInputActive() &&
@@ -5257,15 +5299,8 @@ int RunGame(NativeWindow& window,
 #endif
         if (editorFlyCameraKey)
         {
-            const auto viewportDiag = editorImGui.GetViewportInputDiagnostics();
-            const bool lastMouseInsideViewport =
-                editorHasMousePosition &&
-                viewportDiag.sceneViewRectValid &&
-                static_cast<float>(editorLastMouseX) >= viewportDiag.sceneViewMin[0] &&
-                static_cast<float>(editorLastMouseX) < viewportDiag.sceneViewMin[0] + viewportDiag.sceneViewSize[0] &&
-                static_cast<float>(editorLastMouseY) >= viewportDiag.sceneViewMin[1] &&
-                static_cast<float>(editorLastMouseY) < viewportDiag.sceneViewMin[1] + viewportDiag.sceneViewSize[1];
-            const bool viewportHovered = lastMouseInsideViewport || viewportDiag.sceneViewHovered;
+            InputEvent pointer; pointer.x = editorLastMouseX; pointer.y = editorLastMouseY;
+            const bool viewportHovered = editorHasMousePosition && editorImGui.IsSceneViewInputTarget(pointer);
             const bool wantCaptureKeyboard = editorImGui.IsTextInputActive();
             const bool gateOpen = viewportHovered && !wantCaptureKeyboard;
             editorFlyMovement.ApplyGatedEdge(event, gateOpen);
@@ -6006,6 +6041,10 @@ int RunGame(NativeWindow& window,
     // the audio sources and the script instances (OnStart). The editor wraps it with its own
     // snapshot/selection handling.
     auto startPlaySession = [&]() {
+        // A scene loaded during this frame must expose its Canvas handles before scripts' OnStart.
+        const auto& scenes = SceneManager::Instance();
+        rmlUi.SyncSceneCanvases(scenes.GetCurrentScene().uiCanvases, scenes.UiRevision(),
+            ProjectManager::Instance().AssetRootPath().generic_string());
         // With a player character present, Play hands WASD/Space to the character (the editor
         // free-fly would otherwise capture those keys). Without one, keep free-fly so you can fly
         // around the running simulation.
@@ -6574,6 +6613,9 @@ int RunGame(NativeWindow& window,
     bool running = true;
     while (running)
     {
+        const auto& uiScene = SceneManager::Instance();
+        rmlUi.SyncSceneCanvases(uiScene.GetCurrentScene().uiCanvases, uiScene.UiRevision(),
+            ProjectManager::Instance().AssetRootPath().generic_string());
         const auto frameCpuStart = std::chrono::steady_clock::now();
         FrameCpuProfile frameProfile{};
         running = window.PumpMessages();
@@ -7433,7 +7475,7 @@ int RunGame(NativeWindow& window,
 #if defined(IXTREEME_WITH_EDITOR)
             if (terrainOk)
             {
-                terrain.SetMapEditorOpen(runtimeSession->IsMapEditorOpen());
+                terrain.SetMapEditorOpen(runtimeSession->IsMapEditorOpen() && !editorImGui.IsSceneView2D());
                 const MapEditorSettings editorSettings = editorImGui.GetMapEditorSettings();
                 terrain.SetMapEditorSettings(editorSettings);
                 // (A SceneData only when one is waiting: building and freeing an empty one every frame

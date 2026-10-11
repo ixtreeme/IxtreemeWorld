@@ -1105,9 +1105,12 @@ void EditorImGui::RenderInspector()
 
     if (!m_inspectorPanelOpen)
         return;
+    EnsureUiCanvasState();
     if (ImGui::Begin(EditorWindow::Inspector, &m_inspectorPanelOpen))
     {
-        if (InspectorShowsTreeGenerator())
+        if (m_uiSelectionActive && SelectedUiCanvas())
+            RenderUiCanvasInspector();
+        else if (InspectorShowsTreeGenerator())
         {
             if (m_treeGeneratorPanel->RenderInspector())
             {

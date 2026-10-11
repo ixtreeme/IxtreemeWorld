@@ -585,20 +585,24 @@ Raycast queries a ray, OverlapSphere a spherical area. RaycastFiltered supports 
 Entity enabled state affects render, physics, scripts, audio and particles together. Overlap returns at most 1024 results; terrain/non-entity hits can have identifier 0. A layer mask differs from a layer index.
 
 <!-- topic: game-ui -->
-### Game UI: RmlUi and text prompts
+### Scene View 2D, Canvas UI, RmlUi and text prompts
 
 #### Purpose
-Game HUDs and menus use RmlUi .rml and .rcss documents. They appear in Game View, separately from editor ImGui panels.
+Build game HUDs and menus visually with a screen-space Canvas. The Scene View 2D mode and the Game view share the same Rect Transform layout. UI elements live in Hierarchy; properties and tools live in Inspector. Canvas data is saved in the scene and included in a packaged game. Existing RmlUi .rml/.rcss documents remain supported.
 
 #### Short tutorial
-1. Create ui/hud.rml in the project's asset folder and give elements id attributes.
-2. Open it using UiOpen with an asset-relative path; check the nonzero handle.
-3. Use UiSetText, UiSetProperty and UiSetClass to update text, RCSS properties and classes.
-4. UiConsumeClick handles a button; UiSetVisible/UiClose hides or closes a document.
-5. PromptText and associated queries request a line of text; secret masks its field.
+1. Create > UI > Canvas switches Scene View to 2D. Use the 3D/2D buttons at the top of Scene View to switch modes; the 3D camera is preserved. Double-click a Canvas or UI element in Hierarchy to edit it in 2D. Create > UI > HUD template creates a player label, health bar and Pause button.
+2. Create > UI or Inspector > Add UI element creates Panel, Text, Image, Button, Toggle, Slider, Input Field or Progress Bar under the selected element. The hierarchy and Parent field let you move elements between containers. Duplicate copies a whole subtree with new Script IDs.
+3. Drag an element to move it; drag the eight handles to resize it. Wheel zooms, middle mouse pans, Inspector > Fit Canvas resets the view, and F frames the selection. Snap uses 8 reference pixels; hold Alt to bypass it. Ctrl+Z/Ctrl+Y undo/redo UI edits, Ctrl+D duplicates and Delete removes the selected subtree while working in Scene View, Hierarchy or Inspector.
+4. Rect Transform has anchor min/max, pivot, position and size delta. Y increases downward. Anchor presets preserve the current rectangle; Stretch to parent fills its parent. Canvas Scaler offers constant pixels or a reference resolution with width/height matching. Test landscape and portrait preview resolutions.
+5. Set text, colours and font size in Inspector. Canvas tools contains preview resolution, snapping and Undo/Redo. Appearance > Images / Skin accepts textures on every element: drop an Asset Browser texture onto an image field or use Choose texture; Clear removes the assignment. Panel, Button and Input Field use Background image; Image uses Source image; Toggle adds Checked image; Slider has separate Track, Fill and Handle image slots; Progress Bar has Background and Fill image slots. Controls support Hover, Pressed and Disabled images; on Sliders these apply to the handle. Image tint colors the textures, while Color, Fill color and Handle color are the fallback colors for empty slots. PNG transparency is preserved. Track height and Handle size use reference pixels. Canvas tools > Control preview shows the selected control's Normal, Hover, Pressed or Disabled appearance without sending game input. Clip children limits content to its parent. Enable Raycast target on controls that receive mouse input; decorative panels and text normally let input pass through.
+6. Save scene or Ctrl+S saves the complete Canvas. It appears automatically in Game View and runtime. Edit the Canvas in Edit mode; Play uses its own runtime document state, discarded on Stop.
+7. A script on any scene object can call UiOpen("canvas:HUD") to access the Canvas named HUD. Use each element's Script ID with UiSetText, UiConsumeClick, UiSetVisible and UiSetClass. UiGetValue reads input/slider text; UiIsChecked reads a toggle. UiSetProperty(doc, id, "value", "0.8") updates an input, slider or progress bar; "checked" with "true"/"false" sets a toggle.
+
+For manually authored UI, put ui/hud.rml in the project's asset folder and call UiOpen("ui/hud.rml"). PromptText still provides simple text/password prompts. Native C++ modules require a rebuild for the new module ABI 8.
 
 #### Result and common mistake
-The HUD works in Play and runtime. Stop closes open documents and session prompt state. Incorrect element IDs or asset paths will not update another element.
+This Canvas renders as Screen Space Overlay. Canvas editing cannot select, move the camera or paint terrain in the 3D world. Floating windows also block pointer events on covered parts of the 3D viewport. UI elements use reference pixels and a separate hierarchy from 3D scene transforms. Sorting order controls stacking between canvases; element order controls stacking between siblings. Runtime text, form values and click state survive viewport resizing. Scene switches remove the previous scene's canvases. Use unique Canvas names and Script IDs; incorrect identifiers or texture paths do not update another element.
 
 <!-- topic: network-native -->
 ### Networking and legacy native C++ scripts

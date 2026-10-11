@@ -11,6 +11,9 @@ add_library(IXEngineRender STATIC
     editor_panels/EditorImGuiProjectPanels.inl
     editor_panels/EditorImGuiSceneViewPanels.inl
     MapEditorTypes.h
+    UiCanvas.h
+    UiCanvas.cpp
+    editor_panels/EditorImGuiCanvasPanels.inl
     FogSettings.h
     FogSettings.cpp
     FogMath.h
@@ -164,6 +167,25 @@ endif()
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
 
 if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(UiCanvasTest tests/UiCanvasTest.cpp)
+    target_link_libraries(UiCanvasTest PRIVATE IXEngineRender)
+    target_compile_definitions(UiCanvasTest PRIVATE IX_UI_TEST_ASSETS_ROOT="${CLIENT_ROOT}"
+        IX_UI_TEST_SHADER_ROOT="${CMAKE_CURRENT_BINARY_DIR}")
+    if(WIN32)
+        target_link_libraries(UiCanvasTest PRIVATE IXEngineVulkan)
+        set(_ui_test_output "${CMAKE_CURRENT_BINARY_DIR}/ui_canvas_test.spv")
+        add_custom_command(OUTPUT "${_ui_test_output}"
+            COMMAND "${DXC_EXECUTABLE}" -spirv -T cs_6_0 -E CSMain
+                -Fo "${_ui_test_output}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/UiCanvasTest.hlsl"
+            DEPENDS tests/UiCanvasTest.hlsl VERBATIM)
+        target_sources(UiCanvasTest PRIVATE "${_ui_test_output}")
+        add_dependencies(UiCanvasTest IXEngineShaders)
+    endif()
+    if(MSVC)
+        set_target_properties(UiCanvasTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME UiCanvasTest COMMAND UiCanvasTest)
+
     add_executable(GodRayQualityTest tests/GodRayQualityTest.cpp)
     target_link_libraries(GodRayQualityTest PRIVATE IXEngineRender)
     if(WIN32)

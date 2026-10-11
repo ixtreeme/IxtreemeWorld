@@ -1019,6 +1019,94 @@ void ReadBoolArray(const JsonValue& object, const char* key, bool* values, size_
         values[i] = array->array[i].BoolOr(values[i]);
 }
 
+std::string FloatArray(const float* values, size_t count);
+
+std::vector<UiCanvas> ReadUiCanvases(const JsonValue& root)
+{
+    std::vector<UiCanvas> result;
+    const auto* list = Find(root, "ui_canvases");
+    if (!list || list->type != JsonValue::Type::Array) return result;
+    for (const auto& object : list->array)
+    {
+        if (object.type != JsonValue::Type::Object || result.size() >= 128) continue;
+        UiCanvas canvas;
+        canvas.id = ReadU32(object, "id", static_cast<std::uint32_t>(result.size() + 1));
+        while (!canvas.id || std::any_of(result.begin(), result.end(), [&](const auto& c) { return c.id == canvas.id; })) ++canvas.id;
+        canvas.name = ReadString(object, "name", "Canvas");
+        canvas.enabled = ReadBool(object, "enabled", true);
+        ReadFloatArray(object, "reference_resolution", canvas.referenceResolution, 2);
+        canvas.scaleMode = ReadString(object, "scale_mode") == "constant" ? UiCanvas::ScaleMode::ConstantPixels : UiCanvas::ScaleMode::ScaleWithScreenSize;
+        canvas.matchWidthOrHeight = ReadFloat(object, "match_width_or_height", 0.5f);
+        canvas.sortingOrder = static_cast<int>(std::clamp(ReadFloat(object, "sorting_order", 0), -10000.0f, 10000.0f));
+        if (const auto* elements = Find(object, "elements"); elements && elements->type == JsonValue::Type::Array)
+            for (const auto& item : elements->array)
+            {
+                if (item.type != JsonValue::Type::Object || canvas.elements.size() >= 4096) continue;
+                UiElement e;
+                e.id = ReadU32(item, "id", 0); e.parentId = ReadU32(item, "parent_id", 0);
+                e.name = ReadString(item, "name", "Element"); e.scriptId = ReadString(item, "script_id");
+                e.type = UiElementTypeFromName(ReadString(item, "type"));
+                e.enabled = ReadBool(item, "enabled", true); e.interactable = ReadBool(item, "interactable", true);
+                e.raycastTarget = ReadBool(item, "raycast_target", false); e.clipChildren = ReadBool(item, "clip_children", false);
+                ReadFloatArray(item, "anchor_min", e.rect.anchorMin, 2); ReadFloatArray(item, "anchor_max", e.rect.anchorMax, 2);
+                ReadFloatArray(item, "pivot", e.rect.pivot, 2); ReadFloatArray(item, "position", e.rect.position, 2);
+                ReadFloatArray(item, "size_delta", e.rect.sizeDelta, 2); ReadFloatArray(item, "color", e.color, 4);
+                ReadFloatArray(item, "text_color", e.textColor, 4);
+                e.text = ReadString(item, "text"); e.imagePath = ReadString(item, "image_path");
+                e.hoverImagePath = ReadString(item, "hover_image_path"); e.pressedImagePath = ReadString(item, "pressed_image_path");
+                e.disabledImagePath = ReadString(item, "disabled_image_path"); e.checkedImagePath = ReadString(item, "checked_image_path");
+                e.fillImagePath = ReadString(item, "fill_image_path"); e.handleImagePath = ReadString(item, "handle_image_path");
+                ReadFloatArray(item, "image_tint", e.imageTint, 4); ReadFloatArray(item, "fill_color", e.fillColor, 4);
+                ReadFloatArray(item, "handle_color", e.handleColor, 4);
+                e.sliderTrackHeight = ReadFloat(item, "slider_track_height", 12);
+                ReadFloatArray(item, "slider_handle_size", e.sliderHandleSize, 2);
+                e.fontSize = ReadFloat(item, "font_size", 24); e.cornerRadius = ReadFloat(item, "corner_radius", 4);
+                e.value = ReadFloat(item, "value", 0.5f); e.checked = ReadBool(item, "checked", false);
+                e.textAlignment = static_cast<int>(std::clamp(ReadFloat(item, "text_alignment", 1), 0.0f, 2.0f));
+                canvas.elements.push_back(std::move(e));
+            }
+        SanitizeUiCanvas(canvas); result.push_back(std::move(canvas));
+    }
+    return result;
+}
+
+void WriteUiCanvases(std::ostream& out, const std::vector<UiCanvas>& canvases)
+{
+    out << "  \"ui_canvases\": [\n";
+    for (std::size_t c = 0; c < canvases.size(); ++c)
+    {
+        const auto& canvas = canvases[c];
+        out << "    {\"id\":" << canvas.id << ",\"name\":\"" << EscapeJson(canvas.name) << "\",\"enabled\":" << (canvas.enabled ? "true" : "false")
+            << ",\"reference_resolution\":" << FloatArray(canvas.referenceResolution, 2)
+            << ",\"scale_mode\":\"" << (canvas.scaleMode == UiCanvas::ScaleMode::ConstantPixels ? "constant" : "scale_with_screen")
+            << "\",\"match_width_or_height\":" << canvas.matchWidthOrHeight << ",\"sorting_order\":" << canvas.sortingOrder << ",\"elements\":[\n";
+        for (std::size_t n = 0; n < canvas.elements.size(); ++n)
+        {
+            const auto& e = canvas.elements[n];
+            out << "      {\"id\":" << e.id << ",\"parent_id\":" << e.parentId << ",\"name\":\"" << EscapeJson(e.name)
+                << "\",\"script_id\":\"" << EscapeJson(e.scriptId) << "\",\"type\":\"" << UiElementTypeName(e.type)
+                << "\",\"enabled\":" << (e.enabled ? "true" : "false") << ",\"interactable\":" << (e.interactable ? "true" : "false")
+                << ",\"raycast_target\":" << (e.raycastTarget ? "true" : "false") << ",\"clip_children\":" << (e.clipChildren ? "true" : "false")
+                << ",\"anchor_min\":" << FloatArray(e.rect.anchorMin, 2) << ",\"anchor_max\":" << FloatArray(e.rect.anchorMax, 2)
+                << ",\"pivot\":" << FloatArray(e.rect.pivot, 2) << ",\"position\":" << FloatArray(e.rect.position, 2)
+                << ",\"size_delta\":" << FloatArray(e.rect.sizeDelta, 2) << ",\"color\":" << FloatArray(e.color, 4)
+                << ",\"text_color\":" << FloatArray(e.textColor, 4) << ",\"text\":\"" << EscapeJson(e.text)
+                << "\",\"image_path\":\"" << EscapeJson(e.imagePath)
+                << "\",\"hover_image_path\":\"" << EscapeJson(e.hoverImagePath) << "\",\"pressed_image_path\":\"" << EscapeJson(e.pressedImagePath)
+                << "\",\"disabled_image_path\":\"" << EscapeJson(e.disabledImagePath) << "\",\"checked_image_path\":\"" << EscapeJson(e.checkedImagePath)
+                << "\",\"fill_image_path\":\"" << EscapeJson(e.fillImagePath) << "\",\"handle_image_path\":\"" << EscapeJson(e.handleImagePath)
+                << "\",\"image_tint\":" << FloatArray(e.imageTint, 4) << ",\"fill_color\":" << FloatArray(e.fillColor, 4)
+                << ",\"handle_color\":" << FloatArray(e.handleColor, 4) << ",\"slider_track_height\":" << e.sliderTrackHeight
+                << ",\"slider_handle_size\":" << FloatArray(e.sliderHandleSize, 2) << ",\"font_size\":" << e.fontSize
+                << ",\"corner_radius\":" << e.cornerRadius << ",\"value\":" << e.value
+                << ",\"checked\":" << (e.checked ? "true" : "false") << ",\"text_alignment\":" << e.textAlignment << "}"
+                << (n + 1 < canvas.elements.size() ? "," : "") << "\n";
+        }
+        out << "    ]}" << (c + 1 < canvases.size() ? "," : "") << "\n";
+    }
+    out << "  ],\n";
+}
+
 std::string FloatArray(const float* values, size_t count)
 {
     std::ostringstream out;
@@ -2370,12 +2458,14 @@ void SceneManager::SetCurrentSceneSnapshot(const SceneData& scene)
     // Called every editor frame: copy-assign so the current buffers are reused (a terrain's grids
     // are megabytes; a fresh copy each frame cost milliseconds).
     std::string name = m_currentScene.name.empty() ? scene.name : m_currentScene.name;
+    if (m_currentScene.uiCanvases != scene.uiCanvases) ++m_uiRevision;
     m_currentScene = scene;
     m_currentScene.name = std::move(name);
 }
 
 void SceneManager::RestoreSceneSnapshot(const SceneData& scene, const std::string& path, bool dirty)
 {
+    ++m_uiRevision;
     m_currentScene = scene;
     m_pendingScene = scene;
     m_hasPendingScene = true;
@@ -2418,6 +2508,7 @@ void SceneManager::NewScene()
         return;
 
     m_currentScene = SceneData{};
+    ++m_uiRevision;
     EnsureSceneMainCamera(m_currentScene);
     m_currentScenePath.clear();
     m_sceneOpen = true;
@@ -2473,6 +2564,7 @@ bool SceneManager::SaveSceneAs(const std::string& path)
 void SceneManager::CloseScene()
 {
     m_currentScene = SceneData{};
+    ++m_uiRevision;
     m_currentScenePath.clear();
     m_sceneOpen = false;
     m_isDirty = false;
@@ -2484,6 +2576,16 @@ void SceneManager::CloseScene()
 void SceneManager::SetSceneName(const std::string& name)
 {
     m_currentScene.name = name.empty() ? "Untitled" : name;
+    MarkDirty();
+}
+
+void SceneManager::SetUiCanvases(std::vector<UiCanvas> canvases)
+{
+    if (!m_sceneOpen) return;
+    for (auto& canvas : canvases) SanitizeUiCanvas(canvas);
+    if (canvases == m_currentScene.uiCanvases) return;
+    m_currentScene.uiCanvases = std::move(canvases);
+    ++m_uiRevision;
     MarkDirty();
 }
 
@@ -2549,6 +2651,7 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     }
 
     SceneData scene;
+    scene.uiCanvases = ReadUiCanvases(root);
     const JsonValue* metadata = Find(root, "metadata");
     if (metadata)
     {
@@ -2799,6 +2902,7 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     EnsureSceneMainCamera(scene);
 
     m_currentScene = scene;
+    ++m_uiRevision;
     m_pendingScene = scene;
     m_hasPendingScene = true;
     m_currentScenePath = path;
@@ -2967,6 +3071,7 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     {
         out << "  \"terrain\": null,\n";
     }
+    WriteUiCanvases(out, scene.uiCanvases);
     out << "  \"entities\": [\n";
 
     const size_t entityCount =

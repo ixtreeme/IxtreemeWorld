@@ -13,6 +13,7 @@
 #include "MapEditorTypes.h"
 #include "HierarchyCache.h"
 #include "WorldCamera.h"
+#include "UiCanvas.h"
 #include "platform/dynamic_library.h"
 #include "tools/tree/TreeGeneratorPanel.h"
 
@@ -42,6 +43,7 @@ struct ImVec2;
 class EditorImGui
 {
     friend struct EditorHierarchyTestAccess;
+    friend struct EditorCanvasTestAccess;
 public:
     struct ViewportInputDiagnostics
     {
@@ -78,8 +80,9 @@ public:
     // True when the Game panel was actually visible (active dock tab, not collapsed) last
     // frame. Lets the engine skip the expensive Game-view scene render when it's not shown.
     bool IsGameViewVisible() const { return m_gameViewVisible; }
-    // Whether the Scene View panel was visible last frame (e.g. not behind the Game tab in Play).
+    // Whether the 3D Scene View needs rendering (a hidden tab or the Canvas 2D view does not).
     bool IsSceneViewVisible() const { return !m_editorModeActive || m_sceneViewVisible; }
+    bool IsSceneView2D() const { return m_sceneView2D; }
     // The editor UI is up and shows the offscreen scene as its Scene View panel image (so a full-window
     // composite of that scene under the UI would be covered by it).
     bool ShowsSceneViewAsPanel() const
@@ -182,8 +185,8 @@ public:
     bool IsTextInputActive() const;
     bool IsSceneViewInputTarget(const InputEvent& event) const;
     InputEvent MapInputToSceneView(const InputEvent& event) const;
-    // A window mouse event in the Game view's pixels (its render target), for the game's own UI.
-    // False when the Game view is not shown or the pointer is outside its image.
+    // Maps pointer events into the Game image; keyboard events require the Game panel's focus.
+    // False when the Game view is hidden or the event belongs to another editor panel.
     bool MapInputToGameView(const InputEvent& event, InputEvent& out) const;
     void SetSceneViewKeyboardFocus(bool focused);
     void SetMapEditorSettings(const MapEditorSettings& settings);
@@ -393,6 +396,19 @@ private:
     void StartHierarchyRename(const HierarchySceneEntity& entity);
     void RenderHierarchyCreateMenuItems();
     void RenderInspector();
+    void EnsureUiCanvasState();
+    void CreateUiCanvas(bool starterHud = false);
+    void SetSceneView2D(bool enabled);
+    void RenderSceneViewToolbar();
+    void RenderUiCanvasSceneView();
+    void HandleUiCanvasHotkeys();
+    void AddUiCanvasElement(UiElementType type);
+    void FitUiCanvasSelection();
+    void RenderUiCanvasHierarchy(bool tableRows = false);
+    void RenderUiCanvasInspector();
+    void CommitUiCanvasEdit(const std::vector<UiCanvas>& before, bool mergeWidget = false);
+    void UiCanvasUndo(bool redo);
+    UiCanvas* SelectedUiCanvas();
     void RenderSelectedWaterBodyInspector();
     void RenderSelectedTerrainInspector();
     void RenderSelectedLightInspector();
@@ -590,6 +606,18 @@ private:
     bool m_frameActive = false;
     bool m_editorModeActive = false;
     bool m_showDemoWindow = false;
+    bool m_sceneView2D = false, m_uiSelectionActive = false;
+    std::uint32_t m_uiSelectedCanvas = 0, m_uiSelectedElement = 0, m_uiLastEditWidget = 0;
+    std::uint64_t m_uiKnownRevision = 0;
+    std::vector<UiCanvas> m_uiCanvases;
+    std::vector<std::vector<UiCanvas>> m_uiUndo, m_uiRedo;
+    std::vector<UiCanvas> m_uiDragBefore;
+    UiLayoutRect m_uiDragRect;
+    float m_uiDragMouse[2] = {}, m_uiPreviewSize[2] = {1920, 1080}, m_uiZoom = 1, m_uiPan[2] = {};
+    int m_uiPreviewState = 0;
+    float m_uiViewportOrigin[2] = {}, m_uiViewportSize[2] = {};
+    int m_uiDragHandle = -1;
+    bool m_uiSnap = true;
     bool m_applyDefaultDockLayout = false;
     bool m_defaultDockLayoutBuilt = false;
     int m_defaultLayoutTabSelectFrames = 0; // frames left to pick the default layout's front tabs
@@ -839,6 +867,7 @@ private:
     bool m_assetBrowserLogged = false;
     std::string m_loggedDragAssetId;
     bool m_gameViewVisible = false;
+    bool m_gameViewFocused = false;
     struct GameViewRect
     {
         bool valid = false;

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "MapEditorTypes.h"
+#include "UiCanvas.h"
 
 #include <array>
 #include <cstdint>
@@ -23,6 +24,7 @@ struct SceneData
     std::vector<PointLight> pointLights;
     std::vector<SpotLight> spotLights;
     std::vector<MeshSceneEntity> meshEntities;
+    std::vector<UiCanvas> uiCanvases;
     std::array<MapEditorPaletteSlot, 8> paletteSlots{};
     std::vector<std::string> preloadAssets;
 };
@@ -50,6 +52,8 @@ public:
     void SetWindowTitleSuffix(std::string suffix);
     void SetSceneName(const std::string& name);
     void SetPhysicsSettings(const PhysicsSceneSettings& settings);
+    void SetUiCanvases(std::vector<UiCanvas> canvases);
+    std::uint64_t UiRevision() const { return m_uiRevision; }
 
     const std::string& GetCurrentScenePath() const { return m_currentScenePath; }
     bool IsDirty() const { return m_isDirty; }
@@ -77,6 +81,7 @@ private:
     bool m_sceneOpen = false;
     std::string m_currentScenePath;
     bool m_isDirty = false;
+    std::uint64_t m_uiRevision = 1;
     std::vector<std::string> m_recentScenes;
     std::function<void(const std::string&)> m_windowTitleCallback;
     std::function<void()> m_snapshotRefresher;

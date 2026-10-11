@@ -221,6 +221,8 @@ std::uint32_t ScriptApiImpl::UiOpen(const std::string& documentPath)
 {
     if (!gameUi)
         return 0;
+    if (documentPath.starts_with("canvas:"))
+        return gameUi->FindSceneCanvas(documentPath.substr(7));
     const std::string path = resolveUiDocument ? resolveUiDocument(documentPath) : documentPath;
     if (path.empty())
     {
@@ -231,6 +233,19 @@ std::uint32_t ScriptApiImpl::UiOpen(const std::string& documentPath)
     if (handle == 0)
         LogError("UiOpen: the document could not be loaded: " + documentPath);
     return handle;
+}
+
+void ScriptApiImpl::UiGetValue(std::uint32_t document, const std::string& elementId, char* out, std::uint32_t capacity)
+{
+    if (!out || !capacity) return;
+    const auto value = gameUi ? gameUi->GetGameElementValue(document, elementId) : std::string{};
+    const auto count = std::min<std::size_t>(value.size(), capacity - 1);
+    std::memcpy(out, value.data(), count); out[count] = '\0';
+}
+
+bool ScriptApiImpl::UiIsChecked(std::uint32_t document, const std::string& elementId)
+{
+    return gameUi && gameUi->IsGameElementChecked(document, elementId);
 }
 
 void ScriptApiImpl::UiClose(std::uint32_t document)

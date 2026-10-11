@@ -18,7 +18,8 @@
 // v5 added IScriptApi::SetMaterial (rebuild v4).
 // v6 added IScriptApi character state/abilities + game UI (RmlUi) slots and action keys (rebuild v5).
 // v7 appends filtered queries and deferred entity activation (rebuild v6 modules).
-#define IXTREEME_MODULE_API_VERSION 7u
+// v8 appends Canvas/form value and checkbox queries (rebuild v7 native modules).
+#define IXTREEME_MODULE_API_VERSION 8u
 
 // The exact exported symbol name the engine resolves in each module DLL.
 #define IXTREEME_MODULE_ENTRY_SYMBOL "IxtreemeGameModule_v1"

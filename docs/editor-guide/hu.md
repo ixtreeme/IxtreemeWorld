@@ -585,20 +585,24 @@ A Raycast sugarat, az OverlapSphere gömbtartományt vizsgál. A RaycastFiltered
 Az entity engedélyezése együtt érinti a render/fizika/script/audio/particle működést. Az overlap legfeljebb 1024 eredményt ad; a terrain/non-entity találat azonosítója lehet 0. A rétegmaszk nem azonos a réteg sorszámával.
 
 <!-- topic: game-ui -->
-### Játékfelület: RmlUi és szöveges kérés
+### Scene View 2D, Canvas UI, RmlUi és szöveges kérés
 
 #### Mire jó?
-A játék saját HUD-ja és menüje RmlUi dokumentumokból, .rml és .rcss fájlokból készül. Ez a Game View rétege, külön az editor ImGui-paneljeitől.
+A játék HUD-ját és menüjét vizuálisan, képernyőre rajzolt Canvasszal készítheted el. A Scene View 2D nézete és a Game View ugyanazt a Rect Transform elrendezést használja. Az elemek a Hierarchyban vannak, a beállítások és eszközök az Inspectorban. A teljes Canvas a jelenettel együtt mentődik és a kiadott játékba is bekerül. A korábbi RmlUi .rml/.rcss dokumentumok továbbra is működnek.
 
 #### Rövid tutorial
-1. A projekt assetmappájában készíts például ui/hud.rml dokumentumot, az elemeknek adj id attribútumot.
-2. Scriptből UiOpen-nel nyisd meg az assetmappához viszonyított útvonalat; ellenőrizd a nem nulla handle-t.
-3. UiSetText, UiSetProperty és UiSetClass segítségével frissíts szöveget, RCSS tulajdonságot vagy osztályt.
-4. UiConsumeClick segítségével kezeld a gombot; UiSetVisible/UiClose rejti vagy bezárja a dokumentumot.
-5. Egy sor szöveg bekéréséhez a PromptText API és kapcsolódó lekérdezések használhatók; secret maszkolja a mezőt.
+1. Create > UI > Canvas: a Scene View 2D nézetre vált. A Scene View tetején a 3D/2D gombokkal váltasz; a 3D kamera nézete megmarad. A Hierarchy Canvas vagy UI elemére duplán kattintva is 2D-re válthatsz. Create > UI > HUD template játékosnevet, életerőcsíkot és Pause gombot készít.
+2. Create > UI vagy az Inspector Add UI element menüje: Panel, Text, Image, Button, Toggle, Slider, Input Field vagy Progress Bar készíthető a kijelölt elem alatt. Az elemlistában húzással vagy a Parent mezővel áthelyezheted másik konténer alá. A Duplicate a teljes részfát másolja, új Script ID-kkal.
+3. Az elemet húzva mozgatod; a nyolc fogóponttal átméretezed. Görgő: nagyítás, középső egérgomb: nézetmozgatás, Inspector > Fit Canvas: alapnézet, F: kijelölt elemre igazítás. A Snap 8 referenciapixelre igazít; Alt mellett kihagyja az igazítást. A Scene Viewban, Hierarchyban vagy Inspectorban Ctrl+Z/Ctrl+Y visszavon és ismétel, Ctrl+D másol, Delete törli a kijelölt részfát.
+4. A Rect Transform mezői: anchor min/max, pivot, position és size delta. Az Y lefelé nő. Az Anchor presets megőrzi a jelenlegi téglalapot; a Stretch to parent kitölti a szülőt. A Canvas Scaler fix pixelméretet vagy referenciafelbontáshoz igazodást ad, szélesség/magasság súlyozással. Próbáld ki a fekvő és álló előnézeteket.
+5. Az Inspectorban állíts szöveget, színt és betűméretet. A Canvas tools csoportban találod az előnézeti felbontást, igazítást és Undo/Redo gombokat. Az Appearance > Images / Skin csoportban bármely elemhez beköthetsz képet: az Asset Browserből húzd a megfelelő képmezőre, vagy nyisd meg a Choose texture listát. A Clear törli a bekötést. Panel, Button és Input Field: Background image; Image: Source image; Toggle: Background és Checked image; Slider: Track, Fill és Handle image; Progress Bar: Background és Fill image. A gomboknak külön Hover, Pressed és Disabled képük lehet, a Slider ugyanezeket a fogantyúhoz használja. Az Image tint a textúrákat színezi; a Color, Fill color és Handle color a kép nélküli rétegek színét adja. A PNG átlátszósága megmarad. A Track height és Handle size referenciapixelben állítható. A Canvas tools > Control preview a kijelölt vezérlő normál, hover, lenyomott vagy letiltott megjelenését mutatja, játékbemenet küldése nélkül. A Clip children a szülő határáig vágja a tartalmat. A Raycast target az egérbemenetet fogadó vezérlőkön legyen bekapcsolva; a díszítő panelek és feliratok általában átengedik a bemenetet.
+6. Save scene vagy Ctrl+S: menti a teljes Canvast. A Game View és a runtime automatikusan megjeleníti. A Canvast Edit módban szerkeszd; a Play saját futásidejű dokumentumállapotot használ, amely Stop után eldobódik.
+7. Bármely jelenetobjektum scriptje elérheti a HUD nevű Canvast: UiOpen("canvas:HUD"). Az elemek Script ID-ját használd a UiSetText, UiConsumeClick, UiSetVisible és UiSetClass hívásokban. A UiGetValue input/slider értéket olvas, a UiIsChecked a Toggle állapotát. UiSetProperty(doc, id, "value", "0.8") inputot, slidert vagy életerőcsíkot frissít; "checked" és "true"/"false" állítja a Toggle-t.
+
+Kézzel írt UI-hoz készíts ui/hud.rml fájlt a projekt assetmappájában, és hívd a UiOpen("ui/hud.rml") függvényt. Egyszerű szöveg/jelszó bekérésére továbbra is használható a PromptText. A natív C++ modulokat az új, 8-as modul ABI-hoz újra kell fordítani.
 
 #### Eredmény és gyakori hiba
-A HUD Play-ben és a runtime-ban jelenik meg. Stop bezárja a nyitott dokumentumokat és a futás kérésállapotát. Hibás elem-id vagy assetútvonal nem módosít másik elemet.
+Ez a Canvas Screen Space Overlay módban jelenik meg. A 2D szerkesztés kattintásai nem jutnak a 3D kijelöléshez, kamerához vagy terrain eszközökhöz; a Scene View fölé helyezett ablakok a 3D nézet egérbemenetét is elfogják. Az elemei referenciapixelt és a 3D transzformoktól külön UI-hierarchiát használnak. A Sorting order a Canvasok, az elemsorrend a testvérelemek takarási sorrendjét adja. Nézetméretezéskor a futásidejű szöveg, inputérték és kattintásállapot megmarad; jelenetváltáskor a régi Canvasok eltűnnek. Használj egyedi Canvasneveket és Script ID-kat; hibás azonosító vagy textúraútvonal nem módosít másik elemet.
 
 <!-- topic: network-native -->
 ### Hálózat és legacy natív C++ scriptek

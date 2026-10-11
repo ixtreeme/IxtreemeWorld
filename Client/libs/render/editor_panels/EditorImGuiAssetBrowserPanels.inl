@@ -205,8 +205,12 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
 
     if (clicked)
     {
+        // Keep the drop target visible while choosing a texture for the Canvas in 2D.
+        // Double-click still opens the asset Inspector as usual.
+        if (!(m_sceneView2D && m_uiSelectionActive && entry.category == AssetLibrary::Category::Texture && !doubleClicked))
+            m_uiSelectionActive = false;
         m_selectedAssetId = entry.id;
-        m_assetInspectorSelectionActive = true;
+        m_assetInspectorSelectionActive = !m_uiSelectionActive;
         m_assetStatus = "Selected: " + entry.displayName;
         if (doubleClicked && entry.category == AssetLibrary::Category::WaterMaterial)
         {

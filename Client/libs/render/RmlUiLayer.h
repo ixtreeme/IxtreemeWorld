@@ -8,13 +8,14 @@
 // record through ixrhi::IXRHICommandList from the canonical frame context.
 //
 // Preserved exactly (NOT redesigned): RmlUi 6.2 callback set
-// (Compile/Render/ReleaseGeometry, Load(stub)/Generate/ReleaseTexture,
+// (Compile/Render/ReleaseGeometry, Load/Generate/ReleaseTexture,
 // Enable/SetScissorRegion, SetTransform no-op), premultiplied-alpha blend
 // (ONE, ONE_MINUS_SRC_ALPHA), depth off, R8G8B8A8_UNORM UI textures, linear
 // clamp sampling, push-constant viewport+translation projection, deferred
 // retire-frame resource release, per-texture descriptor slots.
 
 #include "InputEvent.h"
+#include "UiCanvas.h"
 
 #include "IXRHICommandList.h"
 #include "IXRHIDevice.h"
@@ -120,6 +121,9 @@ public:
     // Opens and shows a document over the whole UI area (path: absolute, or engine-asset relative).
     // Returns its handle, 0 when it cannot be loaded.
     std::uint32_t OpenGameDocument(const std::string& path);
+    // Scene-owned Canvas documents use the same element/script API as .rml documents.
+    void SyncSceneCanvases(const std::vector<UiCanvas>& canvases, std::uint64_t revision, const std::string& assetRoot);
+    std::uint32_t FindSceneCanvas(const std::string& name) const;
     void CloseGameDocument(std::uint32_t handle);
     void CloseAllGameDocuments();
     void SetGameDocumentVisible(std::uint32_t handle, bool visible);
@@ -130,6 +134,8 @@ public:
     bool SetGameElementClass(std::uint32_t handle, const std::string& elementId, const std::string& className, bool enabled);
     // True once per click on the element (or anything inside it) since the last call.
     bool ConsumeGameElementClick(std::uint32_t handle, const std::string& elementId);
+    std::string GetGameElementValue(std::uint32_t handle, const std::string& elementId) const;
+    bool IsGameElementChecked(std::uint32_t handle, const std::string& elementId) const;
     bool HasVisibleGameDocuments() const;
     // True while ANY RmlUi document is shown (script-opened game documents or the built-in
     // login/lobby/HUD/... ones). The engine skips Context::Update() while this is false: RmlUi walks
@@ -142,6 +148,7 @@ public:
     // The pointer is over a game-document element that is not just its empty body: a click there is
     // meant for the UI (a button), not for the game world under it.
     bool IsPointerOverGameUi() const;
+    bool HasGameUiTextFocus() const;
     // UI colors are sRGB: when the render target is sRGB as well, the shader decodes them.
     void SetSrgbTarget(bool srgb);
     const ixrhi::IXRHIRenderPass* TargetPass() const;

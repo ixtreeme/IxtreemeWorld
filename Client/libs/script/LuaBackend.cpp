@@ -290,6 +290,11 @@ struct LuaBackend::Impl
             return a->UiConsumeClick(doc, id);
         });
 
+        t.set_function("UiGetValue", [a](std::uint32_t doc, const std::string& id) {
+            char value[4096]{}; a->UiGetValue(doc, id, value, sizeof(value)); return std::string(value);
+        });
+        t.set_function("UiIsChecked", [a](std::uint32_t doc, const std::string& id) { return a->UiIsChecked(doc, id); });
+
         // --- particles (v7): the entity's Particle System component ---
         t.set_function("ParticlePlay", [a](std::uint32_t id) { a->ParticlePlay(id); });
         t.set_function("ParticleStop", [a](std::uint32_t id) { a->ParticleStop(id); });

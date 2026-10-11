@@ -274,6 +274,10 @@ bool AsUiConsumeClick(std::uint32_t document, const std::string& elementId)
     return Api().UiConsumeClick(document, elementId);
 }
 
+std::string AsUiGetValue(std::uint32_t document, const std::string& id)
+{ char value[4096]{}; Api().UiGetValue(document, id, value, sizeof(value)); return value; }
+bool AsUiIsChecked(std::uint32_t document, const std::string& id) { return Api().UiIsChecked(document, id); }
+
 void AsParticlePlay(std::uint32_t id) { Api().ParticlePlay(id); }
 void AsParticleStop(std::uint32_t id) { Api().ParticleStop(id); }
 void AsParticleRestart(std::uint32_t id) { Api().ParticleRestart(id); }
@@ -507,6 +511,8 @@ void RegisterBindings(asIScriptEngine* engine)
     RegisterGlobal(engine, "void UiSetProperty(uint document, const string &in elementId, const string &in property, const string &in value)", &AsUiSetProperty);
     RegisterGlobal(engine, "void UiSetClass(uint document, const string &in elementId, const string &in className, bool enabled)", &AsUiSetClass);
     RegisterGlobal(engine, "bool UiConsumeClick(uint document, const string &in elementId)", &AsUiConsumeClick);
+    RegisterGlobal(engine, "string UiGetValue(uint document, const string &in elementId)", &AsUiGetValue);
+    RegisterGlobal(engine, "bool UiIsChecked(uint document, const string &in elementId)", &AsUiIsChecked);
 
     RegisterGlobal(engine, "void ParticlePlay(uint id)", &AsParticlePlay);
     RegisterGlobal(engine, "void ParticleStop(uint id)", &AsParticleStop);

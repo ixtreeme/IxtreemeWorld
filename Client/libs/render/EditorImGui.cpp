@@ -754,6 +754,7 @@ void EditorImGui::SetHierarchySceneState(std::uint64_t sceneRootEntity,
 void EditorImGui::SetHierarchySelection(std::uint64_t entity)
 {
     if (m_selectedHierarchyEntity == entity) return;
+    m_uiSelectionActive = false;
     const auto previous = m_selectedHierarchyEntity;
     m_selectedHierarchyEntity = entity;
     for (const auto id : {previous, entity})
@@ -3002,6 +3003,7 @@ void EditorImGui::BeginFrame(bool editorModeActive)
 
 #include "editor_panels/EditorImGuiSceneViewPanels.inl"
 #include "editor_panels/EditorImGuiAnimatorPanels.inl"
+#include "editor_panels/EditorImGuiCanvasPanels.inl"
 #include "editor_panels/EditorImGuiProjectPanels.inl"
 #include "editor_panels/EditorImGuiMenuToolbarPanels.inl"
 #include "editor_panels/EditorImGuiShellPanels.inl"
@@ -3131,8 +3133,27 @@ bool EditorImGui::IsTextInputActive() const
     return context->ActiveId != 0 && context->InputTextState.ID == context->ActiveId;
 }
 
+// Hit-test the windows at this event's position, rather than last frame's hover flag. An Inspector,
+// popup or floating editor window may cover the same rectangle as the underlying viewport.
+static bool ViewportOwnsPointer(const char* name, const InputEvent& event)
+{
+    auto* context = ImGui::GetCurrentContext();
+    auto* view = context ? ImGui::FindWindowByName(name) : nullptr;
+    if (!view || !ImGui::IsWindowContentHoverable(view)) return false;
+    const auto belongs = [view](ImGuiWindow* window) { return window && (window == view || ImGui::IsWindowChildOf(window,view,false,false)); };
+    auto* viewport = ImGui::GetMainViewport();
+    const ImVec2 offset = viewport ? viewport->Pos : ImVec2{};
+    ImGuiWindow *hover = nullptr, *underMoving = nullptr;
+    ImGui::FindHoveredWindowEx({event.x+offset.x,event.y+offset.y},true,&hover,&underMoving);
+    if (!belongs(hover)) return false;
+    if (context->ActiveId && context->ActiveIdMouseButton >= 0 && ImGui::IsMouseDown(context->ActiveIdMouseButton) &&
+        !belongs(context->ActiveIdWindow)) return false;
+    return true;
+}
+
 bool EditorImGui::IsSceneViewInputTarget(const InputEvent& event) const
 {
+    if (m_sceneView2D) return false;  // Canvas authoring owns both the pointer and its shortcuts.
     const auto& diag = m_viewportInputDiagnostics;
     switch (event.type)
     {
@@ -3141,7 +3162,7 @@ bool EditorImGui::IsSceneViewInputTarget(const InputEvent& event) const
     case InputEvent::MouseUp:
     case InputEvent::MouseWheel:
     {
-        if (!diag.sceneViewRectValid)
+        if (!diag.sceneViewRectValid || !ViewportOwnsPointer(EditorWindow::SceneView,event))
             return false;
         const float minX = diag.sceneViewMin[0];
         const float minY = diag.sceneViewMin[1];
@@ -3154,7 +3175,12 @@ bool EditorImGui::IsSceneViewInputTarget(const InputEvent& event) const
     }
     case InputEvent::KeyDown:
     case InputEvent::KeyUp:
-        return m_sceneViewKeyboardFocus || diag.sceneViewFocused || diag.sceneViewHovered;
+    {
+        auto* view = ImGui::FindWindowByName(EditorWindow::SceneView);
+        auto* focus = ImGui::GetCurrentContext()->NavWindow;
+        return diag.sceneViewRectValid && !IsTextInputActive() && view && ImGui::IsWindowContentHoverable(view) &&
+            ((focus && (focus == view || ImGui::IsWindowChildOf(focus,view,false,false))) || m_sceneViewKeyboardFocus);
+    }
     default:
         return false;
     }
@@ -3197,6 +3223,12 @@ bool EditorImGui::MapInputToGameView(const InputEvent& event, InputEvent& out) c
     const GameViewRect& rect = m_gameViewRect;
     if (!rect.valid || !m_gameViewVisible || rect.size[0] <= 1.0f || rect.size[1] <= 1.0f)
         return false;
+    if (event.type == InputEvent::KeyDown || event.type == InputEvent::KeyUp || event.type == InputEvent::Char)
+    {
+        out = event;
+        return m_gameViewFocused;
+    }
+    if (!ViewportOwnsPointer(EditorWindow::Game,event)) return false;
     const float u = (static_cast<float>(event.x) - rect.min[0]) / rect.size[0];
     const float v = (static_cast<float>(event.y) - rect.min[1]) / rect.size[1];
     if (u < 0.0f || u >= 1.0f || v < 0.0f || v >= 1.0f)

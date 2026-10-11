@@ -92,6 +92,8 @@ public:
     void UiSetClass(std::uint32_t document, const std::string& elementId, const std::string& className,
                     bool enabled) override;
     bool UiConsumeClick(std::uint32_t document, const std::string& elementId) override;
+    void UiGetValue(std::uint32_t document, const std::string& elementId, char* out, std::uint32_t capacity) override;
+    bool UiIsChecked(std::uint32_t document, const std::string& elementId) override;
     void ParticlePlay(std::uint32_t id) override;
     void ParticleStop(std::uint32_t id) override;
     void ParticleRestart(std::uint32_t id) override;

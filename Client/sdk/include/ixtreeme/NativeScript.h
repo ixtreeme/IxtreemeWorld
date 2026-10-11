@@ -137,6 +137,8 @@ protected:
         api->UiSetClass(document, elementId, className, enabled);
     }
     bool UiConsumeClick(std::uint32_t document, const std::string& elementId) { return api->UiConsumeClick(document, elementId); }
+    void UiGetValue(std::uint32_t document, const std::string& elementId, char* out, std::uint32_t capacity) { api->UiGetValue(document, elementId, out, capacity); }
+    bool UiIsChecked(std::uint32_t document, const std::string& elementId) { return api->UiIsChecked(document, elementId); }
 
     void Log(const std::string& msg) { api->Log(msg); }
     void LogError(const std::string& msg) { api->LogError(msg); }

@@ -18,6 +18,8 @@ void EditorImGui::RenderEditorPanels()
     m_pendingScriptChanges = PollScriptFileChanges();  // save-to-live: drained by EngineApplication
     RenderHierarchyPanel();
     RenderSceneViewDropTarget();
+    if (!m_sceneView2D && m_uiSelectionActive && GetViewportInputDiagnostics().sceneViewHovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        m_uiSelectionActive = false;
     RenderGameViewPanel();
     RenderAnimatorPanel();
     RenderInspector();
@@ -40,6 +42,7 @@ void EditorImGui::RenderEditorPanels()
     RenderCreatePbrMaterialPopup();
     RenderFbxExportPopup();
     TrackStatusMessages();
+    if (!ImGui::GetActiveID()) m_uiLastEditWidget = 0;
 
     // Auto-switch the active viewport tab on Play/Stop: Game (project Main Camera)
     // while playing, Scene View (free-fly editor camera) while editing. ImGui's public

@@ -119,8 +119,14 @@ void EditorImGui::RenderMenuBar()
     if (ImGui::BeginMenu("Edit"))
     {
         const HierarchySceneEntity* selected = SelectedHierarchyEntity();
-        const bool canEditSelection = editing && selected != nullptr;
-        if (ImGui::MenuItem(ICON_FA_BULLSEYE "  Frame Selection", "F", false, selected != nullptr))
+        const bool canEditSelection = editing && selected != nullptr && !m_uiSelectionActive;
+        if (m_uiSelectionActive)
+        {
+            if (ImGui::MenuItem("Undo UI edit", "Ctrl+Z", false, editing && !m_uiUndo.empty())) UiCanvasUndo(false);
+            if (ImGui::MenuItem("Redo UI edit", "Ctrl+Y", false, editing && !m_uiRedo.empty())) UiCanvasUndo(true);
+            ImGui::Separator();
+        }
+        if (ImGui::MenuItem(ICON_FA_BULLSEYE "  Frame Selection", "F", false, selected != nullptr && !m_uiSelectionActive))
             QueueHierarchyFocus(*selected);
         if (ImGui::MenuItem(ICON_FA_PEN "  Rename", nullptr, false, canEditSelection))
             StartHierarchyRename(*selected);
@@ -169,6 +175,8 @@ void EditorImGui::RenderMenuBar()
         panelItem(ICON_FA_TERMINAL "  Console", m_consolePanelOpen, EditorWindow::Console);
         panelItem(ICON_FA_HAMMER "  Build Output", m_buildOutputPanelOpen, EditorWindow::BuildOutput);
         panelItem(ICON_FA_PERSON_RUNNING "  Animator", m_animatorPanelOpen, EditorWindow::Animator);
+        if (ImGui::MenuItem("Scene View 2D / Canvas", nullptr, m_sceneView2D))
+        { SetSceneView2D(!m_sceneView2D); m_pendingViewFocusWindow = EditorWindow::SceneView; }
         ImGui::Separator();
         if (ImGui::MenuItem(ICON_FA_CUBES "  Scene View"))
             m_pendingViewFocusWindow = EditorWindow::SceneView;
@@ -502,6 +510,7 @@ void EditorImGui::HandleEditorHotkeys()
         return;
 
     ImGuiIO& io = ImGui::GetIO();
+    HandleUiCanvasHotkeys();
     if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S, false))
     {
         if (io.KeyShift)
@@ -550,7 +559,7 @@ void EditorImGui::HandleEditorHotkeys()
     if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F11, false))
         m_commands.captureGpuFrame = true;
 
-    if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F, false))
+    if (!m_sceneView2D && !m_uiSelectionActive && !io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F, false))
     {
         if (const HierarchySceneEntity* selected = SelectedHierarchyEntity())
             QueueHierarchyFocus(*selected);
@@ -571,7 +580,7 @@ void EditorImGui::HandleEditorHotkeys()
         }
     }
 
-    if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F2, false))
+    if (!m_sceneView2D && !m_uiSelectionActive && !io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_F2, false))
     {
         if (m_waterBodyState.selected)
         {
@@ -590,7 +599,7 @@ void EditorImGui::HandleEditorHotkeys()
         }
     }
 
-    if (!io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
+    if (!m_sceneView2D && !m_uiSelectionActive && !io.KeyCtrl && !io.KeyShift && ImGui::IsKeyPressed(ImGuiKey_Delete, false))
     {
         if (m_waterBodyState.selected)
         {
@@ -620,7 +629,7 @@ void EditorImGui::HandleEditorHotkeys()
 
     // W / E / R pick the Move / Rotate / Scale tool, unless the right mouse button is flying the
     // camera (W is "forward" then).
-    if (CanUseEditorTools() && !io.KeyCtrl && !io.KeyShift && !io.KeyAlt && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
+    if (!m_sceneView2D && !m_uiSelectionActive && CanUseEditorTools() && !io.KeyCtrl && !io.KeyShift && !io.KeyAlt && !ImGui::IsMouseDown(ImGuiMouseButton_Right))
     {
         const MapEditorGizmoOperation previous = m_gizmoOperation;
         if (ImGui::IsKeyPressed(ImGuiKey_W, false))
@@ -935,6 +944,7 @@ bool EditorImGui::HierarchySubtreePassesSearch(std::uint64_t entity) const
 
 void EditorImGui::QueueHierarchySelection(const HierarchySceneEntity& entity)
 {
+    m_uiSelectionActive = false;
     m_commands.hierarchySelectEntity = true;
     m_commands.hierarchyEntityType = entity.type;
     m_commands.hierarchyEntityId = entity.objectId;

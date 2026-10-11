@@ -213,6 +213,11 @@ public:
         std::uint32_t* truncated) = 0;
     virtual void SetEntityEnabled(std::uint32_t id, bool enabled) = 0;
 
+    // Canvas/form controls (ABI 8). Caller-owned text keeps the native module seam heap-safe.
+    virtual void UiGetValue(std::uint32_t, const std::string&, char* out, std::uint32_t capacity)
+    { if (out && capacity) out[0] = '\0'; }
+    virtual bool UiIsChecked(std::uint32_t, const std::string&) { return false; }
+
     // (NEVER add an STL-by-value return here — use a caller-owned char* buffer for strings to keep the
     //  /MT module boundary safe. By-value RaycastHit is fine: it is POD, no heap.)
 };

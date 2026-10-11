@@ -15,6 +15,15 @@ void EditorImGui::RenderHierarchyCreateMenuItems()
     if (ImGui::MenuItem(ICON_FA_CLOUD_SUN "  Fog Volume", nullptr, false, canCreate))
         m_commands.addFogVolume = true;
     UI::ItemTooltip("Local fog with box or sphere bounds. Move it and edit its size in the Inspector.");
+    if (ImGui::BeginMenu(ICON_FA_WINDOW_MAXIMIZE "  UI", canCreate))
+    {
+        if (ImGui::MenuItem("Canvas")) CreateUiCanvas();
+        if (ImGui::MenuItem("HUD template")) CreateUiCanvas(true);
+        ImGui::Separator();
+        for (int type = 0; type < 8; ++type)
+            if (ImGui::MenuItem(UiElementTypeName(static_cast<UiElementType>(type)))) AddUiCanvasElement(static_cast<UiElementType>(type));
+        ImGui::EndMenu();
+    }
     ImGui::Separator();
 
     const auto primitive = [&](const char* label, const char* type) {
@@ -305,7 +314,7 @@ void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
     if (!scene.active)
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.62f, 0.62f, 0.62f, 1.0f));
 
-    bool hasChildren = scene.active && !m_hierarchyEntities.empty();
+    bool hasChildren = scene.active && (!m_hierarchyEntities.empty() || !SceneManager::Instance().GetCurrentScene().uiCanvases.empty());
     ImGuiTreeNodeFlags flags =
         ImGuiTreeNodeFlags_OpenOnArrow |
         ImGuiTreeNodeFlags_SpanFullWidth |
@@ -395,6 +404,7 @@ void EditorImGui::RenderProjectSceneNode(const ProjectSceneEntry& scene)
             for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i)
                 RenderHierarchyEntityNode(rows[i].entity, rows[i].depth);
         m_hierarchyScrollToSelection = false;
+        RenderUiCanvasHierarchy(true);
         ImGui::TreePop();
     }
 
