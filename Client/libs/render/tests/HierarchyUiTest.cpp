@@ -119,6 +119,13 @@ int main()
         const auto commands = EditorHierarchyTestAccess::Commands(editor);
         check(commands.addEmptyEntity && !commands.addMeshEntity && !commands.addPrimitiveEntity,
             "Create Empty Object queues a component host without a primitive or model");
+        const auto fogItem = menuFrame();
+        io.AddMousePosEvent(fogItem.x, fogItem.y + ImGui::GetTextLineHeight() + ImGui::GetStyle().ItemSpacing.y);
+        io.AddMouseButtonEvent(0, true); menuFrame();
+        io.AddMouseButtonEvent(0, false); menuFrame();
+        const auto fogCommands = EditorHierarchyTestAccess::Commands(editor);
+        check(fogCommands.addFogVolume && !fogCommands.addEmptyEntity && !fogCommands.addPrimitiveEntity,
+            "Create Fog Volume queues an invisible local fog host");
         SceneManager::Instance().CloseScene();
     }
     ImGui::DestroyContext();

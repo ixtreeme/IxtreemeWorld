@@ -93,6 +93,14 @@ int main()
 
     const float origin[3] = {2, 3, 4};
     auto empty = MakeEmptySceneEntity(77, "Dust emitter", origin);
+    empty.hasFogVolume = true;
+    const auto fogBoxLines = BuildSelectionOutlineLines({SelectedEditorObjectType::MeshEntity, 77}, {empty}, {}, {}, {}, camera, {});
+    Check("Selected zero-scale fog volume shows its full box bounds", fogBoxLines.size() == 12 &&
+        xm::Distance(fogBoxLines.front().a, fogBoxLines.front().b) > 1);
+    empty.fogVolume.shape = FogVolumeComponent::Shape::Sphere;
+    Check("Selected sphere fog volume shows three circles",
+        BuildSelectionOutlineLines({SelectedEditorObjectType::MeshEntity, 77}, {empty}, {}, {}, {}, camera, {}).size() == 144);
+    empty.hasFogVolume = false;
     Check("Empty objects have no geometry, materials or collider",
         !empty.HasMeshGeometry() && empty.materialSlots.empty() && !empty.hasCollider && !empty.hasRigidbody);
     const auto emptyTarget = BuildSceneGizmoTarget({SelectedEditorObjectType::MeshEntity, 77},

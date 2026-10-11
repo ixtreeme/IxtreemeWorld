@@ -1,4 +1,5 @@
 #include "SelectionSystem.h"
+#include "FogMath.h"
 
 namespace xm = ixtreeme::math;
 
@@ -160,7 +161,7 @@ std::optional<std::uint32_t> PickWaterBody(const std::vector<WaterBody>& bodies,
 
 std::vector<SelectionOutlineRenderer::Line> BuildSelectionOutlineLines(
     const SelectedEditorObject& selected,
-    const std::vector<MeshSceneEntity>&,
+    const std::vector<MeshSceneEntity>& meshes,
     const std::vector<PointLight>& pointLights,
     const std::vector<SpotLight>& spotLights,
     const std::vector<WaterBody>& waterBodies,
@@ -193,7 +194,36 @@ std::vector<SelectionOutlineRenderer::Line> BuildSelectionOutlineLines(
             addLine(previous, first);
     };
 
-    if (selected.type == SelectedEditorObjectType::PointLight)
+    if (selected.type == SelectedEditorObjectType::MeshEntity)
+    {
+        const auto it = std::find_if(meshes.begin(), meshes.end(), [&](const auto& mesh) { return mesh.id == selected.id; });
+        if (it != meshes.end() && it->hasFogVolume && !it->editorHidden)
+        {
+            const auto fog = BuildFogVolume(*it);
+            const WorldVec3 center{fog.centerShape[0], fog.centerShape[1], fog.centerShape[2]};
+            const WorldVec3 axes[] = {{fog.axisXExtent[0], fog.axisXExtent[1], fog.axisXExtent[2]},
+                {fog.axisYExtent[0], fog.axisYExtent[1], fog.axisYExtent[2]},
+                {fog.axisZExtent[0], fog.axisZExtent[1], fog.axisZExtent[2]}};
+            if (fog.centerShape[3] == 1)
+            {
+                AddCircle(lines, center, axes[0], axes[1], fog.axisXExtent[3], kOutlineColor, 48);
+                AddCircle(lines, center, axes[0], axes[2], fog.axisXExtent[3], kOutlineColor, 48);
+                AddCircle(lines, center, axes[1], axes[2], fog.axisXExtent[3], kOutlineColor, 48);
+            }
+            else
+            {
+                const WorldVec3 x = axes[0] * fog.axisXExtent[3], y = axes[1] * fog.axisYExtent[3], z = axes[2] * fog.axisZExtent[3];
+                std::array<WorldVec3, 8> corners;
+                for (int i = 0; i < 8; ++i)
+                    corners[i] = center + x * ((i & 1) ? 1.0f : -1.0f) +
+                        y * ((i & 2) ? 1.0f : -1.0f) + z * ((i & 4) ? 1.0f : -1.0f);
+                for (int i = 0; i < 8; ++i)
+                    for (int axis = 0; axis < 3; ++axis)
+                        if (!(i & (1 << axis))) addLine(corners[i], corners[i | (1 << axis)]);
+            }
+        }
+    }
+    else if (selected.type == SelectedEditorObjectType::PointLight)
     {
         auto it = std::find_if(pointLights.begin(), pointLights.end(),
             [&](const PointLight& light) { return light.id == selected.id; });

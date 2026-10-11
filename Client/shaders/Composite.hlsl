@@ -1,4 +1,5 @@
 #pragma pack_matrix(row_major)
+#include "Fog.hlsli"
 
 // The scene renders in floating point (light of any brightness); this pass brings it to the screen:
 // exposure, then a tone curve, into an 8-bit (sRGB) image: the editor's view image or the swapchain.
@@ -11,6 +12,9 @@
 [[vk::combinedImageSampler]] [[vk::binding(1, 0)]] SamplerState u_addedLight0Sampler : register(s1);
 [[vk::combinedImageSampler]] [[vk::binding(2, 0)]] Texture2D u_addedLight1 : register(t2);
 [[vk::combinedImageSampler]] [[vk::binding(2, 0)]] SamplerState u_addedLight1Sampler : register(s2);
+[[vk::combinedImageSampler]] [[vk::binding(3, 0)]] Texture2D<float> u_sceneDepth : register(t3);
+[[vk::combinedImageSampler]] [[vk::binding(3, 0)]] SamplerState u_depthSampler : register(s3);
+[[vk::binding(4, 0)]] ConstantBuffer<FogUniforms> u_fog : register(b0);
 
 struct ToneMapParams
 {
@@ -65,6 +69,21 @@ float4 PSMain(VSOutput input) : SV_Target0
         color += u_addedLight0.SampleLevel(u_addedLight0Sampler, input.uv, 0.0).rgb * u_toneMap.addedLightWeight.x;
     if (u_toneMap.addedLightWeight.y != 0.0)
         color += u_addedLight1.SampleLevel(u_addedLight1Sampler, input.uv, 0.0).rgb * u_toneMap.addedLightWeight.y;
+    if (u_fog.options.x > 0.0 || u_fog.options.z > 0.0)
+    {
+        // Fetch the source texel without filtering across silhouettes. The scene can be smaller
+        // than the output viewport, so destination pixel coordinates cannot index its depth.
+        uint depthWidth, depthHeight;
+        u_sceneDepth.GetDimensions(depthWidth, depthHeight);
+        const int2 depthPixel = min(int2(saturate(input.uv) * float2(depthWidth, depthHeight)),
+            int2(depthWidth, depthHeight) - 1);
+        const float depth = u_sceneDepth.Load(int3(depthPixel, 0));
+        const float4 hit = mul(float4(input.uv * 2.0 - 1.0, depth, 1.0), u_fog.inverseViewProjection);
+        const float3 ray = hit.xyz / hit.w - u_fog.camera.xyz;
+        const float distance = length(ray);
+        const float4 fog = EvaluateFog(u_fog, ray / max(distance, 1.0e-6), distance, depth >= 0.999999);
+        color = color * fog.w + fog.xyz * (1.0 - fog.w);
+    }
     // A floating-point target keeps what an 8-bit one clipped: NaN, infinity, negative light.
     if (any(isnan(color)))
         color = 0.0.xxx;

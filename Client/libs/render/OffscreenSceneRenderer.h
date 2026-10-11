@@ -30,6 +30,7 @@
 #include "IXRHIRenderPass.h"
 #include "IXRHIRenderTarget.h"
 #include "IXRHITexture.h"
+#include "FogMath.h"
 
 #include <array>
 #include <cstdint>
@@ -101,6 +102,11 @@ public:
                        float firstWeight,
                        const std::shared_ptr<ixrhi::IXRHITexture>& second,
                        float secondWeight);
+    // After the final scene pass, before opening the display or swapchain pass. Reads this view's
+    // current depth without copying it, and prepares the per-view fog constants.
+    void PrepareFog(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
+                    const WorldCamera& camera, const GlobalFogSettings& global,
+                    std::span<const MeshSceneEntity> entities, bool respectEditorHidden = false);
     void Destroy();
 
     bool IsReady() const { return m_ready; }
@@ -124,6 +130,7 @@ public:
     ixrhi::IXRHIFormat DepthFormat() const { return m_depthFormat; }
 
 private:
+    friend struct FogRendererTestAccess;
     bool CreateTargets(ixrhi::IXRHIDevice& rhi);
     bool CreateComposite(ixrhi::IXRHIDevice& rhi);
     void DrawToneMap(ixrhi::IXRHICommandList& cmd,
@@ -170,6 +177,10 @@ private:
     std::array<std::shared_ptr<ixrhi::IXRHITexture>, 2> m_addedLight{};
     std::array<float, 2> m_addedLightWeight{};
     std::array<std::array<std::shared_ptr<ixrhi::IXRHITexture>, 2>, kToneMapSets> m_boundAddedLight{};
+    FogUniforms m_fogUniforms{};
+    std::shared_ptr<ixrhi::IXRHITexture> m_fogDepth;
+    std::array<std::shared_ptr<ixrhi::IXRHITexture>, kToneMapSets> m_boundFogDepth{};
+    std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kToneMapSets> m_fogBuffers{};
 
     // Tracked producing-use states (see header contract).
     ixrhi::IXRHIImageLayout m_colorState = ixrhi::IXRHIImageLayout::Undefined;

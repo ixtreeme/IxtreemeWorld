@@ -22,7 +22,7 @@ int main()
         "components", "lights", "camera", "colliders", "rigidbody", "joints", "character-controller",
         "animation-clips", "animator", "blend-trees", "particles", "audio", "scripts", "script-api",
         "script-queries", "game-ui", "network-native", "tree-generator", "lod-occlusion", "impostors",
-        "layered-world", "server-export", "environment", "sky", "post-processing", "project-settings",
+        "layered-world", "server-export", "environment", "sky", "fog", "post-processing", "project-settings",
         "performance", "physics-debugger", "console-diagnostics", "build-game", "shortcuts", "troubleshooting"};
     const auto& hu = Articles(Language::Hungarian);
     const auto& en = Articles(Language::English);

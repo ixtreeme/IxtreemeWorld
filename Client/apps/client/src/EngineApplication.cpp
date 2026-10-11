@@ -739,6 +739,8 @@ MeshRendererEditorState BuildMeshRendererEditorState(const std::vector<MeshScene
     state.script = it->script;
     state.hasParticleSystem = it->hasParticleSystem;
     state.particleSystem = it->particleSystem;
+    state.hasFogVolume = it->hasFogVolume;
+    state.fogVolume = it->fogVolume;
     state.debugAnimationClipId = it->debugAnimationClipId;
     state.animatorControllerId = it->animatorControllerId;
     state.materialSlotCount = std::max<std::uint32_t>(
@@ -783,6 +785,8 @@ void ApplyMeshRendererEditorState(MeshSceneEntity& mesh, const MeshRendererEdito
     mesh.script = state.script;
     mesh.hasParticleSystem = state.hasParticleSystem;
     mesh.particleSystem = state.particleSystem;
+    mesh.hasFogVolume = state.hasFogVolume;
+    mesh.fogVolume = state.fogVolume;
     mesh.debugAnimationClipId = state.debugAnimationClipId;
     mesh.animatorControllerId = state.animatorControllerId;
 }
@@ -1923,6 +1927,7 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
     }
     target.addWaterBody = target.addWaterBody || source.addWaterBody;
     target.addEmptyEntity = target.addEmptyEntity || source.addEmptyEntity;
+    target.addFogVolume = target.addFogVolume || source.addFogVolume;
     if (source.createTerrain)
     {
         target.createTerrain = true;
@@ -8077,6 +8082,7 @@ int RunGame(NativeWindow& window,
                 };
                 auto focusHierarchyEntity = [&](HierarchyEntityType type, std::uint32_t id) {
                     std::optional<WorldVec3> target;
+                    float focusDistance = 15.0f;
                     if (type == HierarchyEntityType::Terrain)
                     {
                         target = WorldVec3{0.0f, 0.0f, 0.0f};
@@ -8107,7 +8113,16 @@ int RunGame(NativeWindow& window,
                         auto it = std::find_if(editorMeshEntities.begin(), editorMeshEntities.end(),
                             [&](const MeshSceneEntity& mesh) { return mesh.id == id; });
                         if (it != editorMeshEntities.end())
+                        {
                             target = WorldVec3{it->position[0], it->position[1], it->position[2]};
+                            if (it->hasFogVolume)
+                            {
+                                const auto fog = BuildFogVolume(*it);
+                                const float radius = fog.centerShape[3] == 1 ? fog.axisXExtent[3] :
+                                    xm::Length(WorldVec3{fog.axisXExtent[3], fog.axisYExtent[3], fog.axisZExtent[3]});
+                                focusDistance = std::max(15.0f, radius * 3.0f);
+                            }
+                        }
                     }
                     else if (type == HierarchyEntityType::Camera)
                     {
@@ -8118,7 +8133,7 @@ int RunGame(NativeWindow& window,
                     }
                     if (!target)
                         return;
-                    cameraController.FocusOn(*target);
+                    cameraController.FocusOn(*target, focusDistance);
                     runtimeSession->SetEditorStatus("Focused camera on entity #" + std::to_string(id));
                     Tracenf("[HIERARCHY] Focused camera on entity: id=%u type=%d", id, static_cast<int>(type));
                 };
@@ -8891,6 +8906,7 @@ int RunGame(NativeWindow& window,
                     commands.createTerrain = false;
                     commands.addMeshEntity = false;
                     commands.addEmptyEntity = false;
+                    commands.addFogVolume = false;
                     commands.addPrimitiveEntity = false;
                     commands.primitiveType.clear();
                     commands.addPrefabInstance = false;
@@ -10695,6 +10711,14 @@ int RunGame(NativeWindow& window,
                         Tracenf("[INSPECTOR-COMP] remove entity=%u component=Particle System", it->id);
                         return true;
                     }
+                    if (componentType == "effects.fog_volume")
+                    {
+                        if (!it->hasFogVolume) return false;
+                        it->hasFogVolume = false;
+                        it->fogVolume = {};
+                        SceneManager::Instance().MarkDirty();
+                        return true;
+                    }
                     const std::size_t oldSize = it->editorComponents.size();
                     it->editorComponents.erase(std::remove_if(it->editorComponents.begin(), it->editorComponents.end(),
                         [&](const EditorAttachedComponent& component) { return component.type == componentType; }),
@@ -10854,6 +10878,12 @@ int RunGame(NativeWindow& window,
                                     it->particleSystem = {};
                                     Tracenf("[INSPECTOR-COMP] add entity=%u component=Particle System", it->id);
                                     runtimeSession->SetEditorStatus("Added Particle System component");
+                                }
+                                else if (commands.addComponentType == EditorComponentType::FogVolume)
+                                {
+                                    it->hasFogVolume = true;
+                                    it->fogVolume = {};
+                                    runtimeSession->SetEditorStatus("Added Fog Volume component");
                                 }
                                 else
                                 {
@@ -11016,18 +11046,19 @@ int RunGame(NativeWindow& window,
                         : spawnAtCameraCenter();
                     instantiatePrefabAt(commands.prefabAssetId, spawn);
                 }
-                if (commands.addEmptyEntity)
+                if (commands.addEmptyEntity || commands.addFogVolume)
                 {
                     const WorldVec3 spawn = spawnAtCameraCenter();
                     const float position[3] = {spawn.x, spawn.y, spawn.z};
                     MeshSceneEntity entity = MakeEmptySceneEntity(nextEditorMeshEntityId++,
-                        makeUniqueSceneEntityName("Empty Object"), position);
+                        makeUniqueSceneEntityName(commands.addFogVolume ? "Fog Volume" : "Empty Object"), position);
+                    entity.hasFogVolume = commands.addFogVolume;
                     editorMeshEntities.push_back(entity);
                     editorMeshEntityLookup[entity.id] = editorMeshEntities.size() - 1u;
                     selectedEditorObject = {SelectedEditorObjectType::MeshEntity, entity.id};
                     editorGizmoMode = EditorGizmoMode::Translate;
                     SceneManager::Instance().MarkDirty();
-                    runtimeSession->SetEditorStatus("Empty object created: " + entity.name);
+                    runtimeSession->SetEditorStatus("Created: " + entity.name);
                     Tracenf("[EMPTY-OBJECT] Created id=%u position=(%.2f,%.2f,%.2f)",
                         entity.id, spawn.x, spawn.y, spawn.z);
                 }
@@ -14452,6 +14483,9 @@ int RunGame(NativeWindow& window,
                             offscreenScene.Width(), offscreenScene.Height());
                     }
                 }
+                if (isInWorld && drawSceneView)
+                    offscreenScene.PrepareFog(*frameInfo.commandList, frameInfo, camera, sceneSky.fog,
+                        editorMeshEntities, runtimeSession->IsMapEditorOpen());
 #if defined(IXTREEME_WITH_EDITOR)
                 // The Scene View panel shows the tone-mapped image, with the editor outlines over it.
                 if (drawSceneView && runtimeSession->IsMapEditorOpen() && editorImGui.ShowsSceneViewAsPanel())
@@ -14605,6 +14639,8 @@ int RunGame(NativeWindow& window,
                                     gameRays.volumeWeight);
                             }
                         }
+                        gameView.PrepareFog(*frameInfo.commandList, frameInfo, gameCamera, sceneSky.fog,
+                            editorMeshEntities);
                         // The panel shows the tone-mapped image, with the game's own UI (a HUD a script
                         // opened) over it, as the built game draws it over its tone-mapped window.
                         gameView.BeginDisplayPass(*frameInfo.commandList, frameInfo, frameToneMap);

@@ -727,6 +727,22 @@ Scene Settings > Sky offers Color, Procedural, Cube map (6 images) and Panorama 
 #### Result and common mistake
 Sky appears behind scene geometry. Environment > Sun controls sun position and colour; there is no separate sky-sun gizmo. Sky types expose different fields; missing images or incorrect paths are reported in status.
 
+<!-- topic: fog -->
+### Global and local fog
+
+#### Purpose
+Global fog fades distant parts of the scene. Fog Volume adds fog only inside a box or sphere. They work independently or together in Scene View, Game View and the packaged game.
+
+#### Short tutorial
+1. View > Scene Settings > Fog: enable Global fog. Start with Density 0.01, Start distance 0, Max distance 1000 and Max opacity 0.98, then choose a Color.
+2. For ground fog, enable Height fog. Density is constant below Base height and decreases above it according to Height falloff. Affect sky controls whether global fog changes the sky.
+3. Create > Fog Volume creates an invisible object with zero scale. Select it in Hierarchy and choose Box or Sphere in Inspector > Fog Volume. Add Component > Fog Volume also attaches fog to an existing object.
+4. Transform Position/Rotation sets its location and orientation; Half extents or Radius sets its size in metres. Half extents are measured from the centre: 10/3/10 means a full size of 20/6/20. Object Scale does not resize the fog volume.
+5. Edge fade softens the boundary inward; 0 makes it sharp. Save with Ctrl+S; local fog can also be saved in a prefab. The selected volume has an editor outline.
+
+#### Result and common mistake
+Density accumulates along distance: at 0.01, about 37% is transmitted over 100 metres. Volumes behind the camera or behind a wall do not obscure the surface in front of them; fog also works from inside the volume. Up to 32 active local volumes are rendered. Fog uses scene depth, so transparent materials and particles that do not write depth receive the fog of the surface behind them. Use God rays for shadow-derived light shafts.
+
 <!-- topic: post-processing -->
 ### God rays and Tone mapping
 

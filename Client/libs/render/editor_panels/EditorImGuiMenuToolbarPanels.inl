@@ -871,6 +871,9 @@ void EditorImGui::RenderSceneSettingsPanel()
             if (ImGui::CollapsingHeader(ICON_FA_SUN "  God rays", ImGuiTreeNodeFlags_DefaultOpen))
                 RenderGodRaysPanel();
 
+            if (ImGui::CollapsingHeader(ICON_FA_CLOUD_SUN "  Fog", ImGuiTreeNodeFlags_DefaultOpen))
+                RenderFogPanel();
+
             if (ImGui::CollapsingHeader(ICON_FA_CAMERA "  Tone mapping", ImGuiTreeNodeFlags_DefaultOpen))
                 RenderToneMappingPanel();
 

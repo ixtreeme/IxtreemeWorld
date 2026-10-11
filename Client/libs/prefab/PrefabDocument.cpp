@@ -684,6 +684,12 @@ void WriteMeshObject(std::ostream& out, const MeshSceneEntity& mesh, const std::
         WriteScript(out, mesh.script, indent);
     if (mesh.hasParticleSystem)
         WriteParticleSystem(out, mesh.particleSystem, indent);
+    if (mesh.hasFogVolume)
+    {
+        out << ",\n" << indent << "\"fog_volume\": {\n";
+        WriteFogFields(out, mesh.fogVolume, indent + "  ");
+        out << indent << "}";
+    }
     out << "\n";
 }
 
@@ -861,6 +867,20 @@ PrefabEntity ParseEntityObject(const std::string& object, const std::string& fal
         {
             entity.mesh.hasParticleSystem = true;
             entity.mesh.particleSystem = ReadParticleSystem(object);
+        }
+        if (const auto volume = ExtractNamedObject(object, "fog_volume"); !volume.empty())
+        {
+            entity.mesh.hasFogVolume = true;
+            auto& fog = entity.mesh.fogVolume;
+            fog.enabled = ixtreeme::common::JsonBoolValue(volume, "enabled", fog.enabled);
+            fog.shape = ixtreeme::common::JsonStringValue(volume, "shape") == "sphere" ?
+                FogVolumeComponent::Shape::Sphere : FogVolumeComponent::Shape::Box;
+            ixtreeme::common::JsonFloatArrayValue(volume, "color", fog.color, 3);
+            fog.density = ixtreeme::common::JsonFloatValue(volume, "density", fog.density);
+            ixtreeme::common::JsonFloatArrayValue(volume, "half_extents", fog.halfExtents, 3);
+            fog.radius = ixtreeme::common::JsonFloatValue(volume, "radius", fog.radius);
+            fog.edgeFade = ixtreeme::common::JsonFloatValue(volume, "edge_fade", fog.edgeFade);
+            SanitizeFog(fog);
         }
         return entity;
     }

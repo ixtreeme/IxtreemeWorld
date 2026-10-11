@@ -145,6 +145,8 @@ void EditorImGui::RenderAddComponentMenu()
             return hasMesh && m_meshRendererState.hasScript;
         if (id == "effects.particle_system")
             return hasMesh && m_meshRendererState.hasParticleSystem;
+        if (id == "effects.fog_volume")
+            return hasMesh && m_meshRendererState.hasFogVolume;
         return hasMesh && hasAttachedComponent(definition.id);
     };
 
@@ -1413,6 +1415,38 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
         ImGui::PopID();
     }
 
+    if (m_meshRendererState.hasFogVolume)
+    {
+        ImGui::PushID("effects.fog_volume");
+        const bool open = ImGui::CollapsingHeader(ICON_FA_CLOUD_SUN " Fog Volume",
+            ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
+        componentMenu("FogVolumeComponentMenu", "effects.fog_volume");
+        if (open)
+        {
+            auto& fog = m_meshRendererState.fogVolume;
+            changed |= UI::Prop::Checkbox("Enabled", &fog.enabled);
+            const char* shapes[] = {"Box", "Sphere"};
+            int shape = fog.shape == FogVolumeComponent::Shape::Sphere ? 1 : 0;
+            if (UI::Prop::Combo("Shape", &shape, shapes, 2))
+            {
+                fog.shape = shape == 1 ? FogVolumeComponent::Shape::Sphere : FogVolumeComponent::Shape::Box;
+                changed = true;
+            }
+            changed |= UI::Prop::ColorEdit3("Color", fog.color);
+            changed |= UI::Prop::DragFloat("Density", &fog.density, 0.001f, 0.0f, 10.0f, "%.4f /m");
+            UI::ItemTooltip("Higher density hides more of the scene inside this volume.");
+            if (fog.shape == FogVolumeComponent::Shape::Box)
+                changed |= UI::Prop::DragFloat3("Half extents", fog.halfExtents, 0.1f, 0.01f, 100000.0f, "%.2f m");
+            else
+                changed |= UI::Prop::DragFloat("Radius", &fog.radius, 0.1f, 0.01f, 100000.0f, "%.2f m");
+            changed |= UI::Prop::DragFloat("Edge fade", &fog.edgeFade, 0.1f, 0.0f, 100000.0f, "%.2f m");
+            UI::ItemTooltip("Softens the boundary inward. Zero makes a sharp boundary.");
+            SanitizeFog(fog);
+            ImGui::TextWrapped("Move and rotate with Transform. Volume size is in metres and works with zero object scale. Local fog also works while global fog is off.");
+        }
+        ImGui::PopID();
+    }
+
     if (m_meshRendererState.hasParticleSystem)
     {
         ImGui::PushID("effects.particle_system");
@@ -2555,6 +2589,41 @@ void EditorImGui::RenderSkyPanel()
 
     if (changed)
         SceneManager::Instance().MarkDirty();
+}
+
+void EditorImGui::RenderFogPanel()
+{
+    auto& fog = m_skySettings.fog;
+    bool changed = UI::Prop::Checkbox("Global fog", &fog.enabled);
+    changed |= UI::Prop::ColorEdit3("Color", fog.color);
+    changed |= UI::Prop::DragFloat("Density", &fog.density, 0.0001f, 0.0f, 10.0f, "%.4f /m");
+    UI::ItemTooltip("Transmission is exp(-density * distance). Density 0.01 leaves about 37% visibility over 100 metres.");
+    changed |= UI::Prop::DragFloat("Start distance", &fog.startDistance, 1.0f, 0.0f, 100000.0f, "%.1f m");
+    changed |= UI::Prop::DragFloat("Max distance", &fog.maxDistance, 1.0f, 0.1f, 100000.0f, "%.1f m");
+    UI::ItemTooltip("Global fog stops accumulating after this distance; local volumes remain independent.");
+    changed |= UI::Prop::SliderFloat("Max opacity", &fog.maxOpacity, 0.0f, 1.0f, "%.2f");
+    changed |= UI::Prop::Checkbox("Height fog", &fog.heightEnabled);
+    if (fog.heightEnabled)
+    {
+        changed |= UI::Prop::DragFloat("Base height", &fog.baseHeight, 0.1f, -100000.0f, 100000.0f, "%.1f m");
+        changed |= UI::Prop::DragFloat("Height falloff", &fog.heightFalloff, 0.001f, 0.0f, 10.0f, "%.3f /m");
+        UI::ItemTooltip("Full density below the base; density decreases exponentially above it.");
+    }
+    changed |= UI::Prop::Checkbox("Affect sky", &fog.affectSky);
+    if (changed)
+    {
+        SanitizeFog(fog);
+        SceneManager::Instance().MarkDirty();
+    }
+    ImGui::TextWrapped("Local fog: Create > Fog Volume, or Add Component > Fog Volume on an object. Global and local fog combine.");
+    const auto& entities = SceneManager::Instance().GetCurrentScene().meshEntities;
+    const auto active = std::count_if(entities.begin(), entities.end(), [](const auto& entity) {
+        return entity.hasFogVolume && entity.enabled && entity.effectiveEnabled &&
+            entity.fogVolume.enabled && entity.fogVolume.density > 0;
+    });
+    ImGui::TextDisabled("Active local volumes: %d / 32", static_cast<int>(active));
+    if (active > 32)
+        ImGui::TextWrapped("Only the first 32 active local volumes are rendered. Disable unused volumes.");
 }
 
 void EditorImGui::RenderGodRaysPanel()

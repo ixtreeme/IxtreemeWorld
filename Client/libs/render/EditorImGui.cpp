@@ -203,9 +203,9 @@ struct InspectorComponentDefinition
     bool addableToMesh;
 };
 
-const std::array<InspectorComponentDefinition, 21>& InspectorComponentRegistry()
+const std::array<InspectorComponentDefinition, 22>& InspectorComponentRegistry()
 {
-    static const std::array<InspectorComponentDefinition, 21> registry{{
+    static const std::array<InspectorComponentDefinition, 22> registry{{
         {"builtin.transform", "Transform", "Core", EditorComponentType::None, false},
         {"builtin.mesh_renderer", "MeshRenderer", "Rendering", EditorComponentType::MeshRenderer, false},
         {kLodComponentId, "LOD Group", "Rendering", EditorComponentType::None, true},
@@ -223,6 +223,7 @@ const std::array<InspectorComponentDefinition, 21>& InspectorComponentRegistry()
         {"audio.audio_listener", "Audio Listener", "Audio", EditorComponentType::AudioListener, true},
         {"scripting.script", "Script", "Scripting", EditorComponentType::Script, true},
         {"effects.particle_system", "Particle System", "Effects", EditorComponentType::ParticleSystem, true},
+        {"effects.fog_volume", "Fog Volume", "Effects", EditorComponentType::FogVolume, true},
         {"builtin.water_body", "Water Body", "Rendering", EditorComponentType::WaterBody, false},
         {"builtin.point_light", "Point Light", "Lighting", EditorComponentType::PointLight, false},
         {"builtin.spot_light", "Spot Light", "Lighting", EditorComponentType::SpotLight, false},

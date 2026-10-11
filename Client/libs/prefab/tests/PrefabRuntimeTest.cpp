@@ -134,9 +134,19 @@ int main()
     auto empty = MakeEmptySceneEntity(55, "Empty emitter", position);
     empty.hasParticleSystem = true;
     empty.particleSystem.turbulenceEnabled = true;
+    empty.hasFogVolume = true;
+    empty.fogVolume.shape = FogVolumeComponent::Shape::Sphere;
+    empty.fogVolume.radius = 7;
+    empty.fogVolume.edgeFade = 2;
+    empty.fogVolume.color[1] = 0.33f;
     std::ostringstream emptyText;
     pf::WriteMesh(emptyText, empty, "Empty emitter");
     const auto emptyDocument = pf::ParseDocument(emptyText.str(), "empty fixture");
+    check(emptyDocument.entities.size() == 1 && emptyDocument.entities[0].mesh.hasFogVolume &&
+        emptyDocument.entities[0].mesh.fogVolume.shape == FogVolumeComponent::Shape::Sphere &&
+        emptyDocument.entities[0].mesh.fogVolume.radius == 7 && emptyDocument.entities[0].mesh.fogVolume.edgeFade == 2 &&
+        std::abs(emptyDocument.entities[0].mesh.fogVolume.color[1] - 0.33f) < 0.0001f,
+        "local fog survives prefab serialization");
     check(emptyDocument.entities.size() == 1 &&
         !emptyDocument.entities[0].mesh.HasMeshGeometry() &&
         emptyDocument.entities[0].mesh.scale[0] == 0 &&
@@ -149,5 +159,8 @@ int main()
         !instance.meshes[0].HasMeshGeometry() && instance.meshes[0].scale[0] == 0 &&
         instance.meshes[0].particleSystem.turbulenceEnabled,
         "empty particle prefab instantiates at runtime without a model");
+    check(instance.meshes.size() == 1 && instance.meshes[0].hasFogVolume &&
+        instance.meshes[0].fogVolume.radius == 7 && instance.meshes[0].scale[0] == 0,
+        "local fog prefab instantiates on a zero-scale host");
     return failures == 0 ? 0 : 1;
 }

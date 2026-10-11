@@ -727,6 +727,22 @@ A Scene Settings > Sky négy módot kínál: Color, Procedural, Cube map (6 imag
 #### Eredmény és gyakori hiba
 Az égbolt háttérként jelenik meg a geometria mögött. A nap helyét és színét az Environment > Sun adja, nem külön gizmo. Más égbolttípushoz eltérő mezők tartoznak; hiányzó kép vagy rossz útvonal esetén a státusz segít.
 
+<!-- topic: fog -->
+### Globális és lokális köd
+
+#### Mire jó?
+A globális köd az egész jelenet távoli részeit halványítja. A Fog Volume csak a kijelölt doboz vagy gömb belsejében hoz létre ködöt; önállóan és a globális köddel együtt is működik a Scene View, Game View és a kiadott játék képén.
+
+#### Rövid tutorial
+1. View > Scene Settings > Fog: kapcsold be a Global fog jelölést. Kezdetnek Density 0.01, Start distance 0, Max distance 1000 és Max opacity 0.98; válassz Color színt.
+2. Talajködhöz kapcsold be a Height fog mezőt: a Base height alatt teljes a sűrűség, fölötte a Height falloff ritkítja. Az Affect sky a globális köd égboltra gyakorolt hatását kapcsolja.
+3. Create > Fog Volume: létrejön egy láthatatlan, nulla scale-ű objektum. A Hierarchy-ban kijelölve az Inspector > Fog Volume alatt válassz Box vagy Sphere alakot. Más objektumra az Add Component > Fog Volume paranccsal is rátehető.
+4. A Transform Position/Rotation a helyét és irányát, a Half extents vagy Radius a méretét adja méterben. A Half extents a középponttól mért félméret: 10/3/10 teljes mérete 20/6/20. Az objektum Scale értéke nem méretezi a ködtérfogatot.
+5. Az Edge fade befelé lágyítja a szélét, 0 éles perem. Ments Ctrl+S-sel; a lokális köd prefabként is tárolható. A kijelölt térfogat körvonala az editorban látható.
+
+#### Eredmény és gyakori hiba
+A sűrűség távolságonként halmozódik: 0.01 mellett 100 méteren kb. 37% marad átengedve. Egy kamera mögötti vagy fal mögötti térfogat nem takarja el az előtte lévő felületet; a kamerán belülről is látható a köd. Legfeljebb 32 aktív lokális térfogat jelenik meg. A rendszer a jelenet mélységéből dolgozik, ezért a mélységet nem író átlátszó anyagok és részecskék a mögöttük lévő felület ködét kapják. Ez a köd nem hoz létre árnyékból képzett fénysugarakat; azokhoz a God rays beállításokat használd.
+
 <!-- topic: post-processing -->
 ### God rays és Tone mapping
 

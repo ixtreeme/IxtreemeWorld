@@ -1126,7 +1126,45 @@ SkySettings::Mode SkyModeFromName(const std::string& name, SkySettings::Mode fal
     return fallback;
 }
 
-// The "sky" object inside "environment".
+// Fog and sky objects inside the environment.
+void WriteGlobalFog(std::ostream& out, const GlobalFogSettings& fog)
+{
+    out << "    \"fog\": {\n";
+    WriteFogFields(out, fog, "      ");
+    out << "    }";
+}
+
+GlobalFogSettings ReadGlobalFog(const JsonValue& object)
+{
+    GlobalFogSettings fog;
+    fog.enabled = ReadBool(object, "enabled", fog.enabled);
+    ReadFloatArray(object, "color", fog.color, 3);
+    fog.density = ReadFloat(object, "density", fog.density);
+    fog.startDistance = ReadFloat(object, "start_distance", fog.startDistance);
+    fog.maxDistance = ReadFloat(object, "max_distance", fog.maxDistance);
+    fog.maxOpacity = ReadFloat(object, "max_opacity", fog.maxOpacity);
+    fog.heightEnabled = ReadBool(object, "height_enabled", fog.heightEnabled);
+    fog.baseHeight = ReadFloat(object, "base_height", fog.baseHeight);
+    fog.heightFalloff = ReadFloat(object, "height_falloff", fog.heightFalloff);
+    fog.affectSky = ReadBool(object, "affect_sky", fog.affectSky);
+    SanitizeFog(fog);
+    return fog;
+}
+
+FogVolumeComponent ReadFogVolume(const JsonValue& object)
+{
+    FogVolumeComponent fog;
+    fog.enabled = ReadBool(object, "enabled", fog.enabled);
+    fog.shape = ReadString(object, "shape") == "sphere" ? FogVolumeComponent::Shape::Sphere : FogVolumeComponent::Shape::Box;
+    ReadFloatArray(object, "color", fog.color, 3);
+    fog.density = ReadFloat(object, "density", fog.density);
+    ReadFloatArray(object, "half_extents", fog.halfExtents, 3);
+    fog.radius = ReadFloat(object, "radius", fog.radius);
+    fog.edgeFade = ReadFloat(object, "edge_fade", fog.edgeFade);
+    SanitizeFog(fog);
+    return fog;
+}
+
 void WriteSkySettings(std::ostream& out, const SkySettings& sky)
 {
     out << "    \"sky\": {\n";
@@ -1717,6 +1755,12 @@ void WriteSceneEntity(std::ostream& out, const MeshSceneEntity& mesh, bool comma
         out << ",\n";
         WriteParticleSystemComponent(out, mesh.particleSystem);
     }
+    if (mesh.hasFogVolume)
+    {
+        out << ",\n      \"fog_volume\": {\n";
+        WriteFogFields(out, mesh.fogVolume, "        ");
+        out << "      }";
+    }
     out << "\n";
     out << "    }" << (comma ? "," : "") << "\n";
 }
@@ -2204,6 +2248,11 @@ MeshSceneEntity ReadMeshSceneEntity(const JsonValue& entity)
         mesh.hasParticleSystem = true;
         mesh.particleSystem = ReadParticleSystemComponent(entity);
     }
+    if (const JsonValue* object = Find(entity, "fog_volume"); object && object->type == JsonValue::Type::Object)
+    {
+        mesh.hasFogVolume = true;
+        mesh.fogVolume = ReadFogVolume(*object);
+    }
     if (mesh.lod.enabled &&
         std::none_of(mesh.editorComponents.begin(), mesh.editorComponents.end(), [](const EditorAttachedComponent& component) {
             return component.type == "rendering.lod";
@@ -2481,6 +2530,8 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
         if (const JsonValue* toneMapping = Find(*env, "tone_mapping");
             toneMapping && toneMapping->type == JsonValue::Type::Object)
             ReadToneMapping(*toneMapping, scene.sky);
+        if (const JsonValue* fog = Find(*env, "fog"); fog && fog->type == JsonValue::Type::Object)
+            scene.sky.fog = ReadGlobalFog(*fog);
     }
     if (const JsonValue* physics = Find(root, "physics"); physics && physics->type == JsonValue::Type::Object)
     {
@@ -2826,6 +2877,8 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     WriteSkySettings(out, scene.sky);
     out << ",\n";
     WriteToneMapping(out, scene.sky);
+    out << ",\n";
+    WriteGlobalFog(out, scene.sky.fog);
     out << "\n  },\n";
     out << "  \"physics\": {\n";
     out << "    \"gravity\": " << FloatArray(scene.physics.gravity, 3) << ",\n";

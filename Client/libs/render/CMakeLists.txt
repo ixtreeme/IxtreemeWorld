@@ -11,6 +11,10 @@ add_library(IXEngineRender STATIC
     editor_panels/EditorImGuiProjectPanels.inl
     editor_panels/EditorImGuiSceneViewPanels.inl
     MapEditorTypes.h
+    FogSettings.h
+    FogSettings.cpp
+    FogMath.h
+    FogMath.cpp
     WorldLabelRenderer.cpp
     WorldLabelRenderer.h
     ParticleRenderer.cpp
@@ -160,6 +164,27 @@ endif()
 target_compile_features(IXEngineRender PUBLIC cxx_std_20)
 
 if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(FogSystemTest tests/FogSystemTest.cpp)
+    target_link_libraries(FogSystemTest PRIVATE IXEngineRender)
+    if(WIN32)
+        target_link_libraries(FogSystemTest PRIVATE IXEngineVulkan)
+        target_compile_definitions(FogSystemTest PRIVATE IX_FOG_TEST_ASSETS_ROOT="${CLIENT_ROOT}"
+            IX_FOG_TEST_SHADER_ROOT="${CMAKE_CURRENT_BINARY_DIR}")
+        foreach(_fog_test_entry IN ITEMS CSMain SampleCS)
+            set(_fog_test_output "${CMAKE_CURRENT_BINARY_DIR}/fog_test_${_fog_test_entry}.spv")
+            add_custom_command(OUTPUT "${_fog_test_output}"
+                COMMAND "${DXC_EXECUTABLE}" -spirv -T cs_6_0 -E ${_fog_test_entry}
+                    -I "${CLIENT_ROOT}/shaders" -Fo "${_fog_test_output}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/FogMathTest.hlsl"
+                DEPENDS tests/FogMathTest.hlsl "${CLIENT_ROOT}/shaders/Fog.hlsli" VERBATIM)
+            target_sources(FogSystemTest PRIVATE "${_fog_test_output}")
+        endforeach()
+        add_dependencies(FogSystemTest IXEngineShaders)
+    endif()
+    if(MSVC)
+        set_target_properties(FogSystemTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME FogSystemTest COMMAND FogSystemTest)
+
     add_executable(ParticleTurbulenceTest tests/ParticleTurbulenceTest.cpp)
     target_link_libraries(ParticleTurbulenceTest PRIVATE IXEngineRender IXEngineParticle)
     target_compile_features(ParticleTurbulenceTest PRIVATE cxx_std_20)

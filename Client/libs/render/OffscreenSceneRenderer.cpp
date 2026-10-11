@@ -106,6 +106,8 @@ void OffscreenSceneRenderer::BeginMainPass(ixrhi::IXRHICommandList& cmd,
         // A new frame's scene: the light added to the last one (SetAddedLight) no longer applies.
         m_addedLight = {};
         m_addedLightWeight = {};
+        m_fogUniforms = {};
+        m_fogDepth.reset();
     }
     if (clear)
         m_activeTarget = storeDepth ? m_clearTarget.get() : m_clearTargetNoDepthStore.get();
@@ -255,6 +257,18 @@ void OffscreenSceneRenderer::SetAddedLight(const std::shared_ptr<ixrhi::IXRHITex
     m_addedLightWeight = {first ? firstWeight : 0.0f, second ? secondWeight : 0.0f};
 }
 
+void OffscreenSceneRenderer::PrepareFog(ixrhi::IXRHICommandList& cmd, const ixrhi::IXRHIFrameInfo& frame,
+                                       const WorldCamera& camera, const GlobalFogSettings& global,
+                                       std::span<const MeshSceneEntity> entities, bool respectEditorHidden)
+{
+    m_fogUniforms = {};
+    m_fogDepth.reset();
+    if (!m_ready || !frame.frameActive || m_passActive || m_displayPassActive) return;
+    if (BuildFogUniforms(m_fogUniforms, camera, global, entities, respectEditorHidden))
+        m_fogDepth = ReadableDepth(cmd, frame);
+    if (!m_fogDepth) m_fogUniforms = {};
+}
+
 void OffscreenSceneRenderer::DrawToneMap(ixrhi::IXRHICommandList& cmd,
                                          const ixrhi::IXRHIFrameInfo& frame,
                                          const ixrhi::IXRHIGraphicsPipeline& pipeline,
@@ -263,6 +277,15 @@ void OffscreenSceneRenderer::DrawToneMap(ixrhi::IXRHICommandList& cmd,
     // This frame slot's set: the GPU is done with it (its frame's fence was waited for). An image
     // not added this frame is bound as the scene color, weighed 0.
     const std::uint32_t set = frame.frameIndex % kToneMapSets;
+    // When fog is off, bind readable colour as the unused depth slot; never bind depth still in
+    // attachment layout. Per-frame buffers and descriptors are updated only after its fence.
+    const auto& fogDepth = m_fogDepth ? m_fogDepth : m_color;
+    if (m_boundFogDepth[set] != fogDepth)
+    {
+        m_bindGroup->UpdateTexture(set, 3, fogDepth, m_sampler);
+        m_boundFogDepth[set] = fogDepth;
+    }
+    m_fogBuffers[set]->Write(0, &m_fogUniforms, sizeof(m_fogUniforms));
     for (std::uint32_t i = 0; i < 2; ++i)
     {
         const std::shared_ptr<ixrhi::IXRHITexture>& image = m_addedLight[i] ? m_addedLight[i] : m_color;
@@ -295,6 +318,10 @@ void OffscreenSceneRenderer::Destroy()
     m_addedLight = {};
     m_addedLightWeight = {};
     m_boundAddedLight = {};
+    m_fogUniforms = {};
+    m_fogDepth.reset();
+    m_boundFogDepth = {};
+    m_fogBuffers = {};
     m_bindGroup.reset();
     m_bindLayout.reset();
     m_compositeVs.reset();
@@ -463,6 +490,8 @@ bool OffscreenSceneRenderer::CreateComposite(ixrhi::IXRHIDevice& rhi)
         {0, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
         {1, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
         {2, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+        {3, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
+        {4, ixrhi::IXRHIBindingType::UniformBuffer, ixrhi::IXRHIShaderStage::Fragment},
     };
     m_bindLayout = rhi.CreateBindGroupLayout(bindings);
     if (!m_bindLayout)
@@ -472,9 +501,18 @@ bool OffscreenSceneRenderer::CreateComposite(ixrhi::IXRHIDevice& rhi)
         return false;
     for (std::uint32_t set = 0; set < kToneMapSets; ++set)
     {
-        for (std::uint32_t binding = 0; binding < 3; ++binding)
+        for (std::uint32_t binding = 0; binding < 4; ++binding)
             m_bindGroup->UpdateTexture(set, binding, m_color, m_sampler);
         m_boundAddedLight[set] = {m_color, m_color};
+        m_boundFogDepth[set] = m_color;
+        ixrhi::IXRHIBufferDesc bufferDesc;
+        bufferDesc.sizeBytes = sizeof(FogUniforms);
+        bufferDesc.usage = ixrhi::IXRHIBufferUsage::Uniform;
+        bufferDesc.cpuAccess = ixrhi::IXRHICpuAccess::Write;
+        bufferDesc.debugName = m_tag + ".Fog";
+        m_fogBuffers[set] = rhi.CreateBuffer(bufferDesc, &m_fogUniforms, sizeof(m_fogUniforms));
+        if (!m_fogBuffers[set]) return false;
+        m_bindGroup->UpdateBuffer(set, 4, m_fogBuffers[set], 0, sizeof(FogUniforms));
     }
 
     ixrhi::IXRHIGraphicsPipelineDesc desc;

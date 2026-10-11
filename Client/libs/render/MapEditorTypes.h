@@ -4,6 +4,7 @@
 #include "audio/AudioComponents.h"
 #include "script/ScriptComponent.h"
 #include "particles/ParticleComponents.h"
+#include "FogSettings.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -242,6 +243,8 @@ struct LightingState
 // The scene's sky: what every view shows behind the geometry, and what the water mirrors.
 struct SkySettings
 {
+    // Saved beside the sky as environment.fog; shared by Scene, Game and packaged runtime views.
+    GlobalFogSettings fog;
     enum class Mode : std::int32_t
     {
         Color = 0,       // one flat colour
@@ -476,6 +479,8 @@ struct MeshSceneEntity
     ixscript::ScriptComponent script;
     bool hasParticleSystem = false;
     ixparticle::ParticleSystemComponent particleSystem;
+    bool hasFogVolume = false;
+    FogVolumeComponent fogVolume;
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;
@@ -565,7 +570,8 @@ enum class EditorComponentType
     AudioSource,
     AudioListener,
     Script,
-    ParticleSystem
+    ParticleSystem,
+    FogVolume
 };
 
 struct HierarchySceneEntity
@@ -655,6 +661,8 @@ struct MeshRendererEditorState
     ixscript::ScriptComponent script;
     bool hasParticleSystem = false;
     ixparticle::ParticleSystemComponent particleSystem;
+    bool hasFogVolume = false;
+    FogVolumeComponent fogVolume;
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;
@@ -952,6 +960,7 @@ struct MapEditorCommands
     TerrainSceneData terrainCreate;
     bool addMeshEntity = false;
     bool addEmptyEntity = false;
+    bool addFogVolume = false;
     std::string meshAssetId;
     bool meshDropScreenPositionValid = false;
     float meshDropScreenPosition[2] = {0.0f, 0.0f};

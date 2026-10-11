@@ -437,6 +437,7 @@ if(WIN32)
         COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain
             -Fo "${COMPOSITE_VS_SPV}" "${CLIENT_ROOT}/shaders/Composite.hlsl"
         DEPENDS "${CLIENT_ROOT}/shaders/Composite.hlsl"
+                "${CLIENT_ROOT}/shaders/Fog.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -445,6 +446,7 @@ if(WIN32)
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain
             -Fo "${COMPOSITE_PS_SPV}" "${CLIENT_ROOT}/shaders/Composite.hlsl"
         DEPENDS "${CLIENT_ROOT}/shaders/Composite.hlsl"
+                "${CLIENT_ROOT}/shaders/Fog.hlsli"
         VERBATIM
     )
     add_custom_command(
