@@ -1,0 +1,7 @@
+add_executable(BlackwaterHollowBuilder EXCLUDE_FROM_ALL BuildScene.cpp)
+target_link_libraries(BlackwaterHollowBuilder PRIVATE IXEngineRender)
+target_compile_features(BlackwaterHollowBuilder PRIVATE cxx_std_20)
+target_compile_definitions(BlackwaterHollowBuilder PRIVATE BWH_ENGINE_ROOT="${CLIENT_ROOT}")
+if(MSVC)
+    set_target_properties(BlackwaterHollowBuilder PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()

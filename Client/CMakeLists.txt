@@ -720,6 +720,10 @@ add_subdirectory(libs/selection_system)
 add_subdirectory(Editor/Build)
 add_subdirectory(apps/client)
 
+if(NOT ANDROID AND IXTREEME_WITH_EDITOR)
+    add_subdirectory(tools/blackwater_hollow)
+endif()
+
 foreach(_ixengine_target IN ITEMS
     IXEngineMath
     IXEngineTree
