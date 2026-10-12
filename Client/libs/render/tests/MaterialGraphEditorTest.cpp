@@ -4,6 +4,7 @@
 #include "tools/material/MaterialInstance.h"
 #include "GeometryFixtures.h"
 #include "asset/AssetDatabase.h"
+#include "MeshTransform.h"
 #include "IconsFontAwesome6.h"
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -80,6 +81,9 @@ struct MaterialGraphPanelTestAccess
     static const std::string& Error(const MaterialGraphPanel& panel) {return panel.compileError_;}
     static bool PendingOpen(const MaterialGraphPanel& panel, const std::filesystem::path& path)
     { return panel.requestUnsaved_ && panel.pendingOpen_ && panel.pendingPath_ == path; }
+    static void ApplyQuality(MaterialGraphPanel& panel) { panel.applyResolution_=0; }
+    static void Poll(MaterialGraphPanel& panel) { panel.PollGeometryBake(); }
+    static bool Running(const MaterialGraphPanel& panel) { return panel.geometryJob_.Running(); }
     static const MaterialCompileResult& Layout(const MaterialGraphPanel& panel) {return panel.program_.Layout();}
     static void NumericOverride(MaterialGraphPanel& panel,const std::string& name,float value) {panel.parameters_.values[name]={value,0,0,0};panel.previewDirty_=true;}
 };
@@ -364,6 +368,54 @@ void Editor(bool capture)
         Check(!MaterialGraphPanelTestAccess::Error(panel).empty() && MaterialGraphPanelTestAccess::Pixels(panel)==generatorPixels,"corrupt generator preserves last valid preview with diagnostic");
         SaveMaterialTextAtomic(movedGenerator,generatorText,error);frame();frame();Check(MaterialGraphPanelTestAccess::Error(panel).empty(),"repaired generator recovers preview automatically");
         const auto intactGeneratorGraph=panel.Document();Check(!panel.AddGeneratorAsset(movedGenerator,999999) && panel.Document()==intactGeneratorGraph,"invalid generator layer target preserves current material");
+        MaterialGraphPanel applyPanel;applyPanel.SetServices(&smartLibrary,nullptr);
+        Check(applyPanel.Load(generatedFile),"quick apply opens the full generator material");
+        MeshRendererEditorState target;target.selected=true;target.id=77;target.name="Quick apply box";target.meshAssetPath=meshFile.string();
+        target.meshAssetId=AssetDatabase::Instance().getOrCreateGuid(meshFile).toString();
+        target.position[0]=3;target.position[1]=-1;target.position[2]=2;
+        target.rotation[0]=.2f;target.rotation[1]=.4f;target.rotation[2]=-.1f;
+        target.scale[0]=2;target.scale[1]=.7f;target.scale[2]=1.5f;
+        applyPanel.SetApplyTarget(target,meshFile,true);MaterialGraphPanelTestAccess::ApplyQuality(applyPanel);
+        MaterialGraphPanelTestAccess::NumericOverride(applyPanel,parameter,.42f);
+        const auto requestedDocument=applyPanel.Document();
+        Check(applyPanel.BakeAndApply(),"one Bake & Apply action starts real model geometry baking without saving a definition or cache");
+        MaterialGraphPanelTestAccess::DisableLayer(applyPanel);const auto editedDuringBake=applyPanel.Document();
+        std::optional<SmartMaterialAssignment> applied;
+        const auto applyDeadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+        while(!applied && std::chrono::steady_clock::now()<applyDeadline) {
+            MaterialGraphPanelTestAccess::Poll(applyPanel);applied=applyPanel.TakeMaterialAssignment();std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        Check(applied && applied->entityId==77 && applied->slot==0 && !applied->materialGuid.empty() && applyPanel.Document()==editedDuringBake,
+              "quick apply completes against its captured target and leaves edits made during baking intact");
+        if(applied) {
+            const auto materialPath=AssetDatabase::Instance().resolveGuid(*Guid::fromString(applied->materialGuid));
+            MaterialGraphDocument authored,effective;std::string text;
+            Check(materialPath && LoadMaterialText(materialPath->parent_path()/"definition.materialgraph",text,error) && authored.FromJson(text,error) && authored==requestedDocument,
+                  "quick apply records the requested authored graph snapshot rather than subsequent edits");
+            Check(materialPath && LoadMaterialText(materialPath->parent_path()/"source.materialgraph",text,error) && effective.FromJson(text,error) &&
+                  std::any_of(effective.nodes.begin(),effective.nodes.end(),[&](const auto& n){return n.parameter==parameter && n.value[0]==.42f;}),
+                  "quick apply retains the captured scoped instance override");
+            const auto bakedGuid=materialPath?AssetDatabase::Instance().resolvePath(materialPath->parent_path()/"geometry.ixgeometrybake"):std::nullopt;
+            GraphGeometryCache appliedGeometry;
+            Check(bakedGuid && appliedGeometry.Bind(bakedGuid->toString(),error) &&
+                  appliedGeometry.Bake()->settings.objectToWorld==SelectedMeshBakeSettings(target,128).objectToWorld,
+                  "automatic geometry snapshot retains actual model placement, Euler rotation and nonuniform scale");
+            if(appliedGeometry.Bake()) {
+                const auto& bake=*appliedGeometry.Bake();const auto model=MeshModelMatrix(target.position,target.rotation,target.scale);
+                const auto at=std::find(bake.coverage.begin(),bake.coverage.end(),1);bool matches=false;
+                if(at!=bake.coverage.end()) {const auto& sample=bake.texels[at-bake.coverage.begin()];
+                    const auto rendered=ixtreeme::math::TransformPointRowVector(model.m,{sample.objectPosition[0],sample.objectPosition[1],sample.objectPosition[2]});
+                    matches=std::abs(sample.worldPosition[0]-rendered.x)<.0001f && std::abs(sample.worldPosition[1]-rendered.y)<.0001f && std::abs(sample.worldPosition[2]-rendered.z)<.0001f;}
+                Check(matches,"geometry world positions use the same model matrix convention as the static renderer");
+            }
+        }
+        const auto countBeforeCancel=smartLibrary.EntriesFor(AssetLibrary::Category::Material).size();
+        Check(applyPanel.BakeAndApply(),"a second quick apply can start after consuming the previous result");applyPanel.CancelBakeAndApply();
+        const auto cancelDeadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(MaterialGraphPanelTestAccess::Running(applyPanel) && std::chrono::steady_clock::now()<cancelDeadline)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        MaterialGraphPanelTestAccess::Poll(applyPanel);
+        Check(!applyPanel.TakeMaterialAssignment() && smartLibrary.EntriesFor(AssetLibrary::Category::Material).size()==countBeforeCancel,
+              "cancelled quick apply publishes no material and queues no scene assignment");
         const auto validGeometryPixels=MaterialGraphPanelTestAccess::Pixels(panel);
         SaveMaterialTextAtomic(cacheFile,"broken geometry",error);frame();frame();
         Check(!MaterialGraphPanelTestAccess::Error(panel).empty() && MaterialGraphPanelTestAccess::Pixels(panel)==validGeometryPixels,"invalid geometry keeps the last valid real-mesh preview");

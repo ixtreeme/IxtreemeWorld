@@ -18,6 +18,7 @@
 #include "JobSystem.h"
 #include "LODSystem.h"
 #include "MaterialAssetManager.h"
+#include "tools/material/SmartMaterialApplication.h"
 #include "MeshSystem.h"
 #include "NativeWindow.h"
 #include "AnimationRuntime.h"
@@ -1807,6 +1808,7 @@ std::vector<SelectionOutlineRenderer::Line> BuildPhysicsDebugLines(const std::ve
 
 void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& source)
 {
+    target.smartMaterialAssignments.insert(target.smartMaterialAssignments.end(),source.smartMaterialAssignments.begin(),source.smartMaterialAssignments.end());
     target.generateLayers = target.generateLayers || source.generateLayers;
     target.exportLayers = target.exportLayers || source.exportLayers;
     if (source.exportServerWorld)
@@ -11286,6 +11288,32 @@ int RunGame(NativeWindow& window,
                 }
                 if (commands.selectedMeshEntityChanged)
                     applyPendingSelectedMeshEntityChange();
+                // Apply after this frame's scene edits so an asynchronous result cannot undo them.
+                for (const auto& assignment : commands.smartMaterialAssignments)
+                {
+                    auto mesh=std::find_if(editorMeshEntities.begin(),editorMeshEntities.end(),[&](const MeshSceneEntity& candidate){return candidate.id==assignment.entityId;});
+                    std::string error;
+                    std::error_code assetRootError;
+                    const bool sameAssetRoot=ProjectManager::Instance().HasProject() && std::filesystem::equivalent(
+                        ProjectManager::Instance().AssetRootPath(),std::filesystem::path(assignment.assetRoot),assetRootError);
+                    if (editorPlay.state.mode != EditorPlayMode::Edit)
+                        error="Return to Edit mode to apply the baked material; output remains in Asset Browser.";
+                    else if (!sameAssetRoot)
+                        error="Project changed during baking; the material was kept in the original project's Asset Browser.";
+                    else if (mesh==editorMeshEntities.end()) error="The baked model was deleted; output remains in Asset Browser.";
+                    else {
+                        auto updated=*mesh;
+                        EnsureMeshEntityMaterialSlots(updated);
+                        if (material_tool::ApplySmartMaterialAssignment(updated,assignment,error)) {
+                            mesh->materialSlots=std::move(updated.materialSlots);
+                            mesh->materialOverrides=std::move(updated.materialOverrides);
+                            SceneManager::Instance().MarkDirty();
+                            runtimeSession->SetEditorStatus("Smart material applied to model");
+                        }
+                    }
+                    if (!error.empty()) runtimeSession->SetEditorStatus(error);
+                }
+                commands.smartMaterialAssignments.clear();
                 if (commands.dumpMaterialState)
                 {
                     Tracenf("[MATBIND-DIAG] dump requested meshEntities=%zu", editorMeshEntities.size());

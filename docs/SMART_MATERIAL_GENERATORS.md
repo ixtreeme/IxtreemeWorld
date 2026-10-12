@@ -24,8 +24,11 @@ no generator evaluator or generator-specific operational node.
    `Subgraph_<node ID>/...` scope. Existing instance files retain these overrides
    and optional geometry GUID. The optional Scalar **NoiseMask** input accepts an
    external mask; its unconnected default is 1.
-4. Geometry material publication uses existing PNG/ORM/native material handling,
-   retaining authored dependencies, effective source/overrides and geometry snapshot.
+4. Select the model in Hierarchy and use **Material preview > Apply to model >
+   Bake & Apply to selected model** on the full material. This bakes the selected
+   submesh with the actual model transform, saves the material and assigns the slot
+   in one action. It retains authored dependencies, effective source/overrides and
+   geometry snapshot; separate cache saving and material drag/drop are unnecessary.
 
 Missing/malformed presets retain the last valid image. GUID moves keep references;
 file edits invalidate the shared subgraph cache. **Reload subgraphs** rereads edits

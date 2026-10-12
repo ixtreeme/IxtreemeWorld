@@ -884,8 +884,17 @@ struct PhysicsEventEditorState
     float penetrationDepth = 0.0f;
 };
 
+struct SmartMaterialAssignment
+{
+    std::uint32_t entityId = 0, slot = 0;
+    std::string meshAssetId, meshAssetPath, previousMaterialGuid, materialGuid, assetRoot;
+    MeshSceneEntity::MaterialOverride previousOverride;
+    std::array<float, 3> position{}, rotation{}, scale{1, 1, 1};
+};
+
 struct MapEditorCommands
 {
+    std::vector<SmartMaterialAssignment> smartMaterialAssignments;
     bool save = false;
     bool reload = false;
     bool undo = false;

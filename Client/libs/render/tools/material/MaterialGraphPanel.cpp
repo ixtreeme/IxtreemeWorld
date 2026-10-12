@@ -53,7 +53,7 @@ MaterialGraphPanel::MaterialGraphPanel() = default;
 MaterialGraphPanel::~MaterialGraphPanel() { ResetContext(); if(provider_ && previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_); }
 void MaterialGraphPanel::SetServices(AssetLibrary* library,ixeditor::graphics::IEditorTextureProvider* provider) {
     if(provider_!=provider) {if(provider_ && previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_);previewTexture_={};provider_=provider;previewDirty_=true;}
-    if(library_!=library){library_=library;textures_.Clear();subgraphs_.Clear();forceCompile_=true;parameters_={};previewDirty_=true;}
+    if(library_!=library){if(applyRequest_)geometryJob_.Cancel();applyRequest_.reset();materialAssignment_.reset();library_=library;textures_.Clear();subgraphs_.Clear();forceCompile_=true;parameters_={};previewDirty_=true;}
     textures_.Configure(library_,path_.parent_path());
 }
 void MaterialGraphPanel::ResetContext()
@@ -787,11 +787,63 @@ void MaterialGraphPanel::UpdatePreview()
         if(texture.IsValid()){if(previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_);previewTexture_=texture;}
     }
 }
+void MaterialGraphPanel::SetApplyTarget(const MeshRendererEditorState& mesh, const std::filesystem::path& path, bool allowed)
+{
+    applyTarget_ = mesh; applyModelPath_ = path; applyAllowed_ = allowed;
+}
+bool MaterialGraphPanel::BakeAndApply()
+{
+    if (!library_ || !applyAllowed_ || !applyTarget_.selected || applyTarget_.skinned || applyModelPath_.empty())
+    { status_ = "Select an imported static model in Edit mode before Bake & Apply."; return false; }
+    if (subgraphMode_) { status_ = "Open a full smart material with a PBR Output; generator recipes supply layer masks."; return false; }
+    if (geometryJob_.Running() || applyRequest_ || materialAssignment_)
+    { status_ = "Finish or cancel the current Bake & Apply first."; return false; }
+    MaterialGraphProgram checked;
+    if (!CompileMaterial(checked,status_) || !checked.ValidateOverrides(parameters_,status_)) return false;
+    GraphGeometryCache selected;
+    if (!selected.Select(applyModelPath_,applyTarget_.selectedMaterialSlot,status_)) return false;
+    const auto settings = SelectedMeshBakeSettings(applyTarget_,128U << applyResolution_);
+    if (!geometryJob_.Start(*selected.Mesh(),settings)) { status_ = "Geometry bake could not start."; return false; }
+    ApplyRequest request;
+    request.target = CaptureSmartMaterialTarget(applyTarget_);
+    request.target.assetRoot = library_->LibraryRoot().lexically_normal().generic_string();
+    request.document = document_; request.parameters = parameters_; request.graphFolder = path_.parent_path();
+    request.name = applyTarget_.name.empty() ? "SmartMaterial" : applyTarget_.name + " SmartMaterial";
+    applyRequest_ = std::move(request); geometry_ = std::move(selected); geometrySettings_ = settings;
+    status_ = "Bake & Apply: baking model geometry..."; return true;
+}
+std::optional<SmartMaterialAssignment> MaterialGraphPanel::TakeMaterialAssignment()
+{
+    return std::exchange(materialAssignment_,std::nullopt);
+}
+void MaterialGraphPanel::CancelBakeAndApply()
+{
+    if (applyRequest_) { geometryJob_.Cancel(); applyRequest_.reset(); status_="Bake & Apply cancelled; model material kept."; }
+}
+void MaterialGraphPanel::RenderApplyMaterial()
+{
+    ImGui::SeparatorText("Apply to model");
+    if (applyTarget_.selected) ImGui::Text("%s / Material Slot %u",applyTarget_.name.c_str(),applyTarget_.selectedMaterialSlot+1);
+    else ImGui::TextDisabled("Select a model in Hierarchy.");
+    if (applyTarget_.selected && (applyTarget_.skinned || applyModelPath_.empty())) ImGui::TextDisabled("An imported static model is required.");
+    const char* sizes[] = {"128","256","512"};
+    UI::Prop::Combo("Apply resolution",&applyResolution_,sizes,3);
+    ImGui::BeginDisabled(!applyAllowed_ || !applyTarget_.selected || applyTarget_.skinned || applyModelPath_.empty() || subgraphMode_ || geometryJob_.Running());
+    if (ImGui::Button("Bake & Apply to selected model")) BakeAndApply();
+    ImGui::EndDisabled();
+    if (subgraphMode_) ImGui::TextWrapped("Generator recipes are layer masks. Open a full smart material to apply its appearance.");
+    if (applyRequest_) {
+        ImGui::ProgressBar(geometryJob_.Progress());
+        if (ImGui::Button("Cancel Bake & Apply")) CancelBakeAndApply();
+    }
+    ImGui::TextWrapped("Bakes geometry and textures, saves the material, and assigns this slot automatically. Moving the model later requires rebaking world-dependent effects.");
+}
 void MaterialGraphPanel::RenderPreview()
 {
     if(!ImGui::CollapsingHeader("Material preview",ImGuiTreeNodeFlags_DefaultOpen))return;
     int channel=static_cast<int>(previewSettings_.channel);const char* channels[]={"Shaded","Base Color","Roughness","Metallic","Normal","AO","Height","Emissive","Selected output","Geometry AO","Curvature","Cavity","Thickness / ray distance","Object Normal","World Normal","Object Position (bounds)","World Position (bounds)"};
     if(UI::Prop::Combo("Channel",&channel,channels,17)){previewSettings_.channel=static_cast<PreviewChannel>(channel);if(previewSettings_.channel>=PreviewChannel::GeometryAO)geometryPreview_=true;}
+    RenderApplyMaterial();
     RenderGeometryBake();
     ImGui::BeginDisabled(geometryPreview_);
     UI::Prop::Checkbox("Sphere",&previewSettings_.sphere);
@@ -867,8 +919,18 @@ bool MaterialGraphPanel::BindGeometryBake(const std::string& guid) {
 void MaterialGraphPanel::PollGeometryBake() {
     GeometryBake completed;std::string error;
     if(!geometryJob_.TakeResult(completed,error))return;
-    if(!error.empty()){status_=error;return;}
-    if(!geometry_.Accept(std::move(completed),status_))return;
+    if(!error.empty()){status_=error;applyRequest_.reset();return;}
+    if(!geometry_.Accept(std::move(completed),status_)){applyRequest_.reset();return;}
+    if (applyRequest_) {
+        auto request=std::move(*applyRequest_);applyRequest_.reset();
+        AssetLibrary::Entry material;
+        if (!library_ || !PublishBakedMaterial(*library_,request.document,request.parameters,geometry_.Bake()->settings.resolution,
+            request.name,material,status_,request.graphFolder,geometry_.Bake(),{},&geometry_)) return;
+        geometry_.Refresh(true);
+        if (!geometry_.Bake()) { status_="Model changed during material baking; output remains in Asset Browser. Bake & Apply again."; return; }
+        request.target.materialGuid=material.guid;materialAssignment_=std::move(request.target);
+        geometryPreview_=true;previewDirty_=true;status_="Baked material ready; assigning it to the model.";return;
+    }
     geometryPreview_=true;previewDirty_=true;status_="Geometry Bake complete; save the cache for instances and material export";
 }
 void MaterialGraphPanel::RenderGeometryBake() {

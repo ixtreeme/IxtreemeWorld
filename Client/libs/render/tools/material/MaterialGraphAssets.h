@@ -5,6 +5,7 @@
 #include <filesystem>
 
 namespace material_tool {
+class GraphGeometryCache;
 bool LoadSmartGeneratorAsset(const std::filesystem::path& path,SmartGenerator& generator,std::string& error);
 class GraphSubgraphCache
 {
@@ -48,5 +49,5 @@ private:
 };
 bool PublishBakedMaterial(AssetLibrary& library, const MaterialGraphDocument& document, const ParameterOverrides& parameters,
     unsigned resolution, const std::string& name, AssetLibrary::Entry& result, std::string& error, const std::filesystem::path& graphFolder = {},
-    const GeometryBake* geometry = nullptr, const std::string& geometryGuid = {});
+    const GeometryBake* geometry = nullptr, const std::string& geometryGuid = {}, const GraphGeometryCache* unsavedGeometry = nullptr);
 }

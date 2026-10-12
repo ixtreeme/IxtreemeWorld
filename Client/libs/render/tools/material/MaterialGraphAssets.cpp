@@ -137,15 +137,19 @@ SampledTexture GraphTextureCache::Sample(const GraphNode& n,const std::string& o
     }
     return {result,binding.exr};
 }
-bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& document,const ParameterOverrides& parameters,unsigned resolution,const std::string& name,AssetLibrary::Entry& result,std::string& error,const std::filesystem::path& graphFolder,const GeometryBake* geometry,const std::string& geometryGuid) {
+bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& document,const ParameterOverrides& parameters,unsigned resolution,const std::string& name,AssetLibrary::Entry& result,std::string& error,const std::filesystem::path& graphFolder,const GeometryBake* geometry,const std::string& geometryGuid,const GraphGeometryCache* unsavedGeometry) {
     GraphGeometryCache verifiedGeometry;std::string geometryBytes;
     if(geometry) {
         if(resolution!=geometry->settings.resolution){error="Material resolution must match the Geometry Bake atlas";return false;}
-        if(!verifiedGeometry.Bind(geometryGuid,error))return false;
+        if(unsavedGeometry) {
+            if(!geometryGuid.empty()){error="Provide either a saved cache GUID or an unsaved geometry cache";return false;}
+            verifiedGeometry=*unsavedGeometry;verifiedGeometry.Refresh(true);
+            if(!verifiedGeometry.Bake() || !IsMaterialAssetGuid(verifiedGeometry.MeshGuid())) {error=verifiedGeometry.Error().empty()?"Select and bake a valid native source model":verifiedGeometry.Error();return false;}
+        } else if(!verifiedGeometry.Bind(geometryGuid,error))return false;
         std::string savedBytes;
         if(!EncodeGeometryBake(*geometry,geometryBytes,error) || !EncodeGeometryBake(*verifiedGeometry.Bake(),savedBytes,error))return false;
         if(savedBytes!=geometryBytes){error="Geometry Bake changed since preview; reload or save the cache before publishing";return false;}
-    } else if(!geometryGuid.empty()){error="Geometry Bake GUID requires its validated map data";return false;}
+    } else if(!geometryGuid.empty() || unsavedGeometry){error="Geometry Bake source requires its validated map data";return false;}
     auto source = document; GraphSubgraphCache subgraphs; MaterialSubgraphExpansion expansion;
     const bool hasSubgraphs = std::any_of(document.nodes.begin(), document.nodes.end(), [](const auto& n) { return n.kind == NodeKind::Subgraph; });
     if (hasSubgraphs && !ExpandMaterialSubgraphs(document, subgraphs.Resolver(), source, expansion, error)) return false;

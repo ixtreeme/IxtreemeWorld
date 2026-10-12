@@ -25,6 +25,19 @@ browser tile pointer interactions are not independently automated.
 Asset Browser regression validation on 2026-10-12: full `IxtreemeEngine` Release
 build succeeded; the eight-test editor/material selection below passed in 12.07 s.
 
+Quick application tests run the production asynchronous panel pipeline with a real
+OBJ, generator graph and scoped instance override, including edits during baking,
+automatic publication without a saved input cache, renderer-matching world
+positions under rotation/nonuniform scale, and cancellation without publication.
+Native assignment checks reject changed models, poses, slots/overrides and different
+entity IDs, and preserve unrelated slots/entity metadata. Unsaved geometry also
+rejects changed source content before publication. GUI button clicks and an actual
+GPU scene capture are not independently automated.
+
+Quick application validation on 2026-10-12: full Release editor build succeeded,
+the eight-test selection passed in 14.74 s, and `IXEngineRender` also built with
+`IXTREEME_WITH_EDITOR=OFF` (the assignment/transform helpers require no ImGui).
+
 No test currently reads graph shading back from the GPU. DXC compilation checks
 syntax/types/backends, **not CPU/GPU numerical parity or SPIR-V reflection**.
 Earlier core geometry-context test values are explicitly supplied. The separate

@@ -19,6 +19,10 @@ Használat, teszt- és mérési részletek: `SMART_MATERIAL_GENERATORS.md`,
 Az Asset Browser felismeri és importálja a smart material formátumokat, külön
 kategóriákkal és mentés utáni azonnali frissítéssel. A gráfok, subgraphok és
 generátorok dupla kattintással megnyithatók, a mentetlen gráf védelmével.
+A teljes smart material egyetlen **Bake & Apply to selected model** művelettel
+beköthető a kiválasztott statikus modell Material Slotjába: az aktuális modellmátrix,
+automatikus geometry bake, mentett natív anyag és slotbeállítás ugyanabban a folyamatban
+van, a közben módosult modell/transzformáció/anyaghely védelmével.
 
 Az Asset Browser katalógus/preview thumbnail, a jelenetkijelöléshez kötött 3D mesh
 preview, terrain/skinned bake, GPU reflection/binding/cache és dinamikus játékbeli

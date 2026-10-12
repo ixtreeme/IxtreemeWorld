@@ -102,12 +102,27 @@ void EditorImGui::OpenMaterialGraphAsset(const AssetLibrary::Entry& entry)
 
 void EditorImGui::RenderMaterialGraphPanel()
 {
-    if (!m_materialGraphPanelOpen) return;
+    if (!m_materialGraphPanelOpen && !m_materialGraphPanel) return;
     if (!m_materialGraphPanel) m_materialGraphPanel = std::make_unique<material_tool::MaterialGraphPanel>();
-    if (const auto* scene = ImGui::FindWindowByName(EditorWindow::SceneView); scene && scene->DockId)
+    if (const auto* scene = ImGui::FindWindowByName(EditorWindow::SceneView); m_materialGraphPanelOpen && scene && scene->DockId)
         ImGui::SetNextWindowDockID(scene->DockId, ImGuiCond_FirstUseEver);
     m_materialGraphPanel->SetServices(m_assetLibrary.get(),m_textureProvider);
+    std::filesystem::path modelPath;
+    if (m_assetLibrary && m_meshRendererState.selected) {
+        if (const auto asset=m_assetLibrary->FindById(m_meshRendererState.meshAssetId)) modelPath=m_assetLibrary->AbsolutePath(*asset);
+        else if (const auto guid=Guid::fromString(m_meshRendererState.meshAssetId)) {
+            if (const auto path=AssetDatabase::Instance().resolveGuid(*guid)) modelPath=*path;
+        }
+        if (modelPath.empty() && !m_meshRendererState.meshAssetPath.empty()) {
+            modelPath=m_meshRendererState.meshAssetPath;
+            if (modelPath.is_relative()) modelPath=ProjectManager::Instance().ProjectRoot()/modelPath;
+        }
+    }
+    std::error_code modelPathError;
+    if (!modelPath.empty() && (!std::filesystem::is_regular_file(modelPath,modelPathError) || detectAssetType(modelPath)!=AssetType::Model)) modelPath.clear();
+    m_materialGraphPanel->SetApplyTarget(m_meshRendererState,modelPath,m_playModeState.mode==EditorPlayMode::Edit && ProjectManager::Instance().HasProject());
     m_materialGraphPanel->RenderView(m_materialGraphPanelOpen);
+    if (auto assignment=m_materialGraphPanel->TakeMaterialAssignment()) m_commands.smartMaterialAssignments.push_back(std::move(*assignment));
     InspectorShowsMaterialGraph();
 }
 

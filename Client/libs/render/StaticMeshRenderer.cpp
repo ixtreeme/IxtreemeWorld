@@ -1,5 +1,6 @@
 #include "asset/ExrImage.h"
 #include "StaticMeshRenderer.h"
+#include "MeshTransform.h"
 #include "MeshSurfaceQuery.h"
 #include "ViewImpostorRenderer.h"
 #include "OcclusionCuller.h"
@@ -314,14 +315,8 @@ void FillLightingUniform(const LightingState& lighting, UniformBlock& uniform)
 
 Mat4 BuildStaticMeshModelMatrix(const StaticMeshRenderer::Instance& instance)
 {
-    return Multiply(
-        Multiply(
-            Multiply(
-                Multiply(Scale(instance.scale[0], instance.scale[1], instance.scale[2]),
-                    RotationX(instance.rotation[0])),
-                RotationY(instance.rotation[1])),
-            RotationZ(instance.rotation[2])),
-        Translation(instance.position.x, instance.position.y, instance.position.z));
+    const float position[] = {instance.position.x, instance.position.y, instance.position.z};
+    return MeshModelMatrix(position, instance.rotation, instance.scale);
 }
 
 float AlphaModeCode(const std::string& alphaMode);

@@ -94,7 +94,7 @@ remains planned.
 
 | Phase | Status | Required next implementation |
 | --- | --- | --- |
-| 4 Geometry | CPU/editor reference implemented | Static submesh atlas, maps, checked cache/GUID invalidation, async/cancel and material integration implemented. Scene-object binding, terrain, skinned baking, 3D mesh preview and broader stress profiling remain. |
+| 4 Geometry | CPU/editor reference implemented | Static submesh atlas, maps, checked cache/GUID invalidation, async/cancel and material integration implemented. Selected scene model Bake & Apply uses the renderer's actual model matrix and assigns the captured material slot. Terrain, skinned baking, 3D mesh preview and broader stress profiling remain. |
 | 5 Generators | Core/editor implemented | Six editable subgraph presets, native files/GUIDs, layer-mask insertion, scoped instances and real mesh bake integration. Dedicated browser catalog/thumbnails and GPU numeric parity remain. |
 | 6 Assets | Partial | Graph/instance/subgraph/generator/geometry GUID registration, files and native dependencies implemented; geometry content hashes/invalidation implemented. Browser discovery/import/categories/manifest persistence, immediate save refresh and graph/subgraph/generator opening implemented. Catalog/thumbnails and runtime invalidation remain. |
 | 7 Runtime | Planned | DXC runtime owner, actual reflection, texture/sampler/parameter uploads, variant/pipeline cache, assignment and failure recovery through IXRHI. |

@@ -2,6 +2,7 @@
 #include "tools/material/MaterialGraphIO.h"
 #include "tools/material/GeometryAssets.h"
 #include "tools/material/MaterialInstance.h"
+#include "tools/material/SmartMaterialApplication.h"
 #include "GeometryFixtures.h"
 #include "asset/MaterialAssetManager.h"
 #include <stb_image.h>
@@ -145,6 +146,31 @@ int main() {
         if(!geometryBaked)std::cout<<error<<'\n';
         Check(geometryBaked && detectAssetType(geometryFile)==AssetType::GeometryBake,"real mesh cache bakes, validates and saves with native asset type");
         if(geometryBaked) {
+            GraphGeometryCache unsaved;
+            Check(unsaved.Select(modelFile,0,error) && unsaved.Accept(bake,error) && unsaved.BakeGuid().empty(),
+                  "direct publication accepts a real in-memory bake without an intermediate saved cache");
+            AssetLibrary::Entry automatic;
+            Check(PublishBakedMaterial(library,MaterialGraphDocument::WeatheredStone(),{},32,"Automatic stone",automatic,error,{},unsaved.Bake(),{},&unsaved),
+                  "Bake & Apply publishes verified geometry and a native material without manual cache saving");
+            MeshRendererEditorState applySelection;applySelection.selected=true;applySelection.id=77;applySelection.meshAssetPath=modelFile.string();applySelection.materialSlots={"old-selected","other-slot"};
+            applySelection.materialOverrides.resize(2);applySelection.materialOverrides[0].enabled=true;applySelection.materialOverrides[1].enabled=true;
+            auto assignment=CaptureSmartMaterialTarget(applySelection);assignment.materialGuid=automatic.guid;
+            MeshSceneEntity entity;entity.id=applySelection.id;entity.meshAssetPath=applySelection.meshAssetPath;entity.materialSlots=applySelection.materialSlots;entity.materialOverrides=applySelection.materialOverrides;entity.name="Renamed while baking";
+            auto transformedEntity=entity;transformedEntity.position[0]=1;
+            Check(!ApplySmartMaterialAssignment(transformedEntity,assignment,error) && transformedEntity.materialSlots==applySelection.materialSlots,
+                  "concurrent target transform edit rejects application without altering slots");
+            auto replaced=entity;replaced.meshAssetPath="different.obj";
+            Check(!ApplySmartMaterialAssignment(replaced,assignment,error),"replaced model rejects baked assignment");
+            auto changedSlot=entity;changedSlot.materialSlots[0]="new-user-material";
+            Check(!ApplySmartMaterialAssignment(changedSlot,assignment,error) && changedSlot.materialSlots[0]=="new-user-material",
+                  "concurrent slot edit is preserved");
+            auto changedOverride=entity;changedOverride.materialOverrides[0].roughness=.4f;
+            Check(!ApplySmartMaterialAssignment(changedOverride,assignment,error),"concurrent material override edit is preserved");
+            auto otherEntity=entity;otherEntity.id=78;
+            Check(!ApplySmartMaterialAssignment(otherEntity,assignment,error),"selection changes cannot redirect the baked material to another object");
+            Check(ApplySmartMaterialAssignment(entity,assignment,error) && entity.materialSlots[0]==automatic.guid &&
+                  entity.materialSlots[1]=="other-slot" && !entity.materialOverrides[0].enabled && entity.materialOverrides[1].enabled && entity.name=="Renamed while baking",
+                  "application updates only the captured slot and preserves other slots, overrides and entity metadata");
             const auto browserCache = root / "Assets" / "Smart" / "Box.ixgeometrybake";
             std::filesystem::copy_file(geometryFile, browserCache);
             Check(library.Refresh(error) && library.QueryEntries(AssetLibrary::Category::GeometryBake, "Smart", false, {}, "Box").size() == 1,
@@ -193,6 +219,8 @@ int main() {
             Check(geometry.Refresh() && !geometry.Bake() && geometry.Mesh() && geometry.Error().find("stale")!=std::string::npos,"real source edit invalidates cache but retains mesh for rebaking");
             Check(!bound.Bind(geometryGuid,error) && error.find("stale")!=std::string::npos,"stale saved geometry cannot bind to an instance");
             const auto assetCount=library.Entries().size();
+            Check(!PublishBakedMaterial(library,stone,{},32,"Stale automatic stone",material,error,{},&bake,{},&unsaved) && library.Entries().size()==assetCount,
+                  "unsaved geometry publication rejects stale source content before writing assets");
             Check(!PublishBakedMaterial(library,stone,{},32,"Stale stone",material,error,{},&bake,geometryGuid) && library.Entries().size()==assetCount,"stale geometry publishing fails before any assets are written");
             Check(!geometry.Accept(bake,error),"completed bake for an old mesh cannot replace the current mesh cache");
         }

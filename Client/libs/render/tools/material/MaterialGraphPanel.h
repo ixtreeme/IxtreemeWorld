@@ -3,6 +3,7 @@
 #include "MaterialGraphDocument.h"
 #include "MaterialGraphAssets.h"
 #include "GeometryAssets.h"
+#include "SmartMaterialApplication.h"
 #include "EditorGraphicsBridge.h"
 #include <filesystem>
 #include <optional>
@@ -40,6 +41,10 @@ public:
     bool SaveGeometryBake(const std::filesystem::path& path);
     bool BindGeometryBake(const std::string& guid);
     bool AddGeneratorAsset(const std::filesystem::path& path,std::uint32_t layer = 0);
+    void SetApplyTarget(const MeshRendererEditorState& mesh, const std::filesystem::path& path, bool allowed);
+    bool BakeAndApply();
+    void CancelBakeAndApply();
+    std::optional<SmartMaterialAssignment> TakeMaterialAssignment();
     const MaterialGraphDocument& Document() const { return document_; }
 private:
     void EnsureContext();
@@ -58,6 +63,7 @@ private:
     void RenderPreview();
     void RenderGeometryBake();
     void PollGeometryBake();
+    void RenderApplyMaterial();
     void RenderInstanceParameters();
     void RenderLayerStack();
     void RenderSmartGenerators();
@@ -86,6 +92,19 @@ private:
     GraphGeometryCache geometry_;
     GeometryBakeJob geometryJob_;
     GeometryBakeSettings geometrySettings_;
+    struct ApplyRequest {
+        SmartMaterialAssignment target;
+        MaterialGraphDocument document;
+        ParameterOverrides parameters;
+        std::filesystem::path graphFolder;
+        std::string name;
+    };
+    MeshRendererEditorState applyTarget_;
+    std::filesystem::path applyModelPath_;
+    bool applyAllowed_ = false;
+    int applyResolution_ = 1;
+    std::optional<ApplyRequest> applyRequest_;
+    std::optional<SmartMaterialAssignment> materialAssignment_;
     bool geometryPreview_ = false;
     MaterialGraphProgram program_;
     MaterialGraphDocument evaluated_;

@@ -5,6 +5,17 @@ live GPU graph rendering and GPU baking remain unimplemented.
 
 ## Production workflow
 
+The quick path for a full smart material: select the static model in Hierarchy,
+open the material, then **Material preview > Apply to model > Bake & Apply to
+selected model**. This uses the selected slot/submesh and the same full model
+matrix as the renderer, bakes asynchronously, publishes the native material and
+assigns the captured slot. A valid geometry snapshot is saved inside the material
+folder; no intermediate cache or definition save is required. Resolution is
+128/256/512. Cancellation publishes no material. Model/source/transform/slot changes
+are checked before assignment; unrelated slots and entity edits are preserved.
+The current graph and instance overrides are captured at the start. The following
+manual workflow remains available for custom sampling and reusable instances.
+
 1. Open/create the material, for example **Templates > Smart Weathered Stone**.
 2. In **Material preview > Geometry Bake**, use **Select mesh...**, then choose
    a static submesh. The existing Assimp importer supplies its local coordinates,
