@@ -14,6 +14,17 @@ All tests use real production classes. Final validation date: 2026-10-12.
 | `MaterialGraphEditorTest` | Production panel/headless ImGui and existing synthetic mouse/key workflow; stack/history; graph/instance/subgraph files, GUID rescan/moves, dependency metadata, changed/malformed/fixed subgraph preview, standalone output, scoped instances; full 256-asset cache and dependency-set replacement. Real OBJ selection/async geometry job/atlas preview/cache save, geometry-bound instance/dependencies and invalid cache preview/reload. New binding dialogs and layer drag-and-drop pixel interactions are not independently automated. |
 | `MaterialGraphBakingTest` | Actual UV images, native material/ORM and manifest reload; texture imports/moves/renames, bilinear filtering and native GUID lookup with/without a library; missing GUID cannot select a stale path; subgraph authored/effective source snapshots and scoped overrides; geometry-dependent UV export refusal. Actual Assimp OBJ/geometry cache/native source dependency, mesh Weathered Stone images/material/exact cache snapshot, cache/model moves, corruption/recovery and stale source rejection before publication. |
 
+The native baking test also covers existing Assets/Smart files, all six supported
+smart extensions, case-insensitive discovery, folder/search queries, manifest
+persistence, typed/direct imports with immediate independent GUIDs, and generator
+rename/move resolution. The editor test verifies immediate browser visibility after
+definition/instance/generator/geometry saves and guarded generator open requests.
+The full editor build checks the actual browser double-click/context-menu route;
+browser tile pointer interactions are not independently automated.
+
+Asset Browser regression validation on 2026-10-12: full `IxtreemeEngine` Release
+build succeeded; the eight-test editor/material selection below passed in 12.07 s.
+
 No test currently reads graph shading back from the GPU. DXC compilation checks
 syntax/types/backends, **not CPU/GPU numerical parity or SPIR-V reflection**.
 Earlier core geometry-context test values are explicitly supplied. The separate

@@ -314,6 +314,7 @@ private:
     void RenderGameViewPanel();
     void RenderAnimatorPanel();
     void RenderMaterialGraphPanel();
+    void OpenMaterialGraphAsset(const AssetLibrary::Entry& entry);
     bool InspectorShowsMaterialGraph();
     void RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& imageSize);
     void RenderMenuBar();

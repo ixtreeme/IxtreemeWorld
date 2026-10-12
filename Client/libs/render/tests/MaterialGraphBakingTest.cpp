@@ -1,6 +1,7 @@
 #include "tools/material/MaterialGraphAssets.h"
 #include "tools/material/MaterialGraphIO.h"
 #include "tools/material/GeometryAssets.h"
+#include "tools/material/MaterialInstance.h"
 #include "GeometryFixtures.h"
 #include "asset/MaterialAssetManager.h"
 #include <stb_image.h>
@@ -12,10 +13,78 @@ using namespace material_tool;
 namespace {
 int failures=0;
 void Check(bool ok,const char* message){std::cout<<(ok?"PASS ":"FAIL ")<<message<<'\n';failures+=!ok;}
+void SmartAssetBrowser(AssetLibrary& library, const std::filesystem::path& root)
+{
+    using Category = AssetLibrary::Category;
+    const auto folder = root / "Assets" / "Smart";
+    std::filesystem::create_directories(folder);
+    std::string error;
+    SmartGenerator generator;
+    Check(SmartGenerator::Create(SmartGeneratorKind::MossGrowth, generator, error), "Moss generator browser fixture creates");
+    const auto graph = MaterialGraphDocument::WeatheredStone();
+    Check(SaveMaterialTextAtomic(folder / "Stone.materialgraph", graph.ToJson(), error), "browser definition saves before instance binding");
+    const auto definitionGuid = AssetDatabase::Instance().getOrCreateGuid(folder / "Stone.materialgraph");
+    MaterialInstance instance; instance.definitionGuid = definitionGuid.toString();
+    struct Fixture { const char* filename; Category category; std::string text; };
+    const Fixture fixtures[] = {
+        {"Stone.materialgraph", Category::MaterialGraph, graph.ToJson()},
+        {"Stone.ixsmartmaterial", Category::MaterialGraph, graph.ToJson()},
+        {"Stone.ixmaterialinstance", Category::MaterialInstance, instance.ToJson()},
+        {"Scale.ixmaterialsubgraph", Category::MaterialSubgraph, MaterialSubgraph::Example().ToJson()},
+        {"Moss.ixsmartgenerator", Category::SmartGenerator, generator.ToJson()}
+    };
+    const auto revision = library.Revision();
+    for (const auto& fixture : fixtures)
+        Check(SaveMaterialTextAtomic(folder / fixture.filename, fixture.text, error), "smart browser fixture saves");
+    SaveMaterialTextAtomic(folder / "Ignored.json", "{}", error);
+    Check(library.Refresh(error) && library.Revision() > revision, "disk refresh discovers existing Smart folder and invalidates browser view cache");
+    Check(AssetLibrary::DiscoverableCategory("Moss.IXSMARTGENERATOR") == Category::SmartGenerator &&
+          AssetLibrary::DiscoverableCategory("Stone.IXGEOMETRYBAKE") == Category::GeometryBake,
+          "smart asset detection is case insensitive, including geometry caches");
+    for (const auto& fixture : fixtures)
+    {
+        const auto entries = library.QueryEntries(fixture.category, "Smart", false, {}, fixture.filename);
+        Check(entries.size() == 1 && entries.front().filename == fixture.filename && !entries.front().guid.empty(),
+              "browser folder and search expose the saved smart asset with a GUID");
+        if (entries.empty()) continue;
+        const auto source = entries.front();
+        AssetLibrary reopened(root, root / "Assets");
+        const bool loaded = reopened.InitializeReadOnly();
+        const auto persisted = reopened.FindById(source.id);
+        Check(loaded && persisted && persisted->category == fixture.category && persisted->guid == source.guid,
+              "smart asset category and identity survive manifest reload");
+        AssetLibrary::Entry imported; std::filesystem::path finalPath;
+        Check(library.ImportFileToFolder(folder / fixture.filename, root / "Assets" / "Dropped", imported, finalPath, error) &&
+              imported.category == fixture.category && !imported.guid.empty() && imported.guid != source.guid &&
+              AssetDatabase::Instance().resolveGuid(*Guid::fromString(imported.guid)) == std::optional(finalPath),
+              "direct import recognizes smart format and publishes independent native identity immediately");
+        AssetLibrary::ImportOptions options; options.subpath = "Typed";
+        Check(library.Import(fixture.category, folder / fixture.filename, options, imported, error) &&
+              imported.category == fixture.category && !imported.guid.empty() && imported.guid != source.guid,
+              "typed import accepts smart format and publishes its GUID immediately");
+    }
+    AssetLibrary::Entry rejected;
+    Check(!library.Import(Category::MaterialGraph, folder / "Moss.ixsmartgenerator", rejected, error),
+          "typed import rejects a generator under the wrong category");
+    const auto generators = library.QueryEntries(Category::SmartGenerator, "Smart", false, {}, "Moss");
+    if (!generators.empty())
+    {
+        const auto guid = generators.front().guid;
+        AssetLibrary::Entry moved;
+        Check(library.RenameAsset(generators.front().id, "Moss_Renamed", false, moved, error) &&
+              moved.category == Category::SmartGenerator && moved.guid == guid &&
+              library.MoveAssetToSubpath(moved.id, "Smart/Moved", moved, error),
+              "generator rename and folder move retain browser category and GUID");
+        GraphSubgraphCache cache; MaterialSubgraph body;
+        Check(cache.Resolve(guid, body, error) && body == generator.definition,
+              "generator GUID resolves after browser rename and move without a watcher");
+    }
+}
 }
 int main() {
     const auto root=std::filesystem::temp_directory_path()/("ixtreeme-graph-bake-"+generateGuidV4().toString());
     std::filesystem::create_directories(root);AssetDatabase::Instance().scan(root);AssetLibrary library(root,root/"Assets");Check(library.Initialize(),"isolated test project initializes");
+    SmartAssetBrowser(library, root);
     auto graph=MaterialGraphDocument::Example();graph.FindNode(1)->value={.25f,.5f,.75f,1};graph.FindNode(2)->value[0]=.6f;
     AssetLibrary::Entry material;std::string error;
     const bool baked=PublishBakedMaterial(library,graph,{},16,"Test material",material,error);if(!baked)std::cout<<error<<'\n';
@@ -76,6 +145,14 @@ int main() {
         if(!geometryBaked)std::cout<<error<<'\n';
         Check(geometryBaked && detectAssetType(geometryFile)==AssetType::GeometryBake,"real mesh cache bakes, validates and saves with native asset type");
         if(geometryBaked) {
+            const auto browserCache = root / "Assets" / "Smart" / "Box.ixgeometrybake";
+            std::filesystem::copy_file(geometryFile, browserCache);
+            Check(library.Refresh(error) && library.QueryEntries(AssetLibrary::Category::GeometryBake, "Smart", false, {}, "Box").size() == 1,
+                  "browser discovers a real saved binary geometry bake");
+            AssetLibrary::Entry importedCache; std::filesystem::path cachePath;
+            Check(library.ImportFileToFolder(browserCache, root / "Assets" / "Dropped", importedCache, cachePath, error) &&
+                  importedCache.category == AssetLibrary::Category::GeometryBake && !importedCache.guid.empty(),
+                  "binary geometry bake imports as its own asset category");
             const auto geometryGuid=geometry.BakeGuid(),modelGuid=geometry.MeshGuid();GraphGeometryCache bound;
             Check(bound.Bind(geometryGuid,error) && bound.Bake() && bound.Bake()->meshHash==bake.meshHash,"cache reload verifies actual source content against its GUID dependency");
             Check(AssetDatabase::Instance().loadDependencies(geometryFile)==std::vector<Guid>{*Guid::fromString(modelGuid)},"geometry cache records native source mesh dependency");

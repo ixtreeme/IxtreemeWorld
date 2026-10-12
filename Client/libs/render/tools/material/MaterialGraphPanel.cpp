@@ -13,6 +13,7 @@
 #include <cctype>
 #include <cmath>
 #include <fstream>
+#include <utility>
 #include <windows.h>
 #include <commdlg.h>
 
@@ -140,9 +141,16 @@ void MaterialGraphPanel::RenderNodeMenu()
             if(ImGui::BeginMenu(category)) {for(const auto kind:AllNodeKinds())if(std::string_view(NodeCategory(kind))==category)item(kind);ImGui::EndMenu();}
     }
 }
+void MaterialGraphPanel::RequestOpen(const std::filesystem::path& path)
+{
+    if (path.empty()) return;
+    pendingPath_ = path;
+    RequestReplace(true);
+}
 void MaterialGraphPanel::RequestReplace(bool openFile)
 {
     pendingOpen_ = openFile;
+    if (!openFile) pendingPath_.clear();
     if (document_ != saved_) { requestUnsaved_ = true; return; }
     if (openFile) OpenDialog();
     else
@@ -179,14 +187,14 @@ void MaterialGraphPanel::RenderUnsavedPopup()
             else { saved_ = document_; RequestReplace(false); }
         }
         ImGui::SameLine();
-        if (ImGui::Button("Cancel", {85, 0})) ImGui::CloseCurrentPopup();
+        if (ImGui::Button("Cancel", {85, 0})) { pendingPath_.clear(); ImGui::CloseCurrentPopup(); }
         ImGui::EndPopup();
     }
 }
 void MaterialGraphPanel::RenderToolbar()
 {
     if (ImGui::Button("New")) {pendingPreset_=0;RequestReplace(false);}
-    ImGui::SameLine(); if (ImGui::Button("Open...")) RequestReplace(true);
+    ImGui::SameLine(); if (ImGui::Button("Open...")) { pendingPath_.clear(); RequestReplace(true); }
     ImGui::SameLine(); if (ImGui::Button("Save")) SaveDialog();
     ImGui::SameLine(); if (ImGui::Button("Save As...")) SaveDialog(true);
     ImGui::SameLine(); ImGui::BeginDisabled(!CanUndo()); if (ImGui::Button("Undo")) Undo(); ImGui::EndDisabled();
@@ -468,7 +476,14 @@ bool MaterialGraphPanel::Save(const std::filesystem::path& path)
     for (const auto& node:document_.nodes) if (const auto dependency=Guid::fromString(node.assetGuid))
         if (std::find(dependencies.begin(),dependencies.end(),*dependency)==dependencies.end()) dependencies.push_back(*dependency);
     if (!IsMaterialAssetGuid(guid.toString()) || !database.writeDependencies(path,dependencies)) { status_="Definition saved, but asset identity/dependency metadata failed"; return false; }
-    path_ = path; saved_ = document_; subgraphMode_=subgraph;generatorMode_=generator; textures_.Configure(library_,path_.parent_path()); previewDirty_=true; status_ = generator?"Smart Generator saved":(subgraph?"Subgraph saved":"Graph saved"); return true;
+    path_ = path; saved_ = document_; subgraphMode_=subgraph;generatorMode_=generator; textures_.Configure(library_,path_.parent_path()); previewDirty_=true; status_ = generator?"Smart Generator saved":(subgraph?"Subgraph saved":"Graph saved");
+    RefreshSavedAsset(); return true;
+}
+void MaterialGraphPanel::RefreshSavedAsset()
+{
+    if (!library_) return;
+    std::string error;
+    if (!library_->Refresh(error)) status_ += "; Asset Browser refresh failed: " + error;
 }
 bool MaterialGraphPanel::CompileMaterial(MaterialGraphProgram& program, std::string& error, std::uint32_t previewPin)
 {
@@ -502,7 +517,7 @@ bool MaterialGraphPanel::SaveInstance(const std::filesystem::path& path)
             if (std::find(dependencies.begin(),dependencies.end(),*guid)==dependencies.end()) dependencies.push_back(*guid);
     }
     if (!database.writeDependencies(path,dependencies)) { status_="Instance saved, but asset dependency metadata could not be written"; return false; }
-    status_="Material instance saved"; return true;
+    status_="Material instance saved"; RefreshSavedAsset(); return true;
 }
 bool MaterialGraphPanel::LoadInstance(const std::filesystem::path& path)
 {
@@ -525,7 +540,7 @@ void MaterialGraphPanel::SaveDialog(bool saveAs)
 }
 void MaterialGraphPanel::OpenDialog()
 {
-    const auto source = ChooseGraphFile(false, path_);
+    const auto source = pendingPath_.empty() ? ChooseGraphFile(false, path_) : std::exchange(pendingPath_, {});
     if (!source.empty()) Load(source);
 }
 void MaterialGraphPanel::RenderTextureBinding(GraphNode& node)
@@ -842,7 +857,7 @@ bool MaterialGraphPanel::StartGeometryBake() {
     status_="Geometry bake running";return true;
 }
 bool MaterialGraphPanel::SaveGeometryBake(const std::filesystem::path& path) {
-    if(!geometry_.Save(path,status_))return false;status_="Geometry Bake cache saved";return true;
+    if(!geometry_.Save(path,status_))return false;status_="Geometry Bake cache saved";RefreshSavedAsset();return true;
 }
 bool MaterialGraphPanel::BindGeometryBake(const std::string& guid) {
     if(geometryJob_.Running()){status_="Finish or cancel the active geometry bake first";return false;}

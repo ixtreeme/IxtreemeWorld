@@ -30,6 +30,7 @@ public:
     bool CanUndo() const { return !undo_.empty(); }
     bool CanRedo() const { return !redo_.empty(); }
     void Undo(bool redo = false);
+    void RequestOpen(const std::filesystem::path& path);
     bool Load(const std::filesystem::path& path);
     bool Save(const std::filesystem::path& path);
     bool SaveInstance(const std::filesystem::path& path);
@@ -52,6 +53,7 @@ private:
     void OpenDialog();
     void RequestReplace(bool openFile);
     void RenderUnsavedPopup();
+    void RefreshSavedAsset();
     void SyncPositions();
     void RenderPreview();
     void RenderGeometryBake();
@@ -70,7 +72,7 @@ private:
     MaterialGraphDocument saved_ = document_;
     std::vector<MaterialGraphDocument> undo_, redo_;
     std::optional<MaterialGraphDocument> dragBefore_, propertyBefore_;
-    std::filesystem::path path_;
+    std::filesystem::path path_, pendingPath_;
     std::string status_;
     std::uint32_t selected_ = 0;
     std::array<float, 2> spawn_{180, 100};

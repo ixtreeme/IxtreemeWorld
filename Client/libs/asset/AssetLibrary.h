@@ -34,7 +34,12 @@ public:
         Audio,
         Script,
         ParticleEffect,  // .particle: a reusable Particle System parameter preset
-        UiDocument  // game UI (RmlUi): .rml documents and their .rcss style sheets
+        UiDocument,  // game UI (RmlUi): .rml documents and their .rcss style sheets
+        MaterialGraph,  // .materialgraph / .ixsmartmaterial
+        MaterialInstance,
+        MaterialSubgraph,
+        SmartGenerator,
+        GeometryBake
     };
 
     enum class TextureRole

@@ -96,7 +96,7 @@ remains planned.
 | --- | --- | --- |
 | 4 Geometry | CPU/editor reference implemented | Static submesh atlas, maps, checked cache/GUID invalidation, async/cancel and material integration implemented. Scene-object binding, terrain, skinned baking, 3D mesh preview and broader stress profiling remain. |
 | 5 Generators | Core/editor implemented | Six editable subgraph presets, native files/GUIDs, layer-mask insertion, scoped instances and real mesh bake integration. Dedicated browser catalog/thumbnails and GPU numeric parity remain. |
-| 6 Assets | Partial | Graph/instance/subgraph/geometry GUID registration, files and native dependencies implemented; geometry content hashes/invalidation implemented. Dedicated browser categories, generator assets and runtime invalidation remain. |
+| 6 Assets | Partial | Graph/instance/subgraph/generator/geometry GUID registration, files and native dependencies implemented; geometry content hashes/invalidation implemented. Browser discovery/import/categories/manifest persistence, immediate save refresh and graph/subgraph/generator opening implemented. Catalog/thumbnails and runtime invalidation remain. |
 | 7 Runtime | Planned | DXC runtime owner, actual reflection, texture/sampler/parameter uploads, variant/pipeline cache, assignment and failure recovery through IXRHI. |
 | 8 Optimization | Partial | CPU benchmarks and cancellable async geometry jobs implemented. Material preview/export still synchronous; GPU baking/performance, sample deduplication, folding/CSE and broader stress/lifetime tests remain. |
 
@@ -154,8 +154,8 @@ native AssetDatabase type, render CMake and tests. Public source-compatible Comp
 adds an optional resolver argument. Existing enum values and v1/v2/v3 formats remain.
 New API/schema versions require rebuilding linked consumers. Source defaults on
 calls are snapshots; refresh is explicit. Mtime/size polling has a manual reload
-path for edits that preserve both fields. Dedicated subgraph browser categories,
-content hashes and asynchronous expansion are still planned.
+path for edits that preserve both fields. Subgraph browser discovery/import/opening
+is implemented. Content hashes and asynchronous expansion are still planned.
 
 `MaterialSubgraphTest` exercises real production expansion and actual DXC. Editor
 tests exposed a selected-output restoration bug after recreating the node-editor

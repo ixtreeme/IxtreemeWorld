@@ -89,6 +89,17 @@ void EditorImGui::RenderEditorPanels()
     }
 }
 
+void EditorImGui::OpenMaterialGraphAsset(const AssetLibrary::Entry& entry)
+{
+    if (!m_assetLibrary) return;
+    if (!m_materialGraphPanel) m_materialGraphPanel = std::make_unique<material_tool::MaterialGraphPanel>();
+    m_materialGraphPanel->SetServices(m_assetLibrary.get(), m_textureProvider);
+    m_materialGraphPanel->RequestOpen(m_assetLibrary->AbsolutePath(entry));
+    m_materialGraphPanelOpen = true;
+    m_inspectorShowsMaterialGraph = true;
+    m_assetInspectorSelectionActive = false;
+}
+
 void EditorImGui::RenderMaterialGraphPanel()
 {
     if (!m_materialGraphPanelOpen) return;

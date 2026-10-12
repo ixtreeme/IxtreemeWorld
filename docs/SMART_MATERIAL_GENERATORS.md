@@ -11,6 +11,11 @@ no generator evaluator or generator-specific operational node.
    save an `.ixsmartgenerator`. The single Scalar output is **Mask**; its selected
    output preview is restored automatically. Geometry Bake supplies actual mesh
    inputs; analytic previews retain their labelled test values.
+   Assets saved under the project's Assets folder appear immediately in Asset
+   Browser. Existing `.ixsmartgenerator` files are discovered on project load or
+   Refresh. Double-click or **Open in Material Graph** opens the recipe, with the
+   usual Save/Discard/Cancel prompt protecting unsaved graph edits. Import and
+   filesystem drops accept these files and give copied assets independent GUIDs.
 2. Reopen a material and use **Add generator...** on a Layer Stack row. The call
    and mask assignment are one Undo/Redo transaction. Inspector **Add generator
    preset...** creates an ordinary scalar-output call for a connection or later
@@ -91,7 +96,9 @@ SPIR-V when configured. This proves source compatibility, not GPU numeric readba
 Native editor/baking tests use real files/GUIDs, creation/save, layer Undo/Redo,
 geometry-bound instances, moves/corruption/recovery and mesh material snapshots.
 They found a stale deleted call preview after Undo; history now keeps a valid
-selected output or returns to shading. File-picker clicks/pixel layout, dedicated
-Asset Browser categories/thumbnails, catalog discovery and runtime shader binding/
+selected output or returns to shading. The browser has separate graph, instance,
+subgraph, generator and geometry-cache categories, including manifest persistence,
+case-insensitive detection and immediate save refresh. File-picker clicks/pixel
+layout, generated browser thumbnails, catalog discovery and runtime shader binding/
 reflection/cache/GPU rendering remain next work. CPU timings are documented in
 SMART_MATERIAL_PERFORMANCE.md.

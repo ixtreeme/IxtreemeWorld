@@ -78,6 +78,8 @@ struct MaterialGraphPanelTestAccess
     static float Roughness(MaterialGraphPanel& panel) {std::vector<std::array<GraphValue,14>> work;return panel.program_.Evaluate({},panel.parameters_,{},work).roughness;}
     static const std::vector<std::uint8_t>& Pixels(const MaterialGraphPanel& panel) {return panel.previewPixels_;}
     static const std::string& Error(const MaterialGraphPanel& panel) {return panel.compileError_;}
+    static bool PendingOpen(const MaterialGraphPanel& panel, const std::filesystem::path& path)
+    { return panel.requestUnsaved_ && panel.pendingOpen_ && panel.pendingPath_ == path; }
     static const MaterialCompileResult& Layout(const MaterialGraphPanel& panel) {return panel.program_.Layout();}
     static void NumericOverride(MaterialGraphPanel& panel,const std::string& name,float value) {panel.parameters_.values[name]={value,0,0,0};panel.previewDirty_=true;}
 };
@@ -240,11 +242,18 @@ void Editor(bool capture)
         panel.Undo(true);Check(!panel.Document().layers.back().enabled,"Redo restores layer enablement and topology together");panel.Undo();
         MaterialGraphPanelTestAccess::Detach(panel);Check(panel.Document().layers.empty(),"explicit graph conversion removes managed ownership");
         panel.Undo();Check(panel.Document()==smart,"Undo restores the complete managed graph after conversion");frame();frame();
-        const auto smartRoot=std::filesystem::temp_directory_path()/("ix-smart-editor-"+generateGuidV4().toString());std::filesystem::create_directories(smartRoot);
-        AssetDatabase::Instance().scan(smartRoot);const auto definitionFile=smartRoot/"stone.materialgraph",instanceFile=smartRoot/"stone.ixmaterialinstance";
+        const auto smartProject=std::filesystem::temp_directory_path()/("ix-smart-editor-"+generateGuidV4().toString());
+        const auto smartRoot=smartProject/"Assets"/"Smart";std::filesystem::create_directories(smartRoot);
+        AssetDatabase::Instance().scan(smartProject);
+        AssetLibrary smartLibrary(smartProject,smartProject/"Assets");Check(smartLibrary.Initialize(),"editor browser fixture initializes");
+        panel.SetServices(&smartLibrary,nullptr);
+        const auto definitionFile=smartRoot/"stone.materialgraph",instanceFile=smartRoot/"stone.ixmaterialinstance";
         Check(!panel.SaveInstance(instanceFile),"unsaved definition cannot produce a dangling instance reference");
         Check(panel.Save(definitionFile),"smart definition saves through production panel");MaterialGraphPanelTestAccess::Override(panel,.37f);
         Check(panel.SaveInstance(instanceFile),"production panel saves separate instance with definition GUID");
+        Check(smartLibrary.QueryEntries(AssetLibrary::Category::MaterialGraph,"Smart",false,{},"stone").size()==1 &&
+              smartLibrary.QueryEntries(AssetLibrary::Category::MaterialInstance,"Smart",false,{},"stone").size()==1,
+              "definition and instance saves appear in the browser immediately without a watcher");
         const auto registeredGuid=AssetDatabase::Instance().resolvePath(definitionFile);
         AssetDatabase::Instance().scan(smartRoot);
         Check(registeredGuid && AssetDatabase::Instance().resolvePath(definitionFile)==registeredGuid,"graph GUID survives real asset database rescan and metadata parse");
@@ -323,12 +332,16 @@ void Editor(bool capture)
         if(!MaterialGraphPanelTestAccess::Error(panel).empty())std::cout<<"Geometry preview error: "<<MaterialGraphPanelTestAccess::Error(panel)<<'\n';
         Check(!panel.SaveInstance(meshInstance),"unsaved geometry cache cannot produce a dangling mesh-bound instance");
         Check(panel.SaveGeometryBake(cacheFile) && panel.SaveInstance(meshInstance),"panel saves native geometry cache and mesh-bound material instance");
+        Check(smartLibrary.QueryEntries(AssetLibrary::Category::GeometryBake,"Smart",false,{},"stone").size()==1,
+              "geometry cache save refreshes browser immediately");
         Check(restored.Load(definitionFile) && restored.LoadInstance(meshInstance),"instance reload binds GUID-backed geometry after verifying its source content");
         const auto cacheGuid=AssetDatabase::Instance().resolvePath(cacheFile);const auto meshDependencies=AssetDatabase::Instance().loadDependencies(meshInstance);
         Check(cacheGuid && std::find(meshDependencies.begin(),meshDependencies.end(),*cacheGuid)!=meshDependencies.end(),"mesh-bound instance tracks its geometry asset dependency");
         const auto generatorFile=smartRoot/"wear.ixsmartgenerator";
         MaterialGraphPanelTestAccess::NewGenerator(panel,0);frame();frame();
         Check(MaterialGraphPanelTestAccess::Error(panel).empty() && panel.Save(generatorFile),"production generator template previews and saves native preset metadata");
+        Check(smartLibrary.QueryEntries(AssetLibrary::Category::SmartGenerator,"Smart",false,{},"wear").size()==1,
+              "generator save populates the previously empty Smart browser folder immediately");
         SmartGenerator preset;std::string generatorText;
         Check(LoadMaterialText(generatorFile,generatorText,error) && preset.FromJson(generatorText,error) && preset.kind==SmartGeneratorKind::EdgeWear,"saved generator wrapper retains recipe kind and canonical graph");
         Check(!panel.Save(smartRoot/"lost-metadata.ixmaterialsubgraph"),"generator save cannot silently strip metadata");
@@ -355,7 +368,19 @@ void Editor(bool capture)
         SaveMaterialTextAtomic(cacheFile,"broken geometry",error);frame();frame();
         Check(!MaterialGraphPanelTestAccess::Error(panel).empty() && MaterialGraphPanelTestAccess::Pixels(panel)==validGeometryPixels,"invalid geometry keeps the last valid real-mesh preview");
         Check(!restored.LoadInstance(meshInstance),"invalid geometry instance reload fails transactionally");
-        std::filesystem::remove_all(smartRoot);
+        MaterialGraphPanel browserOpen;
+        browserOpen.RequestOpen(movedGenerator);
+        Check(browserOpen.Document()==preset.definition.graph,"browser open request loads a generator into the shared graph editor");
+        const auto opened=browserOpen.Document();
+        browserOpen.RequestOpen(smartRoot/"missing.ixsmartgenerator");
+        Check(browserOpen.Document()==opened,"failed browser open preserves the current graph");
+        Check(panel.Load(generatedFile),"definition reloads before guarded browser replacement test");
+        MaterialGraphPanelTestAccess::DisableLayer(panel);
+        const auto unsaved=panel.Document();
+        panel.RequestOpen(movedGenerator);
+        Check(panel.Document()==unsaved && MaterialGraphPanelTestAccess::PendingOpen(panel,movedGenerator),
+              "browser open preserves unsaved layer edits and queues the Save/Discard/Cancel modal");
+        std::filesystem::remove_all(smartProject);
         open = false; frame(); Check(!open, "closed panel keeps document without drawing its canvas");
     }
     ImGui::DestroyContext();

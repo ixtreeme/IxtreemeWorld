@@ -1693,6 +1693,16 @@ std::optional<AssetLibrary::Category> AssetLibrary::DiscoverableCategory(const s
         return Category::Model;
     if (ext == ".material")
         return Category::Material;
+    if (ext == ".materialgraph" || ext == ".ixsmartmaterial")
+        return Category::MaterialGraph;
+    if (ext == ".ixmaterialinstance")
+        return Category::MaterialInstance;
+    if (ext == ".ixmaterialsubgraph")
+        return Category::MaterialSubgraph;
+    if (ext == ".ixsmartgenerator")
+        return Category::SmartGenerator;
+    if (ext == ".ixgeometrybake")
+        return Category::GeometryBake;
     if (ext == ".watermat")
         return Category::WaterMaterial;
     if (ext == ".physmat")
@@ -1733,6 +1743,11 @@ const char* AssetLibrary::CategoryName(Category category)
     case Category::Model: return "Models";
     case Category::Animation: return "Animations";
     case Category::Material: return "Materials";
+    case Category::MaterialGraph: return "Smart Materials";
+    case Category::MaterialInstance: return "Material Instances";
+    case Category::MaterialSubgraph: return "Material Subgraphs";
+    case Category::SmartGenerator: return "Smart Generators";
+    case Category::GeometryBake: return "Geometry Bakes";
     case Category::WaterMaterial: return "Water Materials";
     case Category::PhysicsMaterial: return "Physics Materials";
     case Category::AnimationClip: return "Animation Clips";
@@ -2040,6 +2055,11 @@ std::string AssetLibrary::CategoryString(Category category)
     case Category::Model: return "model";
     case Category::Animation: return "animation";
     case Category::Material: return "material";
+    case Category::MaterialGraph: return "material_graph";
+    case Category::MaterialInstance: return "material_instance";
+    case Category::MaterialSubgraph: return "material_subgraph";
+    case Category::SmartGenerator: return "smart_generator";
+    case Category::GeometryBake: return "geometry_bake";
     case Category::WaterMaterial: return "water_material";
     case Category::PhysicsMaterial: return "physics_material";
     case Category::AnimationClip: return "animation_clip";
@@ -2060,6 +2080,11 @@ std::optional<AssetLibrary::Category> AssetLibrary::ParseCategory(const std::str
     if (value == "model") return Category::Model;
     if (value == "animation") return Category::Animation;
     if (value == "material") return Category::Material;
+    if (value == "material_graph") return Category::MaterialGraph;
+    if (value == "material_instance") return Category::MaterialInstance;
+    if (value == "material_subgraph") return Category::MaterialSubgraph;
+    if (value == "smart_generator") return Category::SmartGenerator;
+    if (value == "geometry_bake") return Category::GeometryBake;
     if (value == "water_material" || value == "watermaterial") return Category::WaterMaterial;
     if (value == "physics_material" || value == "physicsmaterial") return Category::PhysicsMaterial;
     if (value == "animation_clip" || value == "animationclip") return Category::AnimationClip;
@@ -2094,6 +2119,11 @@ std::filesystem::path AssetLibrary::LegacyCategoryDirectory(Category category) c
     case Category::Model: return m_libraryRoot / "models";
     case Category::Animation: return m_libraryRoot / "animations";
     case Category::Material: return m_libraryRoot / "materials";
+    case Category::MaterialGraph:
+    case Category::MaterialInstance:
+    case Category::MaterialSubgraph:
+    case Category::SmartGenerator:
+    case Category::GeometryBake: return m_libraryRoot;
     case Category::WaterMaterial: return m_libraryRoot / "materials" / "water";
     case Category::PhysicsMaterial: return m_libraryRoot / "materials" / "physics";
     case Category::AnimationClip: return m_libraryRoot / "animation_clips";
@@ -2766,6 +2796,13 @@ std::optional<AssetLibrary::Entry> AssetLibrary::MakeDiscoveredEntry(Category ca
         entry.thumbnail = "prefab_icon";
         entry.tags = {"prefab"};
         break;
+    case Category::MaterialGraph:
+    case Category::MaterialInstance:
+    case Category::MaterialSubgraph:
+    case Category::SmartGenerator:
+    case Category::GeometryBake:
+        entry.tags = {"smart_material", CategoryString(category)};
+        break;
     default:
         break;
     }
@@ -3263,6 +3300,17 @@ bool AssetLibrary::ValidateFile(Category category, const std::filesystem::path& 
             return false;
         }
         break;
+    case Category::MaterialGraph:
+    case Category::MaterialInstance:
+    case Category::MaterialSubgraph:
+    case Category::SmartGenerator:
+    case Category::GeometryBake:
+        if (DiscoverableCategory(path) != category)
+        {
+            error = "file extension does not match the selected smart material asset type";
+            return false;
+        }
+        break;
     case Category::WaterMaterial:
         if (!HasAnyExtension(path, {".watermat", ".json"}))
         {
@@ -3430,6 +3478,14 @@ std::filesystem::path AssetLibrary::MakeUniqueDestination(const std::string& sub
     return candidate;
 }
 
+bool NeedsImmediateAssetGuid(AssetLibrary::Category category)
+{
+    using Category = AssetLibrary::Category;
+    return category == Category::Texture || category == Category::MaterialGraph ||
+        category == Category::MaterialInstance || category == Category::MaterialSubgraph ||
+        category == Category::SmartGenerator || category == Category::GeometryBake;
+}
+
 std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::filesystem::path& sourcePath)
 {
     const std::string ext = ToLower(sourcePath.extension().string());
@@ -3456,7 +3512,7 @@ std::optional<AssetLibrary::Category> DetectDirectImportCategory(const std::file
         return AssetLibrary::Category::Scene;
     if (ext == ".ixprefab")
         return AssetLibrary::Category::Prefab;
-    return std::nullopt;
+    return AssetLibrary::DiscoverableCategory(sourcePath);
 }
 
 bool AssetLibrary::Import(Category category, const std::filesystem::path& sourcePath, Entry& outEntry, std::string& error)
@@ -3548,9 +3604,9 @@ bool AssetLibrary::Import(Category category,
         std::string importedText((std::istreambuf_iterator<char>(importedFile)), std::istreambuf_iterator<char>());
         entry.physicsMaterial = ReadPhysicsMaterialJson(importedText);
     }
-    // Texture import must publish its GUID immediately: material/instance bindings can
+    // Native material asset imports must publish their GUID immediately: graph/instance bindings can
     // be created before a filesystem watcher or library refresh runs.
-    if (category == Category::Texture) {
+    if (NeedsImmediateAssetGuid(category)) {
         const auto guid = AssetDatabase::Instance().getOrCreateGuid(destination);
         if (!IsEmptyGuid(guid)) entry.guid = guid.toString();
     }
@@ -3563,7 +3619,7 @@ bool AssetLibrary::Import(Category category,
             std::filesystem::remove(dependency, ec);
         if (category == Category::Texture && !entry.thumbnail.empty())
             std::filesystem::remove(m_libraryRoot / entry.thumbnail, ec);
-        if (category == Category::Texture) {
+        if (NeedsImmediateAssetGuid(category)) {
             AssetDatabase::Instance().runtimeRemove(destination);
             auto meta = destination; meta += L".meta"; std::filesystem::remove(meta, ec);
         }
@@ -3687,7 +3743,7 @@ bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
     }
 
     const std::string destinationCanonical = CanonicalPathString(destination);
-    if (*category == Category::Texture) {
+    if (NeedsImmediateAssetGuid(*category)) {
         const auto guid = AssetDatabase::Instance().getOrCreateGuid(destination);
         if (!IsEmptyGuid(guid)) entry.guid = guid.toString();
     }
@@ -3705,7 +3761,7 @@ bool AssetLibrary::ImportFileToFolder(const std::filesystem::path& sourcePath,
         if (!sameFile)
         {
             std::filesystem::remove(destination, ec);
-            if (*category == Category::Texture) AssetDatabase::Instance().runtimeRemove(destination);
+            if (NeedsImmediateAssetGuid(*category)) AssetDatabase::Instance().runtimeRemove(destination);
             for (const auto& dependency : copiedDependencyFiles)
                 std::filesystem::remove(dependency, ec);
         }

@@ -222,6 +222,12 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
         {
             OpenPbrMaterialEditor(entry.id);
         }
+        else if (doubleClicked && (entry.category == AssetLibrary::Category::MaterialGraph ||
+                                  entry.category == AssetLibrary::Category::MaterialSubgraph ||
+                                  entry.category == AssetLibrary::Category::SmartGenerator))
+        {
+            OpenMaterialGraphAsset(entry);
+        }
         else if (doubleClicked && entry.category == AssetLibrary::Category::Model)
         {
             m_commands.addMeshEntity = true;
@@ -277,6 +283,12 @@ void EditorImGui::RenderAssetTile(const AssetLibrary::Entry& entry, float tileSi
     if (ImGui::BeginPopupContextItem("AssetTileContext"))
     {
         ImGui::TextDisabled("%s", entry.displayName.c_str());
+        if (entry.category == AssetLibrary::Category::MaterialGraph ||
+            entry.category == AssetLibrary::Category::MaterialSubgraph ||
+            entry.category == AssetLibrary::Category::SmartGenerator)
+        {
+            if (ImGui::MenuItem("Open in Material Graph")) OpenMaterialGraphAsset(entry);
+        }
         if (ImGui::MenuItem("Rename"))
             BeginAssetRename(entry);
         if (ImGui::MenuItem("Delete"))

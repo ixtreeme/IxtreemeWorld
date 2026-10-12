@@ -356,6 +356,11 @@ ImVec4 AssetCategoryColor(AssetLibrary::Category category)
     case AssetLibrary::Category::Model: return ImVec4(0.48f, 0.38f, 0.70f, 1.0f);
     case AssetLibrary::Category::Animation: return ImVec4(0.72f, 0.50f, 0.20f, 1.0f);
     case AssetLibrary::Category::Material: return ImVec4(0.38f, 0.58f, 0.36f, 1.0f);
+    case AssetLibrary::Category::MaterialGraph: return ImVec4(0.38f, 0.58f, 0.36f, 1.0f);
+    case AssetLibrary::Category::MaterialInstance: return ImVec4(0.46f, 0.68f, 0.42f, 1.0f);
+    case AssetLibrary::Category::MaterialSubgraph: return ImVec4(0.48f, 0.38f, 0.70f, 1.0f);
+    case AssetLibrary::Category::SmartGenerator: return ImVec4(0.72f, 0.50f, 0.20f, 1.0f);
+    case AssetLibrary::Category::GeometryBake: return ImVec4(0.42f, 0.50f, 0.66f, 1.0f);
     case AssetLibrary::Category::WaterMaterial: return ImVec4(0.16f, 0.58f, 0.64f, 1.0f);
     case AssetLibrary::Category::PhysicsMaterial: return ImVec4(0.64f, 0.54f, 0.30f, 1.0f);
     case AssetLibrary::Category::Scene: return ImVec4(0.42f, 0.50f, 0.66f, 1.0f);
@@ -378,6 +383,11 @@ const char* AssetCategoryIcon(AssetLibrary::Category category)
     case AssetLibrary::Category::Model: return ICON_FA_CUBE;
     case AssetLibrary::Category::Animation: return ICON_FA_PERSON_RUNNING;
     case AssetLibrary::Category::Material: return ICON_FA_PALETTE;
+    case AssetLibrary::Category::MaterialGraph: return ICON_FA_DIAGRAM_PROJECT;
+    case AssetLibrary::Category::MaterialInstance: return ICON_FA_LAYER_GROUP;
+    case AssetLibrary::Category::MaterialSubgraph: return ICON_FA_DIAGRAM_PROJECT;
+    case AssetLibrary::Category::SmartGenerator: return ICON_FA_GEAR;
+    case AssetLibrary::Category::GeometryBake: return ICON_FA_CUBE;
     case AssetLibrary::Category::WaterMaterial: return ICON_FA_DROPLET;
     case AssetLibrary::Category::PhysicsMaterial: return ICON_FA_GEAR;
     case AssetLibrary::Category::Scene: return ICON_FA_GLOBE;
@@ -421,6 +431,8 @@ const char* ImportDetectedTypeName(const std::filesystem::path& path)
         return "Particle Effect";
     if (ext == ".scene")
         return "Scene";
+    if (const auto category = AssetLibrary::DiscoverableCategory(path))
+        return AssetLibrary::CategoryName(*category);
     return "Unknown";
 }
 

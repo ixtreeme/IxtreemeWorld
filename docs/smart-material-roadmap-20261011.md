@@ -16,7 +16,11 @@ Használat, teszt- és mérési részletek: `SMART_MATERIAL_GENERATORS.md`,
 `SMART_MATERIAL_GEOMETRY.md`, `SMART_MATERIAL_TESTS.md` és
 `SMART_MATERIAL_PERFORMANCE.md`.
 
-A dedikált Asset Browser kategóriák/katalógus, a jelenetkijelöléshez kötött 3D mesh
+Az Asset Browser felismeri és importálja a smart material formátumokat, külön
+kategóriákkal és mentés utáni azonnali frissítéssel. A gráfok, subgraphok és
+generátorok dupla kattintással megnyithatók, a mentetlen gráf védelmével.
+
+Az Asset Browser katalógus/preview thumbnail, a jelenetkijelöléshez kötött 3D mesh
 preview, terrain/skinned bake, GPU reflection/binding/cache és dinamikus játékbeli
 materialgráf-renderelés továbbra is hátravan. Az alábbi eredeti állapotfelmérés a
 2026. október 11-i helyzetet rögzíti; a friss státuszhoz a fenti dokumentumokat használd.
