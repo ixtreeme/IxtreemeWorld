@@ -196,6 +196,9 @@ Toolbar **Templates** supplies weathered metal (UV) and mossy rock (world) start
 
 Middle mouse pans, the wheel zooms, **Fit** frames the graph and Delete removes selected nodes/links. Undo/Redo restores movement, links and Inspector edits. Ctrl+S saves when the graph or its Inspector owns focus. **Save / Save As...** writes versioned `.materialgraph` files; **Open...** also reads version 1. Closing the panel retains the draft in memory. Save before exiting the editor.
 
+#### Smart Generators
+**Templates > Smart Generators** creates editable Edge Wear, Dirt Accumulation, Rust Spread, Moss Growth, Dust Accumulation or Water Streaks graphs. Save the Scalar **Mask** output as an `.ixsmartgenerator`, reopen your material and choose **Add generator...** on a Layer Stack row. The call and mask form one Undo/Redo edit. Inspector **Smart Generators > Add generator preset...** instead adds a mask call for direct scalar links. Controls become separate instance parameters per call; **NoiseMask** accepts an optional external scalar mask. A valid Geometry Bake supplies actual mesh inputs; analytic previews use labelled test values. Water follows **GravityDirection** with separate width/length; Moss uses **GrowthDirection** and optional projected-height fade. Preset GUIDs survive moves; changed files refresh and malformed files retain the last valid image. Refresh interfaces as for subgraphs; keep one Scalar Mask output. Save the definition and valid geometry cache before saving a mesh-bound instance or publishing its material.
+
 <!-- topic: prefabs -->
 ### Creating and updating prefabs
 

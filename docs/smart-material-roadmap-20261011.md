@@ -1,5 +1,28 @@
 # Smart Material rendszer: meglévő alapok és hiányzó feladatok
 
+## Frissítés — 2026. október 12.
+
+A későbbi mérföldkövek már közös UI-független gráfot/IR-t, kezelt Layer Stack-et,
+külön menthető GUID-alapú instance-okat és típusos subgraph asseteket adnak. A
+statikus mesh geometry baker tényleges AO/curvature/cavity/thickness és object/world
+pozíció/normál térképeket készít, paddinggel, megszakítható háttérmunkával és ellenőrzött
+GUID-cache-sel. A mesh-atlas preview és a Weathered Stone objektumhoz kötött native
+material export is működik.
+
+Hat szerkeszthető `.ixsmartgenerator` preset épül ugyanarra a backend-re: Edge Wear,
+Dirt Accumulation, Rust Spread, Moss Growth, Dust Accumulation és Water Streaks.
+Menthetők, külön hívásonként paraméterezhetők és rétegmaszkként hozzárendelhetők.
+Használat, teszt- és mérési részletek: `SMART_MATERIAL_GENERATORS.md`,
+`SMART_MATERIAL_GEOMETRY.md`, `SMART_MATERIAL_TESTS.md` és
+`SMART_MATERIAL_PERFORMANCE.md`.
+
+A dedikált Asset Browser kategóriák/katalógus, a jelenetkijelöléshez kötött 3D mesh
+preview, terrain/skinned bake, GPU reflection/binding/cache és dinamikus játékbeli
+materialgráf-renderelés továbbra is hátravan. Az alábbi eredeti állapotfelmérés a
+2026. október 11-i helyzetet rögzíti; a friss státuszhoz a fenti dokumentumokat használd.
+
+## Korábbi állapotfelmérés
+
 Állapotfelmérés: 2026. október 11., a jelenlegi motor forráskódja alapján.
 
 A tervezett Smart Material újrahasználható, réteges felületi anyag: például egy kő alapanyagára automatikusan moha kerül a felfelé néző részeken, nedvesség az alján, kosz a mélyedésekben. Ugyanez terrainen füvet, sziklát és sarat keverhet. Az alábbi cél egy közös anyagrendszer terrainhez és modellekhez; az első megvalósítás terrainre szűkíthető. A felsorolt új funkciók tervek, még nincsenek megépítve.

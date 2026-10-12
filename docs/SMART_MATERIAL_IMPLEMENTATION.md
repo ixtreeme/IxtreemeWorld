@@ -95,7 +95,7 @@ remains planned.
 | Phase | Status | Required next implementation |
 | --- | --- | --- |
 | 4 Geometry | CPU/editor reference implemented | Static submesh atlas, maps, checked cache/GUID invalidation, async/cancel and material integration implemented. Scene-object binding, terrain, skinned baking, 3D mesh preview and broader stress profiling remain. |
-| 5 Generators | Planned | The reusable subgraph mechanism and real geometry inputs are implemented; six reusable generator presets remain. The current dirt/moss recipe is ordinary graph content. |
+| 5 Generators | Core/editor implemented | Six editable subgraph presets, native files/GUIDs, layer-mask insertion, scoped instances and real mesh bake integration. Dedicated browser catalog/thumbnails and GPU numeric parity remain. |
 | 6 Assets | Partial | Graph/instance/subgraph/geometry GUID registration, files and native dependencies implemented; geometry content hashes/invalidation implemented. Dedicated browser categories, generator assets and runtime invalidation remain. |
 | 7 Runtime | Planned | DXC runtime owner, actual reflection, texture/sampler/parameter uploads, variant/pipeline cache, assignment and failure recovery through IXRHI. |
 | 8 Optimization | Partial | CPU benchmarks and cancellable async geometry jobs implemented. Material preview/export still synchronous; GPU baking/performance, sample deduplication, folding/CSE and broader stress/lifetime tests remain. |
@@ -191,7 +191,7 @@ requires rebaking and keeps the prior preview image with a diagnostic.
 Weathered Stone can now publish an object-specific native material through the
 existing asset pipeline, with real PNG/ORM images, a checked geometry snapshot and
 dependency metadata. Source placement and UVs are baked into these images. The
-runtime shader/reflection path and six reusable smart generators are still planned.
+runtime shader/reflection path remains planned; the following milestone adds six reusable smart generators.
 No extra dependency was introduced; C++ standard threads power the geometry job.
 
 Reference fixtures and real OBJ files verify geometry, corruption/cancel recovery,
@@ -199,3 +199,30 @@ cache moves/staleness, editor job completion, instance reload and material outpu
 The editor sequence found a stale Selected Output mode after switching from a
 subgraph to an ordinary material; Load now resets that unavailable selection.
 The cache/algorithm schema and current limitations are in `SMART_MATERIAL_GEOMETRY.md`.
+
+## Milestone 4 — smart generators
+
+Implemented Edge Wear, Dirt Accumulation, Rust Spread, Moss Growth, Dust
+Accumulation and Water Streaks as editable ordinary subgraphs. SmartGenerator
+provides preset metadata/catalog, transactional wrapper v1 and validation of one
+Scalar Mask output. Existing graph/IR/evaluator/HLSL mechanisms execute recipes;
+the factory only builds initial data. Context nodes use real mesh data, published
+parameters support instances and NoiseMask accepts an external scalar modulation.
+
+Native `.ixsmartgenerator` GUIDs resolve through the existing subgraph cache,
+including moves, invalidation, nested dependencies and explicit interface refresh.
+The editor creates/saves/reopens presets, lists calls, inserts them into a graph
+or assigns layer masks as one undoable edit. Ordinary subgraph saves cannot strip
+generator metadata. Geometry material publishing retains authored dependencies,
+effective source/overrides and actual geometry snapshots.
+
+Tests cover numerical references, deterministic seeds, amounts/directions/height,
+gravity anisotropy, bounded input/range recovery, scopes, real geometry and native
+file/editor/bake workflows. The factory's seed constant was brought within the
+existing ±1M serialized field bound; noise scaling uses a bounded shared vector
+instruction before lattice conversion. Editor tests found stale selected-output
+state when Undo removed a generator call; history now selects a valid output or
+returns to shading. No test or loader bounds were weakened to accept these issues.
+All six recipes have actual DXIL/SPIR-V compilation tests. GPU numeric parity,
+runtime reflection/assignment and dedicated browser catalog remain planned.
+See SMART_MATERIAL_GENERATORS.md and the validation/performance documents.

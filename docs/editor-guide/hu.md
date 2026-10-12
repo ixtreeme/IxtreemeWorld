@@ -196,6 +196,9 @@ A toolbar **Templates** menüje rozsdás fém (UV) és mohás kő (world) kezdő
 
 Középső egérgombbal mozgatod a nézetet, görgővel nagyítasz, a **Fit** befoglalja a gráfot, a Delete törli a kijelölt node-okat vagy kapcsolatokat. Az Undo/Redo a node-mozgatást, bekötéseket és Inspector-szerkesztéseket is visszaállítja. A Ctrl+S a gráfot menti, ha a Material Graph vagy annak Inspectora kapja a billentyűzetes fókuszt. A **Save / Save As...** verziózott `.materialgraph` fájlba ment; az **Open...** a korábbi, 1-es formátumot is betölti. A panel bezárásakor a vázlat megmarad a memóriában; az editor bezárása előtt mentsd el.
 
+#### Smart Generators
+A **Templates > Smart Generators** szerkeszthető Edge Wear, Dirt Accumulation, Rust Spread, Moss Growth, Dust Accumulation vagy Water Streaks gráfot készít. A Scalar **Mask** kimenetet mentsd `.ixsmartgenerator` fájlba, nyisd meg újra a materialt, majd a Layer Stack során válaszd az **Add generator...** gombot. A hívás és a maszk egyetlen Undo/Redo művelet. Az Inspector **Smart Generators > Add generator preset...** külön maszk-hívást ad scalar bekötéshez. A vezérlők hívásonként külön instance-paraméterek; a **NoiseMask** opcionális külső scalar maszkot fogad. Helyes Geometry Bake valódi mesh-adatot ad; az analitikus preview jelölt tesztértékeket használ. A Water **GravityDirection** szerint nyúlik külön width/length értékkel; a Moss **GrowthDirection** és opcionális vetített magasság szerint nő. A preset GUID-ja mozgatáskor megmarad; módosult fájlnál frissül a preview, hibás fájlnál megmarad az utolsó helyes kép. Az interfészt subgraphként frissítsd; egy Scalar Mask kimenet maradjon. Meshhez kötött instance és export előtt mentsd a definíciót és a helyes geometriai cache-t.
+
 <!-- topic: prefabs -->
 ### Prefab készítése és frissítése
 

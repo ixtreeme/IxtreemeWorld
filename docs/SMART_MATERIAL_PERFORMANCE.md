@@ -129,3 +129,30 @@ The benchmark proves this fixture timing only; it is not a production-mesh,
 million-triangle, frame-latency or cache hit/miss-rate result. The editor worker
 keeps this computation off the UI thread, while import and material preview/export
 still need broader profiling and jobs for large assets.
+
+## Smart generator timing — 2026-10-12
+
+Same Release machine. `SmartGeneratorTest.exe --benchmark` exits 0 and measures
+each recipe with two warmups and the median of five samples per operation.
+Compilation expands a single resolver-backed call into the ordinary Example
+material, with its mask also selected. Preview uses a real 128-square concave
+corner geometry bake, Scalar Selected Output, NoiseInfluence .5, default other
+controls and no texture resources. Geometry baking itself is outside these timings.
+
+| Recipe | Compile (ms) | Preview 128 (ms) | Reachable IR instructions | Numeric parameter bytes |
+| --- | ---: | ---: | ---: | ---: |
+| Edge Wear | 7.2286 | 11.8860 | 35 | 96 |
+| Dirt Accumulation | 6.7800 | 10.8983 | 33 | 80 |
+| Rust Spread | 7.9076 | 13.9433 | 43 | 112 |
+| Moss Growth | 12.8472 | 21.5602 | 67 | 160 |
+| Dust Accumulation | 6.7429 | 12.1965 | 37 | 96 |
+| Water Streaks | 14.1589 | 25.7261 | 75 | 160 |
+
+Compilation includes schema validation, scoped expansion and reachable IR; the
+resolver supplies in-memory definitions. Preview includes real atlas sampling,
+shared evaluation and RGBA output allocation. Native import/GUID IO, shader DXC,
+file/cache IO, material PNG/export, GPU and job scheduling are excluded. Parameter
+byte counts exclude instance/container heap overhead. These are fixture timings,
+not production multi-generator materials, GPU timings or a 60 Hz latency guarantee.
+Material preview remains synchronous; larger layered/256-square previews need
+future jobs and shared-IR optimization, rather than assuming this table scales linearly.

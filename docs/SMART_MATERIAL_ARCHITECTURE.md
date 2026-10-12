@@ -83,7 +83,7 @@ selection yet. Specialized additive/multiply modes and layer groups are planned.
 | `GeometryBaker.*` / `IXGeometryBaker` | UI-independent UV rasterizer, dihedral curvature/cavity, BVH ray AO/thickness, object/world maps, padding, checked cache codec and cancellable worker. |
 | `GeometryAssets.*` / `GraphGeometryCache` | Existing Assimp import, native model/cache GUID dependencies, content validation and invalidation; editor thread only. |
 | `MaterialSubgraph.*` / `GraphSubgraphCache` | Versioned typed assets, GUID resolution, bounded expansion, cycle checks, caller scopes and file invalidation. |
-| Future generators | Reusable generator presets built on the subgraph mechanism and real geometry data. |
+| `SmartGenerator.*` | Six editable subgraph presets, metadata wrapper, Scalar mask validation and canonical layer insertion; existing IR/backends. |
 | Future runtime shader owner | DXC/reflection/cache/IXRHI bindings/lifetime and renderer assignment. |
 
 No independent evaluator, renderer replacement or new third-party dependency is
