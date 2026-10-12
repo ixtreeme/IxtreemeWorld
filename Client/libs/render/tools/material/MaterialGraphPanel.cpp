@@ -29,7 +29,7 @@ ImVec4 PinColor(PinType type)
     case PinType::Texture:return {.9f,.45f,.45f,1};case PinType::Surface:return {.95f,.82f,.35f,1};
     }return {1,1,1,1};
 }
-std::filesystem::path ChooseGraphFile(bool save, const std::filesystem::path& current, bool instance = false)
+std::filesystem::path ChooseGraphFile(bool save, const std::filesystem::path& current, bool instance = false, bool subgraph = false)
 {
     wchar_t file[32768]{};
     const auto initial = current.wstring();
@@ -39,8 +39,9 @@ std::filesystem::path ChooseGraphFile(bool save, const std::filesystem::path& cu
     const auto* viewport = ImGui::GetMainViewport();
     dialog.hwndOwner = static_cast<HWND>(viewport->PlatformHandleRaw);
     dialog.lpstrFile = file; dialog.nMaxFile = static_cast<DWORD>(std::size(file));
-    dialog.lpstrFilter = instance ? L"Material Instance (*.ixmaterialinstance)\0*.ixmaterialinstance\0All Files\0*.*\0" : L"Material Graph (*.materialgraph)\0*.materialgraph\0All Files\0*.*\0";
-    dialog.lpstrDefExt = instance ? L"ixmaterialinstance" : L"materialgraph";
+    dialog.lpstrFilter = instance ? L"Material Instance (*.ixmaterialinstance)\0*.ixmaterialinstance\0All Files\0*.*\0" :
+        (subgraph && save ? L"Material Subgraph (*.ixmaterialsubgraph)\0*.ixmaterialsubgraph\0" : L"Material Documents\0*.materialgraph;*.ixsmartmaterial;*.ixmaterialsubgraph\0All Files\0*.*\0");
+    dialog.lpstrDefExt = instance ? L"ixmaterialinstance" : (subgraph ? L"ixmaterialsubgraph" : L"materialgraph");
     dialog.lpstrTitle = save ? L"Save Material Graph" : L"Open Material Graph";
     dialog.Flags = OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
     if (save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog)) return std::filesystem::path(file);
@@ -51,7 +52,7 @@ MaterialGraphPanel::MaterialGraphPanel() = default;
 MaterialGraphPanel::~MaterialGraphPanel() { ResetContext(); if(provider_ && previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_); }
 void MaterialGraphPanel::SetServices(AssetLibrary* library,ixeditor::graphics::IEditorTextureProvider* provider) {
     if(provider_!=provider) {if(provider_ && previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_);previewTexture_={};provider_=provider;previewDirty_=true;}
-    if(library_!=library){library_=library;textures_.Clear();parameters_={};previewDirty_=true;}
+    if(library_!=library){library_=library;textures_.Clear();subgraphs_.Clear();forceCompile_=true;parameters_={};previewDirty_=true;}
     textures_.Configure(library_,path_.parent_path());
 }
 void MaterialGraphPanel::ResetContext()
@@ -130,7 +131,7 @@ void MaterialGraphPanel::RenderNodeMenu()
             if(label.find(filter)!=std::string::npos){item(kind);found=true;}}
         if(!found)ImGui::TextDisabled("No matching nodes");
     } else {
-        for(const auto* category:{"Constants","Parameters","Coordinates","Textures","Math","Color","Masks","Materials"})
+        for(const auto* category:{"Constants","Parameters","Coordinates","Textures","Math","Color","Masks","Materials","Subgraphs"})
             if(ImGui::BeginMenu(category)) {for(const auto kind:AllNodeKinds())if(std::string_view(NodeCategory(kind))==category)item(kind);ImGui::EndMenu();}
     }
 }
@@ -141,8 +142,11 @@ void MaterialGraphPanel::RequestReplace(bool openFile)
     if (openFile) OpenDialog();
     else
     {
-        document_ = pendingPreset_==1?MaterialGraphDocument::WeatheredMetal():(pendingPreset_==2?MaterialGraphDocument::MossyRock():(pendingPreset_==3?MaterialGraphDocument::WeatheredStone():MaterialGraphDocument::Example())); pendingPreset_=0; saved_ = MaterialGraphDocument::Example(); path_.clear();
+        subgraphMode_=pendingPreset_==4; subgraphVersion_=1;
+        document_ = subgraphMode_?MaterialSubgraph::Example().graph:(pendingPreset_==1?MaterialGraphDocument::WeatheredMetal():(pendingPreset_==2?MaterialGraphDocument::MossyRock():(pendingPreset_==3?MaterialGraphDocument::WeatheredStone():MaterialGraphDocument::Example()))); pendingPreset_=0; saved_ = MaterialGraphDocument::Example(); path_.clear();
         undo_.clear(); redo_.clear(); selected_ = 0; parameters_={}; previewDirty_=true; ResetContext(); fitPending_ = true; status_.clear();
+        subgraphs_.Clear(); forceCompile_=true;
+        if (subgraphMode_) { selected_=4; previewPin_=PinId(4,1); previewSettings_.channel=PreviewChannel::SelectedOutput; }
     }
 }
 void MaterialGraphPanel::RenderUnsavedPopup()
@@ -190,6 +194,7 @@ void MaterialGraphPanel::RenderToolbar()
         if(ImGui::MenuItem("Weathered metal (UV)")){pendingPreset_=1;RequestReplace(false);}
         if(ImGui::MenuItem("Mossy rock (world)")){pendingPreset_=2;RequestReplace(false);}
         if(ImGui::MenuItem("Smart Weathered Stone")){pendingPreset_=3;RequestReplace(false);}
+        if(ImGui::MenuItem("New reusable subgraph")){pendingPreset_=4;RequestReplace(false);}
         ImGui::EndPopup();
     }
     ImGui::TextDisabled("%s%s  |  %zu nodes, %zu links", path_.empty() ? "Untitled" : path_.filename().string().c_str(), document_ != saved_ ? " *" : "", document_.nodes.size(), document_.links.size());
@@ -207,7 +212,7 @@ void MaterialGraphPanel::DrawNode(const GraphNode& node)
         ImGui::GetWindowDrawList()->AddRectFilled(at, {at.x + 200, at.y + 25}, ImGui::ColorConvertFloat4ToU32({node.value[0], node.value[1], node.value[2], 1}), 3);
         ImGui::Dummy({200, 30});
     }
-    const auto pins = NodePins(node.kind);
+    const auto pins = NodePins(node);
     for (std::size_t slot = 0; slot < pins.size(); ++slot)
     {
         const auto& pin = pins[slot];
@@ -246,6 +251,7 @@ void MaterialGraphPanel::RenderView(bool& open)
     RenderToolbar();
     // Toolbar undo/new/open may have replaced the context.
     EnsureContext(); ed::SetCurrentEditor(context_);
+    const bool restoreSelection = layoutPending_ && document_.FindNode(selected_);
     if (layoutPending_)
     {
         for (const auto& node : document_.nodes) ed::SetNodePosition(ed::NodeId(node.id * 16), {node.position[0], node.position[1]});
@@ -258,6 +264,7 @@ void MaterialGraphPanel::RenderView(bool& open)
     ed::Begin("MaterialGraphCanvas", {0, std::max(100.0f, ImGui::GetContentRegionAvail().y - 45)});
     ed::EnableShortcuts(!ImGui::GetIO().WantTextInput);
     for (const auto& node : document_.nodes) DrawNode(node);
+    if (restoreSelection) ed::SelectNode(ed::NodeId(selected_ * 16));
     for (const auto& link : document_.links)
         if (const auto pin = document_.FindPin(link.output)) ed::Link(ed::LinkId(link.id * 16 + 15), ed::PinId(link.output), ed::PinId(link.input), PinColor(pin->definition.type), 2);
     if (ed::BeginCreate())
@@ -334,7 +341,7 @@ void MaterialGraphPanel::RenderInspector()
     char name[256]; std::snprintf(name,sizeof(name),"%s",node->name.c_str());
     edit([&]{const bool changed=UI::Prop::InputText("Name",name,sizeof(name));if(changed)node->name=name;return changed;});
     using N=NodeKind;
-    if(node->kind==N::ScalarParameter || node->kind==N::ColorParameter || node->kind==N::TextureParameter || node->kind==N::Vector2Parameter || node->kind==N::Vector3Parameter) {
+    if(node->kind==N::ScalarParameter || node->kind==N::ColorParameter || node->kind==N::TextureParameter || node->kind==N::Vector2Parameter || node->kind==N::Vector3Parameter || node->kind==N::SubgraphInput || node->kind==N::SubgraphOutput) {
         char key[256];std::snprintf(key,sizeof(key),"%s",node->parameter.c_str());
         ImGui::BeginDisabled(node->region == GraphRegion::ManagedLayer);
         edit([&]{const bool changed=UI::Prop::InputText("Parameter",key,sizeof(key));if(changed)node->parameter=key;return changed;});
@@ -342,6 +349,22 @@ void MaterialGraphPanel::RenderInspector()
         ImGui::TextWrapped("Exposed by name. Instance overrides below leave the graph defaults intact.");
     }
     switch(node->kind) {
+    case N::Subgraph:RenderSubgraphBinding(node->id);break;
+    case N::SubgraphInput:case N::SubgraphOutput:{
+        int type=static_cast<int>(node->interfaceType); const char* types[]={"Scalar","Color","Vector2","Vector3","Texture","Surface"};
+        if (UI::Prop::Combo("Port type",&type,types,6)) {
+            const auto before=document_; auto draft=document_; draft.FindNode(node->id)->interfaceType=static_cast<PinType>(type);
+            MaterialGraphDocument checked;
+            if (checked.FromJson(draft.ToJson(),status_)) { document_=std::move(draft); RecordUndo(before); node=document_.FindNode(selected_); }
+        }
+        if (node->kind==N::SubgraphInput) {
+            if (node->interfaceType==PinType::Scalar) number("Default",node->value[0]);
+            if (node->interfaceType==PinType::Color) edit([&]{return UI::Prop::ColorEdit4("Default (linear)",node->value.data());});
+            if (node->interfaceType==PinType::Vector2) edit([&]{return UI::Prop::DragFloat2("Default XY",node->value.data(),.01f);});
+            if (node->interfaceType==PinType::Vector3) edit([&]{return UI::Prop::DragFloat3("Default XYZ",node->value.data(),.01f);});
+        }
+        ImGui::TextWrapped("Stable declaration ID. Connected type changes are rejected; callers refresh interface changes explicitly. Texture/Surface inputs require a caller binding.");break;
+    }
     case N::Scalar:case N::ScalarParameter:number("Value",node->value[0]);break;
     case N::Color:case N::ColorParameter:edit([&]{return UI::Prop::ColorEdit4("Color (linear)",node->value.data());});break;
     case N::Vector2:case N::Vector2Parameter:edit([&]{return UI::Prop::DragFloat2("XY",node->value.data(),.01f);});break;
@@ -393,17 +416,44 @@ bool MaterialGraphPanel::Load(const std::filesystem::path& path)
     std::string text;
     if (!LoadMaterialText(path, text, status_)) return false;
     MaterialGraphDocument draft;
-    if (!draft.FromJson(text, status_)) return false;
+    const bool subgraph = detectAssetType(path)==AssetType::MaterialSubgraph;
+    std::uint32_t interfaceVersion=1;
+    if (subgraph) {
+        MaterialSubgraph asset; if (!asset.FromJson(text,status_)) return false;
+        draft=std::move(asset.graph); interfaceVersion=asset.interfaceVersion;
+    } else if (!draft.FromJson(text, status_)) return false;
     document_ = std::move(draft); saved_ = document_; path_ = path; undo_.clear(); redo_.clear();
     dragBefore_.reset(); propertyBefore_.reset(); selected_ = 0; ResetContext(); fitPending_ = true;
-    parameters_={};previewDirty_=true;textures_.Clear(); textures_.Configure(library_,path_.parent_path()); status_ = "Graph opened"; return true;
+    subgraphMode_=subgraph; subgraphVersion_=interfaceVersion; subgraphs_.Clear(); forceCompile_=true;
+    if (subgraph) for (const auto& node:document_.nodes) if (node.kind==NodeKind::SubgraphOutput) { selected_=node.id; previewPin_=PinId(node.id,1); previewSettings_.channel=PreviewChannel::SelectedOutput; break; }
+    parameters_={};previewDirty_=true;textures_.Clear(); textures_.Configure(library_,path_.parent_path()); status_ = subgraph?"Subgraph opened":"Graph opened"; return true;
 }
 bool MaterialGraphPanel::Save(const std::filesystem::path& path)
 {
-    const auto text = document_.ToJson();
+    const bool subgraph = detectAssetType(path)==AssetType::MaterialSubgraph;
+    if (subgraphMode_ && !subgraph) { status_="Save subgraph assets with the .ixmaterialsubgraph extension"; return false; }
+    if (!subgraph && detectAssetType(path)!=AssetType::MaterialGraph) { status_="Use .materialgraph, .ixsmartmaterial or .ixmaterialsubgraph"; return false; }
+    auto text = document_.ToJson();
     MaterialGraphDocument checked;
-    if (!checked.FromJson(text, status_) || !SaveMaterialTextAtomic(path, text, status_)) return false;
-    path_ = path; saved_ = document_; textures_.Configure(library_,path_.parent_path()); previewDirty_=true; status_ = "Graph saved"; return true;
+    if (!checked.FromJson(text, status_)) return false;
+    if (subgraph) {
+        MaterialSubgraph asset{subgraphVersion_,document_}; std::vector<MaterialGraphPort> ports;
+        if (!asset.GetInterface(ports,status_)) return false; text=asset.ToJson();
+    }
+    if (!SaveMaterialTextAtomic(path, text, status_)) return false;
+    auto& database=AssetDatabase::Instance(); const auto guid=database.getOrCreateGuid(path);
+    std::vector<Guid> dependencies;
+    for (const auto& node:document_.nodes) if (const auto dependency=Guid::fromString(node.assetGuid))
+        if (std::find(dependencies.begin(),dependencies.end(),*dependency)==dependencies.end()) dependencies.push_back(*dependency);
+    if (!IsMaterialAssetGuid(guid.toString()) || !database.writeDependencies(path,dependencies)) { status_="Definition saved, but asset identity/dependency metadata failed"; return false; }
+    path_ = path; saved_ = document_; subgraphMode_=subgraph; textures_.Configure(library_,path_.parent_path()); previewDirty_=true; status_ = subgraph?"Subgraph saved":"Graph saved"; return true;
+}
+bool MaterialGraphPanel::CompileMaterial(MaterialGraphProgram& program, std::string& error, std::uint32_t previewPin)
+{
+    if (&program!=&program_) forceCompile_=true;
+    subgraphs_.BeginCompilation();
+    const bool result=program.Compile(document_,error,previewPin,subgraphs_.Resolver());
+    subgraphs_.FinishCompilation(); return result;
 }
 bool MaterialGraphPanel::SaveInstance(const std::filesystem::path& path)
 {
@@ -411,7 +461,7 @@ bool MaterialGraphPanel::SaveInstance(const std::filesystem::path& path)
     std::error_code sameFileError;
     if (std::filesystem::equivalent(path_,path,sameFileError)) { status_="An instance cannot replace its material definition"; return false; }
     MaterialGraphProgram program;
-    if (!program.Compile(document_,status_)) return false;
+    if (!CompileMaterial(program,status_)) return false;
     MaterialInstance instance; instance.definitionGuid=AssetDatabase::Instance().getOrCreateGuid(path_).toString(); instance.overrides=parameters_;
     if (!instance.Validate(program,status_)) return false;
     if (!SaveMaterialTextAtomic(path,instance.ToJson(),status_)) return false;
@@ -430,7 +480,7 @@ bool MaterialGraphPanel::LoadInstance(const std::filesystem::path& path)
 {
     if (path_.empty()) { status_="Open the material definition before loading its instance"; return false; }
     std::string text; MaterialInstance instance; MaterialGraphProgram program;
-    if (!LoadMaterialText(path,text,status_) || !instance.FromJson(text,status_) || !program.Compile(document_,status_)) return false;
+    if (!LoadMaterialText(path,text,status_) || !instance.FromJson(text,status_) || !CompileMaterial(program,status_)) return false;
     if (instance.definitionGuid!=AssetDatabase::Instance().getOrCreateGuid(path_).toString()) { status_="This instance references a different material definition"; return false; }
     if (!instance.geometryBakeGuid.empty()) { status_="Geometry bake binding requires the geometry baker integration"; return false; }
     if (!instance.Validate(program,status_)) return false;
@@ -438,7 +488,7 @@ bool MaterialGraphPanel::LoadInstance(const std::filesystem::path& path)
 }
 void MaterialGraphPanel::SaveDialog(bool saveAs)
 {
-    const auto destination = saveAs || path_.empty() ? ChooseGraphFile(true, path_) : path_;
+    const auto destination = saveAs || path_.empty() ? ChooseGraphFile(true, path_,false,subgraphMode_) : path_;
     if (!destination.empty()) Save(destination);
 }
 void MaterialGraphPanel::OpenDialog()
@@ -476,6 +526,42 @@ void MaterialGraphPanel::RenderTextureBinding(GraphNode& node)
         }
     }ImGui::SameLine();if(ImGui::SmallButton("Clear")){const auto before=document_;node.resource.clear();node.assetGuid.clear();node.assetId.clear();RecordUndo(before);textures_.Clear();}
     ImGui::PopID();
+}
+void MaterialGraphPanel::RenderSubgraphBinding(std::uint32_t id)
+{
+    auto* node=document_.FindNode(id);
+    if (!node) return;
+    ImGui::TextWrapped("Referenced subgraph: %s",node->resource.empty()?"Unbound":node->resource.c_str());
+    const bool browse=ImGui::Button("Bind subgraph..."); ImGui::SameLine(); const bool refresh=ImGui::Button("Refresh interface");
+    if (browse || refresh) {
+        std::string guid=node->assetGuid, resource=node->resource;
+        if (browse) {
+            wchar_t file[32768]{}; OPENFILENAMEW dialog{}; dialog.lStructSize=sizeof(dialog);
+            dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);
+            dialog.lpstrFile=file; dialog.nMaxFile=static_cast<DWORD>(std::size(file)); dialog.lpstrFilter=L"Material Subgraph\0*.ixmaterialsubgraph\0";
+            dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
+            if (!GetOpenFileNameW(&dialog)) return;
+            guid=AssetDatabase::Instance().getOrCreateGuid(file).toString(); resource=std::filesystem::path(file).filename().string();
+        }
+        const auto before=document_; MaterialSubgraph asset; subgraphs_.Clear(); forceCompile_=true;
+        if (subgraphs_.Resolve(guid,asset,status_) && BindMaterialSubgraph(document_,id,guid,asset,status_)) {
+            document_.FindNode(id)->resource=resource; RecordUndo(before); ResetContext(); previewDirty_=true; status_="Subgraph interface bound";
+        }
+        return;
+    }
+    ImGui::Text("Interface version: %u",node->interfaceVersion);
+    for (auto& port:node->ports) if (port.input && port.type!=PinType::Texture && port.type!=PinType::Surface) {
+        ImGui::PushID(static_cast<int>(port.id)); const auto before=document_; bool changed=false;
+        if (port.type==PinType::Scalar) changed=UI::Prop::DragFloat(port.name.c_str(),port.defaultValue.data(),.01f,-1000000.0f,1000000.0f,"%.3f");
+        if (port.type==PinType::Color) changed=UI::Prop::ColorEdit4(port.name.c_str(),port.defaultValue.data());
+        if (port.type==PinType::Vector2) changed=UI::Prop::DragFloat2(port.name.c_str(),port.defaultValue.data(),.01f);
+        if (port.type==PinType::Vector3) changed=UI::Prop::DragFloat3(port.name.c_str(),port.defaultValue.data(),.01f);
+        if (ImGui::IsItemActivated()) propertyBefore_=before;
+        if (changed && !propertyBefore_) propertyBefore_=before;
+        if (ImGui::IsItemDeactivatedAfterEdit() && propertyBefore_) { RecordUndo(*propertyBefore_); propertyBefore_.reset(); }
+        ImGui::PopID();
+    }
+    ImGui::TextWrapped("Unconnected numeric inputs use these defaults. Connected inputs take precedence. Published parameters appear below with a scope for this call.");
 }
 void MaterialGraphPanel::RenderLayerStack()
 {
@@ -532,7 +618,7 @@ void MaterialGraphPanel::RenderLayerStack()
         if (ImGui::BeginCombo("Mask",selectedMask?document_.FindNode(selectedMask->node)->name.c_str():"None")) {
             if (ImGui::Selectable("None",!layer.maskPin)) { maskPin=0; action=Action::Mask; }
             for (const auto& node:document_.nodes) {
-                const auto pins=NodePins(node.kind);
+                const auto pins=NodePins(node);
                 for (std::size_t slot=0;slot<pins.size();++slot) if (!pins[slot].input && pins[slot].type==PinType::Scalar) {
                     const auto pin=PinId(node.id,slot);const auto label=node.name+" / "+pins[slot].name+"##"+std::to_string(pin);
                     if (ImGui::Selectable(label.c_str(),layer.maskPin==pin)) { maskPin=pin; action=Action::Mask; }
@@ -573,42 +659,44 @@ void MaterialGraphPanel::RenderInstanceParameters()
     if (ImGui::Button("Save instance...")) { const auto path=ChooseGraphFile(true,{},true); if (!path.empty()) SaveInstance(path); }
     ImGui::SameLine(); if (ImGui::Button("Load instance...")) { const auto path=ChooseGraphFile(false,{},true); if (!path.empty()) LoadInstance(path); }
     if (ImGui::SmallButton("Reset all overrides")) { parameters_={}; textures_.Clear(); previewDirty_=true; }
-    for(const auto& n:document_.nodes) {
-        if(n.kind!=NodeKind::ScalarParameter && n.kind!=NodeKind::ColorParameter && n.kind!=NodeKind::TextureParameter && n.kind!=NodeKind::Vector2Parameter && n.kind!=NodeKind::Vector3Parameter)continue;
-        ImGui::PushID(static_cast<int>(n.id));
-        auto value=parameters_.values.contains(n.parameter)?parameters_.values.at(n.parameter):n.value;
+    for(const auto& parameter:program_.Layout().parameters) {
+        const auto& name=parameter.name; const auto type=parameter.type;
+        ImGui::PushID(name.c_str());
+        auto value=parameters_.values.contains(name)?parameters_.values.at(name):parameter.defaultValue;
         bool changed=false;
-        if(n.kind==NodeKind::ScalarParameter)changed=UI::Prop::DragFloat(n.parameter.c_str(),value.data(),.01f,-1000000.0f,1000000.0f,"%.3f");
-        if(n.kind==NodeKind::ColorParameter)changed=UI::Prop::ColorEdit4(n.parameter.c_str(),value.data());
-        if(n.kind==NodeKind::Vector2Parameter)changed=UI::Prop::DragFloat2(n.parameter.c_str(),value.data(),.01f);
-        if(n.kind==NodeKind::Vector3Parameter)changed=UI::Prop::DragFloat3(n.parameter.c_str(),value.data(),.01f);
-        if(changed){parameters_.values[n.parameter]=value;previewDirty_=true;}
-        if(n.kind==NodeKind::TextureParameter) {
-            std::string label="Default";if(parameters_.textures.contains(n.parameter))label=std::filesystem::path(std::u8string(parameters_.textures.at(n.parameter).begin(),parameters_.textures.at(n.parameter).end())).filename().string();
-            ImGui::TextUnformatted(n.parameter.c_str());ImGui::Button(label.c_str(),{std::max(100.0f,ImGui::GetContentRegionAvail().x),26});
+        if(type==PinType::Scalar)changed=UI::Prop::DragFloat(name.c_str(),value.data(),.01f,-1000000.0f,1000000.0f,"%.3f");
+        if(type==PinType::Color)changed=UI::Prop::ColorEdit4(name.c_str(),value.data());
+        if(type==PinType::Vector2)changed=UI::Prop::DragFloat2(name.c_str(),value.data(),.01f);
+        if(type==PinType::Vector3)changed=UI::Prop::DragFloat3(name.c_str(),value.data(),.01f);
+        if(changed){parameters_.values[name]=value;previewDirty_=true;}
+        if(type==PinType::Texture) {
+            std::string label="Default";if(parameters_.textures.contains(name))label=std::filesystem::path(std::u8string(parameters_.textures.at(name).begin(),parameters_.textures.at(name).end())).filename().string();
+            ImGui::TextUnformatted(name.c_str());ImGui::Button(label.c_str(),{std::max(100.0f,ImGui::GetContentRegionAvail().x),26});
             if(ImGui::BeginDragDropTarget()) {
                 if(const auto* payload=ImGui::AcceptDragDropPayload("ASSET_ID")) {std::string id(static_cast<const char*>(payload->Data),payload->DataSize);if(!id.empty() && id.back()==0)id.pop_back();const auto entry=library_?library_->FindById(id):std::optional<AssetLibrary::Entry>{};
-                    if(entry && entry->category==AssetLibrary::Category::Texture){parameters_.textures[n.parameter]=entry->guid.empty()?"asset:"+entry->id:"guid:"+entry->guid;textures_.Clear();previewDirty_=true;}}
+                    if(entry && entry->category==AssetLibrary::Category::Texture){parameters_.textures[name]=entry->guid.empty()?"asset:"+entry->id:"guid:"+entry->guid;textures_.Clear();previewDirty_=true;}}
                 ImGui::EndDragDropTarget();
             }
         }
-        if(ImGui::SmallButton("Reset")){parameters_.values.erase(n.parameter);parameters_.textures.erase(n.parameter);previewDirty_=true;textures_.Clear();}ImGui::PopID();
+        if(ImGui::SmallButton("Reset")){parameters_.values.erase(name);parameters_.textures.erase(name);previewDirty_=true;textures_.Clear();}ImGui::PopID();
     }
 }
 void MaterialGraphPanel::UpdatePreview()
 {
     const auto revision=library_?library_->Revision():0;
     if(revision!=libraryRevision_){libraryRevision_=revision;textures_.Clear();previewDirty_=true;}
-    if(!previewDirty_ && SameEvaluationGraph(evaluated_,document_) && previewSettings_==renderedSettings_ && previewPin_==renderedPin_)return;
+    const bool dependencyChanged=subgraphs_.Changed();
+    if (dependencyChanged) { textures_.Clear(); previewDirty_=true; }
+    if(!previewDirty_ && !forceCompile_ && SameEvaluationGraph(evaluated_,document_) && previewSettings_==renderedSettings_ && previewPin_==renderedPin_)return;
     // Coalesce continuous slider edits while keeping the final released value exact.
     if(ImGui::IsAnyItemActive() && ImGui::GetTime()-previewTime_<.1)return;
     previewTime_=ImGui::GetTime();
     const auto pin=previewSettings_.channel==PreviewChannel::SelectedOutput?previewPin_:0;
     const auto previousPin=renderedSettings_.channel==PreviewChannel::SelectedOutput?renderedPin_:0;
-    const bool recompile = !SameEvaluationGraph(evaluated_,document_) || pin != previousPin || program_.Instructions().empty();
+    const bool recompile = forceCompile_ || dependencyChanged || !SameEvaluationGraph(evaluated_,document_) || pin != previousPin || program_.Instructions().empty();
     evaluated_=document_;renderedSettings_=previewSettings_;renderedPin_=previewPin_;previewDirty_=false;
     if(previewSettings_.channel==PreviewChannel::SelectedOutput && !pin){compileError_="Select a numeric or surface output";return;}
-    if (recompile) program_.Compile(document_,graphError_,pin);
+    if (recompile) { CompileMaterial(program_,graphError_,pin); forceCompile_=false; }
     if (!graphError_.empty()) { compileError_=graphError_; return; }
     if (!program_.ValidateOverrides(parameters_, compileError_)) return;
     textures_.Configure(library_,path_.parent_path());
@@ -632,7 +720,7 @@ void MaterialGraphPanel::RenderPreview()
     if(previewSettings_.channel==PreviewChannel::SelectedOutput) {
         const auto* node=document_.FindNode(selected_);bool found=false;
         if(node) {
-            const auto pins=NodePins(node->kind);
+            const auto pins=NodePins(*node);
             for(size_t s=0;s<pins.size();++s)if(!pins[s].input && pins[s].type!=PinType::Texture){if(previewPin_/16!=selected_ || !document_.FindPin(previewPin_))previewPin_=PinId(selected_,s);found=true;break;}
             if(found && ImGui::BeginCombo("Output",document_.FindPin(previewPin_)->definition.name)) {
                 for(size_t s=0;s<pins.size();++s)if(!pins[s].input && pins[s].type!=PinType::Texture)if(ImGui::Selectable(pins[s].name,previewPin_==PinId(selected_,s)))previewPin_=PinId(selected_,s);ImGui::EndCombo();
@@ -642,6 +730,7 @@ void MaterialGraphPanel::RenderPreview()
         if(const auto pin=document_.FindPin(previewPin_))previewSettings_.selectedType=pin->definition.type;
     }
     if(ImGui::SmallButton("Reload textures")){textures_.Clear();previewDirty_=true;}
+    ImGui::SameLine(); if(ImGui::SmallButton("Reload subgraphs")){subgraphs_.Clear();forceCompile_=true;previewDirty_=true;}
     UpdatePreview();
     if(!previewPixels_.empty()) {
         const auto at=ImGui::GetCursorScreenPos();const float size=std::clamp(ImGui::GetContentRegionAvail().x,96.0f,256.0f);
@@ -674,7 +763,7 @@ void MaterialGraphPanel::BakeMaterial()
 }
 void MaterialGraphPanel::ExportShader()
 {
-    MaterialGraphProgram program;if(!program.Compile(document_,status_))return;
+    MaterialGraphProgram program;if(!CompileMaterial(program,status_))return;
     wchar_t file[32768]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);dialog.lpstrFile=file;dialog.nMaxFile=static_cast<DWORD>(std::size(file));
     dialog.lpstrFilter=L"HLSL shader (*.hlsl)\0*.hlsl\0";dialog.lpstrDefExt=L"hlsl";dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_OVERWRITEPROMPT;
     if(!GetSaveFileNameW(&dialog))return;

@@ -1,4 +1,5 @@
 #include "tools/material/MaterialGraphAssets.h"
+#include "tools/material/MaterialGraphIO.h"
 #include "asset/MaterialAssetManager.h"
 #include <stb_image.h>
 #include <stb_image_write.h>
@@ -38,6 +39,30 @@ int main() {
     cache.BeginEvaluation();GraphNode wrongGuid=node;wrongGuid.id=26;wrongGuid.assetGuid="missing-guid";wrongGuid.resource=library.AssetRelativePath(moved);
     Check(cache.Sample(wrongGuid,"",.25f,.25f).rgba!=red && !cache.Error().empty(),"missing GUID cannot fall back to a valid stale texture path");
     cache.BeginEvaluation();Check(cache.Sample(other,"guid:"+moved.guid,.25f,.25f).rgba==red && cache.Error().empty(),"GUID-based instance texture override resolves after a move");
+    GraphTextureCache noLibrary;noLibrary.Configure(nullptr,root);
+    Check(noLibrary.Sample(node,"",.25f,.25f).rgba==red && noLibrary.Error().empty(),"texture GUID resolves through the native database without an AssetLibrary pointer");
+    wrongGuid.resource=library.AbsolutePath(moved).string();
+    Check(noLibrary.Sample(wrongGuid,"",.25f,.25f).rgba!=red && !noLibrary.Error().empty(),"missing GUID remains authoritative when no AssetLibrary is configured");
+    AssetLibrary::Entry renamed;
+    Check(library.RenameAsset(moved.id,"renamed_texture",false,renamed,error),"texture rename succeeds through the native library workflow");
+    noLibrary.Clear();
+    Check(noLibrary.Sample(node,"",.25f,.25f).rgba==red && noLibrary.Error().empty(),"native GUID lookup follows texture rename immediately without a watcher event");
     const auto count=library.Entries().size();Check(!PublishBakedMaterial(library,MaterialGraphDocument::MossyRock(),{},16,"Invalid UV",material,error)&&library.Entries().size()==count,"world-dependent material is rejected before writing assets");
+    auto subgraph=MaterialSubgraph::Example();const auto subgraphFile=root/"scale.ixmaterialsubgraph";
+    SaveMaterialTextAtomic(subgraphFile,subgraph.ToJson(),error);const auto subgraphGuid=AssetDatabase::Instance().getOrCreateGuid(subgraphFile);
+    auto subgraphMaterial=MaterialGraphDocument::Example();const auto call=subgraphMaterial.AddNode(NodeKind::Subgraph,{});
+    BindMaterialSubgraph(subgraphMaterial,call,subgraphGuid.toString(),subgraph,error);subgraphMaterial.Connect(PinId(call,1),PinId(3,1),error);
+    ParameterOverrides overrides;overrides.values["Subgraph_"+std::to_string(call)+"/Scale"]={.5f,0,0,0};
+    const bool subgraphBaked=PublishBakedMaterial(library,subgraphMaterial,overrides,16,"Subgraph material",material,error);
+    Check(subgraphBaked,"GUID-backed subgraph with scoped instance parameters publishes a real native material");
+    if(subgraphBaked) {
+        const auto folder=library.AbsolutePath(material).parent_path();std::string text;MaterialGraphDocument effective,authored;
+        const bool sources=LoadMaterialText(folder/"source.materialgraph",text,error)&&effective.FromJson(text,error)&&LoadMaterialText(folder/"definition.materialgraph",text,error)&&authored.FromJson(text,error);
+        Check(sources && authored==subgraphMaterial && std::none_of(effective.nodes.begin(),effective.nodes.end(),[](const auto& n){return n.kind==NodeKind::Subgraph;}),"bake retains authored definition and a self-contained effective source snapshot");
+        MaterialGraphProgram source;std::vector<std::array<GraphValue,14>> work;
+        Check(source.Compile(effective,error)&&std::abs(source.Evaluate({}, {}, {},work).roughness-.25f)<.0001f,"effective source retains scoped override values without resolving external subgraphs again");
+        const auto dependencies=AssetDatabase::Instance().loadDependencies(folder/"definition.materialgraph");
+        Check(std::find(dependencies.begin(),dependencies.end(),subgraphGuid)!=dependencies.end(),"baked authored definition tracks native subgraph dependencies");
+    }
     std::filesystem::remove_all(root);std::cout<<"Material graph baking failures: "<<failures<<'\n';return failures?1:0;
 }

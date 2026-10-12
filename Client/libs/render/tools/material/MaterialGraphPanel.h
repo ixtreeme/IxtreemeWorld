@@ -52,6 +52,8 @@ private:
     void RenderLayerStack();
     void UpdatePreview();
     void RenderTextureBinding(GraphNode& node);
+    void RenderSubgraphBinding(std::uint32_t node);
+    bool CompileMaterial(MaterialGraphProgram& program, std::string& error, std::uint32_t previewPin = 0);
     void ExportShader();
     void BakeMaterial();
     ax::NodeEditor::EditorContext* context_ = nullptr;
@@ -69,6 +71,7 @@ private:
     ixeditor::graphics::IEditorTextureProvider* provider_ = nullptr;
     ixeditor::graphics::EditorTextureHandle previewTexture_;
     GraphTextureCache textures_;
+    GraphSubgraphCache subgraphs_;
     MaterialGraphProgram program_;
     MaterialGraphDocument evaluated_;
     ParameterOverrides parameters_;
@@ -77,6 +80,8 @@ private:
     std::string compileError_;
     std::string graphError_;
     bool previewDirty_ = true;
+    bool forceCompile_ = false, subgraphMode_ = false;
+    std::uint32_t subgraphVersion_ = 1;
     double previewTime_ = -1;
     std::uint64_t libraryRevision_ = 0;
     std::uint32_t previewPin_ = 0, renderedPin_ = 0;

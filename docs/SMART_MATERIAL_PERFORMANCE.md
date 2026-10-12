@@ -67,7 +67,37 @@ foreach ($materialBackend in @('dxil', 'spirv')) {
 }
 ```
 
-## Limits and next profiling work
+## Subgraph milestone measurements
+
+The same machine/Release method additionally measures 32 connected calls to one
+in-memory GUID-backed asset. All calls feed a sum into roughness; the expanded IR
+has 129 reachable instructions and 32 separately scoped float4 parameters (512
+bytes). The resulting HLSL is 26075 bytes. Run:
+
+```powershell
+& './build/client-gui-check/libs/render/Release/MaterialSubgraphTest.exe' --benchmark
+```
+
+| Operation | Median |
+| --- | ---: |
+| Validation + 32-call expansion + IR compilation | 12.2956 ms |
+| HLSL generation | 0.4064 ms |
+| CPU sphere preview, 128 x 128 | 26.0766 ms |
+| 1000 scoped instance updates + buffer packing | 1.1004 ms |
+
+The resolver is called once per compilation for the shared GUID. Validated
+interfaces are cached once per GUID within compilation as well: the same fixture
+measured 16.1337 ms before that change, compared with 12.2956 ms afterward.
+These are local five-run medians with uncontrolled background load, not a general
+speedup guarantee. Expansion copies caller-specific IR bodies; instances continue
+sharing the resulting immutable program.
+
+This benchmark excludes native file resolution, IO, texture fetching, GPU execution
+and real geometry. The native cache's 256-asset budget/replacement is a correctness
+stress test, not a cache hit/miss-rate or frame-time benchmark. Geometry baking and
+runtime shader-variant caching remain unmeasured/unimplemented.
+
+## Remaining profiling work
 
 The CPU preview still runs synchronously when dirty. A 256-square update at about
 66 ms exceeds a 60 Hz frame budget; jobs/cancel/coalescing are needed before larger

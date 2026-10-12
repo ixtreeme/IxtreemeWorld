@@ -4,6 +4,28 @@
 #include <filesystem>
 
 namespace material_tool {
+class GraphSubgraphCache
+{
+public:
+    void Clear() { entries_.clear(); used_.clear(); }
+    void BeginCompilation() { used_.clear(); }
+    void FinishCompilation();
+    bool Changed() const;
+    bool Resolve(const std::string& guid, MaterialSubgraph& asset, std::string& error);
+    MaterialSubgraphResolver Resolver() { return [this](const auto& guid, auto& asset, auto& error) { return Resolve(guid, asset, error); }; }
+private:
+    struct Stamp {
+        std::filesystem::path path;
+        std::filesystem::file_time_type modified{};
+        std::uintmax_t bytes = 0;
+        bool exists = false;
+        bool operator==(const Stamp&) const = default;
+    };
+    struct Entry { Stamp stamp; MaterialSubgraph asset; std::string error; };
+    static Stamp Current(const std::string& guid);
+    std::unordered_map<std::string, Entry> entries_;
+    std::vector<std::string> used_;
+};
 class GraphTextureCache {
 public:
     void Configure(AssetLibrary* library, const std::filesystem::path& graphFolder);

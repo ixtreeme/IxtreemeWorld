@@ -73,3 +73,8 @@ The smallest full vertical slice is Stone Base + cavity/AO Dirt + slope/noise Mo
 one graph/layer document, saved instance overrides, real selected-mesh geometry
 contexts and UV rasterization. Its CPU part can precede GPU runtime integration,
 but it must not be called a completed GPU Smart Material framework.
+
+Follow-up 2026-10-12: the canonical core/layers/instances and GUID-backed subgraph
+expansion have since been implemented. This table remains the starting-state
+audit. Current capabilities, verification and outstanding geometry/runtime work
+are recorded in `SMART_MATERIAL_IMPLEMENTATION.md` and `SMART_MATERIAL_TESTS.md`.

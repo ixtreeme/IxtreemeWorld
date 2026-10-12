@@ -62,6 +62,19 @@ struct MaterialGraphPanelTestAccess
     static void Detach(MaterialGraphPanel& panel) {const auto before=panel.document_;panel.document_.ConvertToCustomGraph();panel.RecordUndo(before);}
     static void Override(MaterialGraphPanel& panel,float value) {panel.parameters_.values["MossAmount"]={value,0,0,0};panel.previewDirty_=true;}
     static const ParameterOverrides& Overrides(const MaterialGraphPanel& panel) {return panel.parameters_;}
+    static std::uint32_t Subgraph(MaterialGraphPanel& panel,const std::string& guid,const MaterialSubgraph& asset) {
+        panel.document_=MaterialGraphDocument::Example();std::string error;
+        const auto call=panel.document_.AddNode(NodeKind::Subgraph,{});BindMaterialSubgraph(panel.document_,call,guid,asset,error);
+        panel.document_.Connect(PinId(call,1),PinId(3,1),error);
+        panel.undo_.clear();panel.redo_.clear();panel.parameters_={};panel.path_.clear();panel.subgraphMode_=false;
+        panel.selected_=call;panel.previewSettings_={};panel.previewPin_=0;panel.ResetContext();panel.fitPending_=true;
+        panel.subgraphs_.Clear();panel.forceCompile_=true;panel.previewDirty_=true;return call;
+    }
+    static float Roughness(MaterialGraphPanel& panel) {std::vector<std::array<GraphValue,14>> work;return panel.program_.Evaluate({},panel.parameters_,{},work).roughness;}
+    static const std::vector<std::uint8_t>& Pixels(const MaterialGraphPanel& panel) {return panel.previewPixels_;}
+    static const std::string& Error(const MaterialGraphPanel& panel) {return panel.compileError_;}
+    static const MaterialCompileResult& Layout(const MaterialGraphPanel& panel) {return panel.program_.Layout();}
+    static void NumericOverride(MaterialGraphPanel& panel,const std::string& name,float value) {panel.parameters_.values[name]={value,0,0,0};panel.previewDirty_=true;}
 };
 }
 namespace
@@ -188,7 +201,7 @@ void Editor(bool capture)
         std::ofstream(root / "bad.materialgraph") << "not JSON";
         const auto intact = reopened.Document();
         Check(!reopened.Load(root / "bad.materialgraph") && reopened.Document() == intact, "failed Open preserves current document");
-        std::filesystem::remove(file); std::filesystem::remove(root / "bad.materialgraph"); std::filesystem::remove(root);
+        std::filesystem::remove_all(root); // production Save now also writes native identity/dependency metadata
         const auto normalZoom = MaterialGraphPanelTestAccess::Zoom(panel);
         io.AddMousePosEvent(400, 350); frame(); io.AddMouseWheelEvent(0, 2); frame(); for(int i=0;i<30;++i)frame();
         Check(std::abs(MaterialGraphPanelTestAccess::Zoom(panel) - normalZoom) > .01f, "mouse wheel changes canvas zoom");
@@ -245,6 +258,55 @@ void Editor(bool capture)
         std::string instanceText,error;MaterialInstance wrong;LoadMaterialText(instanceFile,instanceText,error);wrong.FromJson(instanceText,error);wrong.definitionGuid=generateGuidV4().toString();
         const auto wrongFile=smartRoot/"wrong.ixmaterialinstance";SaveMaterialTextAtomic(wrongFile,wrong.ToJson(),error);const auto previousOverrides=MaterialGraphPanelTestAccess::Overrides(restored);
         Check(!restored.LoadInstance(wrongFile) && MaterialGraphPanelTestAccess::Overrides(restored)==previousOverrides,"mismatched instance fails without losing current overrides");
+        auto subgraph=MaterialSubgraph::Example(); const auto subgraphFile=smartRoot/"scale.ixmaterialsubgraph";
+        Check(SaveMaterialTextAtomic(subgraphFile,subgraph.ToJson(),error),"real subgraph fixture saves atomically");
+        const auto subgraphGuid=AssetDatabase::Instance().getOrCreateGuid(subgraphFile);
+        Check(detectAssetType(subgraphFile)==AssetType::MaterialSubgraph && IsMaterialAssetGuid(subgraphGuid.toString()),"subgraph has a native asset type and stable metadata GUID");
+        const auto subgraphCall=MaterialGraphPanelTestAccess::Subgraph(panel,subgraphGuid.toString(),subgraph);frame();frame();
+        Check(MaterialGraphPanelTestAccess::Error(panel).empty() && std::abs(MaterialGraphPanelTestAccess::Roughness(panel)-.5f)<.0001f,"production Inspector renders typed subgraph call and evaluates through native GUID resolution");
+        const auto materialFile=smartRoot/"subgraph-material.materialgraph";
+        Check(panel.Save(materialFile),"material definition with subgraph saves through production panel");
+        const auto subgraphDependencies=AssetDatabase::Instance().loadDependencies(materialFile);
+        Check(std::find(subgraphDependencies.begin(),subgraphDependencies.end(),subgraphGuid)!=subgraphDependencies.end(),"definition records its native subgraph dependency");
+        GraphSubgraphCache cache;MaterialSubgraph resolved;cache.BeginCompilation();
+        Check(cache.Resolve(subgraphGuid.toString(),resolved,error),"native cache loads a real GUID-backed subgraph");cache.FinishCompilation();
+        Check(!cache.Changed(),"unchanged subgraph dependency keeps the cache valid");
+        subgraph.graph.FindNode(2)->value[0]=.5f;
+        const auto priorStamp=std::filesystem::last_write_time(subgraphFile);
+        SaveMaterialTextAtomic(subgraphFile,subgraph.ToJson(),error);std::filesystem::last_write_time(subgraphFile,priorStamp+std::chrono::seconds(1));
+        Check(cache.Changed(),"real subgraph file change invalidates dependency cache");frame();frame();
+        Check(MaterialGraphPanelTestAccess::Error(panel).empty() && std::abs(MaterialGraphPanelTestAccess::Roughness(panel)-.25f)<.0001f,"dependency change refreshes production preview without editing the parent graph");
+        const auto previousPixels=MaterialGraphPanelTestAccess::Pixels(panel);
+        SaveMaterialTextAtomic(subgraphFile,"invalid subgraph",error);frame();frame();
+        Check(!MaterialGraphPanelTestAccess::Error(panel).empty() && MaterialGraphPanelTestAccess::Pixels(panel)==previousPixels,"malformed dependency preserves the last valid preview with a diagnostic");
+        SaveMaterialTextAtomic(subgraphFile,subgraph.ToJson(),error);frame();frame();
+        Check(MaterialGraphPanelTestAccess::Error(panel).empty(),"fixing the dependency recovers the preview automatically");
+        const auto movedSubgraph=smartRoot/"moved-scale.ixmaterialsubgraph";
+        std::filesystem::rename(subgraphFile,movedSubgraph);AssetDatabase::Instance().runtimeMove(subgraphFile,movedSubgraph);frame();frame();
+        Check(MaterialGraphPanelTestAccess::Error(panel).empty() && std::abs(MaterialGraphPanelTestAccess::Roughness(panel)-.25f)<.0001f,"native GUID resolution follows a moved subgraph while the saved path hint stays stale");
+        const auto scoped="Subgraph_"+std::to_string(subgraphCall)+"/Scale";
+        MaterialGraphPanelTestAccess::NumericOverride(panel,scoped,.75f);frame();frame();
+        const auto subgraphInstance=smartRoot/"subgraph.ixmaterialinstance";
+        Check(panel.SaveInstance(subgraphInstance) && restored.Load(materialFile) && restored.LoadInstance(subgraphInstance),"scoped subgraph parameters save and validate through production instance files");
+        Check(MaterialGraphPanelTestAccess::Overrides(restored).values.contains(scoped),"instance reload retains a published nested parameter override");
+        Check(panel.Load(movedSubgraph) && panel.Save(movedSubgraph),"the existing graph editor opens and saves wrapped subgraph assets");frame();frame();
+        Check(MaterialGraphPanelTestAccess::Error(panel).empty() && !MaterialGraphPanelTestAccess::Pixels(panel).empty(),"standalone subgraph output preview uses declared numeric defaults");
+        if (!MaterialGraphPanelTestAccess::Error(panel).empty()) std::cout<<"Subgraph authoring preview error: "<<MaterialGraphPanelTestAccess::Error(panel)<<'\n';
+        AssetDatabase::Instance().scan(smartRoot);
+        Check(AssetDatabase::Instance().resolvePath(movedSubgraph)==std::optional<Guid>(subgraphGuid),"subgraph GUID survives real metadata rescan after a move");
+        cache.BeginCompilation();cache.FinishCompilation();
+        Check(!cache.Changed(),"unused dependencies are pruned when the material stops referencing them");
+        GraphSubgraphCache fullCache;fullCache.BeginCompilation();bool fullCacheLoaded=true;
+        const auto catalog=smartRoot/"CacheCatalog";std::filesystem::create_directories(catalog);
+        for (unsigned index=0;index<256;++index) {
+            const auto assetFile=catalog/(std::to_string(index)+".ixmaterialsubgraph");
+            fullCacheLoaded &= SaveMaterialTextAtomic(assetFile,subgraph.ToJson(),error);
+            const auto guid=AssetDatabase::Instance().getOrCreateGuid(assetFile);
+            fullCacheLoaded &= fullCache.Resolve(guid.toString(),resolved,error);
+        }
+        fullCache.FinishCompilation();Check(fullCacheLoaded,"native subgraph cache accepts its full 256-asset dependency budget");
+        fullCache.BeginCompilation();
+        Check(fullCache.Resolve(subgraphGuid.toString(),resolved,error),"new definition can replace a full previous dependency set without a manual cache clear");fullCache.FinishCompilation();
         std::filesystem::remove_all(smartRoot);
         open = false; frame(); Check(!open, "closed panel keeps document without drawing its canvas");
     }

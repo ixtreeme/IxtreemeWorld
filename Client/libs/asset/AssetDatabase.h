@@ -57,7 +57,8 @@ enum class AssetType
     UiDocument,  // game UI (RmlUi): .rml / .rcss
     Unknown,
     MaterialGraph,
-    MaterialInstance
+    MaterialInstance,
+    MaterialSubgraph
 };
 
 AssetType detectAssetType(const std::filesystem::path& filePath);

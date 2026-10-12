@@ -4550,6 +4550,7 @@ bool AssetLibrary::MoveAssetToSubpath(const std::string& id,
         return false;
     }
 
+    AssetDatabase::Instance().runtimeMove(source, destination);
     outEntry = moved;
     return true;
 }
@@ -4750,6 +4751,7 @@ bool AssetLibrary::RenameAsset(const std::string& id,
         return false;
     }
 
+    AssetDatabase::Instance().runtimeMove(source, destination);
     outEntry = renamed;
     return true;
 }

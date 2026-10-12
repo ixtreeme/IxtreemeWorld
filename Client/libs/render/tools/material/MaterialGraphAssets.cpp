@@ -1,5 +1,7 @@
 #include "MaterialGraphAssets.h"
 #include "MaterialInstance.h"
+#include "MaterialGraphIO.h"
+#include "asset/AssetDatabase.h"
 #include "asset/ExrImage.h"
 #include "asset/MaterialAssetManager.h"
 #include <stb_image.h>
@@ -11,6 +13,54 @@
 #include <fstream>
 
 namespace material_tool {
+GraphSubgraphCache::Stamp GraphSubgraphCache::Current(const std::string& guid)
+{
+    Stamp result;
+    if (const auto parsed = Guid::fromString(guid)) if (const auto path = AssetDatabase::Instance().resolveGuid(*parsed)) {
+        result.path = *path; std::error_code error;
+        if (detectAssetType(*path) != AssetType::MaterialSubgraph || !std::filesystem::is_regular_file(*path, error)) return result;
+        result.modified = std::filesystem::last_write_time(*path, error); if (error) return result;
+        result.bytes = std::filesystem::file_size(*path, error); if (error) return result;
+        result.exists = true;
+    }
+    return result;
+}
+void GraphSubgraphCache::FinishCompilation()
+{
+    std::erase_if(entries_, [&](const auto& item) { return std::find(used_.begin(), used_.end(), item.first) == used_.end(); });
+}
+bool GraphSubgraphCache::Changed() const
+{
+    for (const auto& [guid, entry] : entries_) if (Current(guid) != entry.stamp) return true;
+    return false;
+}
+bool GraphSubgraphCache::Resolve(const std::string& guid, MaterialSubgraph& asset, std::string& error)
+{
+    error.clear();
+    if (!IsMaterialAssetGuid(guid)) { error = "Invalid subgraph GUID"; return false; }
+    if (std::find(used_.begin(), used_.end(), guid) == used_.end()) used_.push_back(guid);
+    const auto current = Current(guid);
+    auto found = entries_.find(guid);
+    if (found == entries_.end() || found->second.stamp != current) {
+        // A new definition may replace a full previous dependency set. Only entries
+        // used in this compilation count toward the live limit.
+        if (found == entries_.end() && entries_.size() >= 256)
+            std::erase_if(entries_, [&](const auto& item) { return std::find(used_.begin(),used_.end(),item.first)==used_.end(); });
+        if (found == entries_.end() && entries_.size() >= 256) { error = "Subgraph cache exceeds 256 assets"; return false; }
+        Entry entry; entry.stamp = current; std::string text;
+        if (!current.exists) entry.error = "Missing MaterialSubgraph asset GUID: " + guid;
+        else if (!LoadMaterialText(current.path, text, entry.error) || !entry.asset.FromJson(text, entry.error))
+            entry.error = "Subgraph " + guid + ": " + entry.error;
+        else for (auto& node:entry.asset.graph.nodes) if (node.assetGuid.empty() && node.assetId.empty() && !node.resource.empty() &&
+            (node.kind==NodeKind::TextureParameter || node.kind==NodeKind::TextureSample || node.kind==NodeKind::Triplanar)) {
+            auto path=std::filesystem::path(std::u8string(node.resource.begin(),node.resource.end()));
+            if (path.is_relative()) { const auto utf8=(current.path.parent_path()/path).generic_u8string(); node.resource.assign(utf8.begin(),utf8.end()); }
+        }
+        found = entries_.insert_or_assign(guid, std::move(entry)).first;
+    }
+    if (!found->second.error.empty()) { error = found->second.error; return false; }
+    asset = found->second.asset; return true;
+}
 void GraphTextureCache::Configure(AssetLibrary* library,const std::filesystem::path& graphFolder) {
     if(library!=library_ || graphFolder!=graphFolder_){Clear();library_=library;graphFolder_=graphFolder;}
 }
@@ -18,8 +68,10 @@ void GraphTextureCache::Clear(){images_.clear();bindings_.clear();error_.clear()
 std::filesystem::path GraphTextureCache::Resolve(const GraphNode& n,const std::string& overridePath) const {
     // An explicit GUID is authoritative. Never let a stale path pick another texture.
     const auto guid = overridePath.starts_with("guid:") ? overridePath.substr(5) : (overridePath.empty() ? n.assetGuid : std::string{});
-    if (!guid.empty() && library_) {
-        for (const auto& entry : library_->Entries()) if (entry.category == AssetLibrary::Category::Texture && entry.guid == guid) return library_->AbsolutePath(entry);
+    if (!guid.empty()) {
+        if (const auto parsed=Guid::fromString(guid)) if (const auto path=AssetDatabase::Instance().resolveGuid(*parsed))
+            return detectAssetType(*path)==AssetType::Texture ? *path : std::filesystem::path{};
+        if (library_) for (const auto& entry : library_->Entries()) if (entry.category == AssetLibrary::Category::Texture && entry.guid == guid) return library_->AbsolutePath(entry);
         return {};
     }
     if(library_)for(const auto& entry:library_->Entries())if(entry.category==AssetLibrary::Category::Texture &&
@@ -77,7 +129,10 @@ SampledTexture GraphTextureCache::Sample(const GraphNode& n,const std::string& o
     return {result,binding.exr};
 }
 bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& document,const ParameterOverrides& parameters,unsigned resolution,const std::string& name,AssetLibrary::Entry& result,std::string& error,const std::filesystem::path& graphFolder) {
-    MaterialGraphProgram program;if(!program.Compile(document,error))return false;
+    auto source = document; GraphSubgraphCache subgraphs; MaterialSubgraphExpansion expansion;
+    const bool hasSubgraphs = std::any_of(document.nodes.begin(), document.nodes.end(), [](const auto& n) { return n.kind == NodeKind::Subgraph; });
+    if (hasSubgraphs && !ExpandMaterialSubgraphs(document, subgraphs.Resolver(), source, expansion, error)) return false;
+    MaterialGraphProgram program;if(!program.Compile(source,error))return false;
     if (!program.ValidateOverrides(parameters, error)) return false;
     GraphTextureCache cache;cache.Configure(&library,graphFolder);BakedMaterialImages images;
     if(!BakeMaterialUV(program,parameters,[&](const auto& n,const auto& p,float u,float v){return cache.Sample(n,p,u,v);},resolution,images,error))return false;
@@ -95,14 +150,23 @@ bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& doc
     }
     // Generated images must be in the database before the material resolves their texture GUIDs.
     for(const auto* filename:filenames)AssetDatabase::Instance().getOrCreateGuid(folder/filename);
-    auto source=document;for(auto& n:source.nodes) {
+    for(auto& n:source.nodes) {
         if(parameters.values.contains(n.parameter))n.value=parameters.values.at(n.parameter);
         if(parameters.textures.contains(n.parameter)){const auto& overrideValue=parameters.textures.at(n.parameter);n.resource=overrideValue;n.assetGuid.clear();n.assetId.clear();
             if(overrideValue.starts_with("asset:"))if(const auto entry=library.FindById(overrideValue.substr(6))){n.assetId=entry->id;n.assetGuid=entry->guid;n.resource=library.AssetRelativePath(*entry);}
             if(overrideValue.starts_with("guid:"))for(const auto& entry:library.Entries())if(entry.guid==overrideValue.substr(5)){n.assetGuid=entry.guid;n.assetId=entry.id;n.resource=library.AssetRelativePath(entry);break;}}
     }
-    std::ofstream graph(folder/"source.materialgraph",std::ios::binary);graph<<source.ToJson();graph.close();
-    if(!graph){error="Cannot save material source graph";return false;}
+    if (!SaveMaterialTextAtomic(folder/"source.materialgraph",source.ToJson(),error)) return false;
+    if (hasSubgraphs) {
+        // Keep both the authored definition and an effective, self-contained source for
+        // this bake. Changes to an external subgraph cannot alter the baked snapshot.
+        const auto authored = folder/"definition.materialgraph";
+        if (!SaveMaterialTextAtomic(authored,document.ToJson(),error)) return false;
+        AssetDatabase::Instance().getOrCreateGuid(authored);
+        std::vector<Guid> dependencies;
+        for (const auto& guid : expansion.dependencyGuids) if (const auto parsed=Guid::fromString(guid)) dependencies.push_back(*parsed);
+        if (!AssetDatabase::Instance().writeDependencies(authored,dependencies)) { error="Cannot write baked definition dependencies"; return false; }
+    }
     GltfMaterialSource material;material.name=name;material.baseColorTexturePath=folder/filenames[0];material.normalTexturePath=folder/filenames[1];material.aoTexturePath=folder/filenames[2];material.roughnessTexturePath=folder/filenames[3];material.metallicTexturePath=folder/filenames[4];material.heightTexturePath=folder/filenames[5];material.emissiveTexturePath=folder/filenames[6];material.emissive={1,1,1,1};material.roughness=1;material.metallic=1;
     for(size_t at=3;at<images.color.size();at+=4)if(images.color[at]<255){material.alphaMode="blend";break;}
     auto& manager=MaterialAssetManager::Instance();const auto guid=manager.createFromGltfMaterial(material,folder,stem);

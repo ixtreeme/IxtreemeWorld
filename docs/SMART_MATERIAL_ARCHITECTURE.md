@@ -26,6 +26,8 @@ Legacy-compatible custom graphs continue to save as v2. Managed definitions and
 graphs using new nodes/channel semantics/seed pins save as v3, with
 ownership and layer records; corrupt topology/IDs or unsupported versions fail
 transactionally. Unknown future formats are never silently flattened.
+Version 4 additionally records typed subgraph declarations and GUID-backed call
+interfaces. Version 3 continues to load; graphs without subgraphs retain v2/v3.
 
 ## Compiler and instances
 
@@ -33,6 +35,10 @@ transactionally. Unknown future formats are never silently flattened.
 instruction index/output slot and output numeric types derive from `NodePins`.
 Whole-graph validation precedes reachable-node elimination and Kahn ordering.
 Node/link array storage order does not change generated HLSL or binding order.
+GUID-backed subgraphs are validated/expanded before these steps. Declared ports
+become parent bindings/default constants and aliases; all operational instructions
+still use the original CPU/HLSL backends. See `SMART_MATERIAL_SUBGRAPHS.md` for
+stable interface IDs, instance scoping, bounds, dependencies and editor integration.
 
 `MaterialCompileResult` publishes a deterministic **HLSL source layout**:
 numeric parameters ordered by node ID, one aligned float4 per parameter; texture
@@ -75,7 +81,8 @@ selection yet. Specialized additive/multiply modes and layer groups are planned.
 | `MaterialGraphAssets.*` | Existing AssetLibrary/MaterialAssetManager bridge and texture cache. |
 | `AssetDatabase` / `AssetLibrary` | Recognize graph/instance GUID metadata, prevent duplicate metadata identity, publish texture-import GUIDs immediately; instance save writes native dependencies. |
 | Future geometry baker | UI-independent mesh UV rasterizer, real AO/curvature/cavity/position/normal/thickness, cache/cancel. |
-| Future subgraphs/generators | Expansion into the same document/IR, GUID dependency and cycle checks. |
+| `MaterialSubgraph.*` / `GraphSubgraphCache` | Versioned typed assets, GUID resolution, bounded expansion, cycle checks, caller scopes and file invalidation. |
+| Future generators | Reusable generator presets built on the subgraph mechanism and real geometry data. |
 | Future runtime shader owner | DXC/reflection/cache/IXRHI bindings/lifetime and renderer assignment. |
 
 No independent evaluator, renderer replacement or new third-party dependency is

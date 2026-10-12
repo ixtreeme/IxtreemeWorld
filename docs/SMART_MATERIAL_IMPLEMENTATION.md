@@ -43,7 +43,7 @@ managed inputs/deletion is rejected. Native Unknown enum value is retained.
 Published-name renames produce stale override diagnostics instead of remapping
 values silently. ABI changes require rebuilding all linked targets.
 
-## Phase 2 — foundation nodes implemented, subgraphs planned
+## Phase 2 — foundation nodes and subgraphs implemented; GPU parity pending
 
 CPU and HLSL now implement Normal Strength/Unpack/Flip Y, Normalize, Cross,
 Length, Distance, Sine, Cosine, Fract, Floor, Ceil, Step, Sign, Reflect, Mask
@@ -54,9 +54,10 @@ channels bypass RGB decoding; preset normal samples use linear inputs.
 
 Automated reference-value and invalid-data cases cover every added kind, plus
 normal strength 0/.5/1/2, zero vectors, degenerate levels and unsupported mask
-operations. DXC checks both DXIL and SPIR-V. Actual GPU numerical parity and
-subgraph expansion/assets/cycles are still planned; source compilation is not
-GPU evaluation evidence.
+operations. DXC checks both DXIL and SPIR-V. Actual GPU numerical parity
+remains planned; source compilation is not GPU evaluation
+evidence. Subgraph expansion/assets/cycles were implemented in the next milestone
+described below.
 
 ## Phase 3 — basic managed stack implemented, advanced layering planned
 
@@ -92,8 +93,8 @@ existing UV-only baker rejects Weathered Stone before creating fake geometry.
 | Phase | Status | Required next implementation |
 | --- | --- | --- |
 | 4 Geometry | Planned | UI-independent mesh baker, UV validation/rasterization/padding, independent curvature/cavity, ray AO/thickness, cache/cancel and preview integration. |
-| 5 Generators | Planned | Reusable GUID-backed subgraphs/presets and the six requested generators. The current dirt/moss recipe is ordinary graph content. |
-| 6 Assets | Partial | GUID registration, instance files/dependencies implemented; Smart Material Asset Browser categories/loaders, subgraphs, generator assets, recursive dependency invalidation remain. |
+| 5 Generators | Planned | The reusable subgraph mechanism is implemented; the six generator presets and geometry integration remain. The current dirt/moss recipe is ordinary graph content. |
+| 6 Assets | Partial | Graph/instance/subgraph GUID registration, files and native dependencies implemented; dedicated browser categories, generator assets and content-hash/runtime invalidation remain. |
 | 7 Runtime | Planned | DXC runtime owner, actual reflection, texture/sampler/parameter uploads, variant/pipeline cache, assignment and failure recovery through IXRHI. |
 | 8 Optimization | Partial measurement | CPU benchmark available; asynchronous/GPU bake jobs, GPU performance, sample deduplication, folding/CSE and stress/lifetime tests remain. |
 
@@ -111,9 +112,9 @@ metadata safety, dependency persistence and transactional mismatched-instance
 failure. Float endpoint comparisons use appropriate tolerance. Advanced channel
 semantics remain v3 after conversion to avoid older readers silently ignoring them.
 
-## Verified milestone and next step
+## First milestone validation and current next step
 
-Release editor executable and all four material test targets build. The editor
+At the first milestone, the Release editor executable and all four material test targets built. The editor
 material selection passes 4/4; the separately configured editor-disabled core
 passes 2/2. DXC compiles every node and all three presets to DXIL/SPIR-V. The
 recorded CPU/CLI measurements are in `SMART_MATERIAL_PERFORMANCE.md`. Standalone
@@ -125,8 +126,44 @@ separate commits. The implementation checkpoint includes the user's retained
 Material Graph/editor/bake prerequisites because the new core depends on them;
 it preserves that work rather than attempting to reconstruct an earlier version.
 
-The next dependency is GUID-backed subgraph expansion into this same typed graph,
-with recursive dependency/cycle tests, followed by the independent mesh geometry
-baker. Neither requires replacing the renderer. Completing those allows reusable
-generator masks and the actual mesh-dependent Weathered Stone CPU/bake workflow;
-IXRHI reflection/binding/cache then enables runtime GPU acceptance.
+The subgraph dependency is now implemented. The next dependency is the independent
+mesh geometry baker; it does not require replacing the renderer. Geometry data then
+allows generator presets and the actual mesh-dependent Weathered Stone CPU/bake
+workflow. IXRHI reflection/binding/cache enables runtime GPU acceptance afterward.
+
+## Milestone 2 — reusable subgraph assets
+
+Implemented `MaterialSubgraph`, input/output/call nodes, graph v4, file wrapper v1,
+typed stable-ID interfaces, scoped published parameters and transactional expansion
+into the existing compiler. Cycles, missing assets, mismatched schemas and expansion
+limits report errors while preserving valid state. Ordinary-node provenance is
+available in the compile result and generated HLSL.
+
+Native AssetDatabase recognizes subgraphs. The existing editor creates/opens/saves
+them, binds and refreshes interfaces, and validates connected port changes. It
+exposes the compiled parameter layout, including nested scopes. Native GUID cache
+polling refreshes changed/moved files, preserves valid previews on malformed files
+and recovers when fixed. Definition saves record native dependencies. UV publishing
+keeps both the authored graph and an effective self-contained snapshot with scoped
+overrides. This does not implement runtime GPU or geometry baking.
+
+Modules: new `MaterialSubgraph.*`, document/compiler, graph assets/cache/panel,
+native AssetDatabase type, render CMake and tests. Public source-compatible Compile
+adds an optional resolver argument. Existing enum values and v1/v2/v3 formats remain.
+New API/schema versions require rebuilding linked consumers. Source defaults on
+calls are snapshots; refresh is explicit. Mtime/size polling has a manual reload
+path for edits that preserve both fields. Dedicated subgraph browser categories,
+content hashes and asynchronous expansion are still planned.
+
+`MaterialSubgraphTest` exercises real production expansion and actual DXC. Editor
+tests exposed a selected-output restoration bug after recreating the node-editor
+context; selection is now restored once nodes exist. Real files exercise native
+GUID moves, invalidation, failure recovery, standalone preview and instance reload.
+The baking test verifies effective source override values and native material output.
+Asset tests also exposed delayed native GUID path updates after texture moves.
+Successful AssetLibrary moves/renames now update the native database immediately;
+GUID sampling without a library pointer follows those paths and never falls back
+to a stale hint. The full 256-entry dependency cache can be replaced by a new
+definition without manual clearing. Validated interfaces are cached per GUID in
+the compiler, with before/after measurements in the performance document.
+Final builds/results are recorded in `SMART_MATERIAL_TESTS.md` after verification.
