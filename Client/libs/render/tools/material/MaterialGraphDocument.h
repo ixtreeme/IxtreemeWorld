@@ -21,11 +21,22 @@ enum class NodeKind {
     NormalStrength, NormalUnpack, NormalFlipY, Normalize, Cross, Length, Distance,
     Sine, Cosine, Fract, Floor, Ceil, Step, Sign, Reflect,
     MaskCombine, MaskLevels, MaskContrast, MaskInvert, Fresnel,
-    Vector2Parameter, Vector3Parameter, Count
+    Vector2Parameter, Vector3Parameter,
+    SubgraphInput, SubgraphOutput, Subgraph, Count
 };
 enum class PinType { Scalar, Color, Vector2, Vector3, Texture, Surface };
 enum class GraphRegion { Custom, ManagedLayer, Output };
 struct PinDefinition { const char* name; PinType type; bool input; };
+struct MaterialGraphPort
+{
+    // Interface IDs are the stable declaration-node IDs in the referenced asset.
+    std::uint32_t id = 0;
+    std::string name;
+    PinType type = PinType::Scalar;
+    bool input = true;
+    std::array<float, 4> defaultValue{};
+    bool operator==(const MaterialGraphPort&) const = default;
+};
 struct GraphNode
 {
     std::uint32_t id = 0;
@@ -38,6 +49,9 @@ struct GraphNode
     bool srgb = true;
     GraphRegion region = GraphRegion::Custom;
     std::uint32_t owner = 0;
+    PinType interfaceType = PinType::Scalar;
+    std::uint32_t interfaceVersion = 1;
+    std::vector<MaterialGraphPort> ports;
     bool operator==(const GraphNode&) const = default;
 };
 struct GraphLink
@@ -58,9 +72,12 @@ struct MaterialLayer
 };
 const char* NodeKindName(NodeKind kind);
 const char* NodeCategory(NodeKind kind);
+bool IsSubgraphNode(NodeKind kind);
 const char* PinTypeName(PinType type);
 std::span<const NodeKind> AllNodeKinds();
 std::span<const PinDefinition> NodePins(NodeKind kind);
+// Dynamic declarations point into node strings; the node must outlive these definitions.
+std::vector<PinDefinition> NodePins(const GraphNode& node);
 // Disjoint UI IDs: node = id*16, pins = id*16+1.., link = id*16+15.
 std::uint32_t PinId(std::uint32_t node, std::size_t slot);
 

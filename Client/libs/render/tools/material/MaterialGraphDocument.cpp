@@ -61,7 +61,7 @@ constexpr const char* Names[] = {
     "Normal Strength", "Normal Unpack", "Normal Flip Y", "Normalize", "Cross Product", "Length", "Distance",
     "Sine", "Cosine", "Fract", "Floor", "Ceil", "Step", "Sign", "Reflect",
     "Mask Combine", "Mask Levels", "Mask Contrast", "Mask Invert", "Fresnel",
-    "Vector2 Parameter", "Vector3 Parameter"
+    "Vector2 Parameter", "Vector3 Parameter", "Subgraph Input", "Subgraph Output", "Subgraph"
 };
 static_assert(std::size(Names) == static_cast<size_t>(NodeKind::Count));
 using Json = crude_json::value;
@@ -112,6 +112,7 @@ std::span<const NodeKind> AllNodeKinds()
 const char* NodeCategory(NodeKind kind)
 {
     switch (kind) {
+    case NodeKind::SubgraphInput: case NodeKind::SubgraphOutput: case NodeKind::Subgraph: return "Subgraphs";
     case NodeKind::Scalar: case NodeKind::Color: case NodeKind::Vector2: case NodeKind::Vector3: return "Constants";
     case NodeKind::ScalarParameter: case NodeKind::ColorParameter: case NodeKind::TextureParameter: case NodeKind::Vector2Parameter: case NodeKind::Vector3Parameter: return "Parameters";
     case NodeKind::UV: case NodeKind::TilingOffset: case NodeKind::WorldPosition: case NodeKind::WorldNormal: case NodeKind::MakeVector: case NodeKind::SplitVector: case NodeKind::VectorScale: case NodeKind::Dot: return "Coordinates";
@@ -134,6 +135,9 @@ const char* PinTypeName(PinType type)
 std::span<const PinDefinition> NodePins(NodeKind kind)
 {
     switch (kind) {
+    case NodeKind::SubgraphInput: return ScalarPins;
+    case NodeKind::SubgraphOutput: return UnaryPins;
+    case NodeKind::Subgraph: return ScalarPins; // unbound editable declaration; per-node interface is authoritative
     case NodeKind::Scalar: case NodeKind::ScalarParameter: case NodeKind::AO: case NodeKind::Curvature: case NodeKind::Cavity: return ScalarPins;
     case NodeKind::Color: case NodeKind::ColorParameter: return ColorPins;
     case NodeKind::Vector2: case NodeKind::Vector2Parameter: case NodeKind::UV: return V2Pins;
@@ -177,6 +181,22 @@ std::span<const PinDefinition> NodePins(NodeKind kind)
     default: return {};
     }
 }
+bool IsSubgraphNode(NodeKind kind)
+{
+    return kind == NodeKind::SubgraphInput || kind == NodeKind::SubgraphOutput || kind == NodeKind::Subgraph;
+}
+std::vector<PinDefinition> NodePins(const GraphNode& node)
+{
+    const char* name = node.parameter.empty() ? "Value" : node.parameter.c_str();
+    if (node.kind == NodeKind::SubgraphInput) return {{name, node.interfaceType, false}};
+    if (node.kind == NodeKind::SubgraphOutput) return {{name, node.interfaceType, true}, {name, node.interfaceType, false}};
+    if (node.kind == NodeKind::Subgraph) {
+        std::vector<PinDefinition> result;
+        for (const auto& port : node.ports) result.push_back({port.name.c_str(), port.type, port.input});
+        return result;
+    }
+    const auto pins = NodePins(node.kind); return {pins.begin(), pins.end()};
+}
 std::uint32_t PinId(std::uint32_t node, std::size_t slot) { return node * 16 + static_cast<std::uint32_t>(slot) + 1; }
 GraphNode* MaterialGraphDocument::FindNode(std::uint32_t id)
 {
@@ -192,8 +212,14 @@ std::optional<GraphPin> MaterialGraphDocument::FindPin(std::uint32_t id) const
 {
     const auto* node = FindNode(id / 16);
     const auto slot = id % 16;
-    if (!node || slot == 0 || slot > NodePins(node->kind).size()) return {};
-    return GraphPin{node->id, NodePins(node->kind)[slot - 1]};
+    if (!node || slot == 0) return {};
+    if (!IsSubgraphNode(node->kind)) {
+        const auto pins = NodePins(node->kind);
+        return slot <= pins.size() ? std::optional<GraphPin>{{node->id, pins[slot - 1]}} : std::nullopt;
+    }
+    const auto pins = NodePins(*node);
+    if (slot > pins.size()) return {};
+    return GraphPin{node->id, pins[slot - 1]};
 }
 std::uint32_t MaterialGraphDocument::AddNode(NodeKind kind, std::array<float, 2> position)
 {
@@ -227,6 +253,8 @@ std::uint32_t MaterialGraphDocument::AddNode(NodeKind kind, std::array<float, 2>
     if (kind == NodeKind::ScalarParameter || kind == NodeKind::ColorParameter || kind == NodeKind::TextureParameter || kind == NodeKind::Vector2Parameter || kind == NodeKind::Vector3Parameter) {
         node.parameter = "Parameter_" + std::to_string(id); node.settings = {0, 1, 0, 0};
     }
+    if (kind == NodeKind::SubgraphInput || kind == NodeKind::SubgraphOutput)
+        node.parameter = std::string(kind == NodeKind::SubgraphInput ? "Input_" : "Output_") + std::to_string(id);
     nodes.push_back(std::move(node));
     return id;
 }
@@ -336,7 +364,8 @@ std::string MaterialGraphDocument::ToJson() const
     }) || std::any_of(links.begin(), links.end(), [&](const auto& l) {
         const auto* n = FindNode(l.input / 16); return n && n->kind == NodeKind::Noise && l.input == PinId(n->id,3);
     });
-    root["format"] = "ixtreeme.materialgraph"; root["version"] = managed ? 3.0 : 2.0;
+    const bool subgraphs = std::any_of(nodes.begin(), nodes.end(), [](const auto& n) { return IsSubgraphNode(n.kind); });
+    root["format"] = "ixtreeme.materialgraph"; root["version"] = subgraphs ? 4.0 : (managed ? 3.0 : 2.0);
     root["next_id"] = static_cast<double>(nextId);
     root["nodes"] = Json(crude_json::type_t::array); root["links"] = Json(crude_json::type_t::array);
     for (const auto& node : nodes)
@@ -346,6 +375,17 @@ std::string MaterialGraphDocument::ToJson() const
         n["value"] = Array(node.value); n["position"] = Array(node.position); n["settings"] = Array(node.settings);
         n["resource"] = node.resource; n["asset_guid"] = node.assetGuid; n["asset_id"] = node.assetId; n["parameter"] = node.parameter; n["srgb"] = node.srgb;
         if (managed) { n["region"] = static_cast<double>(node.region); n["owner"] = static_cast<double>(node.owner); }
+        if (IsSubgraphNode(node.kind)) {
+            n["interface_type"] = static_cast<double>(node.interfaceType);
+            n["interface_version"] = static_cast<double>(node.interfaceVersion);
+            n["ports"] = Json(crude_json::type_t::array);
+            for (const auto& port : node.ports) {
+                Json p(crude_json::type_t::object);
+                p["id"] = static_cast<double>(port.id); p["name"] = port.name;
+                p["type"] = static_cast<double>(port.type); p["input"] = port.input;
+                p["default"] = Array(port.defaultValue); n["ports"].push_back(std::move(p));
+            }
+        }
         root["nodes"].push_back(std::move(n));
     }
     for (const auto& link : links)
@@ -374,7 +414,7 @@ bool MaterialGraphDocument::FromJson(const std::string& text, std::string& error
     const Json root = Json::parse(text);
     double version;
     if (!root.is_object() || !root.contains("format") || !root["format"].is_string() || root["format"].get<crude_json::string>() != "ixtreeme.materialgraph") return fail("Not a Material Graph file");
-    if (!Number(root, "version", version) || (version != 1 && version != 2 && version != 3)) return fail("Unsupported Material Graph version");
+    if (!Number(root, "version", version) || version < 1 || version > 4 || std::floor(version) != version) return fail("Unsupported Material Graph version");
     if (!root.contains("nodes") || !root["nodes"].is_array() || !root.contains("links") || !root["links"].is_array()) return fail("Missing graph nodes or links");
     const auto& sourceNodes = root["nodes"].get<crude_json::array>();
     const auto& sourceLinks = root["links"].get<crude_json::array>();
@@ -391,6 +431,7 @@ bool MaterialGraphDocument::FromJson(const std::string& text, std::string& error
         for (auto kind : AllNodeKinds())
             if (source["kind"].get<crude_json::string>() == NodeKindName(kind)) { node.kind = kind; found = true; break; }
         if (!found) return fail("Unknown node kind");
+        if (IsSubgraphNode(node.kind) && version < 4) return fail("Subgraph declarations require Material Graph version 4");
         if (node.kind == NodeKind::PbrOutput && ++outputs > 1) return fail("Only one PBR Output is allowed");
         node.name = source["name"].get<crude_json::string>();
         if (node.name.size() > 255) return fail("Node name is too long");
@@ -403,17 +444,39 @@ bool MaterialGraphDocument::FromJson(const std::string& text, std::string& error
             node.srgb = source["srgb"].get<crude_json::boolean>();
             if(source.contains("asset_id")) {if(!source["asset_id"].is_string() || source["asset_id"].get<crude_json::string>().size()>255)return fail("Invalid asset ID");node.assetId=source["asset_id"].get<crude_json::string>();}
             if(node.parameter.size()>255)return fail("Parameter name is too long");
-            if (version == 3) {
+            if (version >= 3) {
                 double region, owner;
                 if (!Number(source, "region", region) || region < 0 || region > 2 || std::floor(region) != region ||
                     !Number(source, "owner", owner) || owner < 0 || owner > MaxId || std::floor(owner) != owner) return fail("Invalid graph ownership");
                 node.region = static_cast<GraphRegion>(static_cast<int>(region)); node.owner = static_cast<std::uint32_t>(owner);
             }
+            if (IsSubgraphNode(node.kind)) {
+                double type;
+                if (!Number(source, "interface_type", type) || type < 0 || type > 5 || std::floor(type) != type ||
+                    !Id(source, "interface_version", node.interfaceVersion, 65535) ||
+                    !source.contains("ports") || !source["ports"].is_array() || source["ports"].get<crude_json::array>().size() > 14)
+                    return fail("Invalid subgraph interface");
+                node.interfaceType = static_cast<PinType>(static_cast<int>(type));
+                std::unordered_set<std::uint32_t> portIds;
+                std::unordered_set<std::string> portNames;
+                for (const auto& p : source["ports"].get<crude_json::array>()) {
+                    MaterialGraphPort port;
+                    if (!Id(p, "id", port.id) || !portIds.insert(port.id).second || !p.contains("name") || !p["name"].is_string() ||
+                        !Number(p, "type", type) || type < 0 || type > 5 || std::floor(type) != type ||
+                        !p.contains("input") || !p["input"].is_boolean() || !FloatArray(p, "default", port.defaultValue))
+                        return fail("Invalid subgraph port");
+                    port.name = p["name"].get<crude_json::string>();
+                    if (port.name.empty() || port.name.size() > 255 || !portNames.insert(port.name).second) return fail("Empty or duplicate subgraph port name");
+                    port.type = static_cast<PinType>(static_cast<int>(type)); port.input = p["input"].get<crude_json::boolean>();
+                    node.ports.push_back(std::move(port));
+                }
+                if (node.kind != NodeKind::Subgraph && (!node.ports.empty() || node.parameter.empty())) return fail("Invalid subgraph declaration");
+            }
         } else if (node.kind == NodeKind::PbrOutput) node.settings = {0.5f, 0, 1, 0};
         draft.nextId = std::max(draft.nextId, node.id + 1);
         draft.nodes.push_back(std::move(node));
     }
-    if (version == 3) {
+    if (version >= 3) {
         if (!root.contains("layers") || !root["layers"].is_array() ||
             root["layers"].get<crude_json::array>().size() > 256) return fail("Invalid material layers");
         for (const auto& source : root["layers"].get<crude_json::array>()) {

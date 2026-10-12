@@ -94,6 +94,7 @@ void Shaders() {
     writePreview(MaterialGraphDocument::MossyRock(),"mossy-rock.rgba");
     writePreview(MaterialGraphDocument::WeatheredStone(),"weathered-stone.rgba");
     for(const auto kind:AllNodeKinds()) {
+        if (IsSubgraphNode(kind)) continue; // declaration/call nodes are tested through real expansion
         MaterialGraphDocument d;const auto id=d.AddNode(kind,{});std::string error;MaterialGraphProgram program;
         if(kind==NodeKind::TextureParameter){const auto sample=d.AddNode(NodeKind::TextureSample,{});d.Connect(PinId(id,0),PinId(sample,0),error);Check(program.Compile(d,error,PinId(sample,2)),"texture parameter compiler path");}
         else if(kind==NodeKind::PbrOutput)Check(program.Compile(d,error),"output compiler path");

@@ -1,5 +1,6 @@
 #pragma once
 #include "MaterialGraphDocument.h"
+#include "MaterialSubgraph.h"
 #include <functional>
 #include <unordered_map>
 
@@ -44,6 +45,7 @@ struct MaterialCompileResult
     std::vector<MaterialParameter> parameters;
     std::vector<MaterialTextureBinding> textures;
     std::vector<std::string> dependencyGuids;
+    std::vector<MaterialNodeOrigin> subgraphOrigins;
     std::uint32_t parameterBufferBytes = 0;
     bool worldDependent = false, needsGeometryData = false;
 };
@@ -67,7 +69,8 @@ struct GraphInstruction
 class MaterialGraphProgram
 {
 public:
-    bool Compile(const MaterialGraphDocument& document, std::string& error, std::uint32_t previewPin = 0);
+    bool Compile(const MaterialGraphDocument& document, std::string& error, std::uint32_t previewPin = 0,
+                 const MaterialSubgraphResolver& subgraphs = {});
     // Workspace is caller-owned and reused over every texel: no per-pixel graph traversal/allocation.
     Surface Evaluate(const EvaluationContext& context, const ParameterOverrides& parameters,
                      const TextureSampler& sample, std::vector<std::array<GraphValue, 14>>& workspace) const;

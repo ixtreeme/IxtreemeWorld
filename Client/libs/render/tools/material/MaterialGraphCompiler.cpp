@@ -67,14 +67,22 @@ bool SameEvaluationGraph(const MaterialGraphDocument& a, const MaterialGraphDocu
     if(a.nodes.size()!=b.nodes.size() || a.links!=b.links)return false;
     for(size_t i=0;i<a.nodes.size();++i) {
         const auto& x=a.nodes[i]; const auto& y=b.nodes[i];
-        if(x.id!=y.id || x.kind!=y.kind || x.value!=y.value || x.settings!=y.settings || x.resource!=y.resource || x.assetGuid!=y.assetGuid || x.assetId!=y.assetId || x.parameter!=y.parameter || x.srgb!=y.srgb)return false;
+        if(x.id!=y.id || x.kind!=y.kind || x.value!=y.value || x.settings!=y.settings || x.resource!=y.resource || x.assetGuid!=y.assetGuid || x.assetId!=y.assetId || x.parameter!=y.parameter || x.srgb!=y.srgb || x.interfaceType!=y.interfaceType || x.interfaceVersion!=y.interfaceVersion || x.ports!=y.ports)return false;
     } return true;
 }
-bool MaterialGraphProgram::Compile(const MaterialGraphDocument& document, std::string& error, std::uint32_t previewPin)
+bool MaterialGraphProgram::Compile(const MaterialGraphDocument& document, std::string& error, std::uint32_t previewPin,
+                                   const MaterialSubgraphResolver& subgraphs)
 {
     error.clear(); MaterialGraphProgram draft;
     // Revalidate programmatically assembled documents as well as documents loaded from disk.
     MaterialGraphDocument valid; if(!valid.FromJson(document.ToJson(),error)) return false;
+    if (std::any_of(valid.nodes.begin(), valid.nodes.end(), [](const auto& n) { return IsSubgraphNode(n.kind); })) {
+        MaterialSubgraphExpansion expansion;
+        if (!ExpandMaterialSubgraphs(document, subgraphs, valid, expansion, error, previewPin)) return false;
+        previewPin = expansion.previewPin;
+        draft.layout_.dependencyGuids = std::move(expansion.dependencyGuids);
+        draft.layout_.subgraphOrigins = std::move(expansion.origins);
+    }
     // Stored array order is editor data, not program identity or binding order.
     std::sort(valid.nodes.begin(), valid.nodes.end(), [](const auto& a, const auto& b) { return a.id < b.id; });
     std::sort(valid.links.begin(), valid.links.end(), [](const auto& a, const auto& b) { return a.input < b.input; });
@@ -309,6 +317,8 @@ float4 GraphFinite(float4 v) { return float4(isfinite(v.x)?clamp(v.x,-1e6,1e6):0
         h<<"};\n";
     }
     h<<"GraphSurface EvaluateMaterialGraph(GraphContext c) {\n";
+    std::unordered_map<std::uint32_t, const MaterialNodeOrigin*> origins;
+    for (const auto& origin : layout_.subgraphOrigins) origins[origin.expandedNode] = &origin;
     const auto var=[&](int index,int slot){return "n"+std::to_string(instructions_[index].node.id)+"_"+std::to_string(slot);};
     for(size_t index=0;index<instructions_.size();++index) {
         const auto& i=instructions_[index];const auto& n=i.node; const auto prefix="n"+std::to_string(n.id);
@@ -324,6 +334,10 @@ float4 GraphFinite(float4 v) { return float4(isfinite(v.x)?clamp(v.x,-1e6,1e6):0
             const auto rgb=n.srgb?"float4(GraphSRGB("+raw+".rgb),"+raw+".a)":raw;
             emit(first,n.srgb && textures.contains(sourceId)?"(textureInfo_"+std::to_string(sourceId)+".x>0.5?"+raw+":"+rgb+")":rgb);for(int k=0;k<4;++k)emitScalar(first+k+1,raw+"."+std::string(1,"rgba"[k]));};
         h<<"    // Node "<<n.id<<": "<<NodeKindName(n.kind)<<"\n";
+        if (const auto found=origins.find(n.id); found!=origins.end()) {
+            const auto& origin=*found->second;
+            h<<"    // Subgraph "<<origin.assetGuid<<", source node "<<origin.sourceNode<<", scope "<<origin.instancePath<<"\n";
+        }
         switch(n.kind) {
         case NodeKind::Scalar: case NodeKind::Color: case NodeKind::Vector2: case NodeKind::Vector3:emit(0,Literal(n.value));break;
         case NodeKind::ScalarParameter:case NodeKind::ColorParameter:case NodeKind::Vector2Parameter:case NodeKind::Vector3Parameter:emit(0,"parameter_"+std::to_string(n.id));break;

@@ -80,6 +80,7 @@ add_library(IXMaterialGraph STATIC
     tools/material/MaterialGraphImages.cpp
     tools/material/MaterialGraphIO.cpp
     tools/material/MaterialInstance.cpp
+    tools/material/MaterialSubgraph.cpp
     "${CLIENT_ROOT}/third_party/imgui-node-editor/crude_json.cpp")
 target_include_directories(IXMaterialGraph PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(IXMaterialGraph SYSTEM PRIVATE "${CLIENT_ROOT}/third_party/imgui-node-editor")
@@ -334,6 +335,17 @@ if(BUILD_TESTING AND NOT ANDROID)
     endif()
     add_test(NAME SmartMaterialCoreTest COMMAND SmartMaterialCoreTest)
     set_tests_properties(SmartMaterialCoreTest PROPERTIES TIMEOUT 30)
+    add_executable(MaterialSubgraphTest tests/MaterialSubgraphTest.cpp)
+    target_link_libraries(MaterialSubgraphTest PRIVATE IXMaterialGraph)
+    target_compile_definitions(MaterialSubgraphTest PRIVATE IX_SUBGRAPH_SHADER_OUTPUT="${CMAKE_CURRENT_BINARY_DIR}/subgraph-shader-tests/expanded.hlsl")
+    if(WIN32 AND DXC_EXECUTABLE)
+        target_compile_definitions(MaterialSubgraphTest PRIVATE IX_GRAPH_DXC="${DXC_EXECUTABLE}")
+    endif()
+    if(MSVC)
+        set_target_properties(MaterialSubgraphTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME MaterialSubgraphTest COMMAND MaterialSubgraphTest)
+    set_tests_properties(MaterialSubgraphTest PROPERTIES TIMEOUT 30)
     target_link_libraries(MaterialGraphCompilerTest PRIVATE IXMaterialGraph)
     target_compile_definitions(MaterialGraphCompilerTest PRIVATE
         IX_GRAPH_SHADER_OUTPUT="${CMAKE_CURRENT_BINARY_DIR}/graph-shader-tests")
