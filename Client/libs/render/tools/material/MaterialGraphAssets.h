@@ -1,9 +1,11 @@
 #pragma once
 #include "MaterialGraphImages.h"
+#include "SmartGenerator.h"
 #include "AssetLibrary.h"
 #include <filesystem>
 
 namespace material_tool {
+bool LoadSmartGeneratorAsset(const std::filesystem::path& path,SmartGenerator& generator,std::string& error);
 class GraphSubgraphCache
 {
 public:

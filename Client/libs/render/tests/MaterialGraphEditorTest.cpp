@@ -66,6 +66,7 @@ struct MaterialGraphPanelTestAccess
     static void SmallGeometry(MaterialGraphPanel& panel) {panel.geometrySettings_.resolution=32;panel.geometrySettings_.rayDistance=3;}
     static bool GeometryReady(MaterialGraphPanel& panel) {panel.PollGeometryBake();return panel.geometry_.Bake()!=nullptr;}
     static void GeometryPreview(MaterialGraphPanel& panel) {panel.geometryPreview_=true;panel.previewDirty_=true;}
+    static void NewGenerator(MaterialGraphPanel& panel,int preset) {panel.saved_=panel.document_;panel.pendingPreset_=10+preset;panel.RequestReplace(false);}
     static std::uint32_t Subgraph(MaterialGraphPanel& panel,const std::string& guid,const MaterialSubgraph& asset) {
         panel.document_=MaterialGraphDocument::Example();std::string error;
         const auto call=panel.document_.AddNode(NodeKind::Subgraph,{});BindMaterialSubgraph(panel.document_,call,guid,asset,error);
@@ -325,6 +326,31 @@ void Editor(bool capture)
         Check(restored.Load(definitionFile) && restored.LoadInstance(meshInstance),"instance reload binds GUID-backed geometry after verifying its source content");
         const auto cacheGuid=AssetDatabase::Instance().resolvePath(cacheFile);const auto meshDependencies=AssetDatabase::Instance().loadDependencies(meshInstance);
         Check(cacheGuid && std::find(meshDependencies.begin(),meshDependencies.end(),*cacheGuid)!=meshDependencies.end(),"mesh-bound instance tracks its geometry asset dependency");
+        const auto generatorFile=smartRoot/"wear.ixsmartgenerator";
+        MaterialGraphPanelTestAccess::NewGenerator(panel,0);frame();frame();
+        Check(MaterialGraphPanelTestAccess::Error(panel).empty() && panel.Save(generatorFile),"production generator template previews and saves native preset metadata");
+        SmartGenerator preset;std::string generatorText;
+        Check(LoadMaterialText(generatorFile,generatorText,error) && preset.FromJson(generatorText,error) && preset.kind==SmartGeneratorKind::EdgeWear,"saved generator wrapper retains recipe kind and canonical graph");
+        Check(!panel.Save(smartRoot/"lost-metadata.ixmaterialsubgraph"),"generator save cannot silently strip metadata");
+        Check(panel.Load(definitionFile) && cacheGuid && panel.BindGeometryBake(cacheGuid->toString()),"material reopens with valid geometry before adding generator");
+        const auto beforeGenerator=panel.Document();const auto layer=panel.Document().layers.back().id;
+        Check(panel.AddGeneratorAsset(generatorFile,layer),"production Add generator assigns typed scalar mask to a managed layer");
+        const auto generated=panel.Document();const auto call=panel.Document().FindLayer(layer)->maskPin/16;
+        panel.Undo();Check(panel.Document()==beforeGenerator,"Undo restores layer mask and removes generator call together");panel.Undo(true);Check(panel.Document()==generated,"Redo restores generator and layer mask as one transaction");frame();frame();
+        Check(MaterialGraphPanelTestAccess::Error(panel).empty(),"generator layer mask preview uses real mesh context through existing compiler");
+        if(!MaterialGraphPanelTestAccess::Error(panel).empty())std::cout<<"Generator preview error: "<<MaterialGraphPanelTestAccess::Error(panel)<<'\n';
+        const auto generatedFile=smartRoot/"generated-stone.materialgraph",generatedInstance=smartRoot/"generated.ixmaterialinstance";
+        Check(panel.Save(generatedFile),"generator material definition saves native dependency metadata");
+        const auto generatorGuid=AssetDatabase::Instance().resolvePath(generatorFile);const auto generatorDeps=AssetDatabase::Instance().loadDependencies(generatedFile);
+        Check(generatorGuid && std::find(generatorDeps.begin(),generatorDeps.end(),*generatorGuid)!=generatorDeps.end(),"material records stable generator GUID dependency");
+        const auto parameter="Subgraph_"+std::to_string(call)+"/WearAmount";MaterialGraphPanelTestAccess::NumericOverride(panel,parameter,.35f);frame();frame();
+        Check(panel.SaveInstance(generatedInstance) && restored.Load(generatedFile) && restored.LoadInstance(generatedInstance) && MaterialGraphPanelTestAccess::Overrides(restored).values.contains(parameter),"generator scoped instance override saves and reloads with geometry binding");
+        const auto movedGenerator=smartRoot/"moved-wear.ixsmartgenerator";std::filesystem::rename(generatorFile,movedGenerator);AssetDatabase::Instance().runtimeMove(generatorFile,movedGenerator);frame();frame();
+        Check(MaterialGraphPanelTestAccess::Error(panel).empty(),"generator GUID move refreshes preview without rewriting graph path hint");
+        const auto generatorPixels=MaterialGraphPanelTestAccess::Pixels(panel);SaveMaterialTextAtomic(movedGenerator,"broken generator",error);frame();frame();
+        Check(!MaterialGraphPanelTestAccess::Error(panel).empty() && MaterialGraphPanelTestAccess::Pixels(panel)==generatorPixels,"corrupt generator preserves last valid preview with diagnostic");
+        SaveMaterialTextAtomic(movedGenerator,generatorText,error);frame();frame();Check(MaterialGraphPanelTestAccess::Error(panel).empty(),"repaired generator recovers preview automatically");
+        const auto intactGeneratorGraph=panel.Document();Check(!panel.AddGeneratorAsset(movedGenerator,999999) && panel.Document()==intactGeneratorGraph,"invalid generator layer target preserves current material");
         const auto validGeometryPixels=MaterialGraphPanelTestAccess::Pixels(panel);
         SaveMaterialTextAtomic(cacheFile,"broken geometry",error);frame();frame();
         Check(!MaterialGraphPanelTestAccess::Error(panel).empty() && MaterialGraphPanelTestAccess::Pixels(panel)==validGeometryPixels,"invalid geometry keeps the last valid real-mesh preview");

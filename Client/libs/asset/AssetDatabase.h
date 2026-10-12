@@ -59,7 +59,8 @@ enum class AssetType
     MaterialGraph,
     MaterialInstance,
     MaterialSubgraph,
-    GeometryBake
+    GeometryBake,
+    SmartGenerator
 };
 
 AssetType detectAssetType(const std::filesystem::path& filePath);

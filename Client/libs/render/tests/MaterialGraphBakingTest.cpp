@@ -91,6 +91,20 @@ int main() {
                 const auto* native=MaterialAssetManager::Instance().getOrLoad(*Guid::fromString(material.guid));
                 Check(native && native->baseColorTexture && native->normalTexture && native->metallicRoughnessTexture,"mesh bake uses the existing native material renderer path");
             }
+            SmartGenerator generator;const auto generatorFile=root/"wear.ixsmartgenerator";
+            const bool generatorCreated=SmartGenerator::Create(SmartGeneratorKind::EdgeWear,generator,error) && SaveMaterialTextAtomic(generatorFile,generator.ToJson(),error);
+            Check(generatorCreated,"real generator preset writes a validated versioned asset");
+            if(generatorCreated){
+                const auto generatorGuid=AssetDatabase::Instance().getOrCreateGuid(generatorFile);GraphSubgraphCache generators;MaterialSubgraph body;
+                Check(detectAssetType(generatorFile)==AssetType::SmartGenerator && generators.Resolve(generatorGuid.toString(),body,error) && body==generator.definition,"native generator GUID resolves into the shared subgraph cache");
+                auto generated=MaterialGraphDocument::WeatheredStone();const auto generatorCall=AddSmartGenerator(generated,generatorGuid.toString(),generator,generated.layers.back().id,error);
+                ParameterOverrides values;values.values["Subgraph_"+std::to_string(generatorCall)+"/WearAmount"]={.4f,0,0,0};
+                const bool generatedBake=generatorCall && PublishBakedMaterial(library,generated,values,32,"Generated stone",material,error,{},geometry.Bake(),geometryGuid);
+                if(!generatedBake)std::cout<<error<<'\n';Check(generatedBake,"generator layer mask with scoped override publishes real mesh material");
+                if(generatedBake){const auto folder=library.AbsolutePath(material).parent_path();const auto dependencies=AssetDatabase::Instance().loadDependencies(folder/"definition.materialgraph");Check(std::find(dependencies.begin(),dependencies.end(),generatorGuid)!=dependencies.end(),"baked definition tracks its native generator preset dependency");std::string text;MaterialGraphDocument effective;MaterialGraphProgram program;
+                    Check(LoadMaterialText(folder/"source.materialgraph",text,error) && effective.FromJson(text,error) && program.Compile(effective,error),"published generator source is self-contained ordinary IR input");
+                    bool retained=false;for(const auto& n:effective.nodes)if(n.parameter=="Subgraph_"+std::to_string(generatorCall)+"/WearAmount")retained=n.value[0]==.4f;Check(retained,"generator effective snapshot retains scoped instance value");}
+            }
             const auto movedModel=root/"moved-box.obj";std::filesystem::rename(modelFile,movedModel);AssetDatabase::Instance().runtimeMove(modelFile,movedModel);
             Check(geometry.Refresh() && geometry.Bake() && geometry.MeshPath()==movedModel,"mesh GUID move refreshes without invalidating unchanged geometric content");
             const auto movedBake=root/"moved-box.ixgeometrybake";std::filesystem::rename(geometryFile,movedBake);AssetDatabase::Instance().runtimeMove(geometryFile,movedBake);

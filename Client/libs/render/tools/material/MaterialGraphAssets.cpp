@@ -14,12 +14,17 @@
 #include <fstream>
 
 namespace material_tool {
+bool LoadSmartGeneratorAsset(const std::filesystem::path& path,SmartGenerator& generator,std::string& error) {
+    if(detectAssetType(path)!=AssetType::SmartGenerator){error="Choose an .ixsmartgenerator asset";return false;}
+    std::string text;return LoadMaterialText(path,text,error) && generator.FromJson(text,error);
+}
 GraphSubgraphCache::Stamp GraphSubgraphCache::Current(const std::string& guid)
 {
     Stamp result;
     if (const auto parsed = Guid::fromString(guid)) if (const auto path = AssetDatabase::Instance().resolveGuid(*parsed)) {
         result.path = *path; std::error_code error;
-        if (detectAssetType(*path) != AssetType::MaterialSubgraph || !std::filesystem::is_regular_file(*path, error)) return result;
+        const auto type=detectAssetType(*path);
+        if ((type != AssetType::MaterialSubgraph && type != AssetType::SmartGenerator) || !std::filesystem::is_regular_file(*path, error)) return result;
         result.modified = std::filesystem::last_write_time(*path, error); if (error) return result;
         result.bytes = std::filesystem::file_size(*path, error); if (error) return result;
         result.exists = true;
@@ -50,9 +55,12 @@ bool GraphSubgraphCache::Resolve(const std::string& guid, MaterialSubgraph& asse
         if (found == entries_.end() && entries_.size() >= 256) { error = "Subgraph cache exceeds 256 assets"; return false; }
         Entry entry; entry.stamp = current; std::string text;
         if (!current.exists) entry.error = "Missing MaterialSubgraph asset GUID: " + guid;
+        else if(detectAssetType(current.path)==AssetType::SmartGenerator) {
+            SmartGenerator generator;if(LoadSmartGeneratorAsset(current.path,generator,entry.error))entry.asset=std::move(generator.definition);
+        }
         else if (!LoadMaterialText(current.path, text, entry.error) || !entry.asset.FromJson(text, entry.error))
             entry.error = "Subgraph " + guid + ": " + entry.error;
-        else for (auto& node:entry.asset.graph.nodes) if (node.assetGuid.empty() && node.assetId.empty() && !node.resource.empty() &&
+        if(entry.error.empty())for (auto& node:entry.asset.graph.nodes) if (node.assetGuid.empty() && node.assetId.empty() && !node.resource.empty() &&
             (node.kind==NodeKind::TextureParameter || node.kind==NodeKind::TextureSample || node.kind==NodeKind::Triplanar)) {
             auto path=std::filesystem::path(std::u8string(node.resource.begin(),node.resource.end()));
             if (path.is_relative()) { const auto utf8=(current.path.parent_path()/path).generic_u8string(); node.resource.assign(utf8.begin(),utf8.end()); }

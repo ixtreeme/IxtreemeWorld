@@ -84,6 +84,7 @@ add_library(IXMaterialGraph STATIC
     tools/material/MaterialGraphDocument.cpp
     tools/material/MaterialLayers.cpp
     tools/material/SmartMaterialPresets.cpp
+    tools/material/SmartGenerator.cpp
     tools/material/MaterialGraphCompiler.cpp
     tools/material/MaterialGraphImages.cpp
     tools/material/MaterialGraphIO.cpp
@@ -351,6 +352,17 @@ if(BUILD_TESTING AND NOT ANDROID)
         set_target_properties(SmartMaterialCoreTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
     add_test(NAME SmartMaterialCoreTest COMMAND SmartMaterialCoreTest)
+    add_executable(SmartGeneratorTest tests/SmartGeneratorTest.cpp)
+    target_link_libraries(SmartGeneratorTest PRIVATE IXMaterialGraph)
+    target_compile_definitions(SmartGeneratorTest PRIVATE IX_GENERATOR_SHADER_OUTPUT="${CMAKE_CURRENT_BINARY_DIR}/generator-shader-tests")
+    if(WIN32 AND DXC_EXECUTABLE)
+        target_compile_definitions(SmartGeneratorTest PRIVATE IX_GRAPH_DXC="${DXC_EXECUTABLE}")
+    endif()
+    if(MSVC)
+        set_target_properties(SmartGeneratorTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME SmartGeneratorTest COMMAND SmartGeneratorTest)
+    set_tests_properties(SmartGeneratorTest PROPERTIES TIMEOUT 120)
     set_tests_properties(SmartMaterialCoreTest PROPERTIES TIMEOUT 30)
     add_executable(MaterialSubgraphTest tests/MaterialSubgraphTest.cpp)
     target_link_libraries(MaterialSubgraphTest PRIVATE IXMaterialGraph)

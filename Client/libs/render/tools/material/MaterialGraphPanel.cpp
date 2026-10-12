@@ -29,7 +29,7 @@ ImVec4 PinColor(PinType type)
     case PinType::Texture:return {.9f,.45f,.45f,1};case PinType::Surface:return {.95f,.82f,.35f,1};
     }return {1,1,1,1};
 }
-std::filesystem::path ChooseGraphFile(bool save, const std::filesystem::path& current, bool instance = false, bool subgraph = false)
+std::filesystem::path ChooseGraphFile(bool save, const std::filesystem::path& current, bool instance = false, bool subgraph = false, bool generator = false)
 {
     wchar_t file[32768]{};
     const auto initial = current.wstring();
@@ -39,9 +39,9 @@ std::filesystem::path ChooseGraphFile(bool save, const std::filesystem::path& cu
     const auto* viewport = ImGui::GetMainViewport();
     dialog.hwndOwner = static_cast<HWND>(viewport->PlatformHandleRaw);
     dialog.lpstrFile = file; dialog.nMaxFile = static_cast<DWORD>(std::size(file));
-    dialog.lpstrFilter = instance ? L"Material Instance (*.ixmaterialinstance)\0*.ixmaterialinstance\0All Files\0*.*\0" :
-        (subgraph && save ? L"Material Subgraph (*.ixmaterialsubgraph)\0*.ixmaterialsubgraph\0" : L"Material Documents\0*.materialgraph;*.ixsmartmaterial;*.ixmaterialsubgraph\0All Files\0*.*\0");
-    dialog.lpstrDefExt = instance ? L"ixmaterialinstance" : (subgraph ? L"ixmaterialsubgraph" : L"materialgraph");
+    dialog.lpstrFilter = generator?L"Smart Generator (*.ixsmartgenerator)\0*.ixsmartgenerator\0":(instance ? L"Material Instance (*.ixmaterialinstance)\0*.ixmaterialinstance\0All Files\0*.*\0" :
+        (subgraph && save ? L"Material Subgraph (*.ixmaterialsubgraph)\0*.ixmaterialsubgraph\0" : L"Material Documents\0*.materialgraph;*.ixsmartmaterial;*.ixmaterialsubgraph;*.ixsmartgenerator\0All Files\0*.*\0"));
+    dialog.lpstrDefExt = generator?L"ixsmartgenerator":(instance ? L"ixmaterialinstance" : (subgraph ? L"ixmaterialsubgraph" : L"materialgraph"));
     dialog.lpstrTitle = save ? L"Save Material Graph" : L"Open Material Graph";
     dialog.Flags = OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
     if (save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog)) return std::filesystem::path(file);
@@ -101,7 +101,12 @@ void MaterialGraphPanel::Undo(bool redo)
     auto& source = redo ? redo_ : undo_; auto& target = redo ? undo_ : redo_;
     if (source.empty()) return;
     target.push_back(document_); document_ = std::move(source.back()); source.pop_back();
-    dragBefore_.reset(); propertyBefore_.reset(); selected_ = 0;
+    dragBefore_.reset(); propertyBefore_.reset();if(!document_.FindNode(selected_))selected_=0;
+    if(previewSettings_.channel==PreviewChannel::SelectedOutput){
+        const auto pin=document_.FindPin(previewPin_);
+        if(pin && !pin->definition.input && pin->definition.type!=PinType::Texture)selected_=pin->node;
+        else {previewSettings_.channel=PreviewChannel::Shaded;previewPin_=0;}
+    }
     ResetContext(); status_ = redo ? "Edit restored" : "Edit undone";
 }
 void MaterialGraphPanel::HandleHotkeys()
@@ -142,11 +147,16 @@ void MaterialGraphPanel::RequestReplace(bool openFile)
     if (openFile) OpenDialog();
     else
     {
-        subgraphMode_=pendingPreset_==4; subgraphVersion_=1;
-        document_ = subgraphMode_?MaterialSubgraph::Example().graph:(pendingPreset_==1?MaterialGraphDocument::WeatheredMetal():(pendingPreset_==2?MaterialGraphDocument::MossyRock():(pendingPreset_==3?MaterialGraphDocument::WeatheredStone():MaterialGraphDocument::Example()))); pendingPreset_=0; saved_ = MaterialGraphDocument::Example(); path_.clear();
+        const bool generator=pendingPreset_>=10 && pendingPreset_<10+static_cast<int>(SmartGeneratorPresets().size());
+        SmartGenerator preset;
+        if(generator && !SmartGenerator::Create(SmartGeneratorPresets()[pendingPreset_-10].kind,preset,status_))return;
+        generatorMode_=generator;generator_=std::move(preset);subgraphMode_=generator || pendingPreset_==4; subgraphVersion_=1;
+        document_ = generator?generator_.definition.graph:(subgraphMode_?MaterialSubgraph::Example().graph:(pendingPreset_==1?MaterialGraphDocument::WeatheredMetal():(pendingPreset_==2?MaterialGraphDocument::MossyRock():(pendingPreset_==3?MaterialGraphDocument::WeatheredStone():MaterialGraphDocument::Example())))); pendingPreset_=0; saved_ = MaterialGraphDocument::Example(); path_.clear();
         undo_.clear(); redo_.clear(); selected_ = 0; parameters_={}; previewDirty_=true; ResetContext(); fitPending_ = true; status_.clear();
         subgraphs_.Clear(); forceCompile_=true;
-        if (subgraphMode_) { selected_=4; previewPin_=PinId(4,1); previewSettings_.channel=PreviewChannel::SelectedOutput; }
+        previewPin_=0;
+        if (subgraphMode_) {for(const auto& node:document_.nodes)if(node.kind==NodeKind::SubgraphOutput){selected_=node.id;previewPin_=PinId(node.id,1);previewSettings_.channel=PreviewChannel::SelectedOutput;break;}}
+        else if(previewSettings_.channel==PreviewChannel::SelectedOutput)previewSettings_.channel=PreviewChannel::Shaded;
     }
 }
 void MaterialGraphPanel::RenderUnsavedPopup()
@@ -195,6 +205,7 @@ void MaterialGraphPanel::RenderToolbar()
         if(ImGui::MenuItem("Mossy rock (world)")){pendingPreset_=2;RequestReplace(false);}
         if(ImGui::MenuItem("Smart Weathered Stone")){pendingPreset_=3;RequestReplace(false);}
         if(ImGui::MenuItem("New reusable subgraph")){pendingPreset_=4;RequestReplace(false);}
+        if(ImGui::BeginMenu("Smart Generators")){int index=0;for(const auto& preset:SmartGeneratorPresets()){if(ImGui::MenuItem(preset.name)){pendingPreset_=10+index;RequestReplace(false);}++index;}ImGui::EndMenu();}
         ImGui::EndPopup();
     }
     ImGui::TextDisabled("%s%s  |  %zu nodes, %zu links", path_.empty() ? "Untitled" : path_.filename().string().c_str(), document_ != saved_ ? " *" : "", document_.nodes.size(), document_.links.size());
@@ -409,7 +420,7 @@ void MaterialGraphPanel::RenderInspector()
         const auto from=document_.FindPin(link.output),to=document_.FindPin(link.input);ImGui::TextWrapped("%s.%s -> %s.%s",document_.FindNode(from->node)->name.c_str(),from->definition.name,document_.FindNode(to->node)->name.c_str(),to->definition.name);
     }
     } else ImGui::TextWrapped("Select a node in Material Graph to edit its parameters.");
-    RenderInstanceParameters();RenderPreview();
+    RenderSmartGenerators();RenderInstanceParameters();RenderPreview();
 }
 
 bool MaterialGraphPanel::Load(const std::filesystem::path& path)
@@ -417,15 +428,20 @@ bool MaterialGraphPanel::Load(const std::filesystem::path& path)
     std::string text;
     if (!LoadMaterialText(path, text, status_)) return false;
     MaterialGraphDocument draft;
-    const bool subgraph = detectAssetType(path)==AssetType::MaterialSubgraph;
+    const auto type=detectAssetType(path);const bool generator=type==AssetType::SmartGenerator;
+    const bool subgraph = generator || type==AssetType::MaterialSubgraph;
+    SmartGenerator generatorAsset;
     std::uint32_t interfaceVersion=1;
     if (subgraph) {
-        MaterialSubgraph asset; if (!asset.FromJson(text,status_)) return false;
+        MaterialSubgraph asset;
+        if(generator){if(!generatorAsset.FromJson(text,status_))return false;asset=generatorAsset.definition;}
+        else if (!asset.FromJson(text,status_)) return false;
         draft=std::move(asset.graph); interfaceVersion=asset.interfaceVersion;
     } else if (!draft.FromJson(text, status_)) return false;
     document_ = std::move(draft); saved_ = document_; path_ = path; undo_.clear(); redo_.clear();
     dragBefore_.reset(); propertyBefore_.reset(); selected_ = 0; ResetContext(); fitPending_ = true;
     subgraphMode_=subgraph; subgraphVersion_=interfaceVersion; subgraphs_.Clear(); forceCompile_=true;
+    generatorMode_=generator;generator_=std::move(generatorAsset);
     previewPin_=0;
     if (subgraph) {for (const auto& node:document_.nodes) if (node.kind==NodeKind::SubgraphOutput) { selected_=node.id; previewPin_=PinId(node.id,1); previewSettings_.channel=PreviewChannel::SelectedOutput; break; }}
     else if(previewSettings_.channel==PreviewChannel::SelectedOutput)previewSettings_.channel=PreviewChannel::Shaded;
@@ -433,15 +449,18 @@ bool MaterialGraphPanel::Load(const std::filesystem::path& path)
 }
 bool MaterialGraphPanel::Save(const std::filesystem::path& path)
 {
-    const bool subgraph = detectAssetType(path)==AssetType::MaterialSubgraph;
-    if (subgraphMode_ && !subgraph) { status_="Save subgraph assets with the .ixmaterialsubgraph extension"; return false; }
-    if (!subgraph && detectAssetType(path)!=AssetType::MaterialGraph) { status_="Use .materialgraph, .ixsmartmaterial or .ixmaterialsubgraph"; return false; }
+    const auto type=detectAssetType(path);const bool generator=type==AssetType::SmartGenerator;
+    const bool subgraph = generator || type==AssetType::MaterialSubgraph;
+    if(generatorMode_ && !generator){status_="Save generator assets with the .ixsmartgenerator extension to preserve metadata";return false;}
+    if (subgraphMode_ && !subgraph) { status_="Save subgraph assets with .ixmaterialsubgraph or .ixsmartgenerator"; return false; }
+    if (!subgraph && type!=AssetType::MaterialGraph) { status_="Use .materialgraph, .ixsmartmaterial, .ixmaterialsubgraph or .ixsmartgenerator"; return false; }
     auto text = document_.ToJson();
     MaterialGraphDocument checked;
     if (!checked.FromJson(text, status_)) return false;
     if (subgraph) {
         MaterialSubgraph asset{subgraphVersion_,document_}; std::vector<MaterialGraphPort> ports;
         if (!asset.GetInterface(ports,status_)) return false; text=asset.ToJson();
+        if(generator){auto preset=generator_;preset.definition=std::move(asset);if(!preset.Validate(status_))return false;text=preset.ToJson();}
     }
     if (!SaveMaterialTextAtomic(path, text, status_)) return false;
     auto& database=AssetDatabase::Instance(); const auto guid=database.getOrCreateGuid(path);
@@ -449,7 +468,7 @@ bool MaterialGraphPanel::Save(const std::filesystem::path& path)
     for (const auto& node:document_.nodes) if (const auto dependency=Guid::fromString(node.assetGuid))
         if (std::find(dependencies.begin(),dependencies.end(),*dependency)==dependencies.end()) dependencies.push_back(*dependency);
     if (!IsMaterialAssetGuid(guid.toString()) || !database.writeDependencies(path,dependencies)) { status_="Definition saved, but asset identity/dependency metadata failed"; return false; }
-    path_ = path; saved_ = document_; subgraphMode_=subgraph; textures_.Configure(library_,path_.parent_path()); previewDirty_=true; status_ = subgraph?"Subgraph saved":"Graph saved"; return true;
+    path_ = path; saved_ = document_; subgraphMode_=subgraph;generatorMode_=generator; textures_.Configure(library_,path_.parent_path()); previewDirty_=true; status_ = generator?"Smart Generator saved":(subgraph?"Subgraph saved":"Graph saved"); return true;
 }
 bool MaterialGraphPanel::CompileMaterial(MaterialGraphProgram& program, std::string& error, std::uint32_t previewPin)
 {
@@ -501,7 +520,7 @@ bool MaterialGraphPanel::LoadInstance(const std::filesystem::path& path)
 }
 void MaterialGraphPanel::SaveDialog(bool saveAs)
 {
-    const auto destination = saveAs || path_.empty() ? ChooseGraphFile(true, path_,false,subgraphMode_) : path_;
+    const auto destination = saveAs || path_.empty() ? ChooseGraphFile(true, path_,false,subgraphMode_,generatorMode_) : path_;
     if (!destination.empty()) Save(destination);
 }
 void MaterialGraphPanel::OpenDialog()
@@ -551,7 +570,7 @@ void MaterialGraphPanel::RenderSubgraphBinding(std::uint32_t id)
         if (browse) {
             wchar_t file[32768]{}; OPENFILENAMEW dialog{}; dialog.lStructSize=sizeof(dialog);
             dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);
-            dialog.lpstrFile=file; dialog.nMaxFile=static_cast<DWORD>(std::size(file)); dialog.lpstrFilter=L"Material Subgraph\0*.ixmaterialsubgraph\0";
+            dialog.lpstrFile=file; dialog.nMaxFile=static_cast<DWORD>(std::size(file)); dialog.lpstrFilter=L"Subgraph or Smart Generator\0*.ixmaterialsubgraph;*.ixsmartgenerator\0";
             dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
             if (!GetOpenFileNameW(&dialog)) return;
             guid=AssetDatabase::Instance().getOrCreateGuid(file).toString(); resource=std::filesystem::path(file).filename().string();
@@ -627,6 +646,7 @@ void MaterialGraphPanel::RenderLayerStack()
         if (ImGui::SmallButton("Up") && index>0) { moveIndex=index-1; action=Action::Move; }
         ImGui::SameLine(); if (ImGui::SmallButton("Down") && index+1<layers.size()) { moveIndex=index+1; action=Action::Move; }
         ImGui::SameLine(); if (layer.maskPin && ImGui::SmallButton("Preview mask")) { selected_=layer.maskPin/16; previewPin_=layer.maskPin; previewSettings_.channel=PreviewChannel::SelectedOutput; }
+        ImGui::SameLine();if(ImGui::SmallButton("Add generator...")){const auto path=ChooseGraphFile(false,{},false,false,true);if(!path.empty()){AddGeneratorAsset(path,layer.id);ImGui::PopID();return;}}
         const auto selectedMask=document_.FindPin(layer.maskPin);
         if (ImGui::BeginCombo("Mask",selectedMask?document_.FindNode(selectedMask->node)->name.c_str():"None")) {
             if (ImGui::Selectable("None",!layer.maskPin)) { maskPin=0; action=Action::Mask; }
@@ -664,6 +684,32 @@ void MaterialGraphPanel::RenderLayerStack()
             RecordUndo(before); return;
         }
     }
+}
+bool MaterialGraphPanel::AddGeneratorAsset(const std::filesystem::path& path,std::uint32_t layer) {
+    SmartGenerator generator;if(!LoadSmartGeneratorAsset(path,generator,status_))return false;
+    const auto guid=AssetDatabase::Instance().getOrCreateGuid(path).toString();const auto before=document_;
+    const auto call=AddSmartGenerator(document_,guid,generator,layer,status_,spawn_);if(!call)return false;
+    auto& node=*document_.FindNode(call);const auto utf8=path.filename().generic_u8string();node.resource.assign(utf8.begin(),utf8.end());
+    const auto output=std::find_if(node.ports.begin(),node.ports.end(),[](const auto& p){return !p.input;});
+    const auto pin=PinId(call,static_cast<size_t>(output-node.ports.begin()));
+    RecordUndo(before);ResetContext();selected_=call;previewPin_=pin;previewSettings_.channel=PreviewChannel::SelectedOutput;
+    subgraphs_.Clear();forceCompile_=previewDirty_=true;fitPending_=true;requestInspector_=true;status_="Smart Generator added";return true;
+}
+void MaterialGraphPanel::RenderSmartGenerators() {
+    if(!ImGui::CollapsingHeader("Smart Generators"))return;
+    if(generatorMode_){ImGui::TextUnformatted(generator_.name.c_str());ImGui::TextWrapped("%s",generator_.description.c_str());ImGui::TextWrapped("Edit the canonical graph and save its .ixsmartgenerator preset. Mask is the scalar output; parameters become scoped instance overrides in callers.");}
+    if(ImGui::Button("Add generator preset...")){const auto path=ChooseGraphFile(false,{},false,false,true);if(!path.empty())AddGeneratorAsset(path);}
+    ImGui::SameLine();if(ImGui::Button("Create generator preset"))ImGui::OpenPopup("Create smart generator");
+    if(ImGui::BeginPopup("Create smart generator")){int index=0;for(const auto& preset:SmartGeneratorPresets()){if(ImGui::MenuItem(preset.name)){pendingPreset_=10+index;RequestReplace(false);}++index;}ImGui::EndPopup();}
+    for(const auto& node:document_.nodes)if(node.kind==NodeKind::Subgraph){
+        const auto guid=Guid::fromString(node.assetGuid);const auto path=guid?AssetDatabase::Instance().resolveGuid(*guid):std::optional<std::filesystem::path>{};
+        if(!path || detectAssetType(*path)!=AssetType::SmartGenerator)continue;
+        ImGui::PushID(static_cast<int>(node.id));if(ImGui::Selectable(node.name.c_str(),selected_==node.id)){
+            selected_=node.id;const auto output=std::find_if(node.ports.begin(),node.ports.end(),[](const auto& p){return !p.input;});
+            if(output!=node.ports.end()){previewPin_=PinId(node.id,static_cast<size_t>(output-node.ports.begin()));previewSettings_.channel=PreviewChannel::SelectedOutput;}
+        }ImGui::PopID();
+    }
+    ImGui::TextWrapped("Use Add generator on a Layer Stack row to assign its mask in one undoable edit. NoiseMask modulates seeded breakup; geometry inputs come from the same preview/bake context. A valid mesh bake supplies real AO, curvature and cavity.");
 }
 void MaterialGraphPanel::RenderInstanceParameters()
 {

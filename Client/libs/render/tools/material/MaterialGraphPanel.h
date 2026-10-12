@@ -38,6 +38,7 @@ public:
     bool StartGeometryBake();
     bool SaveGeometryBake(const std::filesystem::path& path);
     bool BindGeometryBake(const std::string& guid);
+    bool AddGeneratorAsset(const std::filesystem::path& path,std::uint32_t layer = 0);
     const MaterialGraphDocument& Document() const { return document_; }
 private:
     void EnsureContext();
@@ -57,6 +58,7 @@ private:
     void PollGeometryBake();
     void RenderInstanceParameters();
     void RenderLayerStack();
+    void RenderSmartGenerators();
     void UpdatePreview();
     void RenderTextureBinding(GraphNode& node);
     void RenderSubgraphBinding(std::uint32_t node);
@@ -92,6 +94,8 @@ private:
     std::string graphError_;
     bool previewDirty_ = true;
     bool forceCompile_ = false, subgraphMode_ = false;
+    bool generatorMode_ = false;
+    SmartGenerator generator_;
     std::uint32_t subgraphVersion_ = 1;
     double previewTime_ = -1;
     std::uint64_t libraryRevision_ = 0;
