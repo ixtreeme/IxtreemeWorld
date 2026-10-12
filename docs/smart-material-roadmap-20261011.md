@@ -10,7 +10,15 @@ A felhasználó választása alapján a materialgráf szerkesztőfelületének a
 
 A node editor csak az editor build függősége legyen. A materialgráf adatai, típusellenőrzése, mentése és shadergenerálása külön motoroldali rétegbe kerüljenek, ImGui- és node-editor-típusok nélkül. A játék a lefordított materialt és annak paramétereit használja; a szerkesztőfelület nem fut a játékban.
 
-Az első integrációs mérföldkő egy dokkolható Material Graph panel, néhány összeköthető mintanode-dal. A jelenlegi ImGui 1.92.8-cal a kompatibilitás még nincs kipróbálva. A beépítés során ellenőrizni kell a fordítást, a nagyítást, az inputkezelést, a felugró menüket és egy nagyobb gráf mozgatásának költségét. Ez a próba a szerkesztő alapját igazolja; a Smart Material kiértékeléséhez az alábbi motoroldali feladatok is szükségesek.
+Az első integrációs mérföldkő a dokkolható Material Graph panel és néhány összeköthető mintanode. Ez a szerkesztő alapja; a Smart Material kiértékeléséhez az alábbi motoroldali feladatok is szükségesek.
+
+### Beépített első mérföldkő
+
+Az imgui-node-editor `021aa0ea4da13fed864bafb2a92d4c5205076866` verziója helyi, editor-only függőségként bekerült. Az ImGui 1.92.8 kompatibilitását verziófüggő vektoroperátor biztosítja. A **View > Material Graph** panel kereshető, kategorizált node-készletet, hat csatlakozótípust, ciklusellenőrzést, Inspector-paramétereket, Undo/Redo-t és verziózott `.materialgraph` mentést/betöltést ad.
+
+A további beépítés működő Scalar/Color/Vector és parameter node-okat, UV/Tiling Offset/World Position/Normal node-okat, Texture Sample/Triplanar mintavételezést, matematikai és színműveleteket, seeded Noise/Height/Slope maszkokat, Material Layer/Layer Blend/Height Blend/Normal Blend és teljes PBR Output kiértékelést ad. Az `IXMaterialGraph` könyvtár UI-független dokumentumot, topológiai kiértékelőt, HLSL-generálást és UV-sütést tartalmaz; a runtime build is használhatja. A vendored `crude_json` külön ebben fordul, az ImGui/node editor továbbra is csak editorfüggőség.
+
+Az Inspector élő anyag- és csatornaelőnézetet, külön instance-paramétereket, fájl-/assettextúra-bekötést ad. A cache a pozíció-/névváltozásokat kihagyja, csúszkázáskor összevonja az előnézeti frissítéseket; hibánál megtartja az utolsó sikeres képet. A **Templates** rozsdás fém és mohás kő mintákat ad. A csak UV-tól függő gráf a meglévő material rendszerbe süthető, teljes textúrakészlettel és ORM-csomagolással. A world/geometry-függő gráfok objektum-/terrain-sütése és a közvetlen dinamikus GPU-gráf-hozzárendelés még nincs megépítve. Az AO/Curvature/Cavity bemenetek külső felületi adatot igényelnek; nem helyettesítenek geometriai bakert. Az exposed instance-paraméterek jelenleg preview/bake munkamenetértékek, külön menthető runtime Smart Material instance asset még nincs.
 
 ## Ami már megvan
 
@@ -93,12 +101,14 @@ Egyszerű magasság-/irány-/noise-alapú mesh-anyaghoz még nem szükséges saj
 - [ ] Anyagelőnézet és Scene View frissítés, Undo/Redo, mentés, másolható presetek.
 - [ ] Induló presetek: füves-sziklás terrain, sáros part, mohás kő, koszos beton, rozsdás fém.
 - [ ] Generálási állapot, hibás assethivatkozások és a várható renderköltség látható jelzése.
-- [ ] Az imgui-node-editor beépítése külön editorfüggőségként, rögzített forrásverzióval és megőrzött MIT licenccel.
-- [ ] Dokkolható Material Graph panel, kereshető node-létrehozás, típus szerint jelölt csatlakozók és hibás összekötések elutasítása.
-- [ ] Saját, stabil azonosítójú materialgráf-adatmodell, mentés/betöltés és Undo/Redo; a nézet elrendezése külön szerkesztőadat.
-- [ ] Kezdő node-készlet: Parameter, Texture Sample, Noise, Height Mask, Slope Mask, Layer Blend és PBR Output.
-- [ ] Gráfellenőrzés, ciklusok felismerése, shadergenerálás és fordítási hibák megjelenítése a megfelelő node-nál.
-- [ ] Élő materialelőnézet; fordítási hiba esetén az utolsó sikeresen lefordított material maradjon használható.
+- [x] Az imgui-node-editor beépítése külön editorfüggőségként, rögzített forrásverzióval és megőrzött MIT licenccel.
+- [x] Dokkolható Material Graph panel, kereshető node-létrehozás, típus szerint jelölt csatlakozók és hibás összekötések elutasítása.
+- [x] Saját, stabil azonosítójú materialgráf-vázlat, mentés/betöltés és Undo/Redo; a node-ok helyzete mentett szerkesztőadat, a nézet navigációja külön marad.
+- [x] Kezdő node-készlet: Parameter, Texture Sample, Noise, Height Mask, Slope Mask, Layer Blend és PBR Output.
+- [x] Gráfellenőrzés, ciklusok felismerése és node-azonosítóval jelölt HLSL-generálás; tesztben DXIL és SPIR-V fordítás.
+- [ ] Dinamikus GPU-shader-hozzárendelés és fordítási hibák visszajelölése a vászon node-jára.
+- [x] Élő kiértékelt materialelőnézet és kimeneti csatornák; hibánál az utolsó helyes előnézet marad.
+- [ ] Jelenetbeli GPU-materialcsere, az utolsó sikeresen lefordított shader megőrzésével.
 
 A kiválasztott node editor a materialgráf felülete; az Inspector a kijelölt node vagy materialpéldány paramétereit szerkeszti. A réteglista használható egyszerűbb, előre meghatározott réteges anyagokhoz. A felületek ugyanazokat a motoroldali materialadatokat és mentési útvonalakat használják.
 
