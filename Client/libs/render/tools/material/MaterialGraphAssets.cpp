@@ -1,4 +1,5 @@
 #include "MaterialGraphAssets.h"
+#include "GeometryAssets.h"
 #include "MaterialInstance.h"
 #include "MaterialGraphIO.h"
 #include "asset/AssetDatabase.h"
@@ -128,14 +129,23 @@ SampledTexture GraphTextureCache::Sample(const GraphNode& n,const std::string& o
     }
     return {result,binding.exr};
 }
-bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& document,const ParameterOverrides& parameters,unsigned resolution,const std::string& name,AssetLibrary::Entry& result,std::string& error,const std::filesystem::path& graphFolder) {
+bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& document,const ParameterOverrides& parameters,unsigned resolution,const std::string& name,AssetLibrary::Entry& result,std::string& error,const std::filesystem::path& graphFolder,const GeometryBake* geometry,const std::string& geometryGuid) {
+    GraphGeometryCache verifiedGeometry;std::string geometryBytes;
+    if(geometry) {
+        if(resolution!=geometry->settings.resolution){error="Material resolution must match the Geometry Bake atlas";return false;}
+        if(!verifiedGeometry.Bind(geometryGuid,error))return false;
+        std::string savedBytes;
+        if(!EncodeGeometryBake(*geometry,geometryBytes,error) || !EncodeGeometryBake(*verifiedGeometry.Bake(),savedBytes,error))return false;
+        if(savedBytes!=geometryBytes){error="Geometry Bake changed since preview; reload or save the cache before publishing";return false;}
+    } else if(!geometryGuid.empty()){error="Geometry Bake GUID requires its validated map data";return false;}
     auto source = document; GraphSubgraphCache subgraphs; MaterialSubgraphExpansion expansion;
     const bool hasSubgraphs = std::any_of(document.nodes.begin(), document.nodes.end(), [](const auto& n) { return n.kind == NodeKind::Subgraph; });
     if (hasSubgraphs && !ExpandMaterialSubgraphs(document, subgraphs.Resolver(), source, expansion, error)) return false;
     MaterialGraphProgram program;if(!program.Compile(source,error))return false;
     if (!program.ValidateOverrides(parameters, error)) return false;
     GraphTextureCache cache;cache.Configure(&library,graphFolder);BakedMaterialImages images;
-    if(!BakeMaterialUV(program,parameters,[&](const auto& n,const auto& p,float u,float v){return cache.Sample(n,p,u,v);},resolution,images,error))return false;
+    const TextureSampler sampler=[&](const auto& n,const auto& p,float u,float v){return cache.Sample(n,p,u,v);};
+    if(geometry ? !BakeMaterialOnGeometry(program,parameters,sampler,*geometry,images,error) : !BakeMaterialUV(program,parameters,sampler,resolution,images,error))return false;
     if(!cache.Error().empty()){error=cache.Error();return false;}
     std::string stem;for(const unsigned char c:name)stem+=std::isalnum(c)?static_cast<char>(c):'_';if(stem.empty())stem="GraphMaterial";
     const auto folder=library.LibraryRoot()/"Materials"/"GraphBakes"/(stem+"_"+generateGuidV4().toString());std::error_code ec;std::filesystem::create_directories(folder,ec);
@@ -156,7 +166,19 @@ bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& doc
             if(overrideValue.starts_with("asset:"))if(const auto entry=library.FindById(overrideValue.substr(6))){n.assetId=entry->id;n.assetGuid=entry->guid;n.resource=library.AssetRelativePath(*entry);}
             if(overrideValue.starts_with("guid:"))for(const auto& entry:library.Entries())if(entry.guid==overrideValue.substr(5)){n.assetGuid=entry.guid;n.assetId=entry.id;n.resource=library.AssetRelativePath(entry);break;}}
     }
-    if (!SaveMaterialTextAtomic(folder/"source.materialgraph",source.ToJson(),error)) return false;
+    std::vector<Guid> sourceDependencies;
+    for(const auto& node:source.nodes)if(const auto guid=Guid::fromString(node.assetGuid))if(std::find(sourceDependencies.begin(),sourceDependencies.end(),*guid)==sourceDependencies.end())sourceDependencies.push_back(*guid);
+    if(geometry) {
+        const auto geometryPath=folder/"geometry.ixgeometrybake";
+        if(!SaveMaterialTextAtomic(geometryPath,geometryBytes,error))return false;
+        auto& database=AssetDatabase::Instance();const auto geometrySnapshotGuid=database.getOrCreateGuid(geometryPath);
+        if(!database.writeDependencies(geometryPath,{*Guid::fromString(verifiedGeometry.MeshGuid())})){error="Cannot write geometry snapshot dependency";return false;}
+        sourceDependencies.push_back(geometrySnapshotGuid);
+    }
+    const auto sourcePath=folder/"source.materialgraph";
+    if (!SaveMaterialTextAtomic(sourcePath,source.ToJson(),error)) return false;
+    AssetDatabase::Instance().getOrCreateGuid(sourcePath);
+    if(!AssetDatabase::Instance().writeDependencies(sourcePath,sourceDependencies)){error="Cannot write material bake source dependencies";return false;}
     if (hasSubgraphs) {
         // Keep both the authored definition and an effective, self-contained source for
         // this bake. Changes to an external subgraph cannot alter the baked snapshot.
@@ -168,7 +190,7 @@ bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& doc
         if (!AssetDatabase::Instance().writeDependencies(authored,dependencies)) { error="Cannot write baked definition dependencies"; return false; }
     }
     GltfMaterialSource material;material.name=name;material.baseColorTexturePath=folder/filenames[0];material.normalTexturePath=folder/filenames[1];material.aoTexturePath=folder/filenames[2];material.roughnessTexturePath=folder/filenames[3];material.metallicTexturePath=folder/filenames[4];material.heightTexturePath=folder/filenames[5];material.emissiveTexturePath=folder/filenames[6];material.emissive={1,1,1,1};material.roughness=1;material.metallic=1;
-    for(size_t at=3;at<images.color.size();at+=4)if(images.color[at]<255){material.alphaMode="blend";break;}
+    for(size_t at=3;at<images.color.size();at+=4)if((!geometry || geometry->coverage[at/4]) && images.color[at]<255){material.alphaMode="blend";break;}
     auto& manager=MaterialAssetManager::Instance();const auto guid=manager.createFromGltfMaterial(material,folder,stem);
     if(!manager.getOrLoad(guid)){error="Cannot create material asset";return false;}
     if(!library.Refresh(error))return false;

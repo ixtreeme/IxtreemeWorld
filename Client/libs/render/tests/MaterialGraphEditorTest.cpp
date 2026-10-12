@@ -2,6 +2,7 @@
 #include "tools/material/MaterialGraphPanel.h"
 #include "tools/material/MaterialGraphIO.h"
 #include "tools/material/MaterialInstance.h"
+#include "GeometryFixtures.h"
 #include "asset/AssetDatabase.h"
 #include "IconsFontAwesome6.h"
 #include <imgui.h>
@@ -62,6 +63,9 @@ struct MaterialGraphPanelTestAccess
     static void Detach(MaterialGraphPanel& panel) {const auto before=panel.document_;panel.document_.ConvertToCustomGraph();panel.RecordUndo(before);}
     static void Override(MaterialGraphPanel& panel,float value) {panel.parameters_.values["MossAmount"]={value,0,0,0};panel.previewDirty_=true;}
     static const ParameterOverrides& Overrides(const MaterialGraphPanel& panel) {return panel.parameters_;}
+    static void SmallGeometry(MaterialGraphPanel& panel) {panel.geometrySettings_.resolution=32;panel.geometrySettings_.rayDistance=3;}
+    static bool GeometryReady(MaterialGraphPanel& panel) {panel.PollGeometryBake();return panel.geometry_.Bake()!=nullptr;}
+    static void GeometryPreview(MaterialGraphPanel& panel) {panel.geometryPreview_=true;panel.previewDirty_=true;}
     static std::uint32_t Subgraph(MaterialGraphPanel& panel,const std::string& guid,const MaterialSubgraph& asset) {
         panel.document_=MaterialGraphDocument::Example();std::string error;
         const auto call=panel.document_.AddNode(NodeKind::Subgraph,{});BindMaterialSubgraph(panel.document_,call,guid,asset,error);
@@ -307,6 +311,24 @@ void Editor(bool capture)
         fullCache.FinishCompilation();Check(fullCacheLoaded,"native subgraph cache accepts its full 256-asset dependency budget");
         fullCache.BeginCompilation();
         Check(fullCache.Resolve(subgraphGuid.toString(),resolved,error),"new definition can replace a full previous dependency set without a manual cache clear");fullCache.FinishCompilation();
+        Check(panel.Load(definitionFile),"smart definition reopens for real mesh workflow");
+        const auto meshFile=smartRoot/"stone-box.obj",cacheFile=smartRoot/"stone.ixgeometrybake",meshInstance=smartRoot/"mesh-stone.ixmaterialinstance";
+        geometry_fixtures::WriteObj(meshFile,geometry_fixtures::Box());MaterialGraphPanelTestAccess::SmallGeometry(panel);
+        Check(panel.SelectGeometryMesh(meshFile) && panel.StartGeometryBake(),"production panel starts an asynchronous bake of an imported mesh");
+        const auto geometryDeadline=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(!MaterialGraphPanelTestAccess::GeometryReady(panel) && std::chrono::steady_clock::now()<geometryDeadline)frame();
+        frame();frame();
+        Check(MaterialGraphPanelTestAccess::GeometryReady(panel) && MaterialGraphPanelTestAccess::Error(panel).empty(),"real geometry job completion refreshes the Weathered Stone UV preview");
+        if(!MaterialGraphPanelTestAccess::Error(panel).empty())std::cout<<"Geometry preview error: "<<MaterialGraphPanelTestAccess::Error(panel)<<'\n';
+        Check(!panel.SaveInstance(meshInstance),"unsaved geometry cache cannot produce a dangling mesh-bound instance");
+        Check(panel.SaveGeometryBake(cacheFile) && panel.SaveInstance(meshInstance),"panel saves native geometry cache and mesh-bound material instance");
+        Check(restored.Load(definitionFile) && restored.LoadInstance(meshInstance),"instance reload binds GUID-backed geometry after verifying its source content");
+        const auto cacheGuid=AssetDatabase::Instance().resolvePath(cacheFile);const auto meshDependencies=AssetDatabase::Instance().loadDependencies(meshInstance);
+        Check(cacheGuid && std::find(meshDependencies.begin(),meshDependencies.end(),*cacheGuid)!=meshDependencies.end(),"mesh-bound instance tracks its geometry asset dependency");
+        const auto validGeometryPixels=MaterialGraphPanelTestAccess::Pixels(panel);
+        SaveMaterialTextAtomic(cacheFile,"broken geometry",error);frame();frame();
+        Check(!MaterialGraphPanelTestAccess::Error(panel).empty() && MaterialGraphPanelTestAccess::Pixels(panel)==validGeometryPixels,"invalid geometry keeps the last valid real-mesh preview");
+        Check(!restored.LoadInstance(meshInstance),"invalid geometry instance reload fails transactionally");
         std::filesystem::remove_all(smartRoot);
         open = false; frame(); Check(!open, "closed panel keeps document without drawing its canvas");
     }

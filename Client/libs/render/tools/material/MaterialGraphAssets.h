@@ -45,5 +45,6 @@ private:
     std::size_t bytes_ = 0;
 };
 bool PublishBakedMaterial(AssetLibrary& library, const MaterialGraphDocument& document, const ParameterOverrides& parameters,
-    unsigned resolution, const std::string& name, AssetLibrary::Entry& result, std::string& error, const std::filesystem::path& graphFolder = {});
+    unsigned resolution, const std::string& name, AssetLibrary::Entry& result, std::string& error, const std::filesystem::path& graphFolder = {},
+    const GeometryBake* geometry = nullptr, const std::string& geometryGuid = {});
 }

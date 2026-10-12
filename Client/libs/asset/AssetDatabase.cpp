@@ -131,6 +131,8 @@ std::optional<AssetType> ParseAssetType(const std::string& value)
         return AssetType::MaterialInstance;
     if (value == "MaterialSubgraph")
         return AssetType::MaterialSubgraph;
+    if (value == "GeometryBake")
+        return AssetType::GeometryBake;
     if (value == "Animation")
         return AssetType::Animation;
     if (value == "AnimationClip")
@@ -495,6 +497,8 @@ AssetType detectAssetType(const std::filesystem::path& filePath)
         return AssetType::MaterialInstance;
     if (ext == ".ixmaterialsubgraph")
         return AssetType::MaterialSubgraph;
+    if (ext == ".ixgeometrybake")
+        return AssetType::GeometryBake;
     if (ext == ".anim" || ext == ".ozz")
         return AssetType::Animation;
     if (ext == ".ixclip")
@@ -528,6 +532,7 @@ const char* AssetTypeName(AssetType type)
     case AssetType::MaterialGraph: return "MaterialGraph";
     case AssetType::MaterialInstance: return "MaterialInstance";
     case AssetType::MaterialSubgraph: return "MaterialSubgraph";
+    case AssetType::GeometryBake: return "GeometryBake";
     case AssetType::Animation: return "Animation";
     case AssetType::AnimationClip: return "AnimationClip";
     case AssetType::AnimatorController: return "AnimatorController";

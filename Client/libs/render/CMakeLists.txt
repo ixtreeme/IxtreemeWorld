@@ -72,6 +72,14 @@ add_library(IXEngineRender STATIC
 )
 
 # UI-independent graph serialization, evaluation and shader generation are shared with runtime.
+add_library(IXGeometryBaker STATIC tools/material/GeometryBaker.cpp)
+find_package(Threads REQUIRED)
+target_link_libraries(IXGeometryBaker PUBLIC Threads::Threads)
+target_include_directories(IXGeometryBaker PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_features(IXGeometryBaker PUBLIC cxx_std_20)
+if(MSVC)
+    set_target_properties(IXGeometryBaker PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 add_library(IXMaterialGraph STATIC
     tools/material/MaterialGraphDocument.cpp
     tools/material/MaterialLayers.cpp
@@ -85,6 +93,7 @@ add_library(IXMaterialGraph STATIC
 target_include_directories(IXMaterialGraph PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_include_directories(IXMaterialGraph SYSTEM PRIVATE "${CLIENT_ROOT}/third_party/imgui-node-editor")
 target_compile_features(IXMaterialGraph PUBLIC cxx_std_20)
+target_link_libraries(IXMaterialGraph PUBLIC IXGeometryBaker)
 if(MSVC)
     set_target_properties(IXMaterialGraph PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 endif()
@@ -114,6 +123,7 @@ if(IXTREEME_WITH_EDITOR)
         tools/material/MaterialGraphPanel.cpp
         tools/material/MaterialGraphPanel.h
         tools/material/MaterialGraphAssets.cpp
+        tools/material/GeometryAssets.cpp
         tools/tree/TreeGeneratorPanel.cpp
         tools/tree/TreePreviewRenderer.cpp
     )
@@ -328,6 +338,13 @@ if(BUILD_TESTING AND NOT ANDROID)
     endif()
     add_test(NAME HierarchyCacheTest COMMAND HierarchyCacheTest)
     add_executable(MaterialGraphCompilerTest tests/MaterialGraphCompilerTest.cpp)
+    add_executable(GeometryBakerTest tests/GeometryBakerTest.cpp)
+    target_link_libraries(GeometryBakerTest PRIVATE IXMaterialGraph)
+    if(MSVC)
+        set_target_properties(GeometryBakerTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME GeometryBakerTest COMMAND GeometryBakerTest)
+    set_tests_properties(GeometryBakerTest PROPERTIES TIMEOUT 30)
     add_executable(SmartMaterialCoreTest tests/SmartMaterialCoreTest.cpp)
     target_link_libraries(SmartMaterialCoreTest PRIVATE IXMaterialGraph)
     if(MSVC)

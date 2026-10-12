@@ -243,6 +243,7 @@ void MaterialGraphPanel::SyncPositions()
 }
 void MaterialGraphPanel::RenderView(bool& open)
 {
+    PollGeometryBake();
     if (!open) return;
     ImGui::SetNextWindowSize({900, 600}, ImGuiCond_FirstUseEver);
     if (!ImGui::Begin(WindowName, &open, ImGuiWindowFlags_NoCollapse)) { ImGui::End(); return; }
@@ -425,7 +426,9 @@ bool MaterialGraphPanel::Load(const std::filesystem::path& path)
     document_ = std::move(draft); saved_ = document_; path_ = path; undo_.clear(); redo_.clear();
     dragBefore_.reset(); propertyBefore_.reset(); selected_ = 0; ResetContext(); fitPending_ = true;
     subgraphMode_=subgraph; subgraphVersion_=interfaceVersion; subgraphs_.Clear(); forceCompile_=true;
-    if (subgraph) for (const auto& node:document_.nodes) if (node.kind==NodeKind::SubgraphOutput) { selected_=node.id; previewPin_=PinId(node.id,1); previewSettings_.channel=PreviewChannel::SelectedOutput; break; }
+    previewPin_=0;
+    if (subgraph) {for (const auto& node:document_.nodes) if (node.kind==NodeKind::SubgraphOutput) { selected_=node.id; previewPin_=PinId(node.id,1); previewSettings_.channel=PreviewChannel::SelectedOutput; break; }}
+    else if(previewSettings_.channel==PreviewChannel::SelectedOutput)previewSettings_.channel=PreviewChannel::Shaded;
     parameters_={};previewDirty_=true;textures_.Clear(); textures_.Configure(library_,path_.parent_path()); status_ = subgraph?"Subgraph opened":"Graph opened"; return true;
 }
 bool MaterialGraphPanel::Save(const std::filesystem::path& path)
@@ -463,11 +466,17 @@ bool MaterialGraphPanel::SaveInstance(const std::filesystem::path& path)
     MaterialGraphProgram program;
     if (!CompileMaterial(program,status_)) return false;
     MaterialInstance instance; instance.definitionGuid=AssetDatabase::Instance().getOrCreateGuid(path_).toString(); instance.overrides=parameters_;
+    if(geometryPreview_) {
+        geometry_.Refresh();
+        if(!geometry_.Bake() || geometry_.BakeGuid().empty()){status_="Save the valid Geometry Bake cache before saving a mesh-bound instance";return false;}
+        instance.geometryBakeGuid=geometry_.BakeGuid();
+    }
     if (!instance.Validate(program,status_)) return false;
     if (!SaveMaterialTextAtomic(path,instance.ToJson(),status_)) return false;
     auto& database=AssetDatabase::Instance();database.getOrCreateGuid(path);
     std::vector<Guid> dependencies;
     if (const auto guid=Guid::fromString(instance.definitionGuid)) dependencies.push_back(*guid);
+    if (const auto guid=Guid::fromString(instance.geometryBakeGuid)) dependencies.push_back(*guid);
     for (const auto& [name,resource]:instance.overrides.textures) {
         (void)name;
         if (resource.starts_with("guid:")) if (const auto guid=Guid::fromString(resource.substr(5)))
@@ -482,8 +491,12 @@ bool MaterialGraphPanel::LoadInstance(const std::filesystem::path& path)
     std::string text; MaterialInstance instance; MaterialGraphProgram program;
     if (!LoadMaterialText(path,text,status_) || !instance.FromJson(text,status_) || !CompileMaterial(program,status_)) return false;
     if (instance.definitionGuid!=AssetDatabase::Instance().getOrCreateGuid(path_).toString()) { status_="This instance references a different material definition"; return false; }
-    if (!instance.geometryBakeGuid.empty()) { status_="Geometry bake binding requires the geometry baker integration"; return false; }
     if (!instance.Validate(program,status_)) return false;
+    if(geometryJob_.Running()){status_="Finish or cancel the geometry bake before loading an instance";return false;}
+    GraphGeometryCache geometry;
+    if(!instance.geometryBakeGuid.empty() && !geometry.Bind(instance.geometryBakeGuid,status_))return false;
+    geometry_=std::move(geometry);geometryPreview_=!instance.geometryBakeGuid.empty();
+    if(geometry_.Bake())geometrySettings_=geometry_.Bake()->settings;
     parameters_=instance.overrides; textures_.Clear(); previewDirty_=true; status_="Material instance loaded"; return true;
 }
 void MaterialGraphPanel::SaveDialog(bool saveAs)
@@ -683,6 +696,8 @@ void MaterialGraphPanel::RenderInstanceParameters()
 }
 void MaterialGraphPanel::UpdatePreview()
 {
+    PollGeometryBake();
+    if(geometry_.Refresh())previewDirty_=true;
     const auto revision=library_?library_->Revision():0;
     if(revision!=libraryRevision_){libraryRevision_=revision;textures_.Clear();previewDirty_=true;}
     const bool dependencyChanged=subgraphs_.Changed();
@@ -699,9 +714,11 @@ void MaterialGraphPanel::UpdatePreview()
     if (recompile) { CompileMaterial(program_,graphError_,pin); forceCompile_=false; }
     if (!graphError_.empty()) { compileError_=graphError_; return; }
     if (!program_.ValidateOverrides(parameters_, compileError_)) return;
+    if(previewSettings_.channel>=PreviewChannel::GeometryAO && !geometryPreview_){compileError_="Geometry map channels require Mesh UV atlas preview and a valid Geometry Bake";return;}
+    if(geometryPreview_ && !geometry_.Bake()){compileError_=geometry_.Error().empty()?"Missing Geometry Bake: bake the selected mesh to render its UV atlas":geometry_.Error();return;}
     textures_.Configure(library_,path_.parent_path());
     textures_.BeginEvaluation();
-    auto pixels=RenderMaterialPreview(program_,parameters_,[&](const auto& n,const auto& overridePath,float u,float v){return textures_.Sample(n,overridePath,u,v);},previewSettings_,256);
+    auto pixels=RenderMaterialPreview(program_,parameters_,[&](const auto& n,const auto& overridePath,float u,float v){return textures_.Sample(n,overridePath,u,v);},previewSettings_,256,geometryPreview_?geometry_.Bake():nullptr);
     if(!textures_.Error().empty()){compileError_=textures_.Error();return;}
     previewPixels_=std::move(pixels);
     if(provider_ && provider_->IsReady()) {
@@ -712,11 +729,14 @@ void MaterialGraphPanel::UpdatePreview()
 void MaterialGraphPanel::RenderPreview()
 {
     if(!ImGui::CollapsingHeader("Material preview",ImGuiTreeNodeFlags_DefaultOpen))return;
-    int channel=static_cast<int>(previewSettings_.channel);const char* channels[]={"Shaded","Base Color","Roughness","Metallic","Normal","AO","Height","Emissive","Selected output"};
-    if(UI::Prop::Combo("Channel",&channel,channels,9))previewSettings_.channel=static_cast<PreviewChannel>(channel);
+    int channel=static_cast<int>(previewSettings_.channel);const char* channels[]={"Shaded","Base Color","Roughness","Metallic","Normal","AO","Height","Emissive","Selected output","Geometry AO","Curvature","Cavity","Thickness / ray distance","Object Normal","World Normal","Object Position (bounds)","World Position (bounds)"};
+    if(UI::Prop::Combo("Channel",&channel,channels,17)){previewSettings_.channel=static_cast<PreviewChannel>(channel);if(previewSettings_.channel>=PreviewChannel::GeometryAO)geometryPreview_=true;}
+    RenderGeometryBake();
+    ImGui::BeginDisabled(geometryPreview_);
     UI::Prop::Checkbox("Sphere",&previewSettings_.sphere);
     UI::Prop::DragFloat("World size (m)",&previewSettings_.worldSize,.1f,.01f,10000.0f,"%.2f");
     UI::Prop::DragFloat("Height offset (m)",&previewSettings_.heightOffset,.1f,-10000.0f,10000.0f,"%.2f");
+    ImGui::EndDisabled();
     if(previewSettings_.channel==PreviewChannel::SelectedOutput) {
         const auto* node=document_.FindNode(selected_);bool found=false;
         if(node) {
@@ -742,8 +762,8 @@ void MaterialGraphPanel::RenderPreview()
         }
     }
     if(!compileError_.empty())ImGui::TextWrapped("%s\nKeeping the last valid preview.",compileError_.c_str());
-    if(program_.NeedsSurfaceData()) {
-        ImGui::TextWrapped("Missing Geometry Bake: using explicit preview test inputs, not mesh-baked data.");
+    if(program_.NeedsSurfaceData() && !geometryPreview_) {
+        ImGui::TextWrapped(geometry_.Bake()?"Analytic preview uses explicit test inputs. Enable Mesh UV atlas preview to use the baked geometry.":"Missing Geometry Bake: using explicit preview test inputs, not mesh-baked data.");
         UI::Prop::SliderFloat("Preview AO",&previewSettings_.surfaceData.ao,0.0f,1.0f);
         UI::Prop::SliderFloat("Preview curvature",&previewSettings_.surfaceData.curvature,0.0f,1.0f);
         UI::Prop::SliderFloat("Preview cavity",&previewSettings_.surfaceData.cavity,0.0f,1.0f);
@@ -751,15 +771,89 @@ void MaterialGraphPanel::RenderPreview()
     if(ImGui::CollapsingHeader("Bake UV material")) {
         UI::Prop::InputText("Material name",bakeName_,sizeof(bakeName_));const char* sizes[]={"256","512","1024"};UI::Prop::Combo("Resolution",&bakeResolution_,sizes,3);
         ImGui::BeginDisabled(!library_);if(ImGui::Button("Bake to Asset Browser"))BakeMaterial();ImGui::EndDisabled();
-        ImGui::TextWrapped("Creates a material and textures in Materials/GraphBakes. UV graphs can be assigned through the existing material workflow. World-dependent rules require terrain or per-object baking.");
+        ImGui::TextWrapped(geometryPreview_?"Creates textures for this mesh UV atlas and baked world transform. Reuse requires matching geometry, UVs and placement. Resolution follows Geometry Bake.":"Creates a material and textures in Materials/GraphBakes. World-dependent rules require per-object geometry baking.");
     }
     if(!status_.empty())ImGui::TextWrapped("%s",status_.c_str());
 }
 void MaterialGraphPanel::BakeMaterial()
 {
     if(!library_)return;AssetLibrary::Entry result;std::string error;
-    if(PublishBakedMaterial(*library_,document_,parameters_,256U<<bakeResolution_,bakeName_,result,error,path_.parent_path()))status_="Baked material: "+result.displayName+" in Materials/GraphBakes";
+    geometry_.Refresh();
+    if(geometryPreview_ && (!geometry_.Bake() || geometry_.BakeGuid().empty())){status_="Save a valid Geometry Bake cache before publishing a mesh material";return;}
+    const auto* geometry=geometryPreview_?geometry_.Bake():nullptr;
+    if(PublishBakedMaterial(*library_,document_,parameters_,geometry?geometry->settings.resolution:256U<<bakeResolution_,bakeName_,result,error,path_.parent_path(),geometry,geometryPreview_?geometry_.BakeGuid():""))status_="Baked material: "+result.displayName+" in Materials/GraphBakes";
     else status_=error;
+}
+bool MaterialGraphPanel::SelectGeometryMesh(const std::filesystem::path& path,unsigned index) {
+    if(geometryJob_.Running()){status_="Finish or cancel the active geometry bake first";return false;}
+    if(!geometry_.Select(path,index,status_))return false;
+    geometryPreview_=true;previewDirty_=true;status_="Mesh selected; start Geometry Bake";return true;
+}
+bool MaterialGraphPanel::StartGeometryBake() {
+    geometry_.Refresh();const auto* mesh=geometry_.Mesh();
+    if(!mesh){status_=geometry_.Error().empty()?"Select a static mesh first":geometry_.Error();return false;}
+    if(!geometryJob_.Start(*mesh,geometrySettings_)){status_="A geometry bake is already running";return false;}
+    status_="Geometry bake running";return true;
+}
+bool MaterialGraphPanel::SaveGeometryBake(const std::filesystem::path& path) {
+    if(!geometry_.Save(path,status_))return false;status_="Geometry Bake cache saved";return true;
+}
+bool MaterialGraphPanel::BindGeometryBake(const std::string& guid) {
+    if(geometryJob_.Running()){status_="Finish or cancel the active geometry bake first";return false;}
+    if(!geometry_.Bind(guid,status_))return false;
+    geometrySettings_=geometry_.Bake()->settings;geometryPreview_=true;previewDirty_=true;status_="Geometry Bake bound";return true;
+}
+void MaterialGraphPanel::PollGeometryBake() {
+    GeometryBake completed;std::string error;
+    if(!geometryJob_.TakeResult(completed,error))return;
+    if(!error.empty()){status_=error;return;}
+    if(!geometry_.Accept(std::move(completed),status_))return;
+    geometryPreview_=true;previewDirty_=true;status_="Geometry Bake complete; save the cache for instances and material export";
+}
+void MaterialGraphPanel::RenderGeometryBake() {
+    PollGeometryBake();
+    if(!ImGui::CollapsingHeader("Geometry Bake"))return;
+    const bool running=geometryJob_.Running();
+    ImGui::BeginDisabled(running);
+    if(ImGui::Button("Select mesh...")) {
+        wchar_t file[32768]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);
+        dialog.lpstrFile=file;dialog.nMaxFile=static_cast<DWORD>(std::size(file));dialog.lpstrFilter=L"Static models\0*.fbx;*.obj;*.gltf;*.glb\0";dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
+        if(GetOpenFileNameW(&dialog))SelectGeometryMesh(file);
+    }
+    ImGui::SameLine();if(ImGui::Button("Open bake...")) {
+        wchar_t file[32768]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);
+        dialog.lpstrFile=file;dialog.nMaxFile=static_cast<DWORD>(std::size(file));dialog.lpstrFilter=L"Geometry Bake\0*.ixgeometrybake\0";dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
+        if(GetOpenFileNameW(&dialog))BindGeometryBake(AssetDatabase::Instance().getOrCreateGuid(file).toString());
+    }
+    if(!geometry_.MeshGuid().empty()) {
+        ImGui::TextWrapped("%s (submesh %u of %u)",geometry_.Name().c_str(),geometry_.MeshIndex()+1,geometry_.MeshCount());
+        int index=static_cast<int>(geometry_.MeshIndex());if(ImGui::SliderInt("Submesh",&index,0,static_cast<int>(geometry_.MeshCount())-1))SelectGeometryMesh(geometry_.MeshPath(),static_cast<unsigned>(index));
+        if(ImGui::Checkbox("Mesh UV atlas preview",&geometryPreview_))previewDirty_=true;
+        if(ImGui::SmallButton("Reload geometry dependencies")){geometry_.Refresh(true);previewDirty_=true;}
+    }
+    int resolution=geometrySettings_.resolution==512?2:geometrySettings_.resolution==256?1:0;const char* sizes[]={"128","256","512"};
+    if(UI::Prop::Combo("Bake resolution",&resolution,sizes,3))geometrySettings_.resolution=128U<<resolution;
+    int samples=static_cast<int>(geometrySettings_.aoSamples);if(ImGui::SliderInt("AO rays",&samples,1,128))geometrySettings_.aoSamples=static_cast<unsigned>(samples);
+    int padding=static_cast<int>(geometrySettings_.padding);if(ImGui::SliderInt("UV padding",&padding,0,32))geometrySettings_.padding=static_cast<unsigned>(padding);
+    UI::Prop::DragFloat("Ray distance (m)",&geometrySettings_.rayDistance,.1f,.001f,10000.0f,"%.3f");
+    UI::Prop::DragFloat("Ray bias (m)",&geometrySettings_.rayBias,.0001f,.000001f,1.0f,"%.6f");
+    float translation[]={geometrySettings_.objectToWorld[3],geometrySettings_.objectToWorld[7],geometrySettings_.objectToWorld[11]};
+    if(ImGui::DragFloat3("World translation",translation,.1f)){geometrySettings_.objectToWorld[3]=translation[0];geometrySettings_.objectToWorld[7]=translation[1];geometrySettings_.objectToWorld[11]=translation[2];}
+    if(ImGui::Button("Bake geometry"))StartGeometryBake();
+    ImGui::SameLine();ImGui::BeginDisabled(!geometry_.Bake());
+    if(ImGui::Button("Save bake...")) {
+        wchar_t file[32768]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);
+        dialog.lpstrFile=file;dialog.nMaxFile=static_cast<DWORD>(std::size(file));dialog.lpstrFilter=L"Geometry Bake\0*.ixgeometrybake\0";dialog.lpstrDefExt=L"ixgeometrybake";dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_OVERWRITEPROMPT;
+        if(GetSaveFileNameW(&dialog))SaveGeometryBake(file);
+    }
+    ImGui::EndDisabled();ImGui::EndDisabled();
+    if(running){ImGui::ProgressBar(geometryJob_.Progress());if(ImGui::Button("Cancel geometry bake"))geometryJob_.Cancel();}
+    if(const auto* bake=geometry_.Bake()) {
+        ImGui::Text("%u covered texels, %u open boundary edges",bake->coveredTexels,bake->boundaryEdges);
+        if(geometrySettings_!=bake->settings)ImGui::TextWrapped("Settings changed. Preview uses the previous successful bake until you rebake.");
+    }
+    if(!geometry_.Error().empty())ImGui::TextWrapped("%s",geometry_.Error().c_str());
+    ImGui::TextWrapped("Static submesh in object space. Preview shows its UV atlas with baked world positions/normals. Curvature is 0.5 on flat faces; cavity is concavity. Open surfaces have zero thickness when no exit ray hits.");
 }
 void MaterialGraphPanel::ExportShader()
 {

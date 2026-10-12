@@ -1,5 +1,7 @@
 #include "tools/material/MaterialGraphAssets.h"
 #include "tools/material/MaterialGraphIO.h"
+#include "tools/material/GeometryAssets.h"
+#include "GeometryFixtures.h"
 #include "asset/MaterialAssetManager.h"
 #include <stb_image.h>
 #include <stb_image_write.h>
@@ -63,6 +65,46 @@ int main() {
         Check(source.Compile(effective,error)&&std::abs(source.Evaluate({}, {}, {},work).roughness-.25f)<.0001f,"effective source retains scoped override values without resolving external subgraphs again");
         const auto dependencies=AssetDatabase::Instance().loadDependencies(folder/"definition.materialgraph");
         Check(std::find(dependencies.begin(),dependencies.end(),subgraphGuid)!=dependencies.end(),"baked authored definition tracks native subgraph dependencies");
+    }
+    const auto modelFile=root/"bake-box.obj",geometryFile=root/"box.ixgeometrybake";
+    Check(geometry_fixtures::WriteObj(modelFile,geometry_fixtures::Box()),"real OBJ fixture writes with UV seams");
+    GraphGeometryCache geometry;GeometryBake bake;GeometryBakeSettings settings;settings.resolution=32;settings.rayDistance=3;
+    const bool selected=geometry.Select(modelFile,0,error);
+    Check(selected && geometry.Mesh() && geometry.MeshCount()==1,"geometry bridge imports a native model submesh through Assimp");
+    if(selected) {
+        const bool geometryBaked=BakeGeometry(*geometry.Mesh(),settings,bake,error) && geometry.Accept(bake,error) && geometry.Save(geometryFile,error);
+        if(!geometryBaked)std::cout<<error<<'\n';
+        Check(geometryBaked && detectAssetType(geometryFile)==AssetType::GeometryBake,"real mesh cache bakes, validates and saves with native asset type");
+        if(geometryBaked) {
+            const auto geometryGuid=geometry.BakeGuid(),modelGuid=geometry.MeshGuid();GraphGeometryCache bound;
+            Check(bound.Bind(geometryGuid,error) && bound.Bake() && bound.Bake()->meshHash==bake.meshHash,"cache reload verifies actual source content against its GUID dependency");
+            Check(AssetDatabase::Instance().loadDependencies(geometryFile)==std::vector<Guid>{*Guid::fromString(modelGuid)},"geometry cache records native source mesh dependency");
+            auto stone=MaterialGraphDocument::WeatheredStone();
+            const bool stoneBaked=PublishBakedMaterial(library,stone,{},32,"Mesh Weathered Stone",material,error,{},geometry.Bake(),geometryGuid);
+            if(!stoneBaked)std::cout<<error<<'\n';Check(stoneBaked,"Weathered Stone publishes real mesh-dependent color/normal/ORM/height material");
+            if(stoneBaked) {
+                const auto folder=library.AbsolutePath(material).parent_path();GraphGeometryCache snapshot;
+                const auto snapshotGuid=AssetDatabase::Instance().resolvePath(folder/"geometry.ixgeometrybake");
+                Check(snapshotGuid && snapshot.Bind(snapshotGuid->toString(),error) && snapshot.Bake()->meshHash==bake.meshHash,"published material retains exact geometry snapshot with native dependency");
+                const auto sourceDependencies=AssetDatabase::Instance().loadDependencies(folder/"source.materialgraph");
+                Check(snapshotGuid && std::find(sourceDependencies.begin(),sourceDependencies.end(),*snapshotGuid)!=sourceDependencies.end(),"effective source tracks its geometry snapshot GUID");
+                const auto* native=MaterialAssetManager::Instance().getOrLoad(*Guid::fromString(material.guid));
+                Check(native && native->baseColorTexture && native->normalTexture && native->metallicRoughnessTexture,"mesh bake uses the existing native material renderer path");
+            }
+            const auto movedModel=root/"moved-box.obj";std::filesystem::rename(modelFile,movedModel);AssetDatabase::Instance().runtimeMove(modelFile,movedModel);
+            Check(geometry.Refresh() && geometry.Bake() && geometry.MeshPath()==movedModel,"mesh GUID move refreshes without invalidating unchanged geometric content");
+            const auto movedBake=root/"moved-box.ixgeometrybake";std::filesystem::rename(geometryFile,movedBake);AssetDatabase::Instance().runtimeMove(geometryFile,movedBake);
+            Check(geometry.Refresh() && geometry.Bake() && bound.Bind(geometryGuid,error),"cache GUID move retains model binding");
+            std::string intact;{std::ifstream input(movedBake,std::ios::binary);intact.assign(std::istreambuf_iterator<char>(input),{});}
+            SaveMaterialTextAtomic(movedBake,"corrupt",error);Check(geometry.Refresh() && !geometry.Bake() && !geometry.Error().empty(),"corrupt cache invalidates sampling with diagnostic");
+            SaveMaterialTextAtomic(movedBake,intact,error);Check(geometry.Refresh() && geometry.Bake(),"repaired cache recovers without changing material definition");
+            auto changed=geometry_fixtures::Box();changed.vertices[0].position[0]+=.1f;geometry_fixtures::WriteObj(movedModel,changed);
+            Check(geometry.Refresh() && !geometry.Bake() && geometry.Mesh() && geometry.Error().find("stale")!=std::string::npos,"real source edit invalidates cache but retains mesh for rebaking");
+            Check(!bound.Bind(geometryGuid,error) && error.find("stale")!=std::string::npos,"stale saved geometry cannot bind to an instance");
+            const auto assetCount=library.Entries().size();
+            Check(!PublishBakedMaterial(library,stone,{},32,"Stale stone",material,error,{},&bake,geometryGuid) && library.Entries().size()==assetCount,"stale geometry publishing fails before any assets are written");
+            Check(!geometry.Accept(bake,error),"completed bake for an old mesh cannot replace the current mesh cache");
+        }
     }
     std::filesystem::remove_all(root);std::cout<<"Material graph baking failures: "<<failures<<'\n';return failures?1:0;
 }

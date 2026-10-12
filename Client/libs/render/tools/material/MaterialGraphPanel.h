@@ -2,6 +2,7 @@
 
 #include "MaterialGraphDocument.h"
 #include "MaterialGraphAssets.h"
+#include "GeometryAssets.h"
 #include "EditorGraphicsBridge.h"
 #include <filesystem>
 #include <optional>
@@ -33,6 +34,10 @@ public:
     bool Save(const std::filesystem::path& path);
     bool SaveInstance(const std::filesystem::path& path);
     bool LoadInstance(const std::filesystem::path& path);
+    bool SelectGeometryMesh(const std::filesystem::path& path,unsigned meshIndex = 0);
+    bool StartGeometryBake();
+    bool SaveGeometryBake(const std::filesystem::path& path);
+    bool BindGeometryBake(const std::string& guid);
     const MaterialGraphDocument& Document() const { return document_; }
 private:
     void EnsureContext();
@@ -48,6 +53,8 @@ private:
     void RenderUnsavedPopup();
     void SyncPositions();
     void RenderPreview();
+    void RenderGeometryBake();
+    void PollGeometryBake();
     void RenderInstanceParameters();
     void RenderLayerStack();
     void UpdatePreview();
@@ -72,6 +79,10 @@ private:
     ixeditor::graphics::EditorTextureHandle previewTexture_;
     GraphTextureCache textures_;
     GraphSubgraphCache subgraphs_;
+    GraphGeometryCache geometry_;
+    GeometryBakeJob geometryJob_;
+    GeometryBakeSettings geometrySettings_;
+    bool geometryPreview_ = false;
     MaterialGraphProgram program_;
     MaterialGraphDocument evaluated_;
     ParameterOverrides parameters_;

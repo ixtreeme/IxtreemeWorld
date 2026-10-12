@@ -58,7 +58,8 @@ enum class AssetType
     Unknown,
     MaterialGraph,
     MaterialInstance,
-    MaterialSubgraph
+    MaterialSubgraph,
+    GeometryBake
 };
 
 AssetType detectAssetType(const std::filesystem::path& filePath);
