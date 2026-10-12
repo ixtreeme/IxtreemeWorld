@@ -80,7 +80,8 @@ selection yet. Specialized additive/multiply modes and layer groups are planned.
 | `MaterialGraphPanel.*` | Existing ImGui canvas/Inspector/history/preview; consumes these APIs, renders Layer Stack and saves/loads instances. |
 | `MaterialGraphAssets.*` | Existing AssetLibrary/MaterialAssetManager bridge and texture cache. |
 | `AssetDatabase` / `AssetLibrary` | Recognize graph/instance GUID metadata, prevent duplicate metadata identity, publish texture-import GUIDs immediately; instance save writes native dependencies. |
-| Future geometry baker | UI-independent mesh UV rasterizer, real AO/curvature/cavity/position/normal/thickness, cache/cancel. |
+| `GeometryBaker.*` / `IXGeometryBaker` | UI-independent UV rasterizer, dihedral curvature/cavity, BVH ray AO/thickness, object/world maps, padding, checked cache codec and cancellable worker. |
+| `GeometryAssets.*` / `GraphGeometryCache` | Existing Assimp import, native model/cache GUID dependencies, content validation and invalidation; editor thread only. |
 | `MaterialSubgraph.*` / `GraphSubgraphCache` | Versioned typed assets, GUID resolution, bounded expansion, cycle checks, caller scopes and file invalidation. |
 | Future generators | Reusable generator presets built on the subgraph mechanism and real geometry data. |
 | Future runtime shader owner | DXC/reflection/cache/IXRHI bindings/lifetime and renderer assignment. |
@@ -88,3 +89,26 @@ selection yet. Specialized additive/multiply modes and layer groups are planned.
 No independent evaluator, renderer replacement or new third-party dependency is
 introduced. Atomic material IO uses unique exclusive temporary files in the
 destination directory, flushes file contents, then replaces the destination.
+
+## Real mesh geometry integration
+
+The independent baker owns plain indexed triangles, UVs, normals and an explicit
+object-to-world transform. Its output has separate AO/curvature/cavity/thickness,
+object/world position/normal, UV-derived world tangent frame, coverage and padding.
+It does not evaluate a material or own a graphics resource. The existing shared
+evaluator receives real covered surface samples through `EvaluationContext`;
+no new evaluator was introduced. See `SMART_MATERIAL_GEOMETRY.md` for algorithms,
+cache schema, units, limits and cancellation semantics.
+
+The production editor can select a static source submesh, bake on an independent
+worker, inspect the atlas/maps, save/bind a native `.ixgeometrybake`, and save its
+GUID in an instance. Loading checks the actual source mesh hash. Dependency
+changes invalidate sampling and retain the last valid preview. The cache follows
+GUID moves, uses file/metadata stamps for polling, and has an explicit reload for
+edits preserving timestamps and sizes. Baking still uses immutable input snapshots.
+
+`BakeMaterialOnGeometry` and native material publication use the same graph IR,
+parameters and texture sampler as ordinary UV baking. An object bake retains an
+exact cache snapshot and source dependencies. World-dependent rules flatten only
+for that mesh atlas and baked placement. Direct GPU graph assignment/reflection,
+scene-selected object transforms, terrain and 3D mesh preview remain future work.

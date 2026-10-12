@@ -94,18 +94,38 @@ sharing the resulting immutable program.
 
 This benchmark excludes native file resolution, IO, texture fetching, GPU execution
 and real geometry. The native cache's 256-asset budget/replacement is a correctness
-stress test, not a cache hit/miss-rate or frame-time benchmark. Geometry baking and
-runtime shader-variant caching remain unmeasured/unimplemented.
+stress test, not a cache hit/miss-rate or frame-time benchmark. Geometry measurements
+are recorded separately below; runtime shader-variant caching remains unimplemented.
 
 ## Remaining profiling work
 
 The CPU preview still runs synchronously when dirty. A 256-square update at about
-66 ms exceeds a 60 Hz frame budget; jobs/cancel/coalescing are needed before larger
-interactive bakes. The material core remains editor-independent, but this
-milestone does not implement asynchronous or GPU baking.
+66 ms exceeds a 60 Hz frame budget; material preview/export jobs are still needed
+before larger interactive bakes. The independent geometry baker now has a
+cancellable worker; material previews and exports remain synchronous. GPU baking
+is still unimplemented.
 
 GPU material cost, GPU readback parity, total allocated instance memory, cache
-hit/miss rate, real texture fetch count and geometry bake time are not measured.
-Runtime graph shader/variant cache and geometry baker are not implemented yet.
-Measure those on actual meshes and texture resources after their integration;
-this baseline cannot establish runtime GPU performance or geometric correctness.
+hit/miss rate and real texture fetch count are not measured. Runtime graph shader/
+variant cache is still unimplemented. The fixture timing below does not establish
+performance on large production meshes or runtime GPU performance.
+
+## Geometry reference timing — 2026-10-12
+
+Same MSVC Release machine as the preceding measurements. Command:
+`build/client-gui-check/libs/render/Release/GeometryBakerTest.exe --benchmark`.
+Five process runs exit 0; each first executes the geometry correctness fixtures,
+then times only a synchronous box bake. The median is **67.7521 ms** (range
+66.3321..67.8176 ms) for 12 triangles, a 256-square atlas, 52,628 covered texels,
+32 AO rays, ray distance 3, bias 0.0001, seed 1, identity transform and four-texel
+padding. This is 1,684,096 AO rays plus one thickness ray per covered texel.
+
+Timing includes mesh validation/hash, seam topology/curvature/cavity, UV raster,
+BVH construction/rays, tangent frame, dilation and result validation. It excludes
+Assimp import, native GUID resolution, cache encode/decode/file IO, graph evaluation,
+PNG/material publication, worker scheduling and GPU work. Cache size is
+6,357,112 bytes at 256 square; in-memory temporary arrays/BVH/topology add overhead.
+The benchmark proves this fixture timing only; it is not a production-mesh,
+million-triangle, frame-latency or cache hit/miss-rate result. The editor worker
+keeps this computation off the UI thread, while import and material preview/export
+still need broader profiling and jobs for large assets.

@@ -9,13 +9,16 @@ All tests use real production classes. Final validation date: 2026-10-12.
 | `SmartMaterialCoreTest` | Canonical layers and ID ownership; opacity/channel blending/order/enable/duplication/removal; v3 round-trip and malformed/desynchronized data; explicit conversion; instance JSON/shared program/packing/error recovery; real atomic IO; 22 new node reference/error cases; Weathered Stone preview and geometry-dependent rejection. |
 | `MaterialSubgraphTest` | Graph v4/wrapper v1, all six typed passthrough reference values, defaults, scoped/repeated/nested parameters, preview, UV bake, layer masks, deterministic source, missing assets/resolver, recursion, schema refresh, depth/call/node/ID bounds; actual expanded DXIL/SPIR-V compilation. |
 | `MaterialGraphCompilerTest` | Existing CPU arithmetic, textures, HDR/sRGB, normals, layers, cycles/validation, 2048-node traversal, v1/v2 compatibility; all 69 node kinds and three presets compile using actual DXC to DXIL and SPIR-V when configured. Missing DXC is printed as SKIP rather than asserted as GPU validation. |
-| `MaterialGraphEditorTest` | Production panel/headless ImGui and existing synthetic mouse/key workflow; stack/history; graph/instance/subgraph files, GUID rescan/moves, dependency metadata, changed/malformed/fixed subgraph preview, standalone output, scoped instances; full 256-asset cache and dependency-set replacement. New binding dialogs and layer drag-and-drop pixel interactions are not independently automated. |
-| `MaterialGraphBakingTest` | Actual UV images, native material/ORM and manifest reload; texture imports/moves/renames, bilinear filtering and native GUID lookup with/without a library; missing GUID cannot select a stale path; subgraph authored/effective source snapshots and scoped overrides; geometry-dependent export refusal. |
+| `GeometryBakerTest` | Actual plane/convex and inward boxes/concave corner; barycentric maps, seam topology, AO/thickness references, independent curvature/cavity, nonuniform/reflected positions/normals/thickness, padding/source UV, deterministic seed, malformed/overlap cases, cancellation, portable corruption-safe codec and real shared-evaluator/material/raw map preview values; worker completion/cancel. |
+| `MaterialGraphEditorTest` | Production panel/headless ImGui and existing synthetic mouse/key workflow; stack/history; graph/instance/subgraph files, GUID rescan/moves, dependency metadata, changed/malformed/fixed subgraph preview, standalone output, scoped instances; full 256-asset cache and dependency-set replacement. Real OBJ selection/async geometry job/atlas preview/cache save, geometry-bound instance/dependencies and invalid cache preview/reload. New binding dialogs and layer drag-and-drop pixel interactions are not independently automated. |
+| `MaterialGraphBakingTest` | Actual UV images, native material/ORM and manifest reload; texture imports/moves/renames, bilinear filtering and native GUID lookup with/without a library; missing GUID cannot select a stale path; subgraph authored/effective source snapshots and scoped overrides; geometry-dependent UV export refusal. Actual Assimp OBJ/geometry cache/native source dependency, mesh Weathered Stone images/material/exact cache snapshot, cache/model moves, corruption/recovery and stale source rejection before publication. |
 
 No test currently reads graph shading back from the GPU. DXC compilation checks
 syntax/types/backends, **not CPU/GPU numerical parity or SPIR-V reflection**.
-Geometry-context test values are explicitly supplied; they are not geometry bake
-correctness tests. GPU resource lifetime and runtime cache tests are future work.
+Earlier core geometry-context test values are explicitly supplied. The separate
+geometry fixtures and native OBJ/cache tests execute actual baking. GPU resource
+lifetime and runtime shader cache tests are future work. Mesh preview is a CPU UV
+atlas; native-material asset reload does not prove scene/GPU visual equivalence.
 
 ## Reproduction
 
@@ -24,16 +27,16 @@ Editor build configured with C++20, MSVC Release, static vcpkg runtime and
 
 ```powershell
 cmake -S Client -B build/client-gui-check -DBUILD_TESTING=ON
-cmake --build build/client-gui-check --config Release --target SmartMaterialCoreTest MaterialSubgraphTest MaterialGraphCompilerTest MaterialGraphEditorTest MaterialGraphBakingTest IxtreemeEngine -j 4
-ctest --test-dir build/client-gui-check -C Release -R '^(SmartMaterialCore|MaterialSubgraph|MaterialGraphCompiler|MaterialGraphEditor|MaterialGraphBaking)Test$' --output-on-failure
+cmake --build build/client-gui-check --config Release --target GeometryBakerTest SmartMaterialCoreTest MaterialSubgraphTest MaterialGraphCompilerTest MaterialGraphEditorTest MaterialGraphBakingTest IxtreemeEngine -j 4
+ctest --test-dir build/client-gui-check -C Release -R '^(GeometryBaker|SmartMaterialCore|MaterialSubgraph|MaterialGraphCompiler|MaterialGraphEditor|MaterialGraphBaking)Test$' --output-on-failure
 ```
 
 Separate editor-disabled build:
 
 ```powershell
 cmake -S Client -B build/smart-material-runtime -DIXTREEME_WITH_EDITOR=OFF -DBUILD_TESTING=ON
-cmake --build build/smart-material-runtime --config Release --target SmartMaterialCoreTest MaterialSubgraphTest MaterialGraphCompilerTest -j 4
-ctest --test-dir build/smart-material-runtime -C Release -R '^(SmartMaterialCore|MaterialSubgraph|MaterialGraphCompiler)Test$' --output-on-failure
+cmake --build build/smart-material-runtime --config Release --target GeometryBakerTest SmartMaterialCoreTest MaterialSubgraphTest MaterialGraphCompilerTest -j 4
+ctest --test-dir build/smart-material-runtime -C Release -R '^(GeometryBaker|SmartMaterialCore|MaterialSubgraph|MaterialGraphCompiler)Test$' --output-on-failure
 ```
 
 The local run uses source overrides for already fetched Jolt/meshoptimizer trees
@@ -45,12 +48,13 @@ editor-disabled player build or gameplay rendering test.
 
 | Configuration | Result |
 | --- | --- |
-| Editor-enabled Release | `IxtreemeEngine` and all five material test targets built successfully. |
-| Editor material CTest selection | 5/5 passed, 0 failed; 8.31 s total after the asset-move regression correction. |
-| Editor-disabled Release core | `IXMaterialGraph`, `SmartMaterialCoreTest`, `MaterialSubgraphTest`, `MaterialGraphCompilerTest` built successfully. |
-| Editor-disabled material CTest selection | 3/3 passed, 0 failed; 7.55 s total. |
+| Editor-enabled Release | `IxtreemeEngine` and all six material/geometry test targets built successfully. |
+| Editor material/geometry CTest selection | 6/6 passed, 0 failed; 10.56 s total after geometry integration and preview-mode correction. |
+| Editor-disabled Release core | `IXGeometryBaker`, `IXMaterialGraph`, `GeometryBakerTest`, `SmartMaterialCoreTest`, `MaterialSubgraphTest`, `MaterialGraphCompilerTest` built successfully. |
+| Editor-disabled material/geometry CTest selection | 4/4 passed, 0 failed; 7.98 s total. |
 | Shader checks | All 69 operational node kinds, three presets and an expanded subgraph compile to DXIL and SPIR-V through configured DXC; the three structural kinds use expansion instead of evaluator placeholders. No DXC SKIP in the recorded runs. |
 | CPU benchmark | Exit 0; values/method in `SMART_MATERIAL_PERFORMANCE.md`. |
+| Updated embedded editor help | `EditorHelpTest` built/passed, 1/1, 0 failed; 0.24 s CTest total. Updated English/Hungarian help was rebuilt into `IxtreemeEngine`. |
 
 The final tests include removal of the last layer, serialization of an empty
 managed stack and adding a new layer afterward. Earlier failures and fixes are
@@ -58,3 +62,8 @@ documented in `SMART_MATERIAL_IMPLEMENTATION.md`; no failure is counted as a pas
 The selected material tests are not a claim that the entire repository test suite
 ran. Build diagnostics include an existing Inspector local-name shadow warning
 and informational LTCG linker messages; builds return success.
+
+Geometry fixture benchmark runs five times with exit 0; methodology, measured
+median and exclusions are in `SMART_MATERIAL_PERFORMANCE.md`. The cache/geometry
+limits are not a claim that large production meshes or all permitted dimensions
+were performance/stress-tested. The full repository CTest suite was not run.

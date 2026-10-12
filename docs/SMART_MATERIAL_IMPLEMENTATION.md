@@ -83,20 +83,22 @@ and neutral color/flat-normal/height defaults.
 
 CPU preview, canonical stack editing, v3 save/load, standalone instance save/load
 and HLSL export/compilation are implemented. Different explicitly supplied
-geometry contexts affect masks deterministically. **Selected-mesh bake data,
-mesh UV baking and live runtime GPU assignment are not implemented.** The UI
-labels the missing Geometry Bake and its explicit preview test inputs. The
-existing UV-only baker rejects Weathered Stone before creating fake geometry.
+geometry contexts affect masks deterministically. The next geometry milestone
+adds selected static submesh bake data, atlas preview and object material export.
+Analytic sphere/plane previews still label their explicit test inputs when those
+are used. Ordinary UV export continues rejecting Weathered Stone; the dedicated
+mesh path requires a verified Geometry Bake. Live runtime GPU graph assignment
+remains planned.
 
 ## Phases 4–8 — remaining work
 
 | Phase | Status | Required next implementation |
 | --- | --- | --- |
-| 4 Geometry | Planned | UI-independent mesh baker, UV validation/rasterization/padding, independent curvature/cavity, ray AO/thickness, cache/cancel and preview integration. |
-| 5 Generators | Planned | The reusable subgraph mechanism is implemented; the six generator presets and geometry integration remain. The current dirt/moss recipe is ordinary graph content. |
-| 6 Assets | Partial | Graph/instance/subgraph GUID registration, files and native dependencies implemented; dedicated browser categories, generator assets and content-hash/runtime invalidation remain. |
+| 4 Geometry | CPU/editor reference implemented | Static submesh atlas, maps, checked cache/GUID invalidation, async/cancel and material integration implemented. Scene-object binding, terrain, skinned baking, 3D mesh preview and broader stress profiling remain. |
+| 5 Generators | Planned | The reusable subgraph mechanism and real geometry inputs are implemented; six reusable generator presets remain. The current dirt/moss recipe is ordinary graph content. |
+| 6 Assets | Partial | Graph/instance/subgraph/geometry GUID registration, files and native dependencies implemented; geometry content hashes/invalidation implemented. Dedicated browser categories, generator assets and runtime invalidation remain. |
 | 7 Runtime | Planned | DXC runtime owner, actual reflection, texture/sampler/parameter uploads, variant/pipeline cache, assignment and failure recovery through IXRHI. |
-| 8 Optimization | Partial measurement | CPU benchmark available; asynchronous/GPU bake jobs, GPU performance, sample deduplication, folding/CSE and stress/lifetime tests remain. |
+| 8 Optimization | Partial | CPU benchmarks and cancellable async geometry jobs implemented. Material preview/export still synchronous; GPU baking/performance, sample deduplication, folding/CSE and broader stress/lifetime tests remain. |
 
 There is no external approval blocker or renderer replacement requirement.
 Remaining phases are engineering work, not completed capabilities. See
@@ -167,3 +169,33 @@ to a stale hint. The full 256-entry dependency cache can be replaced by a new
 definition without manual clearing. Validated interfaces are cached per GUID in
 the compiler, with before/after measurements in the performance document.
 Final builds/results are recorded in `SMART_MATERIAL_TESTS.md` after verification.
+
+## Milestone 3 — real static mesh geometry baker
+
+`IXGeometryBaker` is an independent C++20 library, available without editor or
+renderer dependencies. It validates/rasterizes the actual indexed mesh UV atlas,
+welds exact-position seams for topology, calculates signed dihedral curvature and
+separate concavity, ray-tests AO/thickness through a BVH, transforms object/world
+position/normal and derives the real UV tangent frame. Deterministic padding keeps
+the original covered UV. Invalid geometry, settings, overlapping sampled texels,
+cache corruption and cancellation preserve previous valid output.
+
+`GeometryAssets` imports existing Assimp submeshes and owns native model/cache GUID
+binding, content hash validation and file/metadata invalidation. The editor starts
+cancellable worker jobs, displays progress, opens/saves caches and binds them into
+instances. Actual AO/Curvature/Cavity nodes receive these maps through the existing
+evaluator. The preview displays the mesh UV atlas and raw geometry channels; it is
+not a 3D mesh renderer. Source and cache moves keep identity; changed source content
+requires rebaking and keeps the prior preview image with a diagnostic.
+
+Weathered Stone can now publish an object-specific native material through the
+existing asset pipeline, with real PNG/ORM images, a checked geometry snapshot and
+dependency metadata. Source placement and UVs are baked into these images. The
+runtime shader/reflection path and six reusable smart generators are still planned.
+No extra dependency was introduced; C++ standard threads power the geometry job.
+
+Reference fixtures and real OBJ files verify geometry, corruption/cancel recovery,
+cache moves/staleness, editor job completion, instance reload and material output.
+The editor sequence found a stale Selected Output mode after switching from a
+subgraph to an ordinary material; Load now resets that unavailable selection.
+The cache/algorithm schema and current limitations are in `SMART_MATERIAL_GEOMETRY.md`.
