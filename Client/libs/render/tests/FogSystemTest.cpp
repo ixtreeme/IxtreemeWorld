@@ -123,6 +123,12 @@ void Math()
         BuildFogUniforms(fog, camera, global, entities, false), "editor eye hides Scene fog but preserves Game fog");
     entities.assign(40, Volume()); BuildFogUniforms(fog, camera, global, entities);
     Check(fog.options[2] == 32, "local volume budget is bounded");
+    // Farthest first in the scene: the budget must still go to the volumes nearest the camera.
+    for (std::size_t i = 0; i < entities.size(); ++i) entities[i].position[2] = 1000.0f - 20.0f * static_cast<float>(i);
+    BuildFogUniforms(fog, camera, global, entities);
+    bool nearestKept = fog.options[2] == 32;
+    for (std::size_t i = 0; i < 32 && nearestKept; ++i) nearestKept = fog.volumes[i].centerShape[2] <= 1000.0f - 20.0f * 8 + 0.01f;
+    Check(nearestKept && Near(fog.volumes[0].centerShape[2], 1000.0f - 20.0f * 39), "over budget, the volumes nearest to the camera are kept");
     camera.viewProjection = {};
     Check(!BuildFogUniforms(fog, camera, global, entities), "singular camera matrix disables fog safely");
     global.density = std::numeric_limits<float>::quiet_NaN(); global.maxDistance = -5; global.startDistance = 500;

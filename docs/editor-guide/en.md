@@ -773,7 +773,7 @@ Global fog fades distant parts of the scene. Fog Volume adds fog only inside a b
 5. Edge fade softens the boundary inward; 0 makes it sharp. Save with Ctrl+S; local fog can also be saved in a prefab. The selected volume has an editor outline.
 
 #### Result and common mistake
-Density accumulates along distance: at 0.01, about 37% is transmitted over 100 metres. Volumes behind the camera or behind a wall do not obscure the surface in front of them; fog also works from inside the volume. Up to 32 active local volumes are rendered. Fog uses scene depth, so transparent materials and particles that do not write depth receive the fog of the surface behind them. Use God rays for shadow-derived light shafts.
+Density accumulates along distance: at 0.01, about 37% is transmitted over 100 metres. Volumes behind the camera or behind a wall do not obscure the surface in front of them; fog also works from inside the volume. Up to 32 active local volumes are rendered; with more, the 32 nearest to the camera. Fog uses scene depth, so transparent materials and particles that do not write depth receive the fog of the surface behind them. Use God rays for shadow-derived light shafts.
 
 <!-- topic: post-processing -->
 ### God rays and Tone mapping

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace xm = ixtreeme::math;
 namespace {
@@ -63,15 +64,31 @@ bool BuildFogUniforms(FogUniforms& out, const WorldCamera& camera, GlobalFogSett
     out.options[1] = global.affectSky ? 1.0f : 0.0f;
     // The local ray is never limited by the global fog's max distance.
     out.options[3] = global.maxDistance;
-    std::size_t count = 0;
+    // Distance from the eye to the nearest point a volume can reach; 0 inside its bounding sphere.
+    struct Candidate { float distance; const MeshSceneEntity* entity; };
+    std::vector<Candidate> candidates;
     for (const auto& entity : entities)
     {
         if (!entity.hasFogVolume || !entity.effectiveEnabled || !entity.enabled ||
             !entity.fogVolume.enabled || entity.fogVolume.density <= 0 ||
             (respectEditorHidden && entity.editorHidden)) continue;
-        if (count == kMaxFogVolumes) break;
-        out.volumes[count++] = BuildFogVolume(entity);
+        auto fog = entity.fogVolume;
+        SanitizeFog(fog);
+        const float reach = fog.shape == FogVolumeComponent::Shape::Sphere ? fog.radius :
+            xm::Length(WorldVec3{fog.halfExtents[0], fog.halfExtents[1], fog.halfExtents[2]});
+        candidates.push_back({std::max(0.0f, xm::Length(Vec(entity.position) - camera.eye) - reach), &entity});
     }
+    // Over budget, the volumes nearest to the eye are kept: they cover the most of the view. Scene
+    // order decides ties and is left untouched within the budget.
+    if (candidates.size() > kMaxFogVolumes)
+    {
+        std::stable_sort(candidates.begin(), candidates.end(),
+            [](const Candidate& a, const Candidate& b) { return a.distance < b.distance; });
+        candidates.resize(kMaxFogVolumes);
+    }
+    std::size_t count = 0;
+    for (const Candidate& candidate : candidates)
+        out.volumes[count++] = BuildFogVolume(*candidate.entity);
     out.options[2] = static_cast<float>(count);
     return out.options[0] > 0 || count > 0;
 }

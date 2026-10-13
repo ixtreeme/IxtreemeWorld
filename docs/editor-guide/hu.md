@@ -773,7 +773,7 @@ A globális köd az egész jelenet távoli részeit halványítja. A Fog Volume 
 5. Az Edge fade befelé lágyítja a szélét, 0 éles perem. Ments Ctrl+S-sel; a lokális köd prefabként is tárolható. A kijelölt térfogat körvonala az editorban látható.
 
 #### Eredmény és gyakori hiba
-A sűrűség távolságonként halmozódik: 0.01 mellett 100 méteren kb. 37% marad átengedve. Egy kamera mögötti vagy fal mögötti térfogat nem takarja el az előtte lévő felületet; a kamerán belülről is látható a köd. Legfeljebb 32 aktív lokális térfogat jelenik meg. A rendszer a jelenet mélységéből dolgozik, ezért a mélységet nem író átlátszó anyagok és részecskék a mögöttük lévő felület ködét kapják. Ez a köd nem hoz létre árnyékból képzett fénysugarakat; azokhoz a God rays beállításokat használd.
+A sűrűség távolságonként halmozódik: 0.01 mellett 100 méteren kb. 37% marad átengedve. Egy kamera mögötti vagy fal mögötti térfogat nem takarja el az előtte lévő felületet; a kamerán belülről is látható a köd. Legfeljebb 32 aktív lokális térfogat jelenik meg; ha több van, a kamerához legközelebbi 32. A rendszer a jelenet mélységéből dolgozik, ezért a mélységet nem író átlátszó anyagok és részecskék a mögöttük lévő felület ködét kapják. Ez a köd nem hoz létre árnyékból képzett fénysugarakat; azokhoz a God rays beállításokat használd.
 
 <!-- topic: post-processing -->
 ### God rays és Tone mapping
