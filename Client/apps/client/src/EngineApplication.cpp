@@ -11307,6 +11307,10 @@ int RunGame(NativeWindow& window,
                         if (material_tool::ApplySmartMaterialAssignment(updated,assignment,error)) {
                             mesh->materialSlots=std::move(updated.materialSlots);
                             mesh->materialOverrides=std::move(updated.materialOverrides);
+                            if(!assignment.replacementModelGuid.empty()) {
+                                mesh->meshAssetId=std::move(updated.meshAssetId);mesh->meshAssetPath=std::move(updated.meshAssetPath);
+                                syncStaticMeshSpatialEntity(*mesh);
+                            }
                             SceneManager::Instance().MarkDirty();
                             runtimeSession->SetEditorStatus("Smart material applied to model");
                         }

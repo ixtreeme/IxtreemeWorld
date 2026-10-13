@@ -820,7 +820,11 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
         return result;
     }
 
-    const xm::Mat4 axisTransform = UpAxisTransform(*scene);
+    // glTF coordinates are already Y-up, as consumed by the native glTF renderer.
+    // Missing FBX-style UpAxis metadata must not rotate glTF geometry a second time.
+    std::string sourceExtension=fbxPath.extension().string();
+    std::transform(sourceExtension.begin(),sourceExtension.end(),sourceExtension.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
+    const xm::Mat4 axisTransform = sourceExtension==".glb" || sourceExtension==".gltf" ? xm::Mat4Identity() : UpAxisTransform(*scene);
     result.skeletalIgnored = scene->HasAnimations();
     ExtractSkeleton(*scene, result);
     std::unordered_map<std::string, int> boneIndexByName;

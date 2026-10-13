@@ -38,6 +38,22 @@ Quick application validation on 2026-10-12: full Release editor build succeeded,
 the eight-test selection passed in 14.74 s, and `IXEngineRender` also built with
 `IXTREEME_WITH_EDITOR=OFF` (the assignment/transform helpers require no ImGui).
 
+UV repair regression coverage includes tiny exporter roundoff at both atlas borders,
+real invalid/non-finite UV rejection, overlapping box UVs, generated seam topology,
+atlas cancellation, the production asynchronous fallback, and source edits before
+assignment. Reported-model regression modes copy the supplied input into an isolated
+temporary project and run both submesh publication and the one-action panel path:
+
+```powershell
+build/client-gui-check/libs/render/Release/MaterialGraphBakingTest.exe --model-under-test D:/AkitaOnline/Assets/BlackwaterHollow/Models/LanternPost.glb
+build/client-gui-check/libs/render/Release/MaterialGraphEditorTest.exe --model-under-test D:/AkitaOnline/Assets/BlackwaterHollow/Models/LanternPost.glb
+```
+
+These do not modify the supplied original or its metadata. The native mode compares
+UV-to-surface positions/normals on unrelated submeshes; raw exporter buffer ordering
+may differ. The pinned MIT xatlas source and license are included under
+`Client/third_party/xatlas` for offline builds.
+
 No test currently reads graph shading back from the GPU. DXC compilation checks
 syntax/types/backends, **not CPU/GPU numerical parity or SPIR-V reflection**.
 Earlier core geometry-context test values are explicitly supplied. The separate

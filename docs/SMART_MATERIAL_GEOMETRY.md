@@ -16,6 +16,17 @@ are checked before assignment; unrelated slots and entity edits are preserved.
 The current graph and instance overrides are captured at the start. The following
 manual workflow remains available for custom sampling and reusable instances.
 
+Bake & Apply automatically repairs an unsuitable UV layout (reused/overlapping,
+out-of-range or degenerate UVs) with a cancellable xatlas job. It writes a derived
+GLB under `Models/SmartMaterialBakes`, replaces only the target submesh's UVs, and
+switches only the captured scene instance to that model when material publication
+succeeds. Source model files and other instances remain unchanged. The derivative
+tracks its source GUID and retains default material GUIDs. Full source geometry is
+hashed before application so a concurrent source edit rejects the queued result.
+Standalone manual geometry baking continues to require a unique atlas. Tiny UV
+border roundoff (up to eight float epsilons) snaps only in rasterization, retaining
+the original source hash. glTF geometry uses Y-up to match the native renderer.
+
 1. Open/create the material, for example **Templates > Smart Weathered Stone**.
 2. In **Material preview > Geometry Bake**, use **Select mesh...**, then choose
    a static submesh. The existing Assimp importer supplies its local coordinates,

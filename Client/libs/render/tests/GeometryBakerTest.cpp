@@ -1,5 +1,6 @@
 #include "GeometryFixtures.h"
 #include "tools/material/MaterialGraphImages.h"
+#include "tools/material/GeometryUvAtlas.h"
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -21,9 +22,40 @@ int main(int argc,char**) {
     if(plane.texels.empty())return 1;
     Check(plane.coveredTexels==1024 && plane.boundaryEdges==4,"plane coverage/topology");
     GeometryTexel sample;Check(plane.Sample(.5f,.5f,sample),"plane center exists");
+    auto boundaryPlane=geometry_fixtures::Plane();
+    for(auto& vertex:boundaryPlane.vertices)for(float& uv:vertex.uv)uv=uv==0?-8.940696716308594e-8f:std::nextafter(1.0f,2.0f);
+    const auto sourceHash=GeometryMeshHash(boundaryPlane);GeometryBake boundaryBake;
+    Check(BakeGeometry(boundaryPlane,settings,boundaryBake,error),"exporter UV roundoff at both atlas borders: "+error);
+    Check(boundaryBake.coverage==plane.coverage && boundaryBake.coveredTexels==plane.coveredTexels &&
+          boundaryBake.meshHash==sourceHash && GeometryMeshHash(boundaryPlane)==sourceHash,
+          "boundary snapping preserves coverage and original source mesh/hash");
+    GeometryTexel boundarySample;
+    Check(boundaryBake.Sample(.5f,.5f,boundarySample) && boundarySample.objectPosition==sample.objectPosition &&
+          boundarySample.worldNormal==sample.worldNormal,"boundary roundoff matches exact atlas interpolation");
+    for(float invalidUv:{-.0001f,1.0001f,2.0f,std::numeric_limits<float>::infinity(),std::numeric_limits<float>::quiet_NaN()}) {
+        auto invalid=boundaryPlane;invalid.vertices[0].uv[0]=invalidUv;GeometryBake rejected=plane;
+        Check(!BakeGeometry(invalid,settings,rejected,error) && rejected.meshHash==plane.meshHash &&
+              rejected.coverage==plane.coverage && error.find("vertex 0")!=std::string::npos,
+              "real UV range errors remain rejected transactionally with vertex diagnostics");
+    }
     Check(Near(sample.ao,1) && Near(sample.curvature,.5f) && Near(sample.cavity,0) && Near(sample.thickness,0),"open flat plane reference maps");
     Check(Near(sample.objectPosition[0],.03125f) && Near(sample.objectPosition[2],.03125f) && Near(sample.worldNormal[1],1),"barycentric position/normal");
     Check(BakeGeometry(geometry_fixtures::Box(),settings,box,error),"box: "+error);
+    auto repeated=geometry_fixtures::Box();
+    for(std::size_t vertex=0;vertex<repeated.vertices.size();++vertex)repeated.vertices[vertex].uv=geometry_fixtures::Plane().vertices[vertex%4].uv;
+    GeometryMesh unique;GeometryBake uniqueBake;
+    Check(!BakeGeometry(repeated,settings,uniqueBake,error) && error.find("overlaps")!=std::string::npos,"reused UVs on different physical faces remain ambiguous");
+    Check(GenerateGeometryUvAtlas(repeated,128,unique,error) && unique.indices.size()==repeated.indices.size(),"automatic atlas adds seams without dropping faces: "+error);
+    auto atlasSettings=settings;atlasSettings.resolution=128;
+    Check(BakeGeometry(unique,atlasSettings,uniqueBake,error),"automatic atlas bakes reused UV surfaces: "+error);
+    bool sameShape=unique.indices.size()==repeated.indices.size();
+    if(sameShape)for(std::size_t index=0;index<unique.indices.size();++index) {
+        const auto& before=repeated.vertices[repeated.indices[index]];const auto& after=unique.vertices[unique.indices[index]];
+        sameShape &= before.position==after.position && before.normal==after.normal;
+    }
+    Check(sameShape,"atlas preserves triangle positions, winding and normals");
+    const auto intactAtlas=GeometryMeshHash(unique);
+    Check(!GenerateGeometryUvAtlas(repeated,128,unique,error,{[]{return true;},{}}) && GeometryMeshHash(unique)==intactAtlas,"cancelled atlas preserves its output");
     if(box.texels.empty())return 1;
     Check(box.boundaryEdges==0,"UV seams weld into closed box topology");
     Check(Near(Mean(box,&GeometryTexel::ao),1) && Near(Mean(box,&GeometryTexel::thickness),1),"convex box AO/thickness reference");

@@ -3,6 +3,9 @@
 #include "tools/material/GeometryAssets.h"
 #include "tools/material/MaterialInstance.h"
 #include "tools/material/SmartMaterialApplication.h"
+#include "tools/material/GeometryUvAtlas.h"
+#include "tools/material/GeometryAtlasAssets.h"
+#include <string_view>
 #include "GeometryFixtures.h"
 #include "asset/MaterialAssetManager.h"
 #include <stb_image.h>
@@ -82,7 +85,57 @@ void SmartAssetBrowser(AssetLibrary& library, const std::filesystem::path& root)
     }
 }
 }
-int main() {
+int main(int argc, char** argv) {
+    if(argc==3 && std::string_view(argv[1])=="--model-under-test") {
+        // Exercise user-reported files on a copy; no original assets or metadata are changed.
+        const std::filesystem::path source=argv[2];
+        const auto root=std::filesystem::temp_directory_path()/("ix-model-bake-regression-"+generateGuidV4().toString());
+        std::filesystem::create_directories(root/"Assets"/"Models");
+        const auto copied=root/"Assets"/"Models"/source.filename();std::filesystem::copy_file(source,copied);
+        AssetDatabase::Instance().scan(root);AssetLibrary library(root,root/"Assets");
+        Check(library.Initialize(),"reported model test initializes an isolated project");
+        GraphGeometryCache geometry;std::string error;
+        if(!geometry.Select(copied,0,error)){std::cout<<error<<'\n';Check(false,"reported model imports");}
+        else {
+            const auto count=geometry.MeshCount();
+            for(unsigned index=0;index<count;++index) {
+                GeometryBake bake;GeometryBakeSettings settings;settings.resolution=128;
+                bool baked=geometry.Select(copied,index,error) && BakeGeometry(*geometry.Mesh(),settings,bake,error);
+                if(!baked && error.find("UV")!=std::string::npos) {
+                    GeometryMesh atlas;AssetLibrary::Entry model;
+                    baked=GenerateGeometryUvAtlas(*geometry.Mesh(),128,atlas,error) &&
+                        CreateGeometryAtlasAsset(library,geometry.MeshGuid(),SmartMaterialModelHash(copied,error),index,atlas,model,error) &&
+                        geometry.Select(library.AbsolutePath(model),index,error) && BakeGeometry(*geometry.Mesh(),settings,bake,error);
+                    Check(baked,"reported model gets a derived UV atlas preserving its original source");
+                    if(baked)for(unsigned other=0;other<count;++other)if(other!=index) {
+                        GraphGeometryCache before,after;
+                        GeometryBake originalSurface,derivedSurface;
+                        bool unchanged=before.Select(copied,other,error) && after.Select(library.AbsolutePath(model),other,error) &&
+                            BakeGeometry(*before.Mesh(),settings,originalSurface,error) && BakeGeometry(*after.Mesh(),settings,derivedSurface,error) && originalSurface.coverage==derivedSurface.coverage;
+                        if(unchanged)for(std::size_t pixel=0;pixel<originalSurface.texels.size();++pixel)if(originalSurface.coverage[pixel]==1)
+                            for(unsigned component=0;component<3;++component)unchanged &=
+                                std::abs(originalSurface.texels[pixel].objectPosition[component]-derivedSurface.texels[pixel].objectPosition[component])<.00001f &&
+                                std::abs(originalSurface.texels[pixel].objectNormal[component]-derivedSurface.texels[pixel].objectNormal[component])<.00001f;
+                        Check(unchanged,"automatic UV model preserves unrelated submesh UV-to-surface mapping");
+                        if(!unchanged){std::cout<<"Surface comparison: "<<error<<" coverage "<<originalSurface.coveredTexels<<" / "<<derivedSurface.coveredTexels<<'\n';
+                            if(originalSurface.texels.size()==derivedSurface.texels.size())for(std::size_t pixel=0;pixel<originalSurface.texels.size();++pixel)if(originalSurface.coverage[pixel]==1 && derivedSurface.coverage[pixel]==1){
+                                const auto& a=originalSurface.texels[pixel];const auto& b=derivedSurface.texels[pixel];
+                                if(a.objectPosition!=b.objectPosition){std::cout<<"First UV "<<a.uv[0]<<","<<a.uv[1]<<" P "<<a.objectPosition[0]<<","<<a.objectPosition[1]<<","<<a.objectPosition[2]<<" -> "<<b.objectPosition[0]<<","<<b.objectPosition[1]<<","<<b.objectPosition[2]<<'\n';break;}
+                            }
+                        }
+                    }
+                }
+                baked=baked && geometry.Accept(std::move(bake),error);
+                std::cout<<"Submesh "<<index<<": "<<geometry.Name()<<" / "<<error<<'\n';
+                Check(baked,"reported model submesh geometry bakes with native source hash");
+                AssetLibrary::Entry material;
+                if(baked)Check(PublishBakedMaterial(library,MaterialGraphDocument::WeatheredStone(),{},128,
+                    "Reported model "+std::to_string(index),material,error,{},geometry.Bake(),{},&geometry),"reported model publishes a full smart material without manual cache saving");
+                if(!error.empty())std::cout<<error<<'\n';
+            }
+        }
+        std::filesystem::remove_all(root);return failures?1:0;
+    }
     const auto root=std::filesystem::temp_directory_path()/("ixtreeme-graph-bake-"+generateGuidV4().toString());
     std::filesystem::create_directories(root);AssetDatabase::Instance().scan(root);AssetLibrary library(root,root/"Assets");Check(library.Initialize(),"isolated test project initializes");
     SmartAssetBrowser(library, root);

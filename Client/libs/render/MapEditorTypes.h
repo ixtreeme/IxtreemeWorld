@@ -888,6 +888,8 @@ struct SmartMaterialAssignment
 {
     std::uint32_t entityId = 0, slot = 0;
     std::string meshAssetId, meshAssetPath, previousMaterialGuid, materialGuid, assetRoot;
+    std::string sourceModelGuid, replacementModelGuid, replacementModelPath;
+    std::uint64_t sourceModelHash = 0;
     MeshSceneEntity::MaterialOverride previousOverride;
     std::array<float, 3> position{}, rotation{}, scale{1, 1, 1};
 };

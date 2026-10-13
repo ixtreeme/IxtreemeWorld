@@ -73,9 +73,14 @@ add_library(IXEngineRender STATIC
 )
 
 # UI-independent graph serialization, evaluation and shader generation are shared with runtime.
-add_library(IXGeometryBaker STATIC tools/material/GeometryBaker.cpp)
+add_library(IXUvAtlas STATIC "${CLIENT_ROOT}/third_party/xatlas/xatlas.cpp")
+target_include_directories(IXUvAtlas SYSTEM PUBLIC "${CLIENT_ROOT}/third_party/xatlas")
+if(MSVC)
+    set_target_properties(IXUvAtlas PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+add_library(IXGeometryBaker STATIC tools/material/GeometryBaker.cpp tools/material/GeometryUvAtlas.cpp)
 find_package(Threads REQUIRED)
-target_link_libraries(IXGeometryBaker PUBLIC Threads::Threads)
+target_link_libraries(IXGeometryBaker PUBLIC Threads::Threads PRIVATE IXUvAtlas)
 target_include_directories(IXGeometryBaker PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_features(IXGeometryBaker PUBLIC cxx_std_20)
 if(MSVC)
@@ -126,6 +131,7 @@ if(IXTREEME_WITH_EDITOR)
         tools/material/MaterialGraphPanel.h
         tools/material/MaterialGraphAssets.cpp
         tools/material/GeometryAssets.cpp
+        tools/material/GeometryAtlasAssets.cpp
         tools/tree/TreeGeneratorPanel.cpp
         tools/tree/TreePreviewRenderer.cpp
     )

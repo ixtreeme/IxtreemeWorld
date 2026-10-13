@@ -1,6 +1,7 @@
 #include "MaterialGraphPanel.h"
 #include "MaterialGraphIO.h"
 #include "MaterialInstance.h"
+#include "GeometryAtlasAssets.h"
 #include "asset/AssetDatabase.h"
 #include <imgui.h>
 #include <imgui_internal.h>
@@ -53,7 +54,7 @@ MaterialGraphPanel::MaterialGraphPanel() = default;
 MaterialGraphPanel::~MaterialGraphPanel() { ResetContext(); if(provider_ && previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_); }
 void MaterialGraphPanel::SetServices(AssetLibrary* library,ixeditor::graphics::IEditorTextureProvider* provider) {
     if(provider_!=provider) {if(provider_ && previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_);previewTexture_={};provider_=provider;previewDirty_=true;}
-    if(library_!=library){if(applyRequest_)geometryJob_.Cancel();applyRequest_.reset();materialAssignment_.reset();library_=library;textures_.Clear();subgraphs_.Clear();forceCompile_=true;parameters_={};previewDirty_=true;}
+    if(library_!=library){if(applyRequest_){geometryJob_.Cancel();uvAtlasJob_.Cancel();}applyRequest_.reset();materialAssignment_.reset();library_=library;textures_.Clear();subgraphs_.Clear();forceCompile_=true;parameters_={};previewDirty_=true;}
     textures_.Configure(library_,path_.parent_path());
 }
 void MaterialGraphPanel::ResetContext()
@@ -796,17 +797,19 @@ bool MaterialGraphPanel::BakeAndApply()
     if (!library_ || !applyAllowed_ || !applyTarget_.selected || applyTarget_.skinned || applyModelPath_.empty())
     { status_ = "Select an imported static model in Edit mode before Bake & Apply."; return false; }
     if (subgraphMode_) { status_ = "Open a full smart material with a PBR Output; generator recipes supply layer masks."; return false; }
-    if (geometryJob_.Running() || applyRequest_ || materialAssignment_)
+    if (geometryJob_.Running() || uvAtlasJob_.Running() || applyRequest_ || materialAssignment_)
     { status_ = "Finish or cancel the current Bake & Apply first."; return false; }
     MaterialGraphProgram checked;
     if (!CompileMaterial(checked,status_) || !checked.ValidateOverrides(parameters_,status_)) return false;
     GraphGeometryCache selected;
     if (!selected.Select(applyModelPath_,applyTarget_.selectedMaterialSlot,status_)) return false;
     const auto settings = SelectedMeshBakeSettings(applyTarget_,128U << applyResolution_);
+    const auto sourceHash=SmartMaterialModelHash(applyModelPath_,status_);if(!sourceHash)return false;
     if (!geometryJob_.Start(*selected.Mesh(),settings)) { status_ = "Geometry bake could not start."; return false; }
     ApplyRequest request;
     request.target = CaptureSmartMaterialTarget(applyTarget_);
     request.target.assetRoot = library_->LibraryRoot().lexically_normal().generic_string();
+    request.target.sourceModelGuid=selected.MeshGuid();request.target.sourceModelHash=sourceHash;
     request.document = document_; request.parameters = parameters_; request.graphFolder = path_.parent_path();
     request.name = applyTarget_.name.empty() ? "SmartMaterial" : applyTarget_.name + " SmartMaterial";
     applyRequest_ = std::move(request); geometry_ = std::move(selected); geometrySettings_ = settings;
@@ -818,7 +821,7 @@ std::optional<SmartMaterialAssignment> MaterialGraphPanel::TakeMaterialAssignmen
 }
 void MaterialGraphPanel::CancelBakeAndApply()
 {
-    if (applyRequest_) { geometryJob_.Cancel(); applyRequest_.reset(); status_="Bake & Apply cancelled; model material kept."; }
+    if (applyRequest_) { geometryJob_.Cancel(); uvAtlasJob_.Cancel(); applyRequest_.reset(); status_="Bake & Apply cancelled; model material kept."; }
 }
 void MaterialGraphPanel::RenderApplyMaterial()
 {
@@ -828,12 +831,13 @@ void MaterialGraphPanel::RenderApplyMaterial()
     if (applyTarget_.selected && (applyTarget_.skinned || applyModelPath_.empty())) ImGui::TextDisabled("An imported static model is required.");
     const char* sizes[] = {"128","256","512"};
     UI::Prop::Combo("Apply resolution",&applyResolution_,sizes,3);
-    ImGui::BeginDisabled(!applyAllowed_ || !applyTarget_.selected || applyTarget_.skinned || applyModelPath_.empty() || subgraphMode_ || geometryJob_.Running());
+    ImGui::BeginDisabled(!applyAllowed_ || !applyTarget_.selected || applyTarget_.skinned || applyModelPath_.empty() || subgraphMode_ || geometryJob_.Running() || uvAtlasJob_.Running());
     if (ImGui::Button("Bake & Apply to selected model")) BakeAndApply();
     ImGui::EndDisabled();
     if (subgraphMode_) ImGui::TextWrapped("Generator recipes are layer masks. Open a full smart material to apply its appearance.");
     if (applyRequest_) {
-        ImGui::ProgressBar(geometryJob_.Progress());
+        if(uvAtlasJob_.Running())ImGui::TextUnformatted("Preparing automatic UV atlas...");
+        ImGui::ProgressBar(uvAtlasJob_.Running()?uvAtlasJob_.Progress():geometryJob_.Progress());
         if (ImGui::Button("Cancel Bake & Apply")) CancelBakeAndApply();
     }
     ImGui::TextWrapped("Bakes geometry and textures, saves the material, and assigns this slot automatically. Moving the model later requires rebaking world-dependent effects.");
@@ -898,11 +902,12 @@ void MaterialGraphPanel::BakeMaterial()
     else status_=error;
 }
 bool MaterialGraphPanel::SelectGeometryMesh(const std::filesystem::path& path,unsigned index) {
-    if(geometryJob_.Running()){status_="Finish or cancel the active geometry bake first";return false;}
+    if(geometryJob_.Running() || uvAtlasJob_.Running()){status_="Finish or cancel the active geometry bake first";return false;}
     if(!geometry_.Select(path,index,status_))return false;
     geometryPreview_=true;previewDirty_=true;status_="Mesh selected; start Geometry Bake";return true;
 }
 bool MaterialGraphPanel::StartGeometryBake() {
+    if(uvAtlasJob_.Running() || applyRequest_){status_="Finish or cancel Bake & Apply first";return false;}
     geometry_.Refresh();const auto* mesh=geometry_.Mesh();
     if(!mesh){status_=geometry_.Error().empty()?"Select a static mesh first":geometry_.Error();return false;}
     if(!geometryJob_.Start(*mesh,geometrySettings_)){status_="A geometry bake is already running";return false;}
@@ -917,9 +922,27 @@ bool MaterialGraphPanel::BindGeometryBake(const std::string& guid) {
     geometrySettings_=geometry_.Bake()->settings;geometryPreview_=true;previewDirty_=true;status_="Geometry Bake bound";return true;
 }
 void MaterialGraphPanel::PollGeometryBake() {
+    GeometryMesh atlas;std::string atlasError;
+    if(uvAtlasJob_.TakeResult(atlas,atlasError)) {
+        if(!applyRequest_)return;
+        if(!atlasError.empty()){status_=atlasError;applyRequest_.reset();return;}
+        AssetLibrary::Entry model;
+        if(!library_ || !CreateGeometryAtlasAsset(*library_,applyRequest_->target.sourceModelGuid,applyRequest_->target.sourceModelHash,
+            applyRequest_->target.slot,atlas,model,status_) || !geometry_.Select(library_->AbsolutePath(model),applyRequest_->target.slot,status_))
+        {applyRequest_.reset();return;}
+        applyRequest_->target.replacementModelGuid=model.guid;applyRequest_->target.replacementModelPath=library_->AssetRelativePath(model);
+        if(!geometryJob_.Start(*geometry_.Mesh(),geometrySettings_)){status_="Cannot start automatic atlas bake";applyRequest_.reset();return;}
+        status_="Automatic UV model ready; baking material geometry...";return;
+    }
     GeometryBake completed;std::string error;
     if(!geometryJob_.TakeResult(completed,error))return;
-    if(!error.empty()){status_=error;applyRequest_.reset();return;}
+    if(!error.empty()){
+        if(applyRequest_ && !applyRequest_->atlasAttempted && error.find("UV")!=std::string::npos) {
+            geometry_.Refresh(true);applyRequest_->atlasAttempted=true;
+            if(geometry_.Mesh() && uvAtlasJob_.Start(*geometry_.Mesh(),geometrySettings_.resolution)) {status_="Preparing automatic UV atlas for this model...";return;}
+        }
+        status_=error;applyRequest_.reset();return;
+    }
     if(!geometry_.Accept(std::move(completed),status_)){applyRequest_.reset();return;}
     if (applyRequest_) {
         auto request=std::move(*applyRequest_);applyRequest_.reset();
@@ -936,7 +959,7 @@ void MaterialGraphPanel::PollGeometryBake() {
 void MaterialGraphPanel::RenderGeometryBake() {
     PollGeometryBake();
     if(!ImGui::CollapsingHeader("Geometry Bake"))return;
-    const bool running=geometryJob_.Running();
+    const bool running=geometryJob_.Running() || uvAtlasJob_.Running();
     ImGui::BeginDisabled(running);
     if(ImGui::Button("Select mesh...")) {
         wchar_t file[32768]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);

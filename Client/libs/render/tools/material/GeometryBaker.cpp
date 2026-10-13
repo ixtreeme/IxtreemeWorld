@@ -10,6 +10,8 @@ namespace material_tool {
 namespace {
 using V = GeometryVec3;
 constexpr float Pi = 3.14159265358979323846f;
+// Exporters can put a boundary UV a few float ULPs beyond 0 or 1.
+constexpr float UvBoundaryTolerance = 8 * std::numeric_limits<float>::epsilon();
 V Add(V a,V b) { for(int k=0;k<3;++k)a[k]+=b[k];return a; }
 V Sub(V a,V b) { for(int k=0;k<3;++k)a[k]-=b[k];return a; }
 V Mul(V a,float s) { for(auto& v:a)v*=s;return a; }
@@ -113,7 +115,10 @@ bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,
     const float determinant=Dot(col0,Cross(col1,col2));
     for(size_t i=0;i<mesh.vertices.size();++i) {
         if(i%1024==0 && stop())return false;const auto& v=mesh.vertices[i];
-        if(!Finite(v.position) || !Finite(v.normal) || Dot(v.normal,v.normal)<1e-12f || !std::isfinite(v.uv[0]) || !std::isfinite(v.uv[1]) || v.uv[0]<0 || v.uv[0]>1 || v.uv[1]<0 || v.uv[1]>1) {error="Geometry vertex has invalid position/normal or UV outside the 0..1 atlas";return false;}
+        if(!Finite(v.position) || !Finite(v.normal) || Dot(v.normal,v.normal)<1e-12f) {error="Geometry vertex "+std::to_string(i)+" has invalid position or normal";return false;}
+        for(float uv:v.uv) if(!std::isfinite(uv) || uv < -UvBoundaryTolerance || uv > 1+UvBoundaryTolerance) {
+            error="Geometry vertex "+std::to_string(i)+" has UV ("+std::to_string(v.uv[0])+", "+std::to_string(v.uv[1])+") outside the 0..1 atlas; a non-overlapping bake UV layout is required";return false;
+        }
         const auto [it,inserted]=weld.emplace(v.position,static_cast<unsigned>(positions.size()));if(inserted)positions.push_back(v.position);welded[i]=it->second;
         world.push_back(Point(m,v.position));
         // Columns of the cofactor matrix divided by determinant = inverse transpose.
@@ -156,7 +161,11 @@ bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,
     for(unsigned f=0;f<triangles.size();++f) {
         if(f%64==0){if(stop())return false;progress(.15f+.15f*f/triangles.size());}
         const auto a=mesh.indices[f*3],b=mesh.indices[f*3+1],c=mesh.indices[f*3+2];
-        const auto& va=mesh.vertices[a];const auto& vb=mesh.vertices[b];const auto& vc=mesh.vertices[c];const float area=Area(va.uv,vb.uv,vc.uv);
+        auto va=mesh.vertices[a],vb=mesh.vertices[b],vc=mesh.vertices[c];
+        // Only local raster coordinates are snapped; source mesh identity stays exact.
+        for(auto* vertex:{&va,&vb,&vc})for(float& uv:vertex->uv)uv=std::clamp(uv,0.0f,1.0f);
+        const float area=Area(va.uv,vb.uv,vc.uv);
+        if(std::abs(area)<1e-12f){error="Geometry triangle has degenerate UVs after boundary snapping";return false;}
         const int x0=std::max(0,static_cast<int>(std::ceil(std::min({va.uv[0],vb.uv[0],vc.uv[0]})*size-.5f))),x1=std::min(static_cast<int>(size)-1,static_cast<int>(std::floor(std::max({va.uv[0],vb.uv[0],vc.uv[0]})*size-.5f)));
         const int y0=std::max(0,static_cast<int>(std::ceil(std::min({va.uv[1],vb.uv[1],vc.uv[1]})*size-.5f))),y1=std::min(static_cast<int>(size)-1,static_cast<int>(std::floor(std::max({va.uv[1],vb.uv[1],vc.uv[1]})*size-.5f)));
         const float du1=vb.uv[0]-va.uv[0],dv1=vb.uv[1]-va.uv[1],du2=vc.uv[0]-va.uv[0],dv2=vc.uv[1]-va.uv[1];
@@ -166,7 +175,12 @@ bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,
             const std::array<float,2> uv{(x+.5f)/size,(y+.5f)/size};
             const float u=Area(vb.uv,vc.uv,uv)/area,v=Area(vc.uv,va.uv,uv)/area,w=1-u-v;
             if(std::min({u,v,w})<-1e-6f)continue;const bool inside=std::min({u,v,w})>1e-6f;const size_t at=static_cast<size_t>(y)*size+x;
-            if(draft.coverage[at]){if(interior[at] || inside){error="Geometry UV atlas overlaps at texel "+std::to_string(x)+","+std::to_string(y);return false;}continue;}
+            if(draft.coverage[at]){if(interior[at] || inside){
+                const auto difference=Sub(Interpolate(va.position,vb.position,vc.position,u,v,w),draft.texels[at].objectPosition);
+                error="Geometry UV atlas overlaps at texel "+std::to_string(x)+","+std::to_string(y)+
+                    " between triangles "+std::to_string(owners[at])+" and "+std::to_string(f)+
+                    " (surface distance "+std::to_string(std::sqrt(Dot(difference,difference)))+")";return false;
+            }continue;}
             auto& t=draft.texels[at];t.uv=uv;t.objectPosition=Interpolate(va.position,vb.position,vc.position,u,v,w);t.worldPosition=Interpolate(world[a],world[b],world[c],u,v,w);
             t.objectNormal=Unit(Interpolate(va.normal,vb.normal,vc.normal,u,v,w));t.worldNormal=Unit(Interpolate(worldNormals[a],worldNormals[b],worldNormals[c],u,v,w));
             t.worldTangent=Unit(Sub(rawTangent,Mul(t.worldNormal,Dot(rawTangent,t.worldNormal))));

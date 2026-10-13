@@ -83,7 +83,7 @@ struct MaterialGraphPanelTestAccess
     { return panel.requestUnsaved_ && panel.pendingOpen_ && panel.pendingPath_ == path; }
     static void ApplyQuality(MaterialGraphPanel& panel) { panel.applyResolution_=0; }
     static void Poll(MaterialGraphPanel& panel) { panel.PollGeometryBake(); }
-    static bool Running(const MaterialGraphPanel& panel) { return panel.geometryJob_.Running(); }
+    static bool Running(const MaterialGraphPanel& panel) { return panel.geometryJob_.Running() || panel.uvAtlasJob_.Running(); }
     static const MaterialCompileResult& Layout(const MaterialGraphPanel& panel) {return panel.program_.Layout();}
     static void NumericOverride(MaterialGraphPanel& panel,const std::string& name,float value) {panel.parameters_.values[name]={value,0,0,0};panel.previewDirty_=true;}
 };
@@ -416,6 +416,25 @@ void Editor(bool capture)
         MaterialGraphPanelTestAccess::Poll(applyPanel);
         Check(!applyPanel.TakeMaterialAssignment() && smartLibrary.EntriesFor(AssetLibrary::Category::Material).size()==countBeforeCancel,
               "cancelled quick apply publishes no material and queues no scene assignment");
+        auto reused=geometry_fixtures::Box();const auto quad=geometry_fixtures::Plane();
+        for(std::size_t vertex=0;vertex<reused.vertices.size();++vertex)reused.vertices[vertex].uv=quad.vertices[vertex%4].uv;
+        const auto reusedFile=smartRoot/"reused-uv.obj";geometry_fixtures::WriteObj(reusedFile,reused);
+        MeshRendererEditorState reusedTarget=target;reusedTarget.meshAssetPath=reusedFile.string();reusedTarget.meshAssetId=AssetDatabase::Instance().getOrCreateGuid(reusedFile).toString();reusedTarget.materialSlots={"old-material","keep-other"};
+        applyPanel.SetApplyTarget(reusedTarget,reusedFile,true);Check(applyPanel.BakeAndApply(),"quick apply starts on reused UV mesh without a manual unwrap");
+        std::optional<SmartMaterialAssignment> atlasAssignment;const auto atlasDeadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+        while(!atlasAssignment && std::chrono::steady_clock::now()<atlasDeadline){MaterialGraphPanelTestAccess::Poll(applyPanel);atlasAssignment=applyPanel.TakeMaterialAssignment();std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+        Check(atlasAssignment && !atlasAssignment->replacementModelGuid.empty(),"quick apply automatically resolves reused UVs through a derived model");
+        if(atlasAssignment) {
+            MeshSceneEntity scene;scene.id=reusedTarget.id;scene.meshAssetId=reusedTarget.meshAssetId;scene.meshAssetPath=reusedTarget.meshAssetPath;scene.materialSlots=reusedTarget.materialSlots;
+            std::copy_n(reusedTarget.position,3,scene.position);std::copy_n(reusedTarget.rotation,3,scene.rotation);std::copy_n(reusedTarget.scale,3,scene.scale);
+            Check(ApplySmartMaterialAssignment(scene,*atlasAssignment,error) && scene.meshAssetId==atlasAssignment->replacementModelGuid && scene.materialSlots[1]=="keep-other",
+                  "UV model and material apply as one operation preserving unrelated slots");
+            auto changedSource=reused;changedSource.vertices[0].position[0]+=.1f;geometry_fixtures::WriteObj(reusedFile,changedSource);
+            MeshSceneEntity stale;stale.id=reusedTarget.id;stale.meshAssetId=reusedTarget.meshAssetId;stale.meshAssetPath=reusedTarget.meshAssetPath;stale.materialSlots=reusedTarget.materialSlots;
+            std::copy_n(reusedTarget.position,3,stale.position);std::copy_n(reusedTarget.rotation,3,stale.rotation);std::copy_n(reusedTarget.scale,3,stale.scale);
+            Check(!ApplySmartMaterialAssignment(stale,*atlasAssignment,error) && stale.meshAssetPath==reusedTarget.meshAssetPath && stale.materialSlots[0]=="old-material",
+                  "changed original source rejects a queued UV derivative without changing the model or slot");
+        }
         const auto validGeometryPixels=MaterialGraphPanelTestAccess::Pixels(panel);
         SaveMaterialTextAtomic(cacheFile,"broken geometry",error);frame();frame();
         Check(!MaterialGraphPanelTestAccess::Error(panel).empty() && MaterialGraphPanelTestAccess::Pixels(panel)==validGeometryPixels,"invalid geometry keeps the last valid real-mesh preview");
@@ -440,6 +459,28 @@ void Editor(bool capture)
 }
 int main(int argc, char** argv)
 {
+    if(argc==3 && std::string(argv[1])=="--model-under-test") {
+        const auto root=std::filesystem::temp_directory_path()/("ix-auto-atlas-model-"+generateGuidV4().toString());
+        std::filesystem::create_directories(root/"Assets"/"Models");
+        const std::filesystem::path original=argv[2];const auto copied=root/"Assets"/"Models"/original.filename();std::filesystem::copy_file(original,copied);
+        AssetDatabase::Instance().scan(root);AssetLibrary library(root,root/"Assets");Check(library.Initialize(),"actual model quick apply test project initializes");
+        {
+            MaterialGraphPanel panel;panel.SetServices(&library,nullptr);
+            MeshRendererEditorState target;target.selected=true;target.id=77;target.name="Reported model";target.meshAssetPath=copied.string();
+            target.meshAssetId=AssetDatabase::Instance().getOrCreateGuid(copied).toString();target.materialSlots={"original-metal","original-glow"};
+            panel.SetApplyTarget(target,copied,true);MaterialGraphPanelTestAccess::ApplyQuality(panel);
+            Check(panel.BakeAndApply(),"actual reported model starts with one quick apply action");
+            std::optional<SmartMaterialAssignment> assignment;const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+            while(!assignment && std::chrono::steady_clock::now()<deadline) {MaterialGraphPanelTestAccess::Poll(panel);assignment=panel.TakeMaterialAssignment();std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+            Check(assignment && !assignment->replacementModelGuid.empty() && !assignment->materialGuid.empty(),"actual reported model automatically creates and queues a UV model and material");
+            if(assignment) {
+                MeshSceneEntity entity;entity.id=target.id;entity.meshAssetId=target.meshAssetId;entity.meshAssetPath=target.meshAssetPath;entity.materialSlots=target.materialSlots;
+                std::string error;Check(ApplySmartMaterialAssignment(entity,*assignment,error) && entity.meshAssetId==assignment->replacementModelGuid && entity.materialSlots[0]==assignment->materialGuid && entity.materialSlots[1]=="original-glow", "actual reported model applies only the target slot and preserves the glow slot");
+                if(!error.empty())std::cout<<error<<'\n';
+            }
+        }
+        std::filesystem::remove_all(root);return failures?1:0;
+    }
     Model(); Editor(argc > 1 && std::string(argv[1]) == "--capture");
     std::cout << "Material Graph failures: " << failures << '\n'; return failures ? 1 : 0;
 }

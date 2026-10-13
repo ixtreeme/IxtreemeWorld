@@ -178,6 +178,8 @@ A közös material szerkesztése minden használóján változtat; az override c
 A Material Slots kisebb kártyákat mutat az Inspector szélességéhez igazodó rácsban, a material nevével és albedo-előnézetével; albedotextúra nélkül az alapszín látszik. Az egérrel rámutatva a teljes nevet és a submesh sorszámát is láthatod. GUID-sor nincs itt. Materialt az előnézetre vagy névre húzva rendelhetsz hozzá; az X kiüríti a slotot.
 
 #### Material Graph
+Ha a modell ismétlődő vagy átfedő UV-kat használ, a **Bake & Apply** a háttérben külön UV-atlaszt és származtatott GLB-modellt készít. Az új változat csak a kijelölt objektumhoz kerül; az eredeti modell és a többi anyaghely megmarad. A művelet a **Cancel Bake & Apply** gombbal megszakítható.
+
 **Gyors bekötés:** jelöld ki a modellt a Hierarchyban, nyisd meg a teljes smart materialt, majd az Inspector **Material preview > Apply to model** részében kattints a **Bake & Apply to selected model** gombra. Ez a kiválasztott Material Slot modellrészét és aktuális transzformációját használja, geometriát/textúrákat süt, menti az anyagot és beállítja az anyaghelyet. Nem kell külön cache-mentés vagy behúzás. A felbontás 128/256/512; a geometriai lépés megszakítható. Statikus importált modell és teljes PBR anyag szükséges; a generátor önmagában rétegmaszk. A világfüggő hatásokat mozgatás után újra kell sütni. A közben módosult modell/transzformáció/anyaghely védve marad.
 
 A **View > Material Graph** menü dokkolható node-szerkesztőt nyit. Az **Add Node** és a vászon helyi menüje kereshető, kategóriákba rendezett készletet ad: konstansok és paraméterek, UV/világkoordináták, textúrák, matematikai és színműveletek, maszkok, PBR-rétegek. A kijelölt node paraméterei az Inspectorban jelennek meg.

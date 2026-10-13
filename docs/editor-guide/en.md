@@ -178,6 +178,8 @@ Editing a shared material changes all its users; an override changes only its in
 Material Slots shows compact cards in a grid that adapts to the Inspector width, with the material name and its albedo preview (or base-colour swatch if it has no albedo texture). Hover to see the full name and submesh index. GUIDs are omitted here. Drop onto the preview or name to assign a material; the X clears that slot.
 
 #### Material Graph
+For reused or overlapping UVs, **Bake & Apply** generates a unique atlas and derived GLB in the background. Only the selected scene instance uses the new model; the original source and unrelated material slots are preserved. Use **Cancel Bake & Apply** to cancel.
+
 **Quick application:** select a model in Hierarchy, open the full smart material, then click **Material preview > Apply to model > Bake & Apply to selected model** in Inspector. This uses the selected Material Slot's submesh and current model transform, bakes geometry/textures, saves the material and assigns the slot. No separate cache save or drag/drop is needed. Resolution is 128/256/512; geometry baking can be cancelled. This requires an imported static model and full PBR material; a standalone generator is a layer mask. Reapply world-dependent effects after moving the model. Concurrent model/transform/material-slot edits are preserved.
 
 Open **View > Material Graph** for the dockable node editor. **Add Node** and the canvas context menu offer searchable categories: constants and parameters, coordinates, textures, scalar/color math, masks and PBR layers. Select a node to edit its properties in the Inspector.

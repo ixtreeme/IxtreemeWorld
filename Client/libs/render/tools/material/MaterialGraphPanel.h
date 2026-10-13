@@ -4,6 +4,7 @@
 #include "MaterialGraphAssets.h"
 #include "GeometryAssets.h"
 #include "SmartMaterialApplication.h"
+#include "GeometryUvAtlas.h"
 #include "EditorGraphicsBridge.h"
 #include <filesystem>
 #include <optional>
@@ -91,6 +92,7 @@ private:
     GraphSubgraphCache subgraphs_;
     GraphGeometryCache geometry_;
     GeometryBakeJob geometryJob_;
+    GeometryUvAtlasJob uvAtlasJob_;
     GeometryBakeSettings geometrySettings_;
     struct ApplyRequest {
         SmartMaterialAssignment target;
@@ -98,6 +100,7 @@ private:
         ParameterOverrides parameters;
         std::filesystem::path graphFolder;
         std::string name;
+        bool atlasAttempted = false;
     };
     MeshRendererEditorState applyTarget_;
     std::filesystem::path applyModelPath_;
