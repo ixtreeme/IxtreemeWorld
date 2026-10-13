@@ -11,6 +11,8 @@ A statikus objektumok és a fák fő nézetének rajzolása most GPU-n kihagyhat
 
 Az adaptív döntés a már elkészült frame-slot kis láthatósági visszaolvasását használja. Legalább 50 000 kihagyható indexpéldány és a vizsgált indexmunka legalább 25%-ának megtakarítása szükséges a folyamatos működéshez. Ez csak az optimalizáló aktiválását szabályozza; a régi láthatóság soha nem rejt el objektumot. Nem tartalmaz CPU/GPU idő alapján szabályozott költségmodellt, ezért CPU-limitnél az extra csoportosítás költsége számít.
 
+Ha egy nézetben nem marad vizsgálható csoport, nincs visszaolvasás sem, ezért a nézet korábbi „hasznos” állapota azonnal törlődik, és a nézet visszaáll a 120 képkockás próbára. 2026-10-14 előtt ilyenkor az utolsó hasznos döntés beragadt, és a mélységpiramis minden képkockában tovább épült.
+
 ## Az aktuális frame menete
 
 1. A terrain és legfeljebb 64 nagy, teljesen opaque statikus objektum a rendes színt és mélységet is kirajzolja. A modellek teljes geometriát használnak; alpha-mask, Blend, átmeneti LOD-fade és a Scene View kijelölt objektuma nem takarómodell. A kiválasztott takarókat ugyanebben a nézetben nem rajzoljuk ki újra.

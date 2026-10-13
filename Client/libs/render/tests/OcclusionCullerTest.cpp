@@ -137,6 +137,30 @@ struct OcclusionCullerTestAccess
             Check(commands[0].indices == 12 && commands[0].firstIndex == 6 && commands[0].vertexOffset == -2 &&
                 commands[0].firstInstance == 17, "GPU indirect command preserves draw addressing");
         }
+        // A view left without groups reports nothing back; an earlier "useful" verdict must not
+        // keep the optimizer running for it every frame.
+        {
+            std::vector<float> depth(71 * 39, 1);
+            ixrhi::IXRHITextureDesc tex;
+            tex.width = 71; tex.height = 39; tex.format = ixrhi::IXRHIFormat::R32Float;
+            tex.usage = ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
+            auto texture = rhi->CreateTexture(tex, depth.data(), depth.size() * sizeof(float));
+            auto frame = rhi->BeginFrame();
+            Check(static_cast<bool>(frame), "GPU frame acquire for an empty view");
+            if (frame)
+            {
+                auto& cmd = *frame.info.commandList;
+                culler.BeginFrame(frame.info);
+                culler.m_useful[0] = true;
+                const bool began = culler.BeginView(cmd, frame.info, IdentityCamera(), texture, 0);
+                if (began) culler.EndView(cmd);
+                rhi->GetMainRenderTarget()->Begin(cmd); rhi->GetMainRenderTarget()->End(cmd);
+                rhi->EndFrame(frame);
+                rhi->WaitIdle();
+                Check(began && !culler.m_useful[0] && culler.GetStats(0).groups == 0 && OcclusionCuller::Active() == nullptr,
+                    "GPU view without groups drops its useful verdict");
+            }
+        }
         rhi->WaitIdle(); culler.Destroy(); readback.reset();
         rhi->Shutdown(); rhi.reset(); native.Destroy(); window.Destroy();
     }

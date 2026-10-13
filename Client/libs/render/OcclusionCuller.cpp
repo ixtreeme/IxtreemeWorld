@@ -244,7 +244,15 @@ void OcclusionCuller::EndView(ixrhi::IXRHICommandList& cmd)
         m_slot->pending = true;
     }
     else
+    {
         cmd.TransitionBuffer(*m_slot->visible, ixrhi::IXRHIBufferState::ShaderRead, ixrhi::IXRHIBufferState::TransferSrc);
+        // Nothing was tested, so nothing reports back. Without this an earlier "useful" verdict
+        // would keep the depth pyramid running every frame for a view that has no groups left.
+        const auto view = static_cast<std::size_t>(m_slot - m_slots.data()) / 2;
+        m_stats[view] = {};
+        m_useful[view] = false;
+        m_slot->pending = false;
+    }
     m_slot = nullptr; m_group = kInvalidGroup; s_active = nullptr;
 }
 
