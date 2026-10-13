@@ -27,12 +27,20 @@ Standalone manual geometry baking continues to require a unique atlas. Tiny UV
 border roundoff (up to eight float epsilons) snaps only in rasterization, retaining
 the original source hash.
 
-Geometry tools bake the surface the static renderer draws. The renderer reads glTF
-files directly, so the importer returns a glTF's static geometry in the file's own
-Y-up, right-handed coordinates and authored winding; other formats keep the
-importer's converted space, which is what their renderer path draws. A derived UV
-model stores that drawn surface unchanged: the same positions, normals, winding and,
-on untouched submeshes, the same UVs.
+Geometry tools bake the surface the static renderer draws, read through
+`RendererGeometry`. glTF files are read the way the renderer reads them: the file's
+own Y-up, right-handed positions, normals, UVs and authored winding, one submesh per
+primitive in file order. Other formats keep the importer's converted space, which is
+what their renderer path draws. A derived UV model stores that drawn surface
+unchanged: the same positions, normals, winding and, on untouched submeshes, the
+same UVs.
+
+A material slot is a material index, not a submesh index. Bake & Apply bakes every
+submesh drawn with the selected slot as one surface, wherever those submeshes are in
+the model, because the published material is assigned to all of them. If their UVs
+reuse the same atlas area, the automatic UV model joins them into a single submesh
+for that slot. A slot no submesh uses is refused. The manual **Select mesh...** and
+**Submesh** controls still address one submesh by its index.
 
 1. Open/create the material, for example **Templates > Smart Weathered Stone**.
 2. In **Material preview > Geometry Bake**, use **Select mesh...**, then choose

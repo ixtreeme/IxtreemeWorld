@@ -2,13 +2,13 @@
 #include "MeshTransform.h"
 #include "asset/AssetDatabase.h"
 #include "asset/MaterialAssetManager.h"
-#include "import_export/AssimpImporter.h"
+#include "RendererGeometry.h"
 #include <algorithm>
 
 namespace material_tool {
 std::uint64_t SmartMaterialModelHash(const std::filesystem::path& path,std::string& error)
 {
-    const auto imported=AssimpImporter{}.importFile(path);
+    const auto imported=ImportRendererGeometry(path);
     if(!imported.success || imported.hasSkeletal || imported.meshes.empty()){error="Static source model is unavailable or changed";return 0;}
     std::uint64_t hash=1469598103934665603ULL;
     for(const auto& source:imported.meshes){GeometryMesh mesh;mesh.indices=source.indices;

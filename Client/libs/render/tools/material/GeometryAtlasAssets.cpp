@@ -1,7 +1,7 @@
 #include "GeometryAtlasAssets.h"
 #include "SmartMaterialApplication.h"
 #include "asset/AssetDatabase.h"
-#include "import_export/AssimpImporter.h"
+#include "RendererGeometry.h"
 #include <assimp/Exporter.hpp>
 #include <assimp/scene.h>
 #include <assimp/material.h>
@@ -11,15 +11,22 @@
 
 namespace material_tool {
 bool CreateGeometryAtlasAsset(AssetLibrary& library,const std::string& sourceGuid,std::uint64_t sourceHash,
-    unsigned submesh,const GeometryMesh& atlas,AssetLibrary::Entry& result,std::string& error)
+    const std::vector<unsigned>& submeshes,const GeometryMesh& atlas,AssetLibrary::Entry& result,std::string& error)
 {
     auto& database=AssetDatabase::Instance();const auto guid=Guid::fromString(sourceGuid);
     const auto path=guid?database.resolveGuid(*guid):std::nullopt;
     if(!path || !sourceHash || SmartMaterialModelHash(*path,error)!=sourceHash) {error="Source model changed before UV atlas export";return false;}
-    auto imported=AssimpImporter{}.importFile(*path);
-    if(!imported.success || imported.hasSkeletal || submesh>=imported.meshes.size() || atlas.indices.size()!=imported.meshes[submesh].indices.size())
-    {error="Invalid source for automatic UV model";return false;}
-    auto& replaced=imported.meshes[submesh];replaced.vertices.clear();replaced.indices=atlas.indices;
+    auto imported=ImportRendererGeometry(*path);
+    bool valid=imported.success && !imported.hasSkeletal && !submeshes.empty();std::size_t indexCount=0;
+    for(std::size_t k=0;valid && k<submeshes.size();++k) {
+        valid=submeshes[k]<imported.meshes.size() && (!k || submeshes[k]>submeshes[k-1]) &&
+            imported.meshes[submeshes[k]].materialIndex==imported.meshes[submeshes.front()].materialIndex;
+        if(valid)indexCount+=imported.meshes[submeshes[k]].indices.size();
+    }
+    if(!valid || atlas.indices.size()!=indexCount){error="Invalid source for automatic UV model";return false;}
+    // The joined surface takes the place of the slot's first submesh; the rest of the slot is now part of it.
+    for(std::size_t k=submeshes.size();k-->1;)imported.meshes.erase(imported.meshes.begin()+submeshes[k]);
+    auto& replaced=imported.meshes[submeshes.front()];replaced.vertices.clear();replaced.indices=atlas.indices;
     for(const auto& v:atlas.vertices) {AssimpImporter::Vertex vertex;
         std::copy(v.position.begin(),v.position.end(),vertex.position);std::copy(v.normal.begin(),v.normal.end(),vertex.normal);std::copy(v.uv.begin(),v.uv.end(),vertex.uv);
         replaced.vertices.push_back(vertex);

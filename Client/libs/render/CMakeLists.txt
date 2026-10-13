@@ -11,6 +11,8 @@ add_library(IXEngineRender STATIC
     editor_panels/EditorImGuiProjectPanels.inl
     editor_panels/EditorImGuiSceneViewPanels.inl
     MapEditorTypes.h
+    tools/material/RendererGeometry.cpp
+    tools/material/RendererGeometry.h
     tools/material/SmartMaterialApplication.cpp
     UiCanvas.h
     UiCanvas.cpp

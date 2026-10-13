@@ -100,6 +100,7 @@ private:
         ParameterOverrides parameters;
         std::filesystem::path graphFolder;
         std::string name;
+        std::vector<unsigned> submeshes; // Source submeshes drawn with the target material slot.
         bool atlasAttempted = false;
     };
     MeshRendererEditorState applyTarget_;

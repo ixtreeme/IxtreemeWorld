@@ -46,12 +46,13 @@ inline bool WriteObj(const std::filesystem::path& path,const GeometryMesh& mesh)
     for(size_t i=0;i<mesh.indices.size();i+=3){file<<'f';for(unsigned j=0;j<3;++j){const auto index=mesh.indices[i+j]+1;file<<' '<<index<<'/'<<index<<'/'<<index;}file<<'\n';}
     file.close();return !file.fail();
 }
-// One glTF mesh with a primitive and a material per entry. The file stores exactly the given
-// positions, normals, UVs and winding, which is what the native glTF renderer reads.
-inline bool WriteGltf(const std::filesystem::path& path,const std::vector<GeometryMesh>& primitives) {
+// One glTF mesh with a primitive per entry, each drawn with its own material unless material
+// indices are given. The file stores exactly the given positions, normals, UVs and winding,
+// which is what the native glTF renderer reads.
+inline bool WriteGltf(const std::filesystem::path& path,const std::vector<GeometryMesh>& primitives,const std::vector<unsigned>& materialIndices={}) {
     std::string bytes;std::ostringstream views,accessors,parts,materials;
     views<<std::setprecision(std::numeric_limits<float>::max_digits10);accessors<<std::setprecision(std::numeric_limits<float>::max_digits10);
-    unsigned view=0;
+    unsigned view=0,materialCount=0;
     const auto append=[&](const void* data,std::size_t size,int target){
         views<<(view?",":"")<<"{\"buffer\":0,\"byteOffset\":"<<bytes.size()<<",\"byteLength\":"<<size<<",\"target\":"<<target<<'}';
         bytes.append(static_cast<const char*>(data),size);return view++;
@@ -69,9 +70,10 @@ inline bool WriteGltf(const std::filesystem::path& path,const std::vector<Geomet
             <<"{\"bufferView\":"<<first+1<<",\"componentType\":5126,\"count\":"<<mesh.vertices.size()<<",\"type\":\"VEC3\"},"
             <<"{\"bufferView\":"<<first+2<<",\"componentType\":5126,\"count\":"<<mesh.vertices.size()<<",\"type\":\"VEC2\"},"
             <<"{\"bufferView\":"<<first+3<<",\"componentType\":5125,\"count\":"<<mesh.indices.size()<<",\"type\":\"SCALAR\"}";
-        parts<<(index?",":"")<<"{\"attributes\":{\"POSITION\":"<<first<<",\"NORMAL\":"<<first+1<<",\"TEXCOORD_0\":"<<first+2<<"},\"indices\":"<<first+3<<",\"material\":"<<index<<'}';
-        materials<<(index?",":"")<<"{\"name\":\"Material"<<index<<"\"}";
+        const unsigned material=index<materialIndices.size()?materialIndices[index]:static_cast<unsigned>(index);materialCount=std::max(materialCount,material+1);
+        parts<<(index?",":"")<<"{\"attributes\":{\"POSITION\":"<<first<<",\"NORMAL\":"<<first+1<<",\"TEXCOORD_0\":"<<first+2<<"},\"indices\":"<<first+3<<",\"material\":"<<material<<'}';
     }
+    for(unsigned material=0;material<materialCount;++material)materials<<(material?",":"")<<"{\"name\":\"Material"<<material<<"\"}";
     static constexpr char alphabet[]="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     std::string encoded;
     for(std::size_t i=0;i<bytes.size();i+=3) {

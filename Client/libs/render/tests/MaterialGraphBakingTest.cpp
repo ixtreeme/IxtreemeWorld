@@ -9,6 +9,7 @@
 #include "GeometryFixtures.h"
 #include "asset/MaterialAssetManager.h"
 #include "import_export/AssimpImporter.h"
+#include "tools/material/RendererGeometry.h"
 #include <stb_image.h>
 #include <stb_image_write.h>
 #include <chrono>
@@ -41,13 +42,16 @@ void RendererGeometryConvention(AssetLibrary& library, const std::filesystem::pa
     if(!imported)std::cout<<source.errorMessage<<'\n';
     Check(imported && geometry_fixtures::SameSurface(Surface(source.meshes[0]),reused) && geometry_fixtures::SameSurface(Surface(source.meshes[1]),unique),
           "glTF static geometry imports with the file's own positions, normals, UVs and winding");
+    const auto drawnGltf=ImportRendererGeometry(gltf);
+    Check(drawnGltf.success && drawnGltf.meshes.size()==2 && geometry_fixtures::SameSurface(Surface(drawnGltf.meshes[0]),reused) && geometry_fixtures::SameSurface(Surface(drawnGltf.meshes[1]),unique),
+          "geometry tools read a glTF exactly as the static renderer does");
     const auto repair=[&](const std::filesystem::path& model,unsigned submesh,AssimpImporter::ImportResult& derived) {
         GraphGeometryCache geometry;GeometryBake bake;GeometryBakeSettings settings;settings.resolution=128;GeometryMesh atlas;AssetLibrary::Entry entry;
         const bool ready=geometry.Select(model,submesh,error) && !BakeGeometry(*geometry.Mesh(),settings,bake,error) &&
             GenerateGeometryUvAtlas(*geometry.Mesh(),128,atlas,error) &&
-            CreateGeometryAtlasAsset(library,geometry.MeshGuid(),SmartMaterialModelHash(model,error),submesh,atlas,entry,error);
+            CreateGeometryAtlasAsset(library,geometry.MeshGuid(),SmartMaterialModelHash(model,error),{submesh},atlas,entry,error);
         if(!ready){std::cout<<error<<'\n';return false;}
-        derived=AssimpImporter{}.importFile(library.AbsolutePath(entry));
+        derived=ImportRendererGeometry(library.AbsolutePath(entry));
         return derived.success && submesh<derived.meshes.size() && BakeGeometry(Surface(derived.meshes[submesh]),settings,bake,error);
     };
     AssimpImporter::ImportResult derived;
@@ -59,10 +63,61 @@ void RendererGeometryConvention(AssetLibrary& library, const std::filesystem::pa
     // A non-glTF source is drawn from its imported data; the derived glTF must hold that data as written.
     const auto obj=folder/"convention.obj";
     Check(geometry_fixtures::WriteObj(obj,reused),"reused-UV OBJ fixture writes");
-    const auto drawn=AssimpImporter{}.importFile(obj);AssimpImporter::ImportResult derivedObj;
+    const auto drawn=ImportRendererGeometry(obj);AssimpImporter::ImportResult derivedObj;
     Check(drawn.success && drawn.meshes.size()==1 && repair(obj,0,derivedObj),"reused OBJ UVs get a derived model that bakes");
     Check(drawn.meshes.size()==1 && derivedObj.meshes.size()==1 && geometry_fixtures::SameSurface(Surface(derivedObj.meshes[0]),Surface(drawn.meshes[0]),false),
           "automatic UV model of a non-glTF source keeps the surface drawn from its import");
+}
+// A material slot is a material index: it can cover several submeshes and need not follow their order.
+void MaterialSlotGeometry(AssetLibrary& library, const std::filesystem::path& root)
+{
+    const auto folder=root/"Assets"/"Models";std::filesystem::create_directories(folder);std::string error;
+    GeometryMesh first,second,third;
+    geometry_fixtures::Quad(first,{{{0,0,1},{0,0,3},{2,0,3},{2,0,1}}},{0,1,0},.02f,.02f,.4f,.4f);
+    geometry_fixtures::Quad(second,{{{3,0,1},{3,0,2},{4,0,2},{4,0,1}}},{0,1,0},.1f,.1f,.3f,.5f);
+    geometry_fixtures::Quad(third,{{{0,2,1},{0,2,3},{2,2,3},{2,2,1}}},{0,1,0},.52f,.5f,.4f,.4f);
+    const auto join=[](GeometryMesh a,const GeometryMesh& b){const auto base=static_cast<std::uint32_t>(a.vertices.size());
+        a.vertices.insert(a.vertices.end(),b.vertices.begin(),b.vertices.end());for(const auto index:b.indices)a.indices.push_back(base+index);return a;};
+    const auto shared=folder/"shared-slot.gltf";
+    Check(geometry_fixtures::WriteGltf(shared,{first,second,third},{1,0,1}),"glTF fixture with a shared and a reordered material slot writes");
+    const auto drawn=ImportRendererGeometry(shared);
+    Check(drawn.success && drawn.meshes.size()==3 && drawn.meshes[0].materialIndex==1 && drawn.meshes[1].materialIndex==0 && drawn.meshes[2].materialIndex==1,
+          "each glTF submesh reports the material slot the renderer draws it with");
+    GraphGeometryCache slot;
+    Check(slot.SelectMaterialSlot(shared,0,error) && slot.MeshIndices()==std::vector<unsigned>{1} && geometry_fixtures::SameSurface(*slot.Mesh(),second),
+          "a material slot selects the submesh drawn with it, not the submesh at its index");
+    const bool joined=slot.SelectMaterialSlot(shared,1,error) && slot.MeshIndices()==std::vector<unsigned>{0,2} && geometry_fixtures::SameSurface(*slot.Mesh(),join(first,third));
+    Check(joined,"submeshes sharing a material slot are selected as one surface");
+    GraphGeometryCache empty;
+    Check(!empty.SelectMaterialSlot(shared,2,error) && !error.empty() && !empty.Mesh(),"a material slot without geometry is refused");
+    GeometryBake bake;GeometryBakeSettings settings;settings.resolution=64;
+    const bool saved=joined && BakeGeometry(*slot.Mesh(),settings,bake,error) && slot.Accept(bake,error) && slot.Save(folder/"shared-slot.ixgeometrybake",error);
+    if(!saved)std::cout<<error<<'\n';
+    Check(saved,"a shared material slot bakes into one atlas and saves its cache");
+    GraphGeometryCache reopened;
+    Check(saved && reopened.Bind(slot.BakeGuid(),error) && reopened.MeshIndices()==std::vector<unsigned>{0,2} && reopened.Refresh(true) && reopened.Bake(),
+          "a shared-slot cache reopens and revalidates against the joined surface");
+    // Reused UVs across a shared slot: the automatic UV model joins the slot into one submesh.
+    auto copy=first;for(auto& vertex:copy.vertices)vertex.position[1]+=2;
+    const auto overlapping=folder/"shared-overlap.gltf";
+    Check(geometry_fixtures::WriteGltf(overlapping,{first,copy,second},{0,0,1}),"glTF fixture with reused UVs across a shared slot writes");
+    GraphGeometryCache target;GeometryMesh atlas;AssetLibrary::Entry model;
+    const bool repaired=target.SelectMaterialSlot(overlapping,0,error) && !BakeGeometry(*target.Mesh(),settings,bake,error) &&
+        GenerateGeometryUvAtlas(*target.Mesh(),64,atlas,error) &&
+        CreateGeometryAtlasAsset(library,target.MeshGuid(),SmartMaterialModelHash(overlapping,error),target.MeshIndices(),atlas,model,error);
+    if(!repaired)std::cout<<error<<'\n';
+    Check(repaired,"a shared slot with reused UVs gets an automatic UV model");
+    if(repaired) {
+        const auto derived=ImportRendererGeometry(library.AbsolutePath(model));
+        Check(derived.success && derived.meshes.size()==2 && derived.meshes[0].materialIndex==0 && derived.meshes[1].materialIndex==1 &&
+              geometry_fixtures::SameSurface(Surface(derived.meshes[0]),join(first,copy),false) && geometry_fixtures::SameSurface(Surface(derived.meshes[1]),second),
+              "the automatic UV model joins the slot's submeshes and keeps the other slot as drawn");
+        GraphGeometryCache rebaked;
+        Check(rebaked.SelectMaterialSlot(library.AbsolutePath(model),0,error) && rebaked.MeshIndices()==std::vector<unsigned>{0} && BakeGeometry(*rebaked.Mesh(),settings,bake,error),
+              "the joined slot bakes from the automatic UV model");
+    }
+    Check(!CreateGeometryAtlasAsset(library,target.MeshGuid(),SmartMaterialModelHash(overlapping,error),{0,2},atlas,model,error),
+          "submeshes of different material slots are not joined");
 }
 void SmartAssetBrowser(AssetLibrary& library, const std::filesystem::path& root)
 {
@@ -149,9 +204,10 @@ int main(int argc, char** argv) {
                 GeometryBake bake;GeometryBakeSettings settings;settings.resolution=128;
                 bool baked=geometry.Select(copied,index,error) && BakeGeometry(*geometry.Mesh(),settings,bake,error);
                 if(!baked && error.find("UV")!=std::string::npos) {
+                    std::cout<<"Submesh "<<index<<" needs UV repair: "<<error<<'\n';
                     GeometryMesh atlas;AssetLibrary::Entry model;
                     baked=GenerateGeometryUvAtlas(*geometry.Mesh(),128,atlas,error) &&
-                        CreateGeometryAtlasAsset(library,geometry.MeshGuid(),SmartMaterialModelHash(copied,error),index,atlas,model,error) &&
+                        CreateGeometryAtlasAsset(library,geometry.MeshGuid(),SmartMaterialModelHash(copied,error),{index},atlas,model,error) &&
                         geometry.Select(library.AbsolutePath(model),index,error) && BakeGeometry(*geometry.Mesh(),settings,bake,error);
                     Check(baked,"reported model gets a derived UV atlas preserving its original source");
                     if(baked)for(unsigned other=0;other<count;++other)if(other!=index) {
@@ -178,6 +234,7 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(root);AssetDatabase::Instance().scan(root);AssetLibrary library(root,root/"Assets");Check(library.Initialize(),"isolated test project initializes");
     SmartAssetBrowser(library, root);
     RendererGeometryConvention(library, root);
+    MaterialSlotGeometry(library, root);
     auto graph=MaterialGraphDocument::Example();graph.FindNode(1)->value={.25f,.5f,.75f,1};graph.FindNode(2)->value[0]=.6f;
     AssetLibrary::Entry material;std::string error;
     const bool baked=PublishBakedMaterial(library,graph,{},16,"Test material",material,error);if(!baked)std::cout<<error<<'\n';

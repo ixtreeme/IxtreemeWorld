@@ -56,7 +56,10 @@ this in its default mode on a generated two-material glTF and an OBJ that are
 asymmetric along Z and V: the glTF must import exactly as written, and both derived
 models must keep the surface their source's renderer path draws. Before 2026-10-14
 derived models were mirrored along Z for glTF sources and stored a flipped V on
-untouched submeshes. The pinned MIT xatlas source and license are included under
+untouched submeshes. Material-slot cases use a glTF whose primitives use materials
+out of order and share one: the slot selects the submeshes drawn with it, a shared
+slot bakes, saves and reopens as one surface, and reused UVs across a shared slot
+produce a derived model with that slot joined. The pinned MIT xatlas source and license are included under
 `Client/third_party/xatlas` for offline builds.
 
 No test currently reads graph shading back from the GPU. DXC compilation checks

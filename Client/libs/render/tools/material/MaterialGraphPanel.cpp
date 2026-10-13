@@ -802,14 +802,14 @@ bool MaterialGraphPanel::BakeAndApply()
     MaterialGraphProgram checked;
     if (!CompileMaterial(checked,status_) || !checked.ValidateOverrides(parameters_,status_)) return false;
     GraphGeometryCache selected;
-    if (!selected.Select(applyModelPath_,applyTarget_.selectedMaterialSlot,status_)) return false;
+    if (!selected.SelectMaterialSlot(applyModelPath_,applyTarget_.selectedMaterialSlot,status_)) return false;
     const auto settings = SelectedMeshBakeSettings(applyTarget_,128U << applyResolution_);
     const auto sourceHash=SmartMaterialModelHash(applyModelPath_,status_);if(!sourceHash)return false;
     if (!geometryJob_.Start(*selected.Mesh(),settings)) { status_ = "Geometry bake could not start."; return false; }
     ApplyRequest request;
     request.target = CaptureSmartMaterialTarget(applyTarget_);
     request.target.assetRoot = library_->LibraryRoot().lexically_normal().generic_string();
-    request.target.sourceModelGuid=selected.MeshGuid();request.target.sourceModelHash=sourceHash;
+    request.target.sourceModelGuid=selected.MeshGuid();request.target.sourceModelHash=sourceHash;request.submeshes=selected.MeshIndices();
     request.document = document_; request.parameters = parameters_; request.graphFolder = path_.parent_path();
     request.name = applyTarget_.name.empty() ? "SmartMaterial" : applyTarget_.name + " SmartMaterial";
     applyRequest_ = std::move(request); geometry_ = std::move(selected); geometrySettings_ = settings;
@@ -928,7 +928,7 @@ void MaterialGraphPanel::PollGeometryBake() {
         if(!atlasError.empty()){status_=atlasError;applyRequest_.reset();return;}
         AssetLibrary::Entry model;
         if(!library_ || !CreateGeometryAtlasAsset(*library_,applyRequest_->target.sourceModelGuid,applyRequest_->target.sourceModelHash,
-            applyRequest_->target.slot,atlas,model,status_) || !geometry_.Select(library_->AbsolutePath(model),applyRequest_->target.slot,status_))
+            applyRequest_->submeshes,atlas,model,status_) || !geometry_.SelectMaterialSlot(library_->AbsolutePath(model),applyRequest_->target.slot,status_))
         {applyRequest_.reset();return;}
         applyRequest_->target.replacementModelGuid=model.guid;applyRequest_->target.replacementModelPath=library_->AssetRelativePath(model);
         if(!geometryJob_.Start(*geometry_.Mesh(),geometrySettings_)){status_="Cannot start automatic atlas bake";applyRequest_.reset();return;}
