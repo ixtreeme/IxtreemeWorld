@@ -6,7 +6,9 @@ add_library(IXEnginePlatform STATIC
     platform/process.h
     platform/open_external.h
     platform/tcp_stream.h
+    platform/file_dialog.h
     Trash_Stub.cpp
+    FileDialog_Stub.cpp
     DynamicLibrary_Posix.cpp
     Process_Posix.cpp
     OpenExternal_Posix.cpp
@@ -20,6 +22,7 @@ if(WIN32)
         NativeWindow_Win32.cpp
         NativeWindow_Win32.h
         Trash_Win32.cpp
+        FileDialog_Win32.cpp
         DynamicLibrary_Win32.cpp
         Process_Win32.cpp
         OpenExternal_Win32.cpp
@@ -29,6 +32,7 @@ if(WIN32)
         Vulkan::Vulkan
         Gdi32
         Shell32
+        Comdlg32
         Ws2_32
     )
     target_compile_definitions(IXEnginePlatform PUBLIC

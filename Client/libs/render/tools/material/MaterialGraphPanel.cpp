@@ -3,6 +3,7 @@
 #include "MaterialInstance.h"
 #include "GeometryAtlasAssets.h"
 #include "asset/AssetDatabase.h"
+#include "platform/file_dialog.h"
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <imgui_node_editor.h>
@@ -15,8 +16,6 @@
 #include <cmath>
 #include <fstream>
 #include <utility>
-#include <windows.h>
-#include <commdlg.h>
 
 namespace material_tool
 {
@@ -31,23 +30,24 @@ ImVec4 PinColor(PinType type)
     case PinType::Texture:return {.9f,.45f,.45f,1};case PinType::Surface:return {.95f,.82f,.35f,1};
     }return {1,1,1,1};
 }
+std::filesystem::path BrowseFile(bool save, std::vector<platform::FileDialogFilter> filters, const char* defaultExtension = "",
+    const std::filesystem::path& current = {}, const char* title = "")
+{
+    platform::FileDialogOptions options;
+    options.save = save; options.title = title; options.filters = std::move(filters);
+    options.defaultExtension = defaultExtension; options.initialPath = current;
+    options.ownerWindow = ImGui::GetMainViewport()->PlatformHandleRaw;
+    return platform::ShowFileDialog(options).value_or(std::filesystem::path{});
+}
 std::filesystem::path ChooseGraphFile(bool save, const std::filesystem::path& current, bool instance = false, bool subgraph = false, bool generator = false)
 {
-    wchar_t file[32768]{};
-    const auto initial = current.wstring();
-    if (initial.size() < std::size(file)) std::copy(initial.begin(), initial.end(), file);
-    OPENFILENAMEW dialog{};
-    dialog.lStructSize = sizeof(dialog);
-    const auto* viewport = ImGui::GetMainViewport();
-    dialog.hwndOwner = static_cast<HWND>(viewport->PlatformHandleRaw);
-    dialog.lpstrFile = file; dialog.nMaxFile = static_cast<DWORD>(std::size(file));
-    dialog.lpstrFilter = generator?L"Smart Generator (*.ixsmartgenerator)\0*.ixsmartgenerator\0":(instance ? L"Material Instance (*.ixmaterialinstance)\0*.ixmaterialinstance\0All Files\0*.*\0" :
-        (subgraph && save ? L"Material Subgraph (*.ixmaterialsubgraph)\0*.ixmaterialsubgraph\0" : L"Material Documents\0*.materialgraph;*.ixsmartmaterial;*.ixmaterialsubgraph;*.ixsmartgenerator\0All Files\0*.*\0"));
-    dialog.lpstrDefExt = generator?L"ixsmartgenerator":(instance ? L"ixmaterialinstance" : (subgraph ? L"ixmaterialsubgraph" : L"materialgraph"));
-    dialog.lpstrTitle = save ? L"Save Material Graph" : L"Open Material Graph";
-    dialog.Flags = OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | (save ? OFN_OVERWRITEPROMPT : OFN_FILEMUSTEXIST);
-    if (save ? GetSaveFileNameW(&dialog) : GetOpenFileNameW(&dialog)) return std::filesystem::path(file);
-    return {};
+    std::vector<platform::FileDialogFilter> filters;
+    if (generator) filters = {{"Smart Generator (*.ixsmartgenerator)", "*.ixsmartgenerator"}};
+    else if (instance) filters = {{"Material Instance (*.ixmaterialinstance)", "*.ixmaterialinstance"}, {"All Files", "*.*"}};
+    else if (subgraph && save) filters = {{"Material Subgraph (*.ixmaterialsubgraph)", "*.ixmaterialsubgraph"}};
+    else filters = {{"Material Documents", "*.materialgraph;*.ixsmartmaterial;*.ixmaterialsubgraph;*.ixsmartgenerator"}, {"All Files", "*.*"}};
+    return BrowseFile(save, std::move(filters), generator ? "ixsmartgenerator" : (instance ? "ixmaterialinstance" : (subgraph ? "ixmaterialsubgraph" : "materialgraph")),
+        current, save ? "Save Material Graph" : "Open Material Graph");
 }
 }
 MaterialGraphPanel::MaterialGraphPanel() = default;
@@ -563,10 +563,9 @@ void MaterialGraphPanel::RenderTextureBinding(GraphNode& node)
         }ImGui::EndDragDropTarget();
     }
     if(ImGui::SmallButton("Browse...")) {
-        wchar_t file[32768]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);
-        dialog.lpstrFile=file;dialog.nMaxFile=static_cast<DWORD>(std::size(file));dialog.lpstrFilter=L"Textures\0*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.exr\0All Files\0*.*\0";dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
-        if(GetOpenFileNameW(&dialog)) {
-            const auto before=document_;const auto chosen=std::filesystem::path(file);
+        const auto chosen=BrowseFile(false,{{"Textures","*.png;*.jpg;*.jpeg;*.tga;*.bmp;*.exr"},{"All Files","*.*"}});
+        if(!chosen.empty()) {
+            const auto before=document_;
             if(library_) {AssetLibrary::Entry imported;std::string error;
                 if(library_->Import(AssetLibrary::Category::Texture,chosen,imported,error)){node.resource=library_->AssetRelativePath(imported);node.assetGuid=imported.guid;node.assetId=imported.id;}else status_=error;
             }else {const auto utf8=chosen.generic_u8string();node.resource.assign(utf8.begin(),utf8.end());node.assetGuid.clear();node.assetId.clear();}
@@ -584,12 +583,9 @@ void MaterialGraphPanel::RenderSubgraphBinding(std::uint32_t id)
     if (browse || refresh) {
         std::string guid=node->assetGuid, resource=node->resource;
         if (browse) {
-            wchar_t file[32768]{}; OPENFILENAMEW dialog{}; dialog.lStructSize=sizeof(dialog);
-            dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);
-            dialog.lpstrFile=file; dialog.nMaxFile=static_cast<DWORD>(std::size(file)); dialog.lpstrFilter=L"Subgraph or Smart Generator\0*.ixmaterialsubgraph;*.ixsmartgenerator\0";
-            dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
-            if (!GetOpenFileNameW(&dialog)) return;
-            guid=AssetDatabase::Instance().getOrCreateGuid(file).toString(); resource=std::filesystem::path(file).filename().string();
+            const auto file=BrowseFile(false,{{"Subgraph or Smart Generator","*.ixmaterialsubgraph;*.ixsmartgenerator"}});
+            if (file.empty()) return;
+            guid=AssetDatabase::Instance().getOrCreateGuid(file).toString(); resource=file.filename().string();
         }
         const auto before=document_; MaterialSubgraph asset; subgraphs_.Clear(); forceCompile_=true;
         if (subgraphs_.Resolve(guid,asset,status_) && BindMaterialSubgraph(document_,id,guid,asset,status_)) {
@@ -980,14 +976,12 @@ void MaterialGraphPanel::RenderGeometryBake() {
     const bool running=geometryJob_.Running() || uvAtlasJob_.Running();
     ImGui::BeginDisabled(running);
     if(ImGui::Button("Select mesh...")) {
-        wchar_t file[32768]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);
-        dialog.lpstrFile=file;dialog.nMaxFile=static_cast<DWORD>(std::size(file));dialog.lpstrFilter=L"Static models\0*.fbx;*.obj;*.gltf;*.glb\0";dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
-        if(GetOpenFileNameW(&dialog))SelectGeometryMesh(file);
+        const auto file=BrowseFile(false,{{"Static models","*.fbx;*.obj;*.gltf;*.glb"}});
+        if(!file.empty())SelectGeometryMesh(file);
     }
     ImGui::SameLine();if(ImGui::Button("Open bake...")) {
-        wchar_t file[32768]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);
-        dialog.lpstrFile=file;dialog.nMaxFile=static_cast<DWORD>(std::size(file));dialog.lpstrFilter=L"Geometry Bake\0*.ixgeometrybake\0";dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_FILEMUSTEXIST;
-        if(GetOpenFileNameW(&dialog))BindGeometryBake(AssetDatabase::Instance().getOrCreateGuid(file).toString());
+        const auto file=BrowseFile(false,{{"Geometry Bake","*.ixgeometrybake"}});
+        if(!file.empty())BindGeometryBake(AssetDatabase::Instance().getOrCreateGuid(file).toString());
     }
     if(!geometry_.MeshGuid().empty()) {
         ImGui::TextWrapped("%s (submesh %u of %u)",geometry_.Name().c_str(),geometry_.MeshIndex()+1,geometry_.MeshCount());
@@ -1006,9 +1000,8 @@ void MaterialGraphPanel::RenderGeometryBake() {
     if(ImGui::Button("Bake geometry"))StartGeometryBake();
     ImGui::SameLine();ImGui::BeginDisabled(!geometry_.Bake());
     if(ImGui::Button("Save bake...")) {
-        wchar_t file[32768]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);
-        dialog.lpstrFile=file;dialog.nMaxFile=static_cast<DWORD>(std::size(file));dialog.lpstrFilter=L"Geometry Bake\0*.ixgeometrybake\0";dialog.lpstrDefExt=L"ixgeometrybake";dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_OVERWRITEPROMPT;
-        if(GetSaveFileNameW(&dialog))SaveGeometryBake(file);
+        const auto file=BrowseFile(true,{{"Geometry Bake","*.ixgeometrybake"}},"ixgeometrybake");
+        if(!file.empty())SaveGeometryBake(file);
     }
     ImGui::EndDisabled();ImGui::EndDisabled();
     if(running){ImGui::ProgressBar(geometryJob_.Progress());if(ImGui::Button("Cancel geometry bake"))geometryJob_.Cancel();}
@@ -1022,11 +1015,10 @@ void MaterialGraphPanel::RenderGeometryBake() {
 void MaterialGraphPanel::ExportShader()
 {
     MaterialGraphProgram program;if(!CompileMaterial(program,status_))return;
-    wchar_t file[32768]{};OPENFILENAMEW dialog{};dialog.lStructSize=sizeof(dialog);dialog.hwndOwner=static_cast<HWND>(ImGui::GetMainViewport()->PlatformHandleRaw);dialog.lpstrFile=file;dialog.nMaxFile=static_cast<DWORD>(std::size(file));
-    dialog.lpstrFilter=L"HLSL shader (*.hlsl)\0*.hlsl\0";dialog.lpstrDefExt=L"hlsl";dialog.Flags=OFN_NOCHANGEDIR|OFN_PATHMUSTEXIST|OFN_OVERWRITEPROMPT;
-    if(!GetSaveFileNameW(&dialog))return;
-    const auto path=std::filesystem::path(file);auto temporary=path;temporary+=L".tmp";std::ofstream output(temporary,std::ios::binary);output<<program.GenerateHlsl();output.close();
-    if(!output || !MoveFileExW(temporary.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))status_="Cannot save generated shader";
+    const auto path=BrowseFile(true,{{"HLSL shader (*.hlsl)","*.hlsl"}},"hlsl");
+    if(path.empty())return;
+    std::string error;
+    if(!SaveMaterialTextAtomic(path,program.GenerateHlsl(),error))status_=error.empty()?"Cannot save generated shader":error;
     else status_="Generated HLSL exported; bind textures and parameter constants as declared.";
 }
 
