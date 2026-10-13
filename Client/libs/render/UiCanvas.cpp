@@ -101,16 +101,34 @@ void SanitizeUiCanvas(UiCanvas& canvas)
         e.value = std::clamp(Finite(e.value, 0.5f), 0.0f, 1.0f);
         e.textAlignment = std::clamp(e.textAlignment, 0, 2);
     }
-    for (auto& e : canvas.elements)
+    // Missing parents become roots, and an element whose ancestors loop is detached. Parents are
+    // followed by index and a chain already known to reach a root is not walked again, so a deep
+    // hierarchy costs one pass instead of a search per ancestor of every element.
+    const std::size_t count = canvas.elements.size();
+    constexpr std::size_t none = static_cast<std::size_t>(-1);
+    std::unordered_map<std::uint32_t, std::size_t> indexById;
+    indexById.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) indexById.emplace(canvas.elements[i].id, i);
+    std::vector<std::size_t> parentIndex(count, none), path;
+    for (std::size_t i = 0; i < count; ++i)
     {
-        std::unordered_set<std::uint32_t> ancestors{e.id};
-        const auto* parent = FindUiElement(canvas, e.parentId);
-        if (e.parentId && !parent) e.parentId = 0;
-        while (parent)
+        auto& e = canvas.elements[i];
+        if (const auto parent = indexById.find(e.parentId); e.parentId && parent != indexById.end()) parentIndex[i] = parent->second;
+        else e.parentId = 0;
+    }
+    std::vector<std::size_t> walkedBy(count, none);
+    std::vector<char> rooted(count, 0);
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        path.assign(1, i); walkedBy[i] = i;
+        bool loops = false;
+        for (auto at = parentIndex[i]; at != none && !rooted[at]; at = parentIndex[at])
         {
-            if (!ancestors.insert(parent->id).second) { e.parentId = 0; break; }
-            parent = FindUiElement(canvas, parent->parentId);
+            if (walkedBy[at] == i) { loops = true; break; }
+            walkedBy[at] = i; path.push_back(at);
         }
+        if (loops) { canvas.elements[i].parentId = 0; parentIndex[i] = none; rooted[i] = 1; }
+        else for (const auto at : path) rooted[at] = 1;
     }
 }
 

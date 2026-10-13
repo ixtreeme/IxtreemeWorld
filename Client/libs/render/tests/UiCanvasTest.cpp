@@ -82,6 +82,23 @@ void Model()
     c.elements[0].parentId = childId; c.elements[2].parentId = 1; c.elements[1].scriptId = "label";
     c.elements[0].fontSize = std::numeric_limits<float>::quiet_NaN(); SanitizeUiCanvas(c);
     Check(std::isfinite(c.elements[0].fontSize) && c.elements[0].parentId == 0 && c.elements[1].scriptId != c.elements[2].scriptId, "malformed input is sanitized");
+    // A loop detaches the elements that find it, in order; the rest of the chain keeps its parents.
+    UiCanvas loop;
+    for (std::uint32_t id = 1; id <= 4; ++id) { UiElement e; e.id = id; loop.elements.push_back(e); }
+    loop.elements[0].parentId = 2; loop.elements[1].parentId = 3; loop.elements[2].parentId = 2; loop.elements[3].parentId = 99;
+    SanitizeUiCanvas(loop);
+    Check(loop.elements[0].parentId == 0 && loop.elements[1].parentId == 0 && loop.elements[2].parentId == 2 && loop.elements[3].parentId == 0,
+          "looping and missing parents are detached without touching valid links");
+    // The deepest allowed hierarchy, leaf first: every parent is kept and loading stays fast.
+    UiCanvas deep;
+    for (std::uint32_t id = 4096; id >= 1; --id) { UiElement e; e.id = id; e.parentId = id - 1; deep.elements.push_back(e); }
+    const auto sanitizeStart = std::chrono::steady_clock::now();
+    SanitizeUiCanvas(deep);
+    const auto sanitizeTime = std::chrono::steady_clock::now() - sanitizeStart;
+    bool chainKept = deep.elements.size() == 4096;
+    for (const auto& e : deep.elements) chainKept = chainKept && e.parentId == e.id - 1;
+    Check(chainKept && sanitizeTime < std::chrono::seconds(2), "a 4096-deep hierarchy is sanitized intact in one pass");
+    Check(BuildUiCanvasLayout(deep, 640, 360).size() == 4096, "a 4096-deep hierarchy lays out");
 }
 
 class TestRenderer : public Rml::RenderInterface
