@@ -1809,6 +1809,7 @@ std::vector<SelectionOutlineRenderer::Line> BuildPhysicsDebugLines(const std::ve
 void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& source)
 {
     target.smartMaterialAssignments.insert(target.smartMaterialAssignments.end(),source.smartMaterialAssignments.begin(),source.smartMaterialAssignments.end());
+    target.dumpMaterialState = target.dumpMaterialState || source.dumpMaterialState;
     target.generateLayers = target.generateLayers || source.generateLayers;
     target.exportLayers = target.exportLayers || source.exportLayers;
     if (source.exportServerWorld)
@@ -2042,6 +2043,7 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.selectedMeshEntityChanged = true;
         target.selectedMeshEntity = source.selectedMeshEntity;
     }
+    target.fitSelectedColliderToMesh = target.fitSelectedColliderToMesh || source.fitSelectedColliderToMesh;
     if (source.selectedCameraChanged)
     {
         target.selectedCameraChanged = true;
