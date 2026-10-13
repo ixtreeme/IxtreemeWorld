@@ -54,7 +54,7 @@ MaterialGraphPanel::MaterialGraphPanel() = default;
 MaterialGraphPanel::~MaterialGraphPanel() { ResetContext(); if(provider_ && previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_); }
 void MaterialGraphPanel::SetServices(AssetLibrary* library,ixeditor::graphics::IEditorTextureProvider* provider) {
     if(provider_!=provider) {if(provider_ && previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_);previewTexture_={};provider_=provider;previewDirty_=true;}
-    if(library_!=library){if(applyRequest_){geometryJob_.Cancel();uvAtlasJob_.Cancel();}applyRequest_.reset();materialAssignment_.reset();library_=library;textures_.Clear();subgraphs_.Clear();forceCompile_=true;parameters_={};previewDirty_=true;}
+    if(library_!=library){if(applyRequest_){geometryJob_.Cancel();uvAtlasJob_.Cancel();}DiscardApplyRequest();materialAssignment_.reset();library_=library;textures_.Clear();subgraphs_.Clear();forceCompile_=true;parameters_={};previewDirty_=true;}
     textures_.Configure(library_,path_.parent_path());
 }
 void MaterialGraphPanel::ResetContext()
@@ -803,10 +803,10 @@ bool MaterialGraphPanel::BakeAndApply()
     { GeometryMesh stale; std::string staleError; uvAtlasJob_.TakeResult(stale,staleError); }
     MaterialGraphProgram checked;
     if (!CompileMaterial(checked,status_) || !checked.ValidateOverrides(parameters_,status_)) return false;
-    GraphGeometryCache selected;
-    if (!selected.SelectMaterialSlot(applyModelPath_,applyTarget_.selectedMaterialSlot,status_)) return false;
+    GraphGeometryCache selected;std::uint64_t sourceHash=0;
+    if (!selected.SelectMaterialSlot(applyModelPath_,applyTarget_.selectedMaterialSlot,status_,&sourceHash)) return false;
+    if (!sourceHash) { status_ = "Static source model is unavailable or changed"; return false; }
     const auto settings = SelectedMeshBakeSettings(applyTarget_,128U << applyResolution_);
-    const auto sourceHash=SmartMaterialModelHash(applyModelPath_,status_);if(!sourceHash)return false;
     if (!geometryJob_.Start(*selected.Mesh(),settings)) { status_ = "Geometry bake could not start."; return false; }
     ApplyRequest request;
     request.target = CaptureSmartMaterialTarget(applyTarget_);
@@ -823,7 +823,22 @@ std::optional<SmartMaterialAssignment> MaterialGraphPanel::TakeMaterialAssignmen
 }
 void MaterialGraphPanel::CancelBakeAndApply()
 {
-    if (applyRequest_) { geometryJob_.Cancel(); uvAtlasJob_.Cancel(); applyRequest_.reset(); status_="Bake & Apply cancelled; model material kept."; }
+    if (applyRequest_) { geometryJob_.Cancel(); uvAtlasJob_.Cancel(); DiscardApplyRequest(); status_="Bake & Apply cancelled; model material kept."; }
+}
+void MaterialGraphPanel::DiscardApplyRequest()
+{
+    if (!applyRequest_) return;
+    const auto model=applyRequest_->target.replacementModelGuid,source=applyRequest_->target.sourceModelGuid;
+    const auto slot=applyRequest_->target.slot;
+    applyRequest_.reset();
+    if (model.empty() || !library_) return;
+    DiscardGeometryAtlasAsset(*library_,model);
+    if (geometry_.MeshGuid()!=model) return;
+    // The preview was following the removed model; return it to the source it was made from.
+    std::string ignored;const auto guid=Guid::fromString(source);
+    const auto path=guid?AssetDatabase::Instance().resolveGuid(*guid):std::nullopt;
+    if (!path || !geometry_.SelectMaterialSlot(*path,slot,ignored)) geometry_.Clear();
+    previewDirty_=true;
 }
 void MaterialGraphPanel::RenderApplyMaterial()
 {
@@ -927,13 +942,14 @@ void MaterialGraphPanel::PollGeometryBake() {
     GeometryMesh atlas;std::string atlasError;
     if(uvAtlasJob_.TakeResult(atlas,atlasError)) {
         if(!applyRequest_)return;
-        if(!atlasError.empty()){status_=atlasError;applyRequest_.reset();return;}
+        if(!atlasError.empty()){status_=atlasError;DiscardApplyRequest();return;}
         AssetLibrary::Entry model;
         if(!library_ || !CreateGeometryAtlasAsset(*library_,applyRequest_->target.sourceModelGuid,applyRequest_->target.sourceModelHash,
-            applyRequest_->submeshes,atlas,model,status_) || !geometry_.SelectMaterialSlot(library_->AbsolutePath(model),applyRequest_->target.slot,status_))
-        {applyRequest_.reset();return;}
+            applyRequest_->submeshes,atlas,model,status_))
+        {DiscardApplyRequest();return;}
         applyRequest_->target.replacementModelGuid=model.guid;applyRequest_->target.replacementModelPath=library_->AssetRelativePath(model);
-        if(!geometryJob_.Start(*geometry_.Mesh(),geometrySettings_)){status_="Cannot start automatic atlas bake";applyRequest_.reset();return;}
+        if(!geometry_.SelectMaterialSlot(library_->AbsolutePath(model),applyRequest_->target.slot,status_)){DiscardApplyRequest();return;}
+        if(!geometryJob_.Start(*geometry_.Mesh(),geometrySettings_)){status_="Cannot start automatic atlas bake";DiscardApplyRequest();return;}
         status_="Automatic UV model ready; baking material geometry...";return;
     }
     GeometryBake completed;std::string error;auto failure=GeometryBakeFailure::None;
@@ -943,14 +959,14 @@ void MaterialGraphPanel::PollGeometryBake() {
             geometry_.Refresh(true);applyRequest_->atlasAttempted=true;
             if(geometry_.Mesh() && uvAtlasJob_.Start(*geometry_.Mesh(),geometrySettings_.resolution)) {status_="Preparing automatic UV atlas for this model...";return;}
         }
-        status_=error;applyRequest_.reset();return;
+        status_=error;DiscardApplyRequest();return;
     }
-    if(!geometry_.Accept(std::move(completed),status_)){applyRequest_.reset();return;}
+    if(!geometry_.Accept(std::move(completed),status_)){DiscardApplyRequest();return;}
     if (applyRequest_) {
-        auto request=std::move(*applyRequest_);applyRequest_.reset();
         AssetLibrary::Entry material;
-        if (!library_ || !PublishBakedMaterial(*library_,request.document,request.parameters,geometry_.Bake()->settings.resolution,
-            request.name,material,status_,request.graphFolder,geometry_.Bake(),{},&geometry_)) return;
+        if (!library_ || !PublishBakedMaterial(*library_,applyRequest_->document,applyRequest_->parameters,geometry_.Bake()->settings.resolution,
+            applyRequest_->name,material,status_,applyRequest_->graphFolder,geometry_.Bake(),{},&geometry_)) { DiscardApplyRequest(); return; }
+        auto request=std::move(*applyRequest_);applyRequest_.reset();
         geometry_.Refresh(true);
         if (!geometry_.Bake()) { status_="Model changed during material baking; output remains in Asset Browser. Bake & Apply again."; return; }
         request.target.materialGuid=material.guid;materialAssignment_=std::move(request.target);

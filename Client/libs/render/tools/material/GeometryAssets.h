@@ -9,7 +9,8 @@ class GraphGeometryCache {
 public:
     bool Select(const std::filesystem::path& path,unsigned meshIndex,std::string& error);
     // Every submesh drawn with one material slot, as a single surface: a slot is the unit a material is assigned to.
-    bool SelectMaterialSlot(const std::filesystem::path& path,unsigned slot,std::string& error);
+    // modelHash receives the whole model's content identity from the same import.
+    bool SelectMaterialSlot(const std::filesystem::path& path,unsigned slot,std::string& error,std::uint64_t* modelHash=nullptr);
     bool Bind(const std::string& bakeGuid,std::string& error);
     bool Accept(GeometryBake bake,std::string& error);
     bool Save(const std::filesystem::path& path,std::string& error);

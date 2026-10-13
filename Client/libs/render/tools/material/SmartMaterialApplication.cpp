@@ -6,15 +6,20 @@
 #include <algorithm>
 
 namespace material_tool {
-std::uint64_t SmartMaterialModelHash(const std::filesystem::path& path,std::string& error)
+std::uint64_t SmartMaterialModelHash(const AssimpImporter::ImportResult& imported)
 {
-    const auto imported=ImportRendererGeometry(path);
-    if(!imported.success || imported.hasSkeletal || imported.meshes.empty()){error="Static source model is unavailable or changed";return 0;}
+    if(!imported.success || imported.hasSkeletal || imported.meshes.empty())return 0;
     std::uint64_t hash=1469598103934665603ULL;
     for(const auto& source:imported.meshes){GeometryMesh mesh;mesh.indices=source.indices;
         for(const auto& v:source.vertices)mesh.vertices.push_back({{v.position[0],v.position[1],v.position[2]},{v.normal[0],v.normal[1],v.normal[2]},{v.uv[0],v.uv[1]}});
         hash=(hash^GeometryMeshHash(mesh))*1099511628211ULL;hash=(hash^source.materialIndex)*1099511628211ULL;
     }
+    return hash;
+}
+std::uint64_t SmartMaterialModelHash(const std::filesystem::path& path,std::string& error)
+{
+    const auto hash=SmartMaterialModelHash(ImportRendererGeometry(path));
+    if(!hash){error="Static source model is unavailable or changed";return 0;}
     error.clear();return hash;
 }
 GeometryBakeSettings SelectedMeshBakeSettings(const MeshRendererEditorState& mesh, unsigned resolution)

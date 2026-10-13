@@ -8,4 +8,7 @@ namespace material_tool {
 // replaced by a single submesh holding their joined surface with the given unique UVs.
 bool CreateGeometryAtlasAsset(AssetLibrary& library,const std::string& sourceGuid,std::uint64_t sourceHash,
     const std::vector<unsigned>& submeshes,const GeometryMesh& atlas,AssetLibrary::Entry& result,std::string& error);
+// Removes an automatic UV model no material was published for. Only a model this tool wrote under
+// Models/SmartMaterialBakes is removed.
+void DiscardGeometryAtlasAsset(AssetLibrary& library,const std::string& modelGuid);
 }

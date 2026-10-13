@@ -93,6 +93,8 @@ private:
     GraphGeometryCache geometry_;
     GeometryBakeJob geometryJob_;
     GeometryUvAtlasJob uvAtlasJob_;
+    // Ends the pending Bake & Apply; an automatic UV model without its material is removed.
+    void DiscardApplyRequest();
     GeometryBakeSettings geometrySettings_;
     struct ApplyRequest {
         SmartMaterialAssignment target;

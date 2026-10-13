@@ -30,6 +30,10 @@ get a UV triangle of their own between texel centres, so they are valid and neve
 sampled. Zero-area triangles and triangles whose winding disagrees with their
 normals are still rejected with their own message; of the twenty Blackwater Hollow
 models only `Signpost.glb` slot 1 is refused for that reason.
+A derived model is kept only together with its published material: cancelling, a
+failed bake or a failed publication after the model was written removes it again and
+returns the preview to its source. A material that was published but could not be
+assigned (the scene changed meanwhile) stays in the Asset Browser with its model.
 Standalone manual geometry baking continues to require a unique atlas. Tiny UV
 border roundoff (up to eight float epsilons) snaps only in rasterization, retaining
 the original source hash.
@@ -148,6 +152,11 @@ finite invertible transform and positive bias below ray distance. Native cache
 reads are bounded to 28 MiB. A 512-square serialized cache is 25,428,088 bytes;
 in-memory maps, raster workspace, mesh, topology and BVH consume additional memory.
 Limits are defensive bounds, not a claim that 1M-triangle input was stress-tested.
+
+Bake & Apply still reads the model on the editor thread: once when it starts (the
+selected slot and the whole-model hash come from the same read), once to write an
+automatic UV model, once to select that model, and once more when the result is
+assigned. Large models can stall the editor briefly at those points.
 
 Worker ownership is local to `GeometryBakeJob`. It receives copies, touches no
 native database/library/graphics resource, reports atomic progress, and checks

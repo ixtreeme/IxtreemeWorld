@@ -3,6 +3,7 @@
 #include "MaterialInstance.h"
 #include "asset/AssetDatabase.h"
 #include "RendererGeometry.h"
+#include "SmartMaterialApplication.h"
 #include <algorithm>
 #include <fstream>
 
@@ -65,12 +66,14 @@ bool GraphGeometryCache::Select(const std::filesystem::path& path,unsigned index
     const auto guid=AssetDatabase::Instance().getOrCreateGuid(path).toString();if(!IsMaterialAssetGuid(guid)){error="Cannot register geometry model GUID";return false;}
     Clear();mesh_=std::move(mesh);meshGuid_=guid;meshStamp_=Current(guid);meshIndices_=std::move(indices);meshIndex_=index;meshCount_=static_cast<unsigned>(imported.meshes.size());name_=std::move(name);meshValid_=true;return true;
 }
-bool GraphGeometryCache::SelectMaterialSlot(const std::filesystem::path& path,unsigned slot,std::string& error) {
+bool GraphGeometryCache::SelectMaterialSlot(const std::filesystem::path& path,unsigned slot,std::string& error,std::uint64_t* modelHash) {
     error.clear();AssimpImporter::ImportResult imported;if(!Import(path,imported,error))return false;
     GeometryMesh mesh;std::vector<unsigned> indices;std::string name;if(!Gather(imported,true,slot,mesh,indices,name,error))return false;
     const auto guid=AssetDatabase::Instance().getOrCreateGuid(path).toString();if(!IsMaterialAssetGuid(guid)){error="Cannot register geometry model GUID";return false;}
     Clear();mesh_=std::move(mesh);meshGuid_=guid;meshStamp_=Current(guid);meshIndex_=indices.front();meshIndices_=std::move(indices);slot_=slot;bySlot_=true;
-    meshCount_=static_cast<unsigned>(imported.meshes.size());name_=std::move(name);meshValid_=true;return true;
+    meshCount_=static_cast<unsigned>(imported.meshes.size());name_=std::move(name);meshValid_=true;
+    if(modelHash)*modelHash=SmartMaterialModelHash(imported);
+    return true;
 }
 bool GraphGeometryCache::Bind(const std::string& guid,std::string& error) {
     error.clear();const auto stamp=Current(guid);

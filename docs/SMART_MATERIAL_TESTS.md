@@ -65,7 +65,8 @@ produce a derived model with that slot joined.
 layout, other geometry, cancellation) and a sliver triangle kept through the
 automatic atlas. `MaterialGraphEditorTest` starts a second Bake & Apply while a
 cancelled atlas result is still unpolled; without the fix the stale result stops
-that request. The pinned MIT xatlas source and license are included under
+that request. It also cancels after the automatic UV model was written and checks
+that the model is removed and the preview returns to its source. The pinned MIT xatlas source and license are included under
 `Client/third_party/xatlas` for offline builds.
 
 No test currently reads graph shading back from the GPU. DXC compilation checks

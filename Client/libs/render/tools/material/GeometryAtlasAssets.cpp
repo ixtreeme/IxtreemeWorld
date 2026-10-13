@@ -15,8 +15,9 @@ bool CreateGeometryAtlasAsset(AssetLibrary& library,const std::string& sourceGui
 {
     auto& database=AssetDatabase::Instance();const auto guid=Guid::fromString(sourceGuid);
     const auto path=guid?database.resolveGuid(*guid):std::nullopt;
-    if(!path || !sourceHash || SmartMaterialModelHash(*path,error)!=sourceHash) {error="Source model changed before UV atlas export";return false;}
+    if(!path || !sourceHash){error="Source model changed before UV atlas export";return false;}
     auto imported=ImportRendererGeometry(*path);
+    if(SmartMaterialModelHash(imported)!=sourceHash){error="Source model changed before UV atlas export";return false;}
     bool valid=imported.success && !imported.hasSkeletal && !submeshes.empty();std::size_t indexCount=0;
     for(std::size_t k=0;valid && k<submeshes.size();++k) {
         valid=submeshes[k]<imported.meshes.size() && (!k || submeshes[k]>submeshes[k-1]) &&
@@ -53,8 +54,26 @@ bool CreateGeometryAtlasAsset(AssetLibrary& library,const std::string& sourceGui
     if(exporter.Export(&scene,"glb2",temporary.string(),aiProcess_CalcTangentSpace)!=aiReturn_SUCCESS){error=std::string("Cannot export automatic UV model: ")+exporter.GetErrorString();std::filesystem::remove(temporary,ec);return false;}
     std::filesystem::rename(temporary,output,ec);if(ec){error="Cannot publish automatic UV model: "+ec.message();std::filesystem::remove(temporary,ec);return false;}
     const auto modelGuid=database.getOrCreateGuid(output);
-    if(!database.writeDependencies(output,{*guid}) || !database.writeDefaultMaterials(output,database.loadDefaultMaterials(*path)) || !library.Refresh(error))return false;
+    // A model that cannot be registered completely is of no use; leave nothing behind.
+    const auto discard=[&](std::string message){
+        auto meta=output;meta+=L".meta";std::filesystem::remove(output,ec);std::filesystem::remove(meta,ec);
+        std::string ignored;library.Refresh(ignored);error=std::move(message);return false;
+    };
+    if(!database.writeDependencies(output,{*guid}) || !database.writeDefaultMaterials(output,database.loadDefaultMaterials(*path)))
+        return discard("Cannot record the source and materials of the automatic UV model");
+    if(!library.Refresh(error))return discard(error.empty()?"Cannot refresh Asset Browser for the automatic UV model":error);
     for(const auto& entry:library.Entries())if(entry.guid==modelGuid.toString()){result=entry;return true;}
-    error="Automatic UV model is missing from Asset Browser";return false;
+    return discard("Automatic UV model is missing from Asset Browser");
+}
+void DiscardGeometryAtlasAsset(AssetLibrary& library,const std::string& modelGuid)
+{
+    const auto guid=Guid::fromString(modelGuid);const auto path=guid?AssetDatabase::Instance().resolveGuid(*guid):std::nullopt;
+    if(!path)return;
+    std::error_code ec;
+    const auto folder=std::filesystem::weakly_canonical(library.LibraryRoot()/"Models"/"SmartMaterialBakes",ec);
+    const auto parent=ec?std::filesystem::path{}:std::filesystem::weakly_canonical(path->parent_path(),ec);
+    if(ec || parent!=folder || path->filename().string().find("_SmartUV_")==std::string::npos)return;
+    auto meta=*path;meta+=L".meta";std::filesystem::remove(*path,ec);std::filesystem::remove(meta,ec);
+    std::string ignored;library.Refresh(ignored);
 }
 }
