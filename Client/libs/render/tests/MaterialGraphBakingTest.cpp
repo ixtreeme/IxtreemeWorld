@@ -8,6 +8,7 @@
 #include <string_view>
 #include "GeometryFixtures.h"
 #include "asset/MaterialAssetManager.h"
+#include "import_export/AssimpImporter.h"
 #include <stb_image.h>
 #include <stb_image_write.h>
 #include <chrono>
@@ -17,6 +18,52 @@ using namespace material_tool;
 namespace {
 int failures=0;
 void Check(bool ok,const char* message){std::cout<<(ok?"PASS ":"FAIL ")<<message<<'\n';failures+=!ok;}
+GeometryMesh Surface(const AssimpImporter::StaticMeshData& mesh)
+{
+    GeometryMesh result;result.indices=mesh.indices;
+    for(const auto& v:mesh.vertices)result.vertices.push_back({{v.position[0],v.position[1],v.position[2]},{v.normal[0],v.normal[1],v.normal[2]},{v.uv[0],v.uv[1]}});
+    return result;
+}
+// The static renderer reads glTF files directly and other formats through the importer. Geometry
+// tools and automatic UV models must describe the surface that either path draws.
+void RendererGeometryConvention(AssetLibrary& library, const std::filesystem::path& root)
+{
+    const auto folder=root/"Assets"/"Models";std::filesystem::create_directories(folder);std::string error;
+    // Asymmetric along Z and V, so a mirrored or V-flipped copy cannot pass by symmetry.
+    GeometryMesh reused,unique;
+    geometry_fixtures::Quad(reused,{{{0,0,1},{0,0,3},{2,0,3},{2,0,1}}},{0,1,0},0,0,1,1);
+    geometry_fixtures::Quad(reused,{{{0,1,1},{0,1,3},{2,1,3},{2,1,1}}},{0,1,0},0,0,1,1);
+    geometry_fixtures::Quad(unique,{{{3,0,1},{3,0,2},{4,0,2},{4,0,1}}},{0,1,0},.1f,.1f,.3f,.5f);
+    const auto gltf=folder/"convention.gltf";
+    Check(geometry_fixtures::WriteGltf(gltf,{reused,unique}),"two-material glTF fixture writes");
+    const auto source=AssimpImporter{}.importFile(gltf);
+    const bool imported=source.success && source.meshes.size()==2 && source.meshes[0].materialIndex==0 && source.meshes[1].materialIndex==1;
+    if(!imported)std::cout<<source.errorMessage<<'\n';
+    Check(imported && geometry_fixtures::SameSurface(Surface(source.meshes[0]),reused) && geometry_fixtures::SameSurface(Surface(source.meshes[1]),unique),
+          "glTF static geometry imports with the file's own positions, normals, UVs and winding");
+    const auto repair=[&](const std::filesystem::path& model,unsigned submesh,AssimpImporter::ImportResult& derived) {
+        GraphGeometryCache geometry;GeometryBake bake;GeometryBakeSettings settings;settings.resolution=128;GeometryMesh atlas;AssetLibrary::Entry entry;
+        const bool ready=geometry.Select(model,submesh,error) && !BakeGeometry(*geometry.Mesh(),settings,bake,error) &&
+            GenerateGeometryUvAtlas(*geometry.Mesh(),128,atlas,error) &&
+            CreateGeometryAtlasAsset(library,geometry.MeshGuid(),SmartMaterialModelHash(model,error),submesh,atlas,entry,error);
+        if(!ready){std::cout<<error<<'\n';return false;}
+        derived=AssimpImporter{}.importFile(library.AbsolutePath(entry));
+        return derived.success && submesh<derived.meshes.size() && BakeGeometry(Surface(derived.meshes[submesh]),settings,bake,error);
+    };
+    AssimpImporter::ImportResult derived;
+    Check(imported && repair(gltf,0,derived),"reused glTF UVs get a derived model that bakes");
+    Check(derived.meshes.size()==2 && geometry_fixtures::SameSurface(Surface(derived.meshes[1]),unique),
+          "automatic UV model keeps an untouched submesh exactly as the renderer draws its source");
+    Check(derived.meshes.size()==2 && geometry_fixtures::SameSurface(Surface(derived.meshes[0]),reused,false),
+          "automatic UV model keeps the repaired submesh's positions, normals and winding");
+    // A non-glTF source is drawn from its imported data; the derived glTF must hold that data as written.
+    const auto obj=folder/"convention.obj";
+    Check(geometry_fixtures::WriteObj(obj,reused),"reused-UV OBJ fixture writes");
+    const auto drawn=AssimpImporter{}.importFile(obj);AssimpImporter::ImportResult derivedObj;
+    Check(drawn.success && drawn.meshes.size()==1 && repair(obj,0,derivedObj),"reused OBJ UVs get a derived model that bakes");
+    Check(drawn.meshes.size()==1 && derivedObj.meshes.size()==1 && geometry_fixtures::SameSurface(Surface(derivedObj.meshes[0]),Surface(drawn.meshes[0]),false),
+          "automatic UV model of a non-glTF source keeps the surface drawn from its import");
+}
 void SmartAssetBrowser(AssetLibrary& library, const std::filesystem::path& root)
 {
     using Category = AssetLibrary::Category;
@@ -108,21 +155,12 @@ int main(int argc, char** argv) {
                         geometry.Select(library.AbsolutePath(model),index,error) && BakeGeometry(*geometry.Mesh(),settings,bake,error);
                     Check(baked,"reported model gets a derived UV atlas preserving its original source");
                     if(baked)for(unsigned other=0;other<count;++other)if(other!=index) {
+                        // Compared directly: an untouched submesh may itself have UVs that cannot be baked.
                         GraphGeometryCache before,after;
-                        GeometryBake originalSurface,derivedSurface;
-                        bool unchanged=before.Select(copied,other,error) && after.Select(library.AbsolutePath(model),other,error) &&
-                            BakeGeometry(*before.Mesh(),settings,originalSurface,error) && BakeGeometry(*after.Mesh(),settings,derivedSurface,error) && originalSurface.coverage==derivedSurface.coverage;
-                        if(unchanged)for(std::size_t pixel=0;pixel<originalSurface.texels.size();++pixel)if(originalSurface.coverage[pixel]==1)
-                            for(unsigned component=0;component<3;++component)unchanged &=
-                                std::abs(originalSurface.texels[pixel].objectPosition[component]-derivedSurface.texels[pixel].objectPosition[component])<.00001f &&
-                                std::abs(originalSurface.texels[pixel].objectNormal[component]-derivedSurface.texels[pixel].objectNormal[component])<.00001f;
-                        Check(unchanged,"automatic UV model preserves unrelated submesh UV-to-surface mapping");
-                        if(!unchanged){std::cout<<"Surface comparison: "<<error<<" coverage "<<originalSurface.coveredTexels<<" / "<<derivedSurface.coveredTexels<<'\n';
-                            if(originalSurface.texels.size()==derivedSurface.texels.size())for(std::size_t pixel=0;pixel<originalSurface.texels.size();++pixel)if(originalSurface.coverage[pixel]==1 && derivedSurface.coverage[pixel]==1){
-                                const auto& a=originalSurface.texels[pixel];const auto& b=derivedSurface.texels[pixel];
-                                if(a.objectPosition!=b.objectPosition){std::cout<<"First UV "<<a.uv[0]<<","<<a.uv[1]<<" P "<<a.objectPosition[0]<<","<<a.objectPosition[1]<<","<<a.objectPosition[2]<<" -> "<<b.objectPosition[0]<<","<<b.objectPosition[1]<<","<<b.objectPosition[2]<<'\n';break;}
-                            }
-                        }
+                        const bool unchanged=before.Select(copied,other,error) && after.Select(library.AbsolutePath(model),other,error) &&
+                            geometry_fixtures::SameSurface(*before.Mesh(),*after.Mesh());
+                        Check(unchanged,"automatic UV model preserves unrelated submesh positions, normals, UVs and winding");
+                        if(!unchanged)std::cout<<"Surface comparison: submesh "<<other<<" "<<error<<'\n';
                     }
                 }
                 baked=baked && geometry.Accept(std::move(bake),error);
@@ -139,6 +177,7 @@ int main(int argc, char** argv) {
     const auto root=std::filesystem::temp_directory_path()/("ixtreeme-graph-bake-"+generateGuidV4().toString());
     std::filesystem::create_directories(root);AssetDatabase::Instance().scan(root);AssetLibrary library(root,root/"Assets");Check(library.Initialize(),"isolated test project initializes");
     SmartAssetBrowser(library, root);
+    RendererGeometryConvention(library, root);
     auto graph=MaterialGraphDocument::Example();graph.FindNode(1)->value={.25f,.5f,.75f,1};graph.FindNode(2)->value[0]=.6f;
     AssetLibrary::Entry material;std::string error;
     const bool baked=PublishBakedMaterial(library,graph,{},16,"Test material",material,error);if(!baked)std::cout<<error<<'\n';

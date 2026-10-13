@@ -820,11 +820,14 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
         return result;
     }
 
-    // glTF coordinates are already Y-up, as consumed by the native glTF renderer.
-    // Missing FBX-style UpAxis metadata must not rotate glTF geometry a second time.
+    // The native glTF renderer draws the file's own data: Y-up, right-handed positions and the
+    // authored winding. Missing FBX-style UpAxis metadata must not rotate glTF geometry a second
+    // time, and ConvertToLeftHanded is undone for its static geometry below, so geometry tools
+    // see the model that is drawn. Skeletons and animations keep the converted space.
     std::string sourceExtension=fbxPath.extension().string();
     std::transform(sourceExtension.begin(),sourceExtension.end(),sourceExtension.begin(),[](unsigned char c){return static_cast<char>(std::tolower(c));});
-    const xm::Mat4 axisTransform = sourceExtension==".glb" || sourceExtension==".gltf" ? xm::Mat4Identity() : UpAxisTransform(*scene);
+    const bool gltfSource = sourceExtension==".glb" || sourceExtension==".gltf";
+    const xm::Mat4 axisTransform = gltfSource ? xm::Mat4Identity() : UpAxisTransform(*scene);
     result.skeletalIgnored = scene->HasAnimations();
     ExtractSkeleton(*scene, result);
     std::unordered_map<std::string, int> boneIndexByName;
@@ -863,6 +866,8 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
             vertex.position[1] = mesh->mVertices[vertexIndex].y;
             vertex.position[2] = mesh->mVertices[vertexIndex].z;
             ApplyPointTransform(axisTransform, vertex.position[0], vertex.position[1], vertex.position[2]);
+            if (gltfSource)
+                vertex.position[2] = -vertex.position[2];
 
             if (mesh->HasNormals())
             {
@@ -870,6 +875,8 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
                 vertex.normal[1] = mesh->mNormals[vertexIndex].y;
                 vertex.normal[2] = mesh->mNormals[vertexIndex].z;
                 ApplyVectorTransform(axisTransform, vertex.normal[0], vertex.normal[1], vertex.normal[2]);
+                if (gltfSource)
+                    vertex.normal[2] = -vertex.normal[2];
             }
             if (mesh->HasTextureCoords(0))
             {
@@ -883,9 +890,10 @@ AssimpImporter::ImportResult AssimpImporter::importFile(const std::filesystem::p
             const aiFace& face = mesh->mFaces[faceIndex];
             if (face.mNumIndices != 3)
                 continue;
-            outMesh.indices.push_back(face.mIndices[0]);
+            // FlipWindingOrder reversed each face; reversing again restores a glTF file's order.
+            outMesh.indices.push_back(face.mIndices[gltfSource ? 2 : 0]);
             outMesh.indices.push_back(face.mIndices[1]);
-            outMesh.indices.push_back(face.mIndices[2]);
+            outMesh.indices.push_back(face.mIndices[gltfSource ? 0 : 2]);
         }
         if (!outMesh.indices.empty())
         {

@@ -32,8 +32,9 @@ bool CreateGeometryAtlasAsset(AssetLibrary& library,const std::string& sourceGui
     for(unsigned k=0;k<scene.mNumMeshes;++k){const auto& source=imported.meshes[k];auto* mesh=new aiMesh;scene.mMeshes[k]=mesh;
         mesh->mName=aiString(source.name);mesh->mPrimitiveTypes=aiPrimitiveType_TRIANGLE;mesh->mMaterialIndex=std::min(source.materialIndex,scene.mNumMaterials-1);
         mesh->mNumVertices=static_cast<unsigned>(source.vertices.size());mesh->mVertices=new aiVector3D[mesh->mNumVertices];mesh->mNormals=new aiVector3D[mesh->mNumVertices];mesh->mTextureCoords[0]=new aiVector3D[mesh->mNumVertices];mesh->mNumUVComponents[0]=2;
-        // Assimp's glTF exporter handles the V convention on export.
-        for(unsigned v=0;v<mesh->mNumVertices;++v){const auto& vertex=source.vertices[v];mesh->mVertices[v]={vertex.position[0],vertex.position[1],vertex.position[2]};mesh->mNormals[v]={vertex.normal[0],vertex.normal[1],vertex.normal[2]};mesh->mTextureCoords[0][v]={vertex.uv[0],vertex.uv[1],0};}
+        // Imported geometry is already what the renderer draws, and the native glTF loader reads the
+        // file as written. Assimp's glTF exporter stores 1 - V, so V is flipped here to survive it.
+        for(unsigned v=0;v<mesh->mNumVertices;++v){const auto& vertex=source.vertices[v];mesh->mVertices[v]={vertex.position[0],vertex.position[1],vertex.position[2]};mesh->mNormals[v]={vertex.normal[0],vertex.normal[1],vertex.normal[2]};mesh->mTextureCoords[0][v]={vertex.uv[0],1-vertex.uv[1],0};}
         mesh->mNumFaces=static_cast<unsigned>(source.indices.size()/3);mesh->mFaces=new aiFace[mesh->mNumFaces];
         for(unsigned f=0;f<mesh->mNumFaces;++f){mesh->mFaces[f].mNumIndices=3;mesh->mFaces[f].mIndices=new unsigned[3]{source.indices[f*3],source.indices[f*3+1],source.indices[f*3+2]};}
         auto* node=new aiNode(source.name);node->mParent=scene.mRootNode;node->mNumMeshes=1;node->mMeshes=new unsigned[1]{k};scene.mRootNode->mChildren[k]=node;

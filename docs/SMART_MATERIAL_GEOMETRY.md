@@ -25,7 +25,14 @@ tracks its source GUID and retains default material GUIDs. Full source geometry 
 hashed before application so a concurrent source edit rejects the queued result.
 Standalone manual geometry baking continues to require a unique atlas. Tiny UV
 border roundoff (up to eight float epsilons) snaps only in rasterization, retaining
-the original source hash. glTF geometry uses Y-up to match the native renderer.
+the original source hash.
+
+Geometry tools bake the surface the static renderer draws. The renderer reads glTF
+files directly, so the importer returns a glTF's static geometry in the file's own
+Y-up, right-handed coordinates and authored winding; other formats keep the
+importer's converted space, which is what their renderer path draws. A derived UV
+model stores that drawn surface unchanged: the same positions, normals, winding and,
+on untouched submeshes, the same UVs.
 
 1. Open/create the material, for example **Templates > Smart Weathered Stone**.
 2. In **Material preview > Geometry Bake**, use **Select mesh...**, then choose
