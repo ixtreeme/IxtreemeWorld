@@ -59,7 +59,13 @@ derived models were mirrored along Z for glTF sources and stored a flipped V on
 untouched submeshes. Material-slot cases use a glTF whose primitives use materials
 out of order and share one: the slot selects the submeshes drawn with it, a shared
 slot bakes, saves and reopens as one surface, and reused UVs across a shared slot
-produce a derived model with that slot joined. The pinned MIT xatlas source and license are included under
+produce a derived model with that slot joined.
+
+`GeometryBakerTest` checks the typed failure reason of every rejection class (UV
+layout, other geometry, cancellation) and a sliver triangle kept through the
+automatic atlas. `MaterialGraphEditorTest` starts a second Bake & Apply while a
+cancelled atlas result is still unpolled; without the fix the stale result stops
+that request. The pinned MIT xatlas source and license are included under
 `Client/third_party/xatlas` for offline builds.
 
 No test currently reads graph shading back from the GPU. DXC compilation checks

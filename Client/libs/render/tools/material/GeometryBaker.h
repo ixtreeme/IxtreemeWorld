@@ -45,10 +45,14 @@ struct GeometryBakeControl {
     std::function<bool()> cancelled;
     std::function<void(float)> progress;
 };
+// Why a bake stopped. Only a UvLayout failure (reused, out-of-range or degenerate UVs) can be
+// repaired by generating a new atlas for the same surface.
+enum class GeometryBakeFailure { None, Cancelled, UvLayout, Other };
 std::uint64_t GeometryMeshHash(const GeometryMesh& mesh);
 // Failure/cancellation preserves result. Limits: 512 square, 1M vertices/triangles.
 bool BakeGeometry(const GeometryMesh& mesh, const GeometryBakeSettings& settings,
-                  GeometryBake& result, std::string& error, const GeometryBakeControl& control = {});
+                  GeometryBake& result, std::string& error, const GeometryBakeControl& control = {},
+                  GeometryBakeFailure* failure = nullptr);
 bool ValidateGeometryBake(const GeometryBake& bake, std::string& error);
 // Portable, bounded, checksummed little-endian v1 cache; failure preserves the destination.
 bool EncodeGeometryBake(const GeometryBake& bake, std::string& bytes, std::string& error);
@@ -62,13 +66,14 @@ public:
     bool Running() const { return running_.load(); }
     float Progress() const { return progress_.load(); }
     // Returns false until finished. A completed failure reports error and preserves result.
-    bool TakeResult(GeometryBake& result, std::string& error);
+    bool TakeResult(GeometryBake& result, std::string& error, GeometryBakeFailure* failure = nullptr);
 private:
     std::jthread worker_;
     std::atomic<bool> running_{false}, ready_{false};
     std::atomic<float> progress_{0};
     GeometryBake result_;
     std::string error_;
+    GeometryBakeFailure failure_ = GeometryBakeFailure::None;
     bool success_ = false;
 };
 }

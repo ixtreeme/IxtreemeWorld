@@ -23,6 +23,13 @@ switches only the captured scene instance to that model when material publicatio
 succeeds. Source model files and other instances remain unchanged. The derivative
 tracks its source GUID and retains default material GUIDs. Full source geometry is
 hashed before application so a concurrent source edit rejects the queued result.
+Repair starts only from a typed UV-layout failure of the bake (reused, out-of-range,
+collapsed or uncovered UVs), never from another geometry error or from the wording
+of a message. Triangles too thin for the unwrapper stay in the derived surface and
+get a UV triangle of their own between texel centres, so they are valid and never
+sampled. Zero-area triangles and triangles whose winding disagrees with their
+normals are still rejected with their own message; of the twenty Blackwater Hollow
+models only `Signpost.glb` slot 1 is refused for that reason.
 Standalone manual geometry baking continues to require a unique atlas. Tiny UV
 border roundoff (up to eight float epsilons) snaps only in rasterization, retaining
 the original source hash.

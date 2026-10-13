@@ -103,8 +103,9 @@ std::uint64_t GeometryMeshHash(const GeometryMesh& mesh) {
     for(const auto& v:mesh.vertices){for(float f:v.position)F32(bytes,f);for(float f:v.normal)F32(bytes,f);for(float f:v.uv)F32(bytes,f);}
     for(auto i:mesh.indices)U32(bytes,i);return Hash(bytes.data(),bytes.size());
 }
-bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,GeometryBake& result,std::string& error,const GeometryBakeControl& control) {
-    error.clear();const auto stop=[&] {if(control.cancelled && control.cancelled()){error="Geometry bake cancelled";return true;}return false;};
+namespace {
+bool BakeSurface(const GeometryMesh& mesh,const GeometryBakeSettings& settings,GeometryBake& result,std::string& error,const GeometryBakeControl& control,GeometryBakeFailure& failure) {
+    error.clear();const auto stop=[&] {if(control.cancelled && control.cancelled()){failure=GeometryBakeFailure::Cancelled;error="Geometry bake cancelled";return true;}return false;};
     const auto progress=[&](float v){if(control.progress)control.progress(v);};
     if(stop() || !SettingsValid(settings,error))return false;
     if(mesh.vertices.empty() || mesh.vertices.size()>1000000 || mesh.indices.empty() || mesh.indices.size()%3 || mesh.indices.size()>3000000) {error="Geometry bake requires an indexed triangle mesh (maximum 1M vertices/triangles)";return false;}
@@ -117,7 +118,7 @@ bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,
         if(i%1024==0 && stop())return false;const auto& v=mesh.vertices[i];
         if(!Finite(v.position) || !Finite(v.normal) || Dot(v.normal,v.normal)<1e-12f) {error="Geometry vertex "+std::to_string(i)+" has invalid position or normal";return false;}
         for(float uv:v.uv) if(!std::isfinite(uv) || uv < -UvBoundaryTolerance || uv > 1+UvBoundaryTolerance) {
-            error="Geometry vertex "+std::to_string(i)+" has UV ("+std::to_string(v.uv[0])+", "+std::to_string(v.uv[1])+") outside the 0..1 atlas; a non-overlapping bake UV layout is required";return false;
+            failure=GeometryBakeFailure::UvLayout;error="Geometry vertex "+std::to_string(i)+" has UV ("+std::to_string(v.uv[0])+", "+std::to_string(v.uv[1])+") outside the 0..1 atlas; a non-overlapping bake UV layout is required";return false;
         }
         const auto [it,inserted]=weld.emplace(v.position,static_cast<unsigned>(positions.size()));if(inserted)positions.push_back(v.position);welded[i]=it->second;
         world.push_back(Point(m,v.position));
@@ -134,7 +135,8 @@ bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,
         if(a>=mesh.vertices.size() || b>=mesh.vertices.size() || c>=mesh.vertices.size()){error="Geometry triangle index is out of range";return false;}
         const auto objectCross=Cross(Sub(mesh.vertices[b].position,mesh.vertices[a].position),Sub(mesh.vertices[c].position,mesh.vertices[a].position));
         const auto worldCross=Cross(Sub(world[b],world[a]),Sub(world[c],world[a]));
-        if(!Finite(objectCross) || !Finite(worldCross) || Dot(objectCross,objectCross)<1e-20f || Dot(worldCross,worldCross)<1e-20f || std::abs(Area(mesh.vertices[a].uv,mesh.vertices[b].uv,mesh.vertices[c].uv))<1e-12f){error="Geometry triangle has degenerate geometry or UVs";return false;}
+        if(!Finite(objectCross) || !Finite(worldCross) || Dot(objectCross,objectCross)<1e-20f || Dot(worldCross,worldCross)<1e-20f){error="Geometry triangle "+std::to_string(f)+" has no area; remove degenerate triangles from the mesh";return false;}
+        if(std::abs(Area(mesh.vertices[a].uv,mesh.vertices[b].uv,mesh.vertices[c].uv))<1e-12f){failure=GeometryBakeFailure::UvLayout;error="Geometry triangle "+std::to_string(f)+" has degenerate UVs";return false;}
         const auto objectNormal=Unit(objectCross);
         if(Dot(objectNormal,Add(Add(mesh.vertices[a].normal,mesh.vertices[b].normal),mesh.vertices[c].normal))<=0){error="Geometry triangle winding disagrees with its normals";return false;}
         triangles.push_back({world[a],world[b],world[c],Mul(Unit(worldCross),determinant<0?-1.0f:1.0f),objectNormal,Add(world[a],Mul(Add(Sub(world[b],world[a]),Sub(world[c],world[a])),1.0f/3))});
@@ -165,7 +167,7 @@ bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,
         // Only local raster coordinates are snapped; source mesh identity stays exact.
         for(auto* vertex:{&va,&vb,&vc})for(float& uv:vertex->uv)uv=std::clamp(uv,0.0f,1.0f);
         const float area=Area(va.uv,vb.uv,vc.uv);
-        if(std::abs(area)<1e-12f){error="Geometry triangle has degenerate UVs after boundary snapping";return false;}
+        if(std::abs(area)<1e-12f){failure=GeometryBakeFailure::UvLayout;error="Geometry triangle has degenerate UVs after boundary snapping";return false;}
         const int x0=std::max(0,static_cast<int>(std::ceil(std::min({va.uv[0],vb.uv[0],vc.uv[0]})*size-.5f))),x1=std::min(static_cast<int>(size)-1,static_cast<int>(std::floor(std::max({va.uv[0],vb.uv[0],vc.uv[0]})*size-.5f)));
         const int y0=std::max(0,static_cast<int>(std::ceil(std::min({va.uv[1],vb.uv[1],vc.uv[1]})*size-.5f))),y1=std::min(static_cast<int>(size)-1,static_cast<int>(std::floor(std::max({va.uv[1],vb.uv[1],vc.uv[1]})*size-.5f)));
         const float du1=vb.uv[0]-va.uv[0],dv1=vb.uv[1]-va.uv[1],du2=vc.uv[0]-va.uv[0],dv2=vc.uv[1]-va.uv[1];
@@ -177,7 +179,7 @@ bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,
             if(std::min({u,v,w})<-1e-6f)continue;const bool inside=std::min({u,v,w})>1e-6f;const size_t at=static_cast<size_t>(y)*size+x;
             if(draft.coverage[at]){if(interior[at] || inside){
                 const auto difference=Sub(Interpolate(va.position,vb.position,vc.position,u,v,w),draft.texels[at].objectPosition);
-                error="Geometry UV atlas overlaps at texel "+std::to_string(x)+","+std::to_string(y)+
+                failure=GeometryBakeFailure::UvLayout;error="Geometry UV atlas overlaps at texel "+std::to_string(x)+","+std::to_string(y)+
                     " between triangles "+std::to_string(owners[at])+" and "+std::to_string(f)+
                     " (surface distance "+std::to_string(std::sqrt(Dot(difference,difference)))+")";return false;
             }continue;}
@@ -189,7 +191,7 @@ bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,
             draft.coverage[at]=1;owners[at]=f;interior[at]=inside;++draft.coveredTexels;
         }}
     }
-    if(!draft.coveredTexels){error="Geometry UV atlas has no covered texels at this resolution";return false;}
+    if(!draft.coveredTexels){failure=GeometryBakeFailure::UvLayout;error="Geometry UV atlas has no covered texels at this resolution";return false;}
     if(stop())return false;progress(.3f);const Bvh bvh(triangles);
     unsigned finished=0;
     for(size_t at=0;at<count;++at)if(draft.coverage[at]) {
@@ -217,6 +219,11 @@ bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,
             const auto next=static_cast<unsigned>(ny)*size+nx;if(draft.coverage[next])continue;draft.coverage[next]=2;draft.texels[next]=draft.texels[at];depth[next]=depth[at]+1;queue.push_back(next);}
     }
     if(stop() || !ValidateGeometryBake(draft,error))return false;progress(1);result=std::move(draft);return true;
+}
+}
+bool BakeGeometry(const GeometryMesh& mesh,const GeometryBakeSettings& settings,GeometryBake& result,std::string& error,const GeometryBakeControl& control,GeometryBakeFailure* failure) {
+    auto reason=GeometryBakeFailure::Other;const bool baked=BakeSurface(mesh,settings,result,error,control,reason);
+    if(failure)*failure=baked?GeometryBakeFailure::None:reason;return baked;
 }
 bool GeometryBake::Sample(float u,float v,GeometryTexel& texel) const {
     const auto size=settings.resolution;
@@ -252,13 +259,13 @@ GeometryBakeJob::~GeometryBakeJob() {Cancel();if(worker_.joinable())worker_.join
 bool GeometryBakeJob::Start(GeometryMesh mesh,GeometryBakeSettings settings) {
     if(running_)return false;if(worker_.joinable())worker_.join();ready_=false;progress_=0;error_.clear();result_={};running_=true;
     worker_=std::jthread([this,mesh=std::move(mesh),settings](std::stop_token token){
-        try {success_=BakeGeometry(mesh,settings,result_,error_,{[&]{return token.stop_requested();},[&](float v){progress_=v;}});}
-        catch(const std::exception& e){success_=false;error_=std::string("Geometry bake failed: ")+e.what();}
+        try {success_=BakeGeometry(mesh,settings,result_,error_,{[&]{return token.stop_requested();},[&](float v){progress_=v;}},&failure_);}
+        catch(const std::exception& e){success_=false;failure_=GeometryBakeFailure::Other;error_=std::string("Geometry bake failed: ")+e.what();}
         ready_=true;running_=false;
     });return true;
 }
 void GeometryBakeJob::Cancel() {if(worker_.joinable())worker_.request_stop();}
-bool GeometryBakeJob::TakeResult(GeometryBake& result,std::string& error) {
-    if(!ready_.load() || running_.load())return false;if(worker_.joinable())worker_.join();ready_=false;error=error_;if(success_)result=std::move(result_);return true;
+bool GeometryBakeJob::TakeResult(GeometryBake& result,std::string& error,GeometryBakeFailure* failure) {
+    if(!ready_.load() || running_.load())return false;if(worker_.joinable())worker_.join();ready_=false;error=error_;if(failure)*failure=failure_;if(success_)result=std::move(result_);return true;
 }
 }

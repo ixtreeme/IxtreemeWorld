@@ -1,6 +1,7 @@
 #include "GeometryUvAtlas.h"
 #include <xatlas.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <memory>
 
@@ -36,9 +37,24 @@ bool GenerateGeometryUvAtlas(const GeometryMesh& mesh,unsigned resolution,Geomet
     if(output.vertexCount>1000000 || output.indexCount!=mesh.indices.size()){error="Automatic UV atlas exceeded mesh bounds";return false;}
     GeometryMesh draft;draft.vertices.reserve(output.vertexCount);draft.indices.assign(output.indexArray,output.indexArray+output.indexCount);
     for(std::uint32_t index=0;index<output.vertexCount;++index){const auto& v=output.vertexArray[index];
-        if(v.atlasIndex!=0 || v.xref>=mesh.vertices.size()){error="Automatic UV atlas contains an unmapped face";return false;}
+        if(v.atlasIndex>0 || v.xref>=mesh.vertices.size()){error="Automatic UV atlas requires a single valid texture page";return false;}
         auto vertex=mesh.vertices[v.xref];vertex.uv={v.uv[0]/atlas->width,v.uv[1]/atlas->height};draft.vertices.push_back(vertex);
     }
+    // xatlas leaves sliver triangles too small to unwrap without a chart. They keep their place in
+    // the surface and get a UV triangle of their own that lies between texel centres at every bake
+    // resolution, so it is valid, never sampled and cannot overlap a chart.
+    constexpr float Sliver=.4f/512;
+    for(std::size_t face=0;face+2<draft.indices.size();face+=3) {
+        bool charted=true;for(unsigned corner=0;corner<3;++corner)charted=charted && draft.indices[face+corner]<output.vertexCount && output.vertexArray[draft.indices[face+corner]].atlasIndex==0;
+        if(charted)continue;
+        const std::array<std::array<float,2>,3> corners{{{0,0},{Sliver,0},{0,Sliver}}};
+        for(unsigned corner=0;corner<3;++corner) {
+            if(draft.indices[face+corner]>=output.vertexCount){error="Automatic UV atlas returned an invalid face";return false;}
+            auto vertex=draft.vertices[draft.indices[face+corner]];vertex.uv=corners[corner];
+            draft.indices[face+corner]=static_cast<std::uint32_t>(draft.vertices.size());draft.vertices.push_back(vertex);
+        }
+    }
+    if(draft.vertices.size()>1000000){error="Automatic UV atlas exceeded mesh bounds";return false;}
     result=std::move(draft);return true;
 }
 GeometryUvAtlasJob::~GeometryUvAtlasJob(){Cancel();if(worker_.joinable())worker_.join();}

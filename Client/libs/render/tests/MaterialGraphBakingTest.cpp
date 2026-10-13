@@ -202,8 +202,9 @@ int main(int argc, char** argv) {
             const auto count=geometry.MeshCount();
             for(unsigned index=0;index<count;++index) {
                 GeometryBake bake;GeometryBakeSettings settings;settings.resolution=128;
-                bool baked=geometry.Select(copied,index,error) && BakeGeometry(*geometry.Mesh(),settings,bake,error);
-                if(!baked && error.find("UV")!=std::string::npos) {
+                auto failure=GeometryBakeFailure::None;
+                bool baked=geometry.Select(copied,index,error) && BakeGeometry(*geometry.Mesh(),settings,bake,error,{},&failure);
+                if(!baked && failure==GeometryBakeFailure::UvLayout) {
                     std::cout<<"Submesh "<<index<<" needs UV repair: "<<error<<'\n';
                     GeometryMesh atlas;AssetLibrary::Entry model;
                     baked=GenerateGeometryUvAtlas(*geometry.Mesh(),128,atlas,error) &&

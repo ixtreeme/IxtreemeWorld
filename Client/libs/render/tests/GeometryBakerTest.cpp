@@ -86,6 +86,25 @@ int main(int argc,char**) {
     invalid=geometry_fixtures::Plane();invalid.indices.insert(invalid.indices.end(),{0,1,2});Check(!BakeGeometry(invalid,settings,plane,error),"nonmanifold topology rejected");
     invalid=geometry_fixtures::Plane();auto duplicate=invalid;for(auto& v:duplicate.vertices)v.position[1]+=2;invalid.vertices.insert(invalid.vertices.end(),duplicate.vertices.begin(),duplicate.vertices.end());for(auto i:duplicate.indices)invalid.indices.push_back(i+4);Check(!BakeGeometry(invalid,settings,plane,error) && error.find("overlap")!=std::string::npos,"UV overlap rejected");
     unsigned calls=0;Check(!BakeGeometry(geometry_fixtures::Box(),settings,plane,error,{[&]{return ++calls>2;},{}}) && plane.meshHash==oldHash,"mid-bake cancellation is transactional");
+    // A valid triangle too thin for xatlas to unwrap stays in the surface with an unsampled UV triangle.
+    auto thin=repeated;const auto thinFirst=static_cast<std::uint32_t>(thin.vertices.size());
+    thin.vertices.push_back({{0,0,0},{0,1,0},{0,0}});thin.vertices.push_back({{0,0,1},{0,1,0},{0,1}});thin.vertices.push_back({{2e-9f,0,.5f},{0,1,0},{1,1}});
+    thin.indices.insert(thin.indices.end(),{thinFirst,thinFirst+1,thinFirst+2});
+    GeometryMesh thinAtlas;GeometryBake thinBake;auto thinSettings=settings;thinSettings.resolution=128;
+    Check(GenerateGeometryUvAtlas(thin,128,thinAtlas,error) && thinAtlas.indices.size()==thin.indices.size() && geometry_fixtures::SameSurface(thinAtlas,thin,false,0),
+          "automatic atlas keeps a sliver triangle in the surface: "+error);
+    Check(std::count_if(thinAtlas.vertices.begin(),thinAtlas.vertices.end(),[](const GeometryVertex& v){return v.uv[0]+v.uv[1]<.001f;})>=3,"sliver triangle gets its own unsampled UVs");
+    Check(BakeGeometry(thinAtlas,thinSettings,thinBake,error),"automatic atlas with a sliver triangle bakes: "+error);
+    // Only a UV-layout failure may be repaired with a generated atlas.
+    const auto reason=[&](const GeometryMesh& mesh,const GeometryBakeControl& control={}){GeometryBake scratch;auto failure=GeometryBakeFailure::None;BakeGeometry(mesh,settings,scratch,error,control,&failure);return failure;};
+    Check(reason(geometry_fixtures::Plane())==GeometryBakeFailure::None,"successful bake reports no failure");
+    Check(reason(repeated)==GeometryBakeFailure::UvLayout,"reused UVs report a repairable UV layout");
+    invalid=geometry_fixtures::Plane();invalid.vertices[0].uv[0]=-1;Check(reason(invalid)==GeometryBakeFailure::UvLayout,"out-of-range UVs report a repairable UV layout");
+    invalid=geometry_fixtures::Plane();for(auto& v:invalid.vertices)v.uv={.5f,.5f};Check(reason(invalid)==GeometryBakeFailure::UvLayout,"collapsed UVs report a repairable UV layout");
+    invalid=geometry_fixtures::Plane();invalid.vertices[1].position=invalid.vertices[0].position;
+    Check(reason(invalid)==GeometryBakeFailure::Other && error.find("no area")!=std::string::npos,"zero-area triangles are not mistaken for a UV problem");
+    invalid=geometry_fixtures::Plane();invalid.indices[0]=999;Check(reason(invalid)==GeometryBakeFailure::Other,"invalid indices are not a UV problem");
+    Check(reason(geometry_fixtures::Box(),{[]{return true;},{}})==GeometryBakeFailure::Cancelled,"cancellation reports its own reason");
     std::string bytes,again;GeometryBake decoded;
     Check(EncodeGeometryBake(box,bytes,error) && DecodeGeometryBake(bytes,decoded,error) && EncodeGeometryBake(decoded,again,error) && bytes==again,"portable exact cache roundtrip");
     bytes[150]^=1;Check(!DecodeGeometryBake(bytes,decoded,error) && decoded.meshHash==box.meshHash,"corrupt cache preserves valid destination");
@@ -112,7 +131,8 @@ int main(int argc,char**) {
     Check(job.TakeResult(decoded,error) && error.empty() && decoded.meshHash==oldHash && Near(job.Progress(),1),"async production completion");
     settings.resolution=512;settings.aoSamples=128;Check(job.Start(geometry_fixtures::Corner(),settings),"cancel job starts");job.Cancel();
     while(job.Running() && std::chrono::steady_clock::now()<deadline)std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    Check(job.TakeResult(decoded,error) && error.find("cancelled")!=std::string::npos && decoded.meshHash==oldHash,"async cancellation preserves result");
+    auto jobFailure=GeometryBakeFailure::None;
+    Check(job.TakeResult(decoded,error,&jobFailure) && jobFailure==GeometryBakeFailure::Cancelled && error.find("cancelled")!=std::string::npos && decoded.meshHash==oldHash,"async cancellation preserves result and reports its reason");
     if(argc>1){settings.resolution=256;settings.aoSamples=32;const auto start=std::chrono::steady_clock::now();Check(BakeGeometry(geometry_fixtures::Box(),settings,repeat,error),"benchmark box");std::cout<<"box 12 triangles, 256x256, 32 AO samples: "<<std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count()<<" ms; covered="<<repeat.coveredTexels<<"\n";}
     return failures?1:0;
 }

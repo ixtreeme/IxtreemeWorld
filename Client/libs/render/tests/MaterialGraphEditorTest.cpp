@@ -84,6 +84,7 @@ struct MaterialGraphPanelTestAccess
     static void ApplyQuality(MaterialGraphPanel& panel) { panel.applyResolution_=0; }
     static void Poll(MaterialGraphPanel& panel) { panel.PollGeometryBake(); }
     static bool Running(const MaterialGraphPanel& panel) { return panel.geometryJob_.Running() || panel.uvAtlasJob_.Running(); }
+    static bool AtlasStarted(const MaterialGraphPanel& panel) { return panel.applyRequest_ && panel.applyRequest_->atlasAttempted; }
     static const MaterialCompileResult& Layout(const MaterialGraphPanel& panel) {return panel.program_.Layout();}
     static void NumericOverride(MaterialGraphPanel& panel,const std::string& name,float value) {panel.parameters_.values[name]={value,0,0,0};panel.previewDirty_=true;}
 };
@@ -435,6 +436,20 @@ void Editor(bool capture)
             Check(!ApplySmartMaterialAssignment(stale,*atlasAssignment,error) && stale.meshAssetPath==reusedTarget.meshAssetPath && stale.materialSlots[0]=="old-material",
                   "changed original source rejects a queued UV derivative without changing the model or slot");
         }
+        // A cancelled atlas job that finishes before it is polled must not reach the next request.
+        geometry_fixtures::WriteObj(reusedFile,reused);
+        applyPanel.SetApplyTarget(reusedTarget,reusedFile,true);Check(applyPanel.BakeAndApply(),"quick apply restarts on the reused UV mesh");
+        const auto staleDeadline=std::chrono::steady_clock::now()+std::chrono::seconds(10);
+        while(!MaterialGraphPanelTestAccess::AtlasStarted(applyPanel) && std::chrono::steady_clock::now()<staleDeadline){MaterialGraphPanelTestAccess::Poll(applyPanel);std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+        const bool atlasStarted=MaterialGraphPanelTestAccess::AtlasStarted(applyPanel);
+        applyPanel.CancelBakeAndApply();
+        while(MaterialGraphPanelTestAccess::Running(applyPanel) && std::chrono::steady_clock::now()<staleDeadline)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        applyPanel.SetApplyTarget(target,meshFile,true);
+        Check(atlasStarted && applyPanel.BakeAndApply(),"a new quick apply starts while a cancelled atlas result is still unpolled");
+        std::optional<SmartMaterialAssignment> afterStale;
+        while(!afterStale && std::chrono::steady_clock::now()<staleDeadline){MaterialGraphPanelTestAccess::Poll(applyPanel);afterStale=applyPanel.TakeMaterialAssignment();std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+        Check(afterStale && afterStale->entityId==target.id && afterStale->replacementModelGuid.empty(),
+              "an unpolled cancelled atlas result cannot stop or redirect the next quick apply");
         const auto validGeometryPixels=MaterialGraphPanelTestAccess::Pixels(panel);
         SaveMaterialTextAtomic(cacheFile,"broken geometry",error);frame();frame();
         Check(!MaterialGraphPanelTestAccess::Error(panel).empty() && MaterialGraphPanelTestAccess::Pixels(panel)==validGeometryPixels,"invalid geometry keeps the last valid real-mesh preview");

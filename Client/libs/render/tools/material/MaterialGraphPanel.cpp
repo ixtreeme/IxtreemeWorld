@@ -799,6 +799,8 @@ bool MaterialGraphPanel::BakeAndApply()
     if (subgraphMode_) { status_ = "Open a full smart material with a PBR Output; generator recipes supply layer masks."; return false; }
     if (geometryJob_.Running() || uvAtlasJob_.Running() || applyRequest_ || materialAssignment_)
     { status_ = "Finish or cancel the current Bake & Apply first."; return false; }
+    // A cancelled atlas job can finish before it is polled; its result must not reach this request.
+    { GeometryMesh stale; std::string staleError; uvAtlasJob_.TakeResult(stale,staleError); }
     MaterialGraphProgram checked;
     if (!CompileMaterial(checked,status_) || !checked.ValidateOverrides(parameters_,status_)) return false;
     GraphGeometryCache selected;
@@ -934,10 +936,10 @@ void MaterialGraphPanel::PollGeometryBake() {
         if(!geometryJob_.Start(*geometry_.Mesh(),geometrySettings_)){status_="Cannot start automatic atlas bake";applyRequest_.reset();return;}
         status_="Automatic UV model ready; baking material geometry...";return;
     }
-    GeometryBake completed;std::string error;
-    if(!geometryJob_.TakeResult(completed,error))return;
+    GeometryBake completed;std::string error;auto failure=GeometryBakeFailure::None;
+    if(!geometryJob_.TakeResult(completed,error,&failure))return;
     if(!error.empty()){
-        if(applyRequest_ && !applyRequest_->atlasAttempted && error.find("UV")!=std::string::npos) {
+        if(applyRequest_ && !applyRequest_->atlasAttempted && failure==GeometryBakeFailure::UvLayout) {
             geometry_.Refresh(true);applyRequest_->atlasAttempted=true;
             if(geometry_.Mesh() && uvAtlasJob_.Start(*geometry_.Mesh(),geometrySettings_.resolution)) {status_="Preparing automatic UV atlas for this model...";return;}
         }
