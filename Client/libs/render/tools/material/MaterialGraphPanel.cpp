@@ -1,5 +1,6 @@
 #include "MaterialGraphPanel.h"
 #include "MaterialGraphIO.h"
+#include "asset/MaterialAssetManager.h"
 #include "MaterialInstance.h"
 #include "GeometryAtlasAssets.h"
 #include "asset/AssetDatabase.h"
@@ -264,6 +265,7 @@ void MaterialGraphPanel::SyncPositions()
 void MaterialGraphPanel::RenderView(bool& open)
 {
     PollGeometryBake();
+    UpdateLiveMaterial();
     if (!open) return;
     ImGui::SetNextWindowSize({900, 600}, ImGuiCond_FirstUseEver);
     if (!ImGui::Begin(WindowName, &open, ImGuiWindowFlags_NoCollapse)) { ImGui::End(); return; }
@@ -755,6 +757,7 @@ void MaterialGraphPanel::RenderInstanceParameters()
 void MaterialGraphPanel::UpdatePreview()
 {
     PollGeometryBake();
+    UpdateLiveMaterial();
     if(geometry_.Refresh())previewDirty_=true;
     const auto revision=library_?library_->Revision():0;
     if(revision!=libraryRevision_){libraryRevision_=revision;textures_.Clear();previewDirty_=true;}
@@ -836,9 +839,64 @@ void MaterialGraphPanel::DiscardApplyRequest()
     if (!path || !geometry_.SelectMaterialSlot(*path,slot,ignored)) geometry_.Clear();
     previewDirty_=true;
 }
+void MaterialGraphPanel::LinkLiveMaterial(const AssetLibrary::Entry& material, const MaterialGraphDocument& document)
+{
+    live_.reset();
+    const auto guid=Guid::fromString(material.guid);
+    const auto* asset=guid?MaterialAssetManager::Instance().getOrLoad(*guid):nullptr;
+    if(!asset || asset->graphShader.empty())return;
+    LiveMaterial link;
+    link.guid=material.guid;link.name=material.displayName;link.document=document;
+    link.package=asset->path.parent_path()/std::filesystem::path(std::u8string(asset->graphShader.begin(),asset->graphShader.end()));
+    std::string bytes,error;MaterialGraphProgram program;
+    subgraphs_.BeginCompilation();const bool compiled=program.Compile(document,error,0,subgraphs_.Resolver());subgraphs_.FinishCompilation();
+    if(!compiled || !LoadMaterialText(link.package,bytes,error) || !DecodeGraphShaderPackage(bytes,link.data,error))return;
+    link.parameters=program.Layout().parameterBufferBytes/sizeof(Float4);
+    if(link.parameters>link.data.uniforms.size())return;
+    link.checkedDocument=document_;link.checkedParameters=parameters_;
+    GraphLiveValues::Instance().Clear(link.guid);
+    live_=std::move(link);
+}
+namespace {
+// The same graph apart from numeric parameter values: its compiled shader still fits.
+bool SameShaderStructure(MaterialGraphDocument a,MaterialGraphDocument b)
+{
+    for(auto* document:{&a,&b})for(auto& node:document->nodes)
+        if(node.kind==NodeKind::ScalarParameter || node.kind==NodeKind::ColorParameter || node.kind==NodeKind::Vector2Parameter || node.kind==NodeKind::Vector3Parameter)node.value={};
+    return SameEvaluationGraph(a,b);
+}
+}
+void MaterialGraphPanel::UpdateLiveMaterial(bool persistNow)
+{
+    if(!live_)return;
+    auto& link=*live_;
+    if(link.checkedDocument!=document_ || link.checkedParameters!=parameters_) {
+        link.checkedDocument=document_;link.checkedParameters=parameters_;
+        link.structureChanged=!SameShaderStructure(document_,link.document);
+        MaterialGraphProgram program;std::string error;std::vector<Float4> parameters;
+        bool compiled=false;
+        if(!link.structureChanged){subgraphs_.BeginCompilation();compiled=program.Compile(document_,error,0,subgraphs_.Resolver());subgraphs_.FinishCompilation();}
+        if(compiled && program.BuildParameterBuffer(parameters_,parameters,error) &&
+           parameters.size()==link.parameters && !std::equal(parameters.begin(),parameters.end(),link.data.uniforms.begin())) {
+            std::copy(parameters.begin(),parameters.end(),link.data.uniforms.begin());
+            GraphLiveValues::Instance().Set(link.guid,link.data.uniforms);
+            link.unsaved=true;link.changed=std::chrono::steady_clock::now();
+        }
+    }
+    // Saved once the values settle, so a dragged slider writes the file once, not every frame.
+    if(link.unsaved && (persistNow || std::chrono::steady_clock::now()-link.changed>std::chrono::milliseconds(400))) {
+        std::string bytes,error;
+        if(EncodeGraphShaderPackage(link.data,bytes,error) && SaveMaterialTextAtomic(link.package,bytes,error))link.unsaved=false;
+        else status_="Cannot save live material values: "+error;
+    }
+}
 void MaterialGraphPanel::RenderApplyMaterial()
 {
     ImGui::SeparatorText("Apply to model");
+    if(live_) {
+        if(live_->structureChanged)ImGui::TextColored(ImVec4(1,.75f,.3f,1),"%s: the graph changed. Bake & Apply again to update the scene.",live_->name.c_str());
+        else ImGui::TextWrapped("Live in the scene: %s. Parameter changes show at once.",live_->name.c_str());
+    }
     if (applyTarget_.selected) ImGui::Text("%s / Material Slot %u",applyTarget_.name.c_str(),applyTarget_.selectedMaterialSlot+1);
     else ImGui::TextDisabled("Select a model in Hierarchy.");
     if (applyTarget_.selected && (applyTarget_.skinned || applyModelPath_.empty())) ImGui::TextDisabled("An imported static model is required.");
@@ -912,8 +970,10 @@ void MaterialGraphPanel::BakeMaterial()
     if(geometryPreview_ && (!geometry_.Bake() || geometry_.BakeGuid().empty())){status_="Save a valid Geometry Bake cache before publishing a mesh material";return;}
     const auto* geometry=geometryPreview_?geometry_.Bake():nullptr;
     std::string runtimeNotice;
-    if(PublishBakedMaterial(*library_,document_,parameters_,geometry?geometry->settings.resolution:256U<<bakeResolution_,bakeName_,result,error,path_.parent_path(),geometry,geometryPreview_?geometry_.BakeGuid():"",nullptr,&runtimeNotice))
+    if(PublishBakedMaterial(*library_,document_,parameters_,geometry?geometry->settings.resolution:256U<<bakeResolution_,bakeName_,result,error,path_.parent_path(),geometry,geometryPreview_?geometry_.BakeGuid():"",nullptr,&runtimeNotice)) {
         status_="Baked material: "+result.displayName+" in Materials/GraphBakes"+(runtimeNotice.empty()?std::string(" (live graph shader)"):". "+runtimeNotice);
+        if(runtimeNotice.empty())LinkLiveMaterial(result,document_);
+    }
     else status_=error;
 }
 bool MaterialGraphPanel::SelectGeometryMesh(const std::filesystem::path& path,unsigned index) {
@@ -969,6 +1029,7 @@ void MaterialGraphPanel::PollGeometryBake() {
         geometry_.Refresh(true);
         if (!geometry_.Bake()) { status_="Model changed during material baking; output remains in Asset Browser. Bake & Apply again."; return; }
         request.target.materialGuid=material.guid;materialAssignment_=std::move(request.target);
+        if(runtimeNotice.empty())LinkLiveMaterial(material,request.document);
         geometryPreview_=true;previewDirty_=true;
         status_=runtimeNotice.empty()?"Baked material with live graph shader ready; assigning it to the model.":"Baked material ready; assigning it to the model. "+runtimeNotice;return;
     }
@@ -976,6 +1037,7 @@ void MaterialGraphPanel::PollGeometryBake() {
 }
 void MaterialGraphPanel::RenderGeometryBake() {
     PollGeometryBake();
+    UpdateLiveMaterial();
     if(!ImGui::CollapsingHeader("Geometry Bake"))return;
     const bool running=geometryJob_.Running() || uvAtlasJob_.Running();
     ImGui::BeginDisabled(running);

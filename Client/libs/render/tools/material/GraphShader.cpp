@@ -243,6 +243,30 @@ float4 PSMain(VSOutput input) : SV_Target0
     return h.str();
 }
 
+GraphLiveValues& GraphLiveValues::Instance()
+{
+    static GraphLiveValues instance;
+    return instance;
+}
+void GraphLiveValues::Set(const std::string& materialGuid, std::vector<Float4> uniforms)
+{
+    std::lock_guard lock(mutex_);
+    values_[materialGuid] = {next_++, std::move(uniforms)};
+}
+void GraphLiveValues::Clear(const std::string& materialGuid)
+{
+    std::lock_guard lock(mutex_);
+    values_.erase(materialGuid);
+}
+std::uint64_t GraphLiveValues::Get(const std::string& materialGuid, std::uint64_t known, std::vector<Float4>& uniforms) const
+{
+    std::lock_guard lock(mutex_);
+    const auto it = values_.find(materialGuid);
+    if (it == values_.end()) return 0;
+    if (it->second.first != known) uniforms = it->second.second;
+    return it->second.first;
+}
+
 std::filesystem::path FindShaderCompiler()
 {
     std::error_code ec;

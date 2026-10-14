@@ -5,6 +5,8 @@
 #include "GeometryAssets.h"
 #include "SmartMaterialApplication.h"
 #include "GeometryUvAtlas.h"
+#include "GraphShader.h"
+#include <chrono>
 #include "EditorGraphicsBridge.h"
 #include <filesystem>
 #include <optional>
@@ -95,6 +97,24 @@ private:
     GeometryUvAtlasJob uvAtlasJob_;
     // Ends the pending Bake & Apply; an automatic UV model without its material is removed.
     void DiscardApplyRequest();
+    // The material last published from this panel with a compiled graph shader. Parameter edits reach
+    // it in the scene at once (GraphLiveValues) and are written into its package shortly after; a
+    // change to the graph itself needs a new Bake & Apply.
+    struct LiveMaterial
+    {
+        std::string guid, name;
+        std::filesystem::path package;
+        MaterialGraphDocument document; // the authored graph it was compiled from
+        GraphShaderPackage data;
+        std::size_t parameters = 0;     // leading float4s of the uniform block
+        MaterialGraphDocument checkedDocument;
+        ParameterOverrides checkedParameters;
+        bool structureChanged = false, unsaved = false;
+        std::chrono::steady_clock::time_point changed{};
+    };
+    std::optional<LiveMaterial> live_;
+    void LinkLiveMaterial(const AssetLibrary::Entry& material, const MaterialGraphDocument& document);
+    void UpdateLiveMaterial(bool persistNow = false);
     GeometryBakeSettings geometrySettings_;
     struct ApplyRequest {
         SmartMaterialAssignment target;

@@ -85,6 +85,11 @@ struct MaterialGraphPanelTestAccess
     static void Poll(MaterialGraphPanel& panel) { panel.PollGeometryBake(); }
     static bool Running(const MaterialGraphPanel& panel) { return panel.geometryJob_.Running() || panel.uvAtlasJob_.Running(); }
     static bool AtlasStarted(const MaterialGraphPanel& panel) { return panel.applyRequest_ && panel.applyRequest_->atlasAttempted; }
+    static void SetDocument(MaterialGraphPanel& panel, const MaterialGraphDocument& document) { panel.document_ = document; }
+    static std::string LiveGuid(const MaterialGraphPanel& panel) { return panel.live_ ? panel.live_->guid : std::string{}; }
+    static bool LiveStructureChanged(const MaterialGraphPanel& panel) { return panel.live_ && panel.live_->structureChanged; }
+    static std::filesystem::path LivePackage(const MaterialGraphPanel& panel) { return panel.live_ ? panel.live_->package : std::filesystem::path{}; }
+    static void UpdateLive(MaterialGraphPanel& panel, bool persist) { panel.UpdateLiveMaterial(persist); }
     static std::string DerivedModel(const MaterialGraphPanel& panel) { return panel.applyRequest_ ? panel.applyRequest_->target.replacementModelGuid : std::string{}; }
     static const std::string& GeometryModel(const MaterialGraphPanel& panel) { return panel.geometry_.MeshGuid(); }
     static const MaterialCompileResult& Layout(const MaterialGraphPanel& panel) {return panel.program_.Layout();}
@@ -398,6 +403,38 @@ void Editor(bool capture)
             Check(materialPath && LoadMaterialText(materialPath->parent_path()/"source.materialgraph",text,error) && effective.FromJson(text,error) &&
                   std::any_of(effective.nodes.begin(),effective.nodes.end(),[&](const auto& n){return n.parameter==parameter && n.value[0]==.42f;}),
                   "quick apply retains the captured scoped instance override");
+            // Live editing: parameter values reach the published graph shader without a new bake.
+            const auto liveGuid=MaterialGraphPanelTestAccess::LiveGuid(applyPanel);
+            std::error_code compilerError;
+            if(!std::filesystem::is_regular_file(FindShaderCompiler(),compilerError))std::cout<<"SKIP no shader compiler: no live graph material\n";
+            else {
+                Check(liveGuid==applied->materialGuid,"quick apply links its published graph shader for live editing");
+                MaterialGraphPanelTestAccess::SetDocument(applyPanel,requestedDocument);
+                MaterialGraphPanelTestAccess::UpdateLive(applyPanel,false);
+                std::vector<Float4> before;
+                Check(!MaterialGraphPanelTestAccess::LiveStructureChanged(applyPanel) && GraphLiveValues::Instance().Get(liveGuid,0,before)==0,
+                      "the published graph is live and unchanged before any edit");
+                std::string packageBytes;GraphShaderPackage published;
+                const bool readPublished=LoadMaterialText(MaterialGraphPanelTestAccess::LivePackage(applyPanel),packageBytes,error) && DecodeGraphShaderPackage(packageBytes,published,error);
+                MaterialGraphPanelTestAccess::NumericOverride(applyPanel,parameter,.9f);
+                MaterialGraphPanelTestAccess::UpdateLive(applyPanel,true);
+                std::vector<Float4> liveValues;const auto revision=GraphLiveValues::Instance().Get(liveGuid,0,liveValues);
+                std::size_t changed=0;bool changedToNew=false;
+                for(std::size_t i=0;readPublished && i<liveValues.size() && i<published.uniforms.size();++i)
+                    if(liveValues[i]!=published.uniforms[i]){++changed;changedToNew=std::abs(liveValues[i][0]-.9f)<1e-6f;}
+                Check(revision!=0 && liveValues.size()==published.uniforms.size() && changed==1 && changedToNew,
+                      "a parameter edit pushes exactly its uniform to the scene without recompiling");
+                GraphShaderPackage saved;
+                Check(LoadMaterialText(MaterialGraphPanelTestAccess::LivePackage(applyPanel),packageBytes,error) && DecodeGraphShaderPackage(packageBytes,saved,error) &&
+                      saved.uniforms==liveValues && saved.opaqueSpirv==published.opaqueSpirv,
+                      "the live value is saved into the package with its shader unchanged");
+                MaterialGraphPanelTestAccess::DisableLayer(applyPanel);
+                MaterialGraphPanelTestAccess::NumericOverride(applyPanel,parameter,.1f);
+                MaterialGraphPanelTestAccess::UpdateLive(applyPanel,true);
+                std::vector<Float4> ignored;
+                Check(MaterialGraphPanelTestAccess::LiveStructureChanged(applyPanel) && GraphLiveValues::Instance().Get(liveGuid,revision,ignored)==revision,
+                      "a changed graph is not pushed into the old shader and asks for a new Bake & Apply");
+            }
             const auto bakedGuid=materialPath?AssetDatabase::Instance().resolvePath(materialPath->parent_path()/"geometry.ixgeometrybake"):std::nullopt;
             GraphGeometryCache appliedGeometry;
             Check(bakedGuid && appliedGeometry.Bind(bakedGuid->toString(),error) &&

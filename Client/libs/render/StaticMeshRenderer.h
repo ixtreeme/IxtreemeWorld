@@ -405,6 +405,7 @@ private:
         std::filesystem::file_time_type stamp{};
         std::uintmax_t bytes = 0;
         std::uint64_t materialRevision = 0;
+        std::uint64_t liveRevision = 0;  // GraphLiveValues applied to values
         bool failed = false;
         std::unique_ptr<ixrhi::IXRHIBindGroupLayout> layout;
         std::unique_ptr<ixrhi::IXRHIBindGroup> group;  // one set per frame in flight

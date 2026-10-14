@@ -212,11 +212,17 @@ struct GraphMaterialRenderTestAccess
             Check(!renderer.m_lastMaterialBindings.empty() && renderer.m_lastMaterialBindings[0].pipelineName == "StaticMesh:GraphOpaque",
                   "the opaque draw uses the graph pipeline");
 
-            // Live value change: a new uniform block reaches the next frame without recompiling.
-            auto* live = renderer.m_graphMaterials[graphMaterial].get();
-            if (live) live->values[0] = {1.0f, 0.0f, 0.0f, 1.0f};
-            Check(live && render(graphMaterial, pixel) && Near(pixel, {0.5f + 128 / 255.0f, 32 / 255.0f, 200 / 255.0f}),
-                  "a changed parameter value is drawn by the next frame");
+            // Live value change from an editor: a new uniform block reaches the next frame without recompiling.
+            auto liveValues = package.uniforms;
+            liveValues[0] = {1.0f, 0.0f, 0.0f, 1.0f};
+            GraphLiveValues::Instance().Set(graphMaterial, liveValues);
+            Check(render(graphMaterial, pixel) && Near(pixel, {0.5f + 128 / 255.0f, 32 / 255.0f, 200 / 255.0f}),
+                  "a live parameter value is drawn by the next frame");
+            auto wrongSize = liveValues; wrongSize.push_back({});
+            GraphLiveValues::Instance().Set(graphMaterial, wrongSize);
+            Check(render(graphMaterial, pixel) && Near(pixel, {0.5f + 128 / 255.0f, 32 / 255.0f, 200 / 255.0f}),
+                  "live values that do not fit the loaded shader are ignored");
+            GraphLiveValues::Instance().Set(graphMaterial, liveValues);
 
             // A material without a graph keeps the baked path: white default texture lit by ambient.
             Check(render(plainMaterial, pixel) && Near(pixel, {0.5f, 0.5f, 0.5f}) &&
@@ -231,6 +237,7 @@ struct GraphMaterialRenderTestAccess
                   "a failed reload keeps drawing with the last working graph shader");
 
             // A fixed package replaces it, without stopping frames in flight.
+            GraphLiveValues::Instance().Clear(graphMaterial);  // a new publication starts without live edits
             package.uniforms[0] = {0.0f, 0.5f, 0.0f, 1.0f};
             Check(EncodeGraphShaderPackage(package, bytes, error) && WriteFile(root / "Graph" / "graph.ixgraphshader", bytes), "package is republished");
             MaterialAssetManager::Instance().markChanged();

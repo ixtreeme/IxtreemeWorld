@@ -3363,6 +3363,15 @@ StaticMeshRenderer::GraphMaterial* StaticMeshRenderer::EnsureGraphMaterial(ixrhi
     GraphMaterial& graph = *entry;
     if (!graph.opaque || !graph.mask || !graph.maskOnDepth || !graph.blend[0] || !graph.blend[1])
         return nullptr;
+    // Parameter values an editor is changing right now (same layout only).
+    std::vector<std::array<float, 4>> live;
+    if (const auto revision = material_tool::GraphLiveValues::Instance().Get(material.guid.toString(), graph.liveRevision, live);
+        revision != graph.liveRevision)
+    {
+        if (live.size() == graph.values.size())
+            graph.values = std::move(live);
+        graph.liveRevision = revision;
+    }
     graph.resident.clear();
     for (const auto& [binding, guid] : graph.textures)
     {
