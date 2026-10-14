@@ -129,6 +129,7 @@ private:
     void LinkLiveMaterial(const AssetLibrary::Entry& material, const MaterialGraphDocument& document,
                           const ParameterOverrides& parameters, const std::filesystem::path& graphFolder);
     void UpdateLiveMaterial(bool persistNow = false);
+    bool animatePreview_ = false;
     GeometryBakeSettings geometrySettings_;
     struct ApplyRequest {
         SmartMaterialAssignment target;

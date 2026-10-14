@@ -113,4 +113,46 @@ void Shaders() {
     }
 }
 }
-int main(){Numbers();SpatialAndTextures();LayersAndBaking();DeepGraph();Shaders();std::cout<<"Material graph compiler failures: "<<failures<<'\n';return failures?1:0;}
+// Time, Scene Depth and Sky Reflection read the scene a live material is drawn in; without one they
+// use stand-ins. Noise Normal is the noise's slope as a tangent-space normal.
+void SceneNodes() {
+    Fixture time(NodeKind::Time);time.context.time=2.5f;Check(Close(time.Value(0).number[0],2.5f),"Time reads the evaluation time");
+    Fixture depth(NodeKind::SceneDepth);
+    Check(Close(depth.Value(0).number[0],5),"Scene Depth without a scene uses its fallback depth");
+    depth.context.sceneDepth=1.25f;Check(Close(depth.Value(0).number[0],1.25f),"Scene Depth reads the scene behind the surface");
+    depth.context.sceneDepth=-1;depth.graph.FindNode(depth.node)->value[0]=-3;Check(depth.Value(0).number[0]==0,"a negative fallback depth reads as no depth");
+    const auto srgb=[](float a,float b,float c){return Float4{SrgbToLinear(a),SrgbToLinear(b),SrgbToLinear(c),1};};
+    const auto near=[](Float4 a,Float4 b){return Close(a[0],b[0])&&Close(a[1],b[1])&&Close(a[2],b[2]);};
+    Fixture sky(NodeKind::SkyReflection);sky.context.worldNormal={0,1,0,0};
+    sky.context.viewDirection={0,1,0,0};Check(near(sky.Value(1).number,srgb(.22f,.42f,.78f)),"looking straight down a flat surface mirrors the zenith");
+    sky.context.viewDirection={0,0,1,0};Check(near(sky.Value(1).number,srgb(.72f,.82f,.93f)),"a grazing view mirrors the horizon");
+    sky.context.viewDirection={0,1,0,0};sky.graph.FindNode(sky.node)->value={.6f,0,.8f,0};
+    const auto tilted=sky.Value(1).number;Check(!near(tilted,srgb(.22f,.42f,.78f)),"the tangent normal turns the mirrored direction");
+    // Noise Normal: flat at strength 0, steeper with strength, computed only when read.
+    Fixture noise(NodeKind::Noise);noise.context.uv={.37f,.61f,0,0};noise.graph.FindNode(noise.node)->value={9,3,.5f,4};
+    const float mask=noise.Value(2).number[0];
+    Check(noise.Value(4).number!=Float4{} && Close(noise.Value(2).number[0],mask),"reading Noise Normal leaves its mask unchanged");
+    const auto one=noise.Value(4).number;
+    noise.graph.FindNode(noise.node)->settings[1]=2;const auto two=noise.Value(4).number;
+    noise.graph.FindNode(noise.node)->settings[1]=0;const auto flat=noise.Value(4).number;
+    Check(Close(flat[0],0)&&Close(flat[1],0)&&Close(flat[2],1),"Noise Normal at strength 0 is flat");
+    Check(one[2]>0 && std::abs(one[0])+std::abs(one[1])>1e-3f && Close(two[0]/two[2],2*one[0]/one[2]) && Close(two[1]/two[2],2*one[1]/one[2]),"Noise Normal slope scales with its strength");
+    // The slope's direction: the normal leans away from where the noise rises.
+    noise.graph.FindNode(noise.node)->settings[1]=1;
+    const auto at=[&](float u,float v){noise.context.uv={u,v,0,0};return noise.Value(2).number[0];};
+    const float rise=at(.37f+.01f/9,.61f)-at(.37f,.61f);noise.context.uv={.37f,.61f,0,0};
+    Check((rise>0)==(noise.Value(4).number[0]<0),"Noise Normal leans against the rising noise");
+    // Shader text: the normal only when read; every scene node compiles through DXC.
+    MaterialGraphDocument d;std::string error;MaterialGraphProgram program;
+    const auto n=d.AddNode(NodeKind::Noise,{}),t=d.AddNode(NodeKind::Time,{}),s=d.AddNode(NodeKind::SceneDepth,{}),r=d.AddNode(NodeKind::SkyReflection,{}),o=d.AddNode(NodeKind::PbrOutput,{});
+    const auto v=d.AddNode(NodeKind::MakeVector,{});d.Connect(PinId(t,0),PinId(v,2),error);d.Connect(PinId(v,3),PinId(n,0),error);
+    d.Connect(PinId(n,2),PinId(o,1),error);d.Connect(PinId(s,0),PinId(o,7),error);d.Connect(PinId(r,1),PinId(o,3),error);
+    Check(program.Compile(d,error) && program.GenerateHlsl().find("GraphNoiseNormal(n")==std::string::npos,"an unread Noise Normal is not computed");
+    d.Connect(PinId(n,4),PinId(o,4),error);d.Connect(PinId(n,4),PinId(r,0),error);
+    Check(program.Compile(d,error) && program.GenerateHlsl().find("GraphNoiseNormal(n")!=std::string::npos,"a read Noise Normal is computed");
+    MaterialGraphDocument loaded;Check(loaded.FromJson(d.ToJson(),error) && loaded==d,"scene nodes and the Noise Normal link survive saving");
+    Check(program.Layout().worldDependent,"Sky Reflection makes a material view dependent");
+    const auto root=std::filesystem::path(IX_GRAPH_SHADER_OUTPUT);std::filesystem::create_directories(root);
+    const auto file=root/"scene-nodes.hlsl";std::ofstream(file)<<program.GenerateHlsl();CompileShader(file);
+}
+int main(){Numbers();SpatialAndTextures();LayersAndBaking();DeepGraph();Shaders();SceneNodes();std::cout<<"Material graph compiler failures: "<<failures<<'\n';return failures?1:0;}

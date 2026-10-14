@@ -56,6 +56,31 @@ float Noise(Float4 p, int octaves, float persistence, std::uint32_t seed)
         sum+=n*amplitude; weight+=amplitude; amplitude*=persistence; for(int i=0;i<3;++i)p[i]*=2;
     } return sum/std::max(weight,1e-6f);
 }
+// The step of the Noise Normal output's finite differences, in noise lattice units.
+constexpr float kNoiseNormalStep = 0.01f;
+// A tangent-space normal in the frame the editor preview shades with: tangent from the normal's
+// horizontal turn, bitangent = normal x tangent. (The run-time shader uses the mesh's UV frame.)
+Float4 TangentToWorld(Float4 tangentNormal, Float4 normal)
+{
+    const auto tangent = Normalize3({normal[2], 0, -normal[0], 0}, {1, 0, 0, 0});
+    const Float4 bitangent{normal[1]*tangent[2]-normal[2]*tangent[1], normal[2]*tangent[0]-normal[0]*tangent[2], normal[0]*tangent[1]-normal[1]*tangent[0], 0};
+    Float4 world{};
+    for (int k = 0; k < 3; ++k) world[k] = tangent[k]*tangentNormal[0] + bitangent[k]*tangentNormal[1] + normal[k]*tangentNormal[2];
+    return Normalize3(world, normal);
+}
+// The sky where no scene sky exists (baking, editor preview, shader validation): the default
+// procedural sky's gradient (Scene Settings > Sky defaults), without the sun disc.
+Float4 DefaultSkyColor(int which) // 0 zenith, 1 horizon, 2 ground (linear)
+{
+    static const float srgb[3][3] = {{.22f,.42f,.78f},{.72f,.82f,.93f},{.36f,.34f,.32f}};
+    return {SrgbToLinear(srgb[which][0]), SrgbToLinear(srgb[which][1]), SrgbToLinear(srgb[which][2]), 1};
+}
+Float4 DefaultSky(Float4 direction)
+{
+    direction = Normalize3(direction, {0, 1, 0, 0});
+    const float up = direction[1];
+    return up >= 0 ? Mix(DefaultSkyColor(1), DefaultSkyColor(0), std::pow(Sat(up), .45f)) : Mix(DefaultSkyColor(1), DefaultSkyColor(2), Sat(-up*8));
+}
 std::string Float(float f) { std::ostringstream s; s.imbue(std::locale::classic()); s << std::setprecision(9) << f; auto r=s.str(); if(r.find_first_of(".eE")==std::string::npos)r+=".0"; return r; }
 std::string Literal(Float4 v, int n=4) { std::string r="float"+std::to_string(n)+"("; for(int i=0;i<n;++i) {if(i)r+=",";r+=Float(v[i]);} return r+")"; }
 }
@@ -132,7 +157,7 @@ bool MaterialGraphProgram::Compile(const MaterialGraphDocument& document, std::s
             }
         }
         const auto missing=[&](int slot){return instruction.sources[slot]<0;};
-        if(n->kind==NodeKind::WorldPosition || n->kind==NodeKind::WorldNormal || (n->kind==NodeKind::Fresnel && (missing(0)||missing(1))) || (n->kind==NodeKind::HeightMask && missing(0)) || (n->kind==NodeKind::SlopeMask && missing(0)) || (n->kind==NodeKind::Triplanar && (missing(1)||missing(2))) || (n->kind==NodeKind::Noise && missing(0) && n->settings[0]!=0))draft.worldDependent_=true;
+        if(n->kind==NodeKind::WorldPosition || n->kind==NodeKind::WorldNormal || (n->kind==NodeKind::Fresnel && (missing(0)||missing(1))) || (n->kind==NodeKind::HeightMask && missing(0)) || (n->kind==NodeKind::SlopeMask && missing(0)) || (n->kind==NodeKind::Triplanar && (missing(1)||missing(2))) || (n->kind==NodeKind::Noise && missing(0) && n->settings[0]!=0) || n->kind==NodeKind::SkyReflection)draft.worldDependent_=true;
         if(n->kind==NodeKind::AO || n->kind==NodeKind::Curvature || n->kind==NodeKind::Cavity){draft.surfaceData_=true;draft.worldDependent_=true;}
         indices[id]=static_cast<int>(draft.instructions_.size());draft.instructions_.push_back(std::move(instruction));
         for(const auto next:outgoing[id])if(reachable.contains(next) && --degrees[next]==0)pending.push_back(next);
@@ -140,6 +165,9 @@ bool MaterialGraphProgram::Compile(const MaterialGraphDocument& document, std::s
     if(draft.instructions_.size()!=reachable.size()){error="Cyclic graph";return false;}
     if(output!=valid.nodes.end())draft.output_=indices.at(output->id);
     if(previewPin)draft.preview_=indices.at(previewPin/16);
+    // What is read: an output computed only on request (Noise Normal) is skipped otherwise.
+    for(const auto& l:valid.links)if(const auto found=indices.find(l.output/16);found!=indices.end())draft.instructions_[found->second].usedOutputs|=static_cast<std::uint16_t>(1U<<(l.output%16-1));
+    if(draft.preview_>=0)draft.instructions_[draft.preview_].usedOutputs|=static_cast<std::uint16_t>(1U<<draft.previewSlot_);
     for (const auto& i : draft.instructions_) {
         const auto& n = i.node;
         if (n.kind == NodeKind::TextureParameter || ((n.kind == NodeKind::TextureSample || n.kind == NodeKind::Triplanar) && i.sources[0] < 0)) {
@@ -253,7 +281,17 @@ Surface MaterialGraphProgram::Evaluate(const EvaluationContext& c, const Paramet
         case NodeKind::MaskLevels: {const float x=scalar(0,n.value[0]),black=scalar(1,n.value[1]),white=scalar(2,n.value[2]),gamma=std::max(.001f,scalar(3,n.value[3]));out[4].number[0]=std::pow(Sat(SafeDivide(x-black,white-black)),1/gamma);break;}
         case NodeKind::MaskContrast:out[2].number[0]=Sat((scalar(0,n.value[0])-.5f)*std::max(0.0f,scalar(1,n.value[1]))+.5f);break;
         case NodeKind::Fresnel:out[3].number[0]=std::pow(1-Sat(Dot3(Normalize3(value(0,c.worldNormal),{0,1,0,0}),Normalize3(value(1,c.viewDirection)))),std::clamp(scalar(2,n.value[0]),.001f,64.0f));break;
-        case NodeKind::Noise: {auto p=value(0,n.settings[0]==0?Float4{c.uv[0],c.uv[1],0,0}:c.worldPosition);const float scale=scalar(1,n.value[0]);for(int k=0;k<3;++k)p[k]*=scale;out[2].number[0]=Noise(p,std::clamp(static_cast<int>(n.value[1]),1,8),Sat(n.value[2]),static_cast<std::uint32_t>(static_cast<int>(scalar(3,n.value[3]))));break;}
+        case NodeKind::Noise: {auto p=value(0,n.settings[0]==0?Float4{c.uv[0],c.uv[1],0,0}:c.worldPosition);const float scale=scalar(1,n.value[0]);for(int k=0;k<3;++k)p[k]*=scale;
+            const int octaves=std::clamp(static_cast<int>(n.value[1]),1,8);const float persistence=Sat(n.value[2]);const auto seed=static_cast<std::uint32_t>(static_cast<int>(scalar(3,n.value[3])));
+            const float height=Noise(p,octaves,persistence,seed);out[2].number[0]=height;
+            // The noise as a height field over its input's X and Y (U and V for UV input).
+            if(i.usedOutputs&(1U<<4)){auto px=p,py=p;px[0]+=kNoiseNormalStep;py[1]+=kNoiseNormalStep;const float strength=n.settings[1];
+                out[4].number=Normalize3({-(Noise(px,octaves,persistence,seed)-height)/kNoiseNormalStep*strength,-(Noise(py,octaves,persistence,seed)-height)/kNoiseNormalStep*strength,1,0});}
+            break;}
+        case NodeKind::Time:out[0].number[0]=c.time;break;
+        case NodeKind::SceneDepth:out[0].number[0]=c.sceneDepth>=0?c.sceneDepth:std::max(0.0f,n.value[0]);break;
+        case NodeKind::SkyReflection: {const auto normal=TangentToWorld(Normalize3(value(0,n.value)),Normalize3(c.worldNormal,{0,1,0,0}));const auto view=Normalize3(c.viewDirection);const float twice=2*Dot3(view,normal);
+            out[1].number=DefaultSky({twice*normal[0]-view[0],twice*normal[1]-view[1],twice*normal[2]-view[2],0});break;}
         case NodeKind::HeightMask:out[3].number[0]=Smooth(scalar(1,n.value[0]),scalar(2,n.value[1]),value(0,c.worldPosition)[1]);break;
         case NodeKind::SlopeMask:{const auto normal=Normalize3(value(0,c.worldNormal),{0,1,0,0});const float angle=std::acos(std::clamp(normal[1],-1.0f,1.0f))*57.2957795f;out[3].number[0]=Smooth(scalar(1,n.value[0]),scalar(2,n.value[1]),angle);break;}
         case NodeKind::AO:out[0].number[0]=c.ao;break;
@@ -288,7 +326,7 @@ std::string MaterialGraphProgram::GenerateHlsl(const HlslOptions& options) const
     std::ostringstream h; h.imbue(std::locale::classic());
     h << R"HLSL(// Generated material graph. Texture bindings use UNORM views; RGB sRGB decoding is explicit.
 // Supply geometry AO/curvature/cavity when used. Normal outputs are tangent-space.
-struct GraphContext { float2 uv; float3 worldPosition; float3 worldNormal; float3 viewDirection; float ao; float curvature; float cavity; };
+struct GraphContext { float2 uv; float3 worldPosition; float3 worldNormal; float3 viewDirection; float ao; float curvature; float cavity; float time; float sceneDepth; };
 struct GraphSurface { float4 color; float3 normal; float3 emissive; float roughness; float metallic; float ao; float height; float opacity; };
 GraphSurface GraphDefault() { GraphSurface s; s.color=float4(.5,.5,.5,1); s.normal=float3(0,0,1); s.emissive=0; s.roughness=.5; s.metallic=0; s.ao=1; s.height=0; s.opacity=1; return s; }
 float GraphDiv(float a,float b) { return abs(b)<1e-6 ? 0 : a/b; }
@@ -308,6 +346,15 @@ float GraphNoise(float3 p,int octaves,float persistence,uint seed) { float resul
           lerp(lerp(GraphLattice(cell+int3(0,0,1),seed),GraphLattice(cell+int3(1,0,1),seed),v.x),lerp(GraphLattice(cell+int3(0,1,1),seed),GraphLattice(cell+int3(1,1,1),seed),v.x),v.y),v.z);
         result+=n*amplitude; weight+=amplitude; amplitude*=persistence; p*=2; } return result/max(weight,1e-6); }
 float4 GraphFinite(float4 v) { return float4(isfinite(v.x)?clamp(v.x,-1e6,1e6):0,isfinite(v.y)?clamp(v.y,-1e6,1e6):0,isfinite(v.z)?clamp(v.z,-1e6,1e6):0,isfinite(v.w)?clamp(v.w,-1e6,1e6):0); }
+float3 GraphNoiseNormal(float3 p,int octaves,float persistence,uint seed,float height,float strength) { const float e=)HLSL" << Float(kNoiseNormalStep) << R"HLSL(;
+    return GraphNormalize(float3(-(GraphNoise(p+float3(e,0,0),octaves,persistence,seed)-height)/e*strength,-(GraphNoise(p+float3(0,e,0),octaves,persistence,seed)-height)/e*strength,1)); }
+#ifndef GRAPH_ENVIRONMENT
+// No scene (validation, previews): the default sky and the editor preview's tangent frame, as on the CPU.
+float3 GraphSkyColor(float3 d) { d=GraphWorldNormal(d); return d.y>=0 ? lerp()HLSL" << Literal(DefaultSkyColor(1),3) << "," << Literal(DefaultSkyColor(0),3) << R"HLSL(,pow(saturate(d.y),.45)) : lerp()HLSL" << Literal(DefaultSkyColor(1),3) << "," << Literal(DefaultSkyColor(2),3) << R"HLSL(,saturate(-d.y*8)); }
+float3 GraphTangentToWorld(float3 worldNormal,float3 worldPosition,float2 uv,float3 tangentNormal) { const float3 n=GraphWorldNormal(worldNormal);
+    const float3 t=dot(n.xz,n.xz)<1e-12 ? float3(1,0,0) : normalize(float3(n.z,0,-n.x)); const float3 b=cross(n,t);
+    const float3 w=t*tangentNormal.x+b*tangentNormal.y+n*tangentNormal.z; return dot(w,w)<1e-12 ? n : normalize(w); }
+#endif
 )HLSL";
     const bool anyParameter = layout_.parameterBufferBytes != 0;
     const bool vulkan = options.vulkanDescriptorSet;
@@ -410,7 +457,14 @@ float4 GraphFinite(float4 v) { return float4(isfinite(v.x)?clamp(v.x,-1e6,1e6):0
         case NodeKind::MaskLevels:emitScalar(4,"pow(saturate(GraphDiv("+scalar(0,n.value[0])+"-"+scalar(1,n.value[1])+","+scalar(2,n.value[2])+"-"+scalar(1,n.value[1])+")),1/max("+scalar(3,n.value[3])+",.001))");break;
         case NodeKind::MaskContrast:emitScalar(2,"saturate(("+scalar(0,n.value[0])+"-.5)*max("+scalar(1,n.value[1])+",0)+.5)");break;
         case NodeKind::Fresnel:emitScalar(3,"pow(1-saturate(dot(GraphWorldNormal("+context(0,"float4(c.worldNormal,0)")+".xyz),GraphNormalize("+context(1,"float4(c.viewDirection,0)")+".xyz))),clamp("+scalar(2,n.value[0])+",.001,64))");break;
-        case NodeKind::Noise:emitScalar(2,"GraphNoise("+context(0,n.settings[0]==0?"float4(c.uv,0,0)":"float4(c.worldPosition,0)")+".xyz*"+scalar(1,n.value[0])+","+std::to_string(std::clamp(static_cast<int>(n.value[1]),1,8))+","+Float(Sat(n.value[2]))+",uint(int("+scalar(3,n.value[3])+")))");break;
+        case NodeKind::Noise:{const auto p=prefix+"_p",arguments=","+std::to_string(std::clamp(static_cast<int>(n.value[1]),1,8))+","+Float(Sat(n.value[2]))+",uint(int("+scalar(3,n.value[3])+"))";
+            h<<"    float3 "<<p<<" = "<<context(0,n.settings[0]==0?"float4(c.uv,0,0)":"float4(c.worldPosition,0)")<<".xyz*"<<scalar(1,n.value[0])<<";\n";
+            emitScalar(2,"GraphNoise("+p+arguments+")");
+            if(i.usedOutputs&(1U<<4))emit(4,"float4(GraphNoiseNormal("+p+arguments+","+var(static_cast<int>(index),2)+".x,"+Float(n.settings[1])+"),0)");
+            break;}
+        case NodeKind::Time:emitScalar(0,"c.time");break;
+        case NodeKind::SceneDepth:emitScalar(0,"(c.sceneDepth>=0 ? c.sceneDepth : "+Float(std::max(0.0f,n.value[0]))+")");break;
+        case NodeKind::SkyReflection:emit(1,"float4(GraphSkyColor(reflect(-GraphNormalize(c.viewDirection),GraphTangentToWorld(c.worldNormal,c.worldPosition,c.uv,GraphNormalize("+value(0,n.value)+".xyz)))),1)");break;
         case NodeKind::HeightMask:emitScalar(3,"GraphSmooth("+scalar(1,n.value[0])+","+scalar(2,n.value[1])+","+context(0,"float4(c.worldPosition,0)")+".y)");break;
         case NodeKind::SlopeMask:emitScalar(3,"GraphSmooth("+scalar(1,n.value[0])+","+scalar(2,n.value[1])+",acos(clamp(GraphWorldNormal("+context(0,"float4(c.worldNormal,0)")+".xyz).y,-1,1))*57.2957795)");break;
         case NodeKind::AO:emitScalar(0,"c.ao");break;
@@ -438,7 +492,7 @@ float4 GraphFinite(float4 v) { return float4(isfinite(v.x)?clamp(v.x,-1e6,1e6):0
     h<<"    return "<<(output_>=0?var(output_,0):"GraphDefault()")<<";\n}\n";
     h<<R"HLSL(// Standalone entry for shader validation and preview integration.
 float4 GraphValidationPS(float2 uv:TEXCOORD0):SV_TARGET {
-    GraphContext c; c.uv=uv; c.worldPosition=float3(uv.x,0,uv.y); c.worldNormal=float3(0,1,0); c.viewDirection=float3(0,0,1); c.ao=1; c.curvature=.5; c.cavity=0;
+    GraphContext c; c.uv=uv; c.worldPosition=float3(uv.x,0,uv.y); c.worldNormal=float3(0,1,0); c.viewDirection=float3(0,0,1); c.ao=1; c.curvature=.5; c.cavity=0; c.time=0; c.sceneDepth=-1;
     GraphSurface s=EvaluateMaterialGraph(c); return float4(s.color.rgb+s.emissive,s.opacity);
 }
 )HLSL";return h.str();

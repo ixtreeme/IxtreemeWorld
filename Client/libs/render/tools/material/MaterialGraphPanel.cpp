@@ -139,7 +139,7 @@ void MaterialGraphPanel::RenderNodeMenu()
             if(label.find(filter)!=std::string::npos){item(kind);found=true;}}
         if(!found)ImGui::TextDisabled("No matching nodes");
     } else {
-        for(const auto* category:{"Constants","Parameters","Coordinates","Textures","Math","Color","Masks","Materials","Subgraphs"})
+        for(const auto* category:{"Constants","Parameters","Coordinates","Textures","Math","Color","Masks","Materials","Scene","Subgraphs"})
             if(ImGui::BeginMenu(category)) {for(const auto kind:AllNodeKinds())if(std::string_view(NodeCategory(kind))==category)item(kind);ImGui::EndMenu();}
     }
 }
@@ -401,7 +401,7 @@ void MaterialGraphPanel::RenderInspector()
         if(node->kind==N::Triplanar){number("Scale / meter",node->value[0]);number("Blend sharpness",node->value[1]);ImGui::TextWrapped("Color/data triplanar projection uses the geometric world normal. Triplanar tangent normal mapping requires a separate orientation transform.");}
         break;
     case N::TilingOffset:edit([&]{return UI::Prop::DragFloat2("Tiling",node->value.data(),.01f);});edit([&]{return UI::Prop::DragFloat2("Offset",node->value.data()+2,.01f);});break;
-    case N::Noise:{number("Scale",node->value[0]);number("Octaves (1-8)",node->value[1],1);number("Persistence",node->value[2]);number("Seed",node->value[3],1);
+    case N::Noise:{number("Scale",node->value[0]);number("Octaves (1-8)",node->value[1],1);number("Persistence",node->value[2]);number("Seed",node->value[3],1);number("Normal strength",node->settings[1]);
         int space=node->settings[0]==0?0:1;const char* choices[]={"UV","World"};immediate([&]{if(UI::Prop::Combo("Default space",&space,choices,2)){node->settings[0]=static_cast<float>(space);return true;}return false;});break;}
     case N::HeightMask:number("Min height (m)",node->value[0]);number("Max height (m)",node->value[1]);ImGui::TextWrapped("Smooth mask from world position Y. Connected Position replaces the world input.");break;
     case N::SlopeMask:number("Min slope (deg)",node->value[0]);number("Max slope (deg)",node->value[1]);ImGui::TextWrapped("Uses the geometric normal, including undersides; upward is zero degrees.");break;
@@ -415,6 +415,9 @@ void MaterialGraphPanel::RenderInspector()
     case N::NormalFlipY:case N::Normalize:case N::Length:case N::Cross:case N::Distance:case N::Reflect:edit([&]{return UI::Prop::DragFloat3("Unconnected vector",node->value.data(),.01f);});break;
     case N::MaskCombine:{number("A",node->value[0]);number("B",node->value[1]);int mode=static_cast<int>(node->settings[0]);const char* choices[]={"Multiply","Add","Minimum","Maximum","Subtract"};immediate([&]{if(UI::Prop::Combo("Operation",&mode,choices,5)){node->settings[0]=static_cast<float>(mode);return true;}return false;});break;}
     case N::Fresnel:number("Power",node->value[0]);ImGui::TextWrapped("World-space geometric normal and world-space direction toward the camera.");break;
+    case N::Time:ImGui::TextWrapped("Seconds since the game started; animates a material drawn by its live graph shader. Baked textures are made at time 0; the preview uses Preview time.");break;
+    case N::SceneDepth:number("Fallback depth (m)",node->value[0]);ImGui::TextWrapped("Metres of scene behind the surface along the view, for a transparent (Opacity < 1) material drawn by its live graph shader. Opaque materials, baked textures and the preview use the fallback.");break;
+    case N::SkyReflection:edit([&]{return UI::Prop::DragFloat3("Unconnected normal",node->value.data(),.01f);});ImGui::TextWrapped("The scene sky (Scene Settings > Sky) mirrored by the tangent-space normal, in linear HDR colour: add it to Emissive, weighted by Fresnel. Baked textures and the preview mirror a default sky.");break;
     case N::Remap:number("Value",node->settings[0]);number("In Min",node->value[0]);number("In Max",node->value[1]);number("Out Min",node->value[2]);number("Out Max",node->value[3]);break;
     case N::VectorScale:edit([&]{return UI::Prop::DragFloat3("XYZ",node->value.data(),.01f);});number("Scale",node->settings[0]);break;
     case N::AO:case N::Curvature:case N::Cavity:ImGui::TextWrapped("Reads supplied geometry data. Use Texture Sample for imported baked masks. The preview data below is explicit test data; the engine does not yet bake geometry curvature or cavity.");break;
@@ -981,6 +984,10 @@ void MaterialGraphPanel::RenderPreview()
     UI::Prop::DragFloat("World size (m)",&previewSettings_.worldSize,.1f,.01f,10000.0f,"%.2f");
     UI::Prop::DragFloat("Height offset (m)",&previewSettings_.heightOffset,.1f,-10000.0f,10000.0f,"%.2f");
     ImGui::EndDisabled();
+    // Time nodes: a fixed preview time, or running (re-evaluated a few times a second, on the CPU).
+    UI::Prop::DragFloat("Preview time (s)",&previewSettings_.time,.05f,0.0f,100000.0f,"%.2f");
+    UI::Prop::Checkbox("Animate preview",&animatePreview_);
+    if(animatePreview_ && ImGui::GetTime()-previewTime_>.15)previewSettings_.time=std::fmod(previewSettings_.time+static_cast<float>(ImGui::GetTime()-previewTime_),100000.0f);
     if(previewSettings_.channel==PreviewChannel::SelectedOutput) {
         const auto* node=document_.FindNode(selected_);bool found=false;
         if(node) {

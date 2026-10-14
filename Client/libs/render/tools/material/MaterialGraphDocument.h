@@ -22,7 +22,11 @@ enum class NodeKind {
     Sine, Cosine, Fract, Floor, Ceil, Step, Sign, Reflect,
     MaskCombine, MaskLevels, MaskContrast, MaskInvert, Fresnel,
     Vector2Parameter, Vector3Parameter,
-    SubgraphInput, SubgraphOutput, Subgraph, Count
+    SubgraphInput, SubgraphOutput, Subgraph,
+    // Scene inputs of a material drawn at run time: the time, the scene behind a transparent
+    // surface and the sky. Baking and the editor preview use fixed stand-ins (time 0, the node's
+    // fallback depth, a default sky).
+    Time, SceneDepth, SkyReflection, Count
 };
 enum class PinType { Scalar, Color, Vector2, Vector3, Texture, Surface };
 enum class GraphRegion { Custom, ManagedLayer, Output };

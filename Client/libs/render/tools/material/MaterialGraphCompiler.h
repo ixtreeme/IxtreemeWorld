@@ -16,6 +16,8 @@ struct EvaluationContext
 {
     Float4 uv{}, worldPosition{}, worldNormal{0, 1, 0, 0}, viewDirection{0, 0, 1, 0};
     float ao = 1, curvature = 0.5f, cavity = 0;
+    float time = 0;        // seconds, for Time
+    float sceneDepth = -1; // metres of scene behind the surface; negative: none (Scene Depth uses its fallback)
     bool operator==(const EvaluationContext&) const = default;
 };
 struct ParameterOverrides
@@ -75,6 +77,7 @@ struct GraphInstruction
     std::array<int, 14> sources{};
     std::array<int, 14> sourceSlots{};
     std::uint16_t numericOutputs = 0;
+    std::uint16_t usedOutputs = 0; // output slots another instruction or the preview reads
 };
 class MaterialGraphProgram
 {

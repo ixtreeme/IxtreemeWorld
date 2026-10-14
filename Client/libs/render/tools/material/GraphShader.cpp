@@ -224,6 +224,7 @@ float4 PSMain(VSOutput input) : SV_Target0
     c.worldNormal = geometricNormal;
     c.viewDirection = normalize(u_cameraPosition.xyz - input.worldPos);
     c.ao = 1.0; c.curvature = 0.5; c.cavity = 0.0;
+    c.time = 0.0; c.sceneDepth = -1.0;
 )HLSL";
     if (geometry)
         h << "    const float3 geometryMap = graphGeometry.Sample(graphGeometrySampler, input.uv).rgb;\n"

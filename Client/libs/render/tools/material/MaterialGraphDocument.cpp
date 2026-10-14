@@ -34,7 +34,10 @@ constexpr PinDefinition SplitVectorPins[] = {{"XYZ", P::Vector3, true}, {"X", P:
 constexpr PinDefinition VectorScalePins[] = {{"XYZ", P::Vector3, true}, {"Scale", P::Scalar, true}, {"XYZ", P::Vector3, false}};
 constexpr PinDefinition DotPins[] = {{"A", P::Vector3, true}, {"B", P::Vector3, true}, {"Result", P::Scalar, false}};
 constexpr PinDefinition NormalBlendPins[] = {{"Base", P::Vector3, true}, {"Detail", P::Vector3, true}, {"Strength", P::Scalar, true}, {"Normal", P::Vector3, false}};
-constexpr PinDefinition NoisePins[] = {{"Position", P::Vector3, true}, {"Scale", P::Scalar, true}, {"Mask", P::Scalar, false}, {"Seed", P::Scalar, true}};
+constexpr PinDefinition NoisePins[] = {{"Position", P::Vector3, true}, {"Scale", P::Scalar, true}, {"Mask", P::Scalar, false}, {"Seed", P::Scalar, true}, {"Normal", P::Vector3, false}};
+constexpr PinDefinition TimePins[] = {{"Seconds", P::Scalar, false}};
+constexpr PinDefinition SceneDepthPins[] = {{"Depth", P::Scalar, false}};
+constexpr PinDefinition SkyReflectionPins[] = {{"Normal", P::Vector3, true}, {"Color", P::Color, false}};
 constexpr PinDefinition NormalStrengthPins[] = {{"Normal", P::Vector3, true}, {"Strength", P::Scalar, true}, {"Normal", P::Vector3, false}};
 constexpr PinDefinition VectorUnaryPins[] = {{"XYZ", P::Vector3, true}, {"XYZ", P::Vector3, false}};
 constexpr PinDefinition VectorLengthPins[] = {{"XYZ", P::Vector3, true}, {"Length", P::Scalar, false}};
@@ -61,7 +64,8 @@ constexpr const char* Names[] = {
     "Normal Strength", "Normal Unpack", "Normal Flip Y", "Normalize", "Cross Product", "Length", "Distance",
     "Sine", "Cosine", "Fract", "Floor", "Ceil", "Step", "Sign", "Reflect",
     "Mask Combine", "Mask Levels", "Mask Contrast", "Mask Invert", "Fresnel",
-    "Vector2 Parameter", "Vector3 Parameter", "Subgraph Input", "Subgraph Output", "Subgraph"
+    "Vector2 Parameter", "Vector3 Parameter", "Subgraph Input", "Subgraph Output", "Subgraph",
+    "Time", "Scene Depth", "Sky Reflection"
 };
 static_assert(std::size(Names) == static_cast<size_t>(NodeKind::Count));
 using Json = crude_json::value;
@@ -113,6 +117,7 @@ const char* NodeCategory(NodeKind kind)
 {
     switch (kind) {
     case NodeKind::SubgraphInput: case NodeKind::SubgraphOutput: case NodeKind::Subgraph: return "Subgraphs";
+    case NodeKind::Time: case NodeKind::SceneDepth: case NodeKind::SkyReflection: return "Scene";
     case NodeKind::Scalar: case NodeKind::Color: case NodeKind::Vector2: case NodeKind::Vector3: return "Constants";
     case NodeKind::ScalarParameter: case NodeKind::ColorParameter: case NodeKind::TextureParameter: case NodeKind::Vector2Parameter: case NodeKind::Vector3Parameter: return "Parameters";
     case NodeKind::UV: case NodeKind::TilingOffset: case NodeKind::WorldPosition: case NodeKind::WorldNormal: case NodeKind::MakeVector: case NodeKind::SplitVector: case NodeKind::VectorScale: case NodeKind::Dot: return "Coordinates";
@@ -178,6 +183,9 @@ std::span<const PinDefinition> NodePins(NodeKind kind)
     case NodeKind::LayerBlend: return LayerBlendPins;
     case NodeKind::HeightBlend: return HeightBlendPins;
     case NodeKind::PbrOutput: return OutputPins;
+    case NodeKind::Time: return TimePins;
+    case NodeKind::SceneDepth: return SceneDepthPins;
+    case NodeKind::SkyReflection: return SkyReflectionPins;
     default: return {};
     }
 }
@@ -230,7 +238,9 @@ std::uint32_t MaterialGraphDocument::AddNode(NodeKind kind, std::array<float, 2>
     switch (kind) {
     case NodeKind::Vector2: case NodeKind::Vector3: node.value = {0, 0, 0, 0}; break;
     case NodeKind::TilingOffset: node.value = {1, 1, 0, 0}; break;
-    case NodeKind::Noise: node.value = {1, 4, 0.5f, 0}; break;
+    case NodeKind::Noise: node.value = {1, 4, 0.5f, 0}; node.settings[1] = 1; break; // settings[1]: Normal strength
+    case NodeKind::SceneDepth: node.value = {5, 0, 0, 0}; break;                   // fallback depth (m)
+    case NodeKind::SkyReflection: node.value = {0, 0, 1, 0}; break;                // unconnected tangent normal
     case NodeKind::HeightMask: node.value = {0, 10, 0, 0}; break;
     case NodeKind::SlopeMask: node.value = {20, 60, 0, 0}; break;
     case NodeKind::Triplanar: node.value = {1, 4, 0, 0}; break;

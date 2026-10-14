@@ -11,6 +11,7 @@ struct PreviewSettings {
     PreviewChannel channel = PreviewChannel::Shaded;
     bool sphere = true;
     float worldSize = 10, heightOffset = 0;
+    float time = 0; // seconds read by Time nodes
     EvaluationContext surfaceData;
     PinType selectedType = PinType::Scalar;
     bool operator==(const PreviewSettings&) const = default;

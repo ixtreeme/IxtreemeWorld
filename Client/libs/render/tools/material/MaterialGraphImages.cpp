@@ -45,6 +45,7 @@ std::vector<std::uint8_t> RenderMaterialPreview(const MaterialGraphProgram& prog
             auto c=settings.surfaceData;c.uv={u,v,0,0}; c.worldPosition={(u-.5f)*settings.worldSize,settings.heightOffset,(v-.5f)*settings.worldSize,0}; c.worldNormal={0,1,0,0};
             if(geometry)c=Context(texel);
             else if(settings.sphere) {const float z=std::sqrt(1-r2); c.worldNormal={px,py,z,0};c.worldPosition={px*settings.worldSize*.5f,py*settings.worldSize*.5f+settings.heightOffset,z*settings.worldSize*.5f,0}; c.uv={.5f+std::atan2(px,z)/6.2831853f,.5f-std::asin(py)/3.14159265f,0,0};}
+            c.time=settings.time;
             auto s=program.Evaluate(c,parameters,sample,workspace);rgb=Color(s,settings.channel);
             bool srgb=settings.channel==PreviewChannel::Shaded || settings.channel==PreviewChannel::BaseColor || settings.channel==PreviewChannel::Emissive;
             if(geometry && settings.channel>=PreviewChannel::GeometryAO) {
