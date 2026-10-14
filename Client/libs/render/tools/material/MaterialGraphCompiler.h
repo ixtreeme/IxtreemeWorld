@@ -58,6 +58,16 @@ struct SampledTexture {
 // Source owns decoding/cache and returns raw RGBA with bilinear repeat filtering.
 // RGB decoding never changes the separate data-channel and normal outputs.
 using TextureSampler = std::function<SampledTexture(const GraphNode&, const std::string&, float, float)>;
+// Descriptor layout of a graph pixel shader drawn by the static mesh renderer (Vulkan target):
+// one set holding a uniform block (numeric parameters in layout order, then one float4 per
+// texture: x = 1 for linear RGB sources), the caller's geometry map, and each texture with its
+// own bilinear repeat sampler at kGraphFirstTextureBinding + MaterialTextureBinding::binding.
+constexpr std::uint32_t kGraphDescriptorSet = 1, kGraphUniformBinding = 0, kGraphGeometryBinding = 1, kGraphFirstTextureBinding = 2;
+struct HlslOptions
+{
+    bool vulkanDescriptorSet = false;
+    std::uint32_t descriptorSet = kGraphDescriptorSet;
+};
 struct GraphValue { Float4 number{}; Surface surface{}; std::uint32_t textureNode = 0; };
 struct GraphInstruction
 {
@@ -75,7 +85,10 @@ public:
     Surface Evaluate(const EvaluationContext& context, const ParameterOverrides& parameters,
                      const TextureSampler& sample, std::vector<std::array<GraphValue, 14>>& workspace) const;
     GraphValue PreviewValue(const std::vector<std::array<GraphValue, 14>>& workspace) const;
-    std::string GenerateHlsl() const;
+    std::string GenerateHlsl(const HlslOptions& options = {}) const;
+    // The Vulkan uniform block: parameters with overrides applied, then each texture's info.
+    bool BuildRuntimeUniforms(const ParameterOverrides& parameters, const std::vector<bool>& linearTextures,
+                              std::vector<Float4>& block, std::string& error) const;
     const MaterialCompileResult& Layout() const { return layout_; }
     bool ValidateOverrides(const ParameterOverrides& parameters, std::string& error) const;
     bool BuildParameterBuffer(const ParameterOverrides& parameters, std::vector<Float4>& buffer, std::string& error) const;

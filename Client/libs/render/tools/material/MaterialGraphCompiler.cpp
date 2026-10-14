@@ -274,7 +274,16 @@ Surface MaterialGraphProgram::Evaluate(const EvaluationContext& c, const Paramet
 }
 GraphValue MaterialGraphProgram::PreviewValue(const std::vector<std::array<GraphValue,14>>& w) const {return preview_>=0 && w.size()==instructions_.size()?w[preview_][previewSlot_]:GraphValue{};}
 
-std::string MaterialGraphProgram::GenerateHlsl() const
+bool MaterialGraphProgram::BuildRuntimeUniforms(const ParameterOverrides& parameters, const std::vector<bool>& linearTextures,
+    std::vector<Float4>& block, std::string& error) const
+{
+    if (linearTextures.size() != layout_.textures.size()) { error = "Texture colour-space list does not match the graph textures"; return false; }
+    std::vector<Float4> draft;
+    if (!BuildParameterBuffer(parameters, draft, error)) return false;
+    for (const bool linear : linearTextures) draft.push_back({linear ? 1.0f : 0.0f, 0, 0, 0});
+    block = std::move(draft); return true;
+}
+std::string MaterialGraphProgram::GenerateHlsl(const HlslOptions& options) const
 {
     std::ostringstream h; h.imbue(std::locale::classic());
     h << R"HLSL(// Generated material graph. Texture bindings use UNORM views; RGB sRGB decoding is explicit.
@@ -301,16 +310,33 @@ float GraphNoise(float3 p,int octaves,float persistence,uint seed) { float resul
 float4 GraphFinite(float4 v) { return float4(isfinite(v.x)?clamp(v.x,-1e6,1e6):0,isfinite(v.y)?clamp(v.y,-1e6,1e6):0,isfinite(v.z)?clamp(v.z,-1e6,1e6):0,isfinite(v.w)?clamp(v.w,-1e6,1e6):0); }
 )HLSL";
     const bool anyParameter = layout_.parameterBufferBytes != 0;
-    if(anyParameter){ h<<"cbuffer GraphParameters : register(b0) {\n";
-        for (const auto& p : layout_.parameters) if (p.type != PinType::Texture) h << "    float4 parameter_" << p.nodeId << "; // offset " << p.byteOffset << ", default " << Literal(p.defaultValue) << "\n";
-        h<<"};\n";
-    }
+    const bool vulkan = options.vulkanDescriptorSet;
+    const auto set = std::to_string(options.descriptorSet);
     std::unordered_set<std::uint32_t> textures;
     for(const auto& i:instructions_)if(i.node.kind==NodeKind::TextureParameter || ((i.node.kind==NodeKind::TextureSample || i.node.kind==NodeKind::Triplanar)&&i.sources[0]<0)) {
         if(!i.node.resource.empty() || !i.node.assetGuid.empty() || !i.node.assetId.empty() || i.node.kind==NodeKind::TextureParameter)textures.insert(i.node.id);
     }
+    if (vulkan) {
+        // One uniform block in BuildRuntimeUniforms order, and a sampler per texture (combined image samplers).
+        if (anyParameter || !layout_.textures.empty()) {
+            h << "[[vk::binding(" << kGraphUniformBinding << ", " << set << ")]] cbuffer GraphParameters {\n";
+            for (const auto& p : layout_.parameters) if (p.type != PinType::Texture) h << "    float4 parameter_" << p.nodeId << "; // offset " << p.byteOffset << ", default " << Literal(p.defaultValue) << "\n";
+            for (const auto& t : layout_.textures) h << "    float4 textureInfo_" << t.nodeId << "; // x=1 for linear RGB sources (EXR/HDR), x=0 for encoded RGB\n";
+            h << "};\n";
+        }
+        for (const auto& t : layout_.textures) {
+            const auto binding = std::to_string(kGraphFirstTextureBinding + t.binding);
+            h << "[[vk::combinedImageSampler]] [[vk::binding(" << binding << ", " << set << ")]] Texture2D<float4> texture_" << t.nodeId << ";\n";
+            h << "[[vk::combinedImageSampler]] [[vk::binding(" << binding << ", " << set << ")]] SamplerState sampler_" << t.nodeId << ";\n";
+        }
+    } else {
+    if(anyParameter){ h<<"cbuffer GraphParameters : register(b0) {\n";
+        for (const auto& p : layout_.parameters) if (p.type != PinType::Texture) h << "    float4 parameter_" << p.nodeId << "; // offset " << p.byteOffset << ", default " << Literal(p.defaultValue) << "\n";
+        h<<"};\n";
+    }
     for (const auto& t : layout_.textures) h << "Texture2D<float4> texture_" << t.nodeId << " : register(t" << t.binding << ");\n";
-    if(!textures.empty()) {
+    }
+    if (!vulkan && !textures.empty()) {
         h<<"SamplerState graphSampler : register(s0); // bilinear, repeat\n";
         h<<"cbuffer GraphTextureProperties : register(b1) {\n";
         for(const auto& i:instructions_)if(textures.contains(i.node.id))h<<"    float4 textureInfo_"<<i.node.id<<"; // x=1 for linear RGB sources (EXR/HDR), x=0 for encoded RGB; other fields reserved\n";
@@ -329,7 +355,8 @@ float4 GraphFinite(float4 v) { return float4(isfinite(v.x)?clamp(v.x,-1e6,1e6):0
         const auto emit=[&](int slot,const std::string& expression){h<<"    float4 "<<var(static_cast<int>(index),slot)<<" = GraphFinite("<<expression<<");\n";};
         const auto emitScalar=[&](int slot,const std::string& expression){emit(slot,"float4("+expression+",0,0,0)");};
         const auto surface=[&](int s){return linked(s)?var(i.sources[s],i.sourceSlots[s]):std::string("GraphDefault()");};
-        const auto sample=[&](std::string uv){const auto id=linked(0)?instructions_[i.sources[0]].node.id:n.id;return textures.contains(id)?"texture_"+std::to_string(id)+".Sample(graphSampler,"+uv+")":"float4(1,1,1,1)";};
+        const auto sample=[&](std::string uv){const auto id=linked(0)?instructions_[i.sources[0]].node.id:n.id;
+            return textures.contains(id)?"texture_"+std::to_string(id)+".Sample("+(vulkan?"sampler_"+std::to_string(id):std::string("graphSampler"))+","+uv+")":"float4(1,1,1,1)";};
         const auto emitSample=[&](int first,const std::string& raw){const auto sourceId=linked(0)?instructions_[i.sources[0]].node.id:n.id;
             const auto rgb=n.srgb?"float4(GraphSRGB("+raw+".rgb),"+raw+".a)":raw;
             emit(first,n.srgb && textures.contains(sourceId)?"(textureInfo_"+std::to_string(sourceId)+".x>0.5?"+raw+":"+rgb+")":rgb);for(int k=0;k<4;++k)emitScalar(first+k+1,raw+"."+std::string(1,"rgba"[k]));};
