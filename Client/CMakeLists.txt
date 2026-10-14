@@ -347,7 +347,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain
             -Fo "${STATIC_MESH_VS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -355,7 +355,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain
             -Fo "${STATIC_MESH_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -363,7 +363,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D SHADING_MODE_UNLIT=1
             -Fo "${STATIC_MESH_UNLIT_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     # The opaque draws' variants: no discard, so the depth test can run before shading.
@@ -372,7 +372,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D STATIC_MESH_OPAQUE=1
             -Fo "${STATIC_MESH_OPAQUE_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -380,7 +380,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D SHADING_MODE_UNLIT=1 -D STATIC_MESH_OPAQUE=1
             -Fo "${STATIC_MESH_UNLIT_OPAQUE_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -388,7 +388,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain -D STATIC_MESH_OUTLINE=1
             -Fo "${STATIC_MESH_OUTLINE_VS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -396,7 +396,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E PSMain -D STATIC_MESH_OUTLINE=1
             -Fo "${STATIC_MESH_OUTLINE_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -548,7 +548,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T vs_6_0 -E VSMain -D STATIC_MESH_SHADOW=1
             -Fo "${STATIC_MESH_SHADOW_VS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -556,7 +556,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -T ps_6_0 -E ShadowMaskPS
             -Fo "${STATIC_MESH_SHADOW_MASK_PS_SPV}" "${CLIENT_ROOT}/shaders/StaticMesh.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
+        DEPENDS "${CLIENT_ROOT}/shaders/StaticMesh.hlsl" "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli"
         VERBATIM
     )
     add_custom_command(
