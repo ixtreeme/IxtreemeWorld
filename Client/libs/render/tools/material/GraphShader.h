@@ -41,10 +41,18 @@ struct SpirvBinding
 };
 // Descriptor bindings actually present in a SPIR-V module (not the source's declarations).
 bool ReflectSpirvBindings(const std::vector<std::uint32_t>& words, std::vector<SpirvBinding>& bindings, std::string& error);
+// The scene a graph material is drawn in (the renderer's GraphEnvironment): set 2, a uniform block
+// (time, camera planes, viewport, sky parameters), the scene depth copy, the sky cube and panorama.
+// A shader declares the depth and sky images only when its graph has Scene Depth / Sky Reflection.
+constexpr std::uint32_t kGraphEnvironmentSet = 2, kGraphEnvironmentUniformBinding = 0, kGraphSceneDepthBinding = 1,
+    kGraphSkyCubeBinding = 2, kGraphSkyPanoramaBinding = 3;
 // Accepts a graph shader only if every binding it uses is one the static mesh renderer provides:
-// set 0 bindings 0..6 and, in kGraphDescriptorSet, the uniform block, the geometry map when the
-// graph reads geometry data, and textureCount textures.
+// set 0 bindings 0..6, in kGraphDescriptorSet the uniform block, the geometry map when the graph
+// reads geometry data and textureCount textures, and the environment set.
 bool ValidateGraphShaderBindings(const std::vector<std::uint32_t>& words, std::size_t textureCount, bool geometryMap, std::string& error);
+// Whether the shader samples the scene depth (a Scene Depth node): its transparent draws need a
+// depth copy of the view.
+bool GraphShaderReadsSceneDepth(const std::vector<std::uint32_t>& words);
 
 // Complete pixel shader source: the embedded static mesh header, the graph in Vulkan descriptor
 // form, and PSMain. GRAPH_OPAQUE selects the variant without discard.

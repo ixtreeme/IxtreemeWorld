@@ -510,7 +510,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T vs_6_0 -E VSMain
             -Fo "${SKY_VS_SPV}" "${CLIENT_ROOT}/shaders/Sky.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/Sky.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/Sky.hlsl" "${CLIENT_ROOT}/shaders/SkyFunctions.hlsli"
         VERBATIM
     )
     add_custom_command(
@@ -518,7 +518,7 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E make_directory "${GENERATED_SHADER_DIR}"
         COMMAND "${DXC_EXECUTABLE}" -spirv -fvk-use-dx-layout -T ps_6_0 -E PSMain
             -Fo "${SKY_PS_SPV}" "${CLIENT_ROOT}/shaders/Sky.hlsl"
-        DEPENDS "${CLIENT_ROOT}/shaders/Sky.hlsl"
+        DEPENDS "${CLIENT_ROOT}/shaders/Sky.hlsl" "${CLIENT_ROOT}/shaders/SkyFunctions.hlsli"
         VERBATIM
     )
     foreach(_god_ray_stage IN ITEMS "VS;vs_6_0;VSMain" "MASK_PS;ps_6_0;MaskPS" "BLUR_PS;ps_6_0;BlurPS" "VOLBLUR_PS;ps_6_0;VolBlurPS")

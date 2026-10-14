@@ -3,6 +3,8 @@
 // fallback to baked textures, and keeping the last working shader when a reload fails.
 #include "StaticMeshRenderer.h"
 #include "OffscreenSceneRenderer.h"
+#include "GraphEnvironment.h"
+#include <functional>
 #include "tools/material/GraphShader.h"
 #include "asset/AssetDatabase.h"
 #include "asset/FileAssetReader.h"
@@ -40,10 +42,11 @@ bool WriteFile(const std::filesystem::path& path, const std::string& bytes)
     file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     return static_cast<bool>(file);
 }
-std::string MaterialJson(const std::string& name, const std::string& graphShader, const std::string& emissiveTexture = {})
+std::string MaterialJson(const std::string& name, const std::string& graphShader, const std::string& emissiveTexture = {},
+    const std::string& alphaMode = "Opaque")
 {
     return "{\n  \"version\": 2,\n  \"shader\": \"PBR-Standard\",\n  \"shadingMode\": \"Lit\",\n  \"name\": \"" + name +
-        "\",\n  \"baseColor\": [1, 1, 1, 1],\n  \"alphaMode\": \"Opaque\",\n" +
+        "\",\n  \"baseColor\": [1, 1, 1, 1],\n  \"alphaMode\": \"" + alphaMode + "\",\n" +
         (graphShader.empty() ? std::string{} : "  \"graphShader\": \"" + graphShader + "\",\n") +
         (emissiveTexture.empty() ? std::string("  \"textures\": {}\n}\n") :
             "  \"emissive\": [1, 1, 1, 1],\n  \"textures\": {\"emissive\": \"" + emissiveTexture + "\"}\n}\n");
@@ -68,6 +71,9 @@ struct GraphMaterialRenderTestAccess
         if (!native.Create(window, 96, 64)) { Check(false, "GPU device"); window.Destroy(); return; }
         auto rhi = ixvulkan::CreateDevice(native);
         client::asset::FileAssetReader assets(IX_GRAPH_RENDER_TEST_ASSETS_ROOT);
+        GraphEnvironment environment;
+        environment.Create(*rhi);
+        StaticMeshRenderer::SetGraphEnvironment(&environment);
         std::vector<std::array<float, 4>> images[2];
         {
             OffscreenSceneRenderer scene;
@@ -171,6 +177,8 @@ struct GraphMaterialRenderTestAccess
             scene.Destroy();
             shadow = {};
         }
+        StaticMeshRenderer::SetGraphEnvironment(nullptr);
+        environment.Destroy();
         rhi->Shutdown(); rhi.reset(); native.Destroy(); window.Destroy();
         if (images[0].empty() || images[1].empty()) return;
         double sum = 0, worst = 0;
@@ -248,6 +256,9 @@ struct GraphMaterialRenderTestAccess
         if (!native.Create(window, 96, 64)) { Check(false, "GPU device"); window.Destroy(); return; }
         auto rhi = ixvulkan::CreateDevice(native);
         client::asset::FileAssetReader assets(IX_GRAPH_RENDER_TEST_ASSETS_ROOT);
+        GraphEnvironment environment;
+        Check(environment.Create(*rhi), "graph environment (descriptor set 2)");
+        StaticMeshRenderer::SetGraphEnvironment(&environment);
         {
             OffscreenSceneRenderer scene;
             const bool target = scene.Create(*rhi, assets, 96, 64, OffscreenSceneRenderer::kSceneColorFormat,
@@ -307,7 +318,8 @@ struct GraphMaterialRenderTestAccess
             auto output = buffer(U::Storage | U::TransferSrc, false), readback = buffer(U::TransferDst, true);
             auto sampler = rhi->CreateSampler({});
             Check(samplePipeline && sampleGroup && output && readback && sampler, "read-back compute pass");
-            if (!ready || !samplePipeline || !sampleGroup || !output || !readback) { rhi->WaitIdle(); renderer.Destroy(); rhi->Shutdown(); return; }
+            if (!ready || !samplePipeline || !sampleGroup || !output || !readback)
+            { rhi->WaitIdle(); renderer.Destroy(); StaticMeshRenderer::SetGraphEnvironment(nullptr); environment.Destroy(); rhi->Shutdown(); return; }
             sampleGroup->UpdateBuffer(0, 0, output, 0, 16);
             sampleGroup->UpdateTexture(0, 1, scene.GetColorTexture(), sampler);
 
@@ -318,6 +330,8 @@ struct GraphMaterialRenderTestAccess
             bool shadowReady = false;
             using State = ixrhi::IXRHIBufferState;
             auto outputState = State::Undefined, readState = State::Undefined;
+            std::function<void(const ixrhi::IXRHIFrameInfo&)> beforeDraw;  // e.g. GraphEnvironment::Begin
+            bool transparent = false;  // drawn by the transparent pass instead of the opaque one
             const auto render = [&](const std::string& material, float* pixel) {
                 instance.materialSlots = {material};
                 auto frame = rhi->BeginFrame();
@@ -329,8 +343,13 @@ struct GraphMaterialRenderTestAccess
                     shadowReady = true;
                 }
                 renderer.RecordPendingUploads(cmd, frame.info);  // as the engine does every frame
+                if (beforeDraw)
+                    beforeDraw(frame.info);
                 scene.BeginMainPass(cmd, frame.info);
-                renderer.RenderBatchInWorld(cmd, frame.info, 0, camera, {&instance}, 96, 64);
+                if (transparent)
+                    renderer.RenderTransparentInWorld(cmd, frame.info, 0, camera, instance, 96, 64);
+                else
+                    renderer.RenderBatchInWorld(cmd, frame.info, 0, camera, {&instance}, 96, 64);
                 scene.EndMainPass(cmd);
                 cmd.TransitionBuffer(*output, outputState, State::ShaderWrite); outputState = State::ShaderWrite;
                 cmd.SetComputePipeline(*samplePipeline); cmd.BindGroup(0, *sampleGroup, 0); cmd.Dispatch(1, 1, 1);
@@ -400,11 +419,85 @@ struct GraphMaterialRenderTestAccess
             Check(render(graphMaterial, pixel) && render(graphMaterial, pixel) && Near(pixel, {128 / 255.0f, 0.25f + 32 / 255.0f, 200 / 255.0f}),
                   "a republished graph shader replaces the previous one");
 
+            // The scene inputs (GraphEnvironment, set 2): the emissive colour carries the time, the scene
+            // depth behind the quad and the mirrored sky (R = time / 4, G = depth / 4, B = sky blue).
+            MaterialGraphDocument sceneGraph;
+            const auto time = sceneGraph.AddNode(NodeKind::Time, {}), depth = sceneGraph.AddNode(NodeKind::SceneDepth, {}),
+                       mirror = sceneGraph.AddNode(NodeKind::SkyReflection, {}), split = sceneGraph.AddNode(NodeKind::SplitColor, {}),
+                       timeScale = sceneGraph.AddNode(NodeKind::Multiply, {}), depthScale = sceneGraph.AddNode(NodeKind::Multiply, {}),
+                       make = sceneGraph.AddNode(NodeKind::MakeColor, {}), black = sceneGraph.AddNode(NodeKind::Color, {}),
+                       sceneOutput = sceneGraph.AddNode(NodeKind::PbrOutput, {});
+            sceneGraph.FindNode(black)->value = {0, 0, 0, 1};
+            sceneGraph.FindNode(timeScale)->value[1] = 0.25f;
+            sceneGraph.FindNode(depthScale)->value[1] = 0.25f;
+            sceneGraph.FindNode(depth)->value[0] = 3;  // the fallback depth
+            Check(sceneGraph.Connect(PinId(time, 0), PinId(timeScale, 0), error) && sceneGraph.Connect(PinId(depth, 0), PinId(depthScale, 0), error) &&
+                  sceneGraph.Connect(PinId(mirror, 1), PinId(split, 0), error) && sceneGraph.Connect(PinId(timeScale, 2), PinId(make, 0), error) &&
+                  sceneGraph.Connect(PinId(depthScale, 2), PinId(make, 1), error) && sceneGraph.Connect(PinId(split, 3), PinId(make, 2), error) &&
+                  sceneGraph.Connect(PinId(make, 4), PinId(sceneOutput, 3), error) && sceneGraph.Connect(PinId(black, 0), PinId(sceneOutput, 0), error),
+                  "scene input graph connects: " + error);
+            MaterialGraphProgram sceneProgram;
+            GraphShaderPackage scenePackage;
+            Check(sceneProgram.Compile(sceneGraph, error) && CompileGraphShader(sceneProgram, scenePackage, error, compiler) &&
+                  sceneProgram.BuildRuntimeUniforms({}, {}, scenePackage.uniforms, error) && EncodeGraphShaderPackage(scenePackage, bytes, error) &&
+                  WriteFile(root / "Scene" / "graph.ixgraphshader", bytes) &&
+                  WriteFile(root / "Scene" / "Scene.material", MaterialJson("Scene", "graph.ixgraphshader")) &&
+                  WriteFile(root / "SceneBlend" / "graph.ixgraphshader", bytes) &&
+                  WriteFile(root / "SceneBlend" / "SceneBlend.material", MaterialJson("SceneBlend", "graph.ixgraphshader", {}, "Blend")),
+                  "scene input graph is published: " + error);
+            Check(GraphShaderReadsSceneDepth(scenePackage.maskedSpirv) && !GraphShaderReadsSceneDepth(package.maskedSpirv),
+                  "only a graph with Scene Depth samples the scene depth");
+            const auto sceneMaterial = AssetDatabase::Instance().getOrCreateGuid(root / "Scene" / "Scene.material").toString();
+            const auto sceneBlendMaterial = AssetDatabase::Instance().getOrCreateGuid(root / "SceneBlend" / "SceneBlend.material").toString();
+            SkyRenderer::Lookup sky;
+            sky.parameters[3] = 0;  // mode 0: a flat colour, the same in every direction
+            sky.parameters[24] = 0.2f; sky.parameters[25] = 0.4f; sky.parameters[26] = 0.6f;
+            environment.SetSky(sky);
+            // The view's depth copy: one texel at depth 191/255, behind the quad at 0.5.
+            ixrhi::IXRHITextureDesc depthDesc;
+            depthDesc.width = depthDesc.height = 1; depthDesc.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
+            depthDesc.usage = ixrhi::IXRHITextureUsage::Sampled;
+            const std::uint8_t depthTexel[4] = {191, 0, 0, 255};
+            auto sceneDepth = rhi->CreateTexture(depthDesc, depthTexel, sizeof(depthTexel));
+            camera.nearPlane = 1; camera.farPlane = 3;
+            const auto linearDepth = [&](float ndc) {
+                const float a = camera.farPlane / (camera.farPlane - camera.nearPlane), b = camera.nearPlane * camera.farPlane / (camera.farPlane - camera.nearPlane);
+                return b / (a - ndc);
+            };
+            const float behind = linearDepth(191 / 255.0f) - linearDepth(0.5f);
+            std::uint64_t lastFrame = 0;
+            const auto begin = [&](double seconds, bool withDepth) {
+                beforeDraw = [&, seconds, withDepth](const ixrhi::IXRHIFrameInfo& info) {
+                    lastFrame = info.frameNumber;
+                    environment.Begin(info, seconds, camera, 96, 64, withDepth ? sceneDepth : nullptr);
+                };
+            };
+            begin(2.0, true);
+            Check(sceneDepth && render(sceneMaterial, pixel) && Near(pixel, {0.5f, behind * 0.25f, 0.6f}) &&
+                  renderer.m_lastMaterialBindings[0].pipelineName == "StaticMesh:GraphOpaque",
+                  "Time, Scene Depth and Sky Reflection read the view's time, depth copy and sky");
+            std::cout << "scene pixel " << pixel[0] << ' ' << pixel[1] << ' ' << pixel[2] << " (depth behind " << behind << ")\n";
+            begin(1.0, false);
+            Check(render(sceneMaterial, pixel) && Near(pixel, {0.25f, 0.75f, 0.6f}),
+                  "the next frame's time is drawn; without a depth copy Scene Depth uses its fallback");
+            beforeDraw = nullptr;
+            Check(render(sceneMaterial, pixel) && Near(pixel, {0.25f, 0.75f, 0.6f}),
+                  "a frame drawn without a Begin keeps the last view's time");
+            transparent = true;
+            begin(2.0, true);
+            Check(render(sceneBlendMaterial, pixel) && Near(pixel, {0.5f, behind * 0.25f, 0.6f}) &&
+                  environment.SceneDepthReadRecently(lastFrame),
+                  "a transparent graph reads the depth copy and asks the frame owner to keep copying it");
+            transparent = false;
+            beforeDraw = nullptr;
+
             rhi->WaitIdle();
             renderer.Destroy();
             scene.Destroy();
             shadow = {};
         }
+        StaticMeshRenderer::SetGraphEnvironment(nullptr);
+        environment.Destroy();
         rhi->Shutdown(); rhi.reset(); native.Destroy(); window.Destroy();
         std::filesystem::remove_all(root, ec);
     }

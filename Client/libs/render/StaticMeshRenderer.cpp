@@ -12,6 +12,7 @@
 #include "JobSystem.h"
 #include "MaterialAssetManager.h"
 #include "tools/material/GraphShader.h"
+#include "GraphEnvironment.h"
 #include "ProjectManager.h"
 #include "asset/IAssetReader.h"
 
@@ -3405,6 +3406,11 @@ bool StaticMeshRenderer::BuildGraphMaterial(ixrhi::IXRHIDevice& rhi, const std::
         error = "static mesh pipelines are not ready";
         return false;
     }
+    if (!s_graphEnvironment || !s_graphEnvironment->IsReady())
+    {
+        error = "no graph environment (time, scene depth, sky)";
+        return false;
+    }
     const std::size_t textureCount = package.textures.size();
     const bool geometryMap = std::any_of(package.textures.begin(), package.textures.end(),
         [](const auto& texture) { return texture.binding == kGraphGeometryBinding; });
@@ -3462,7 +3468,9 @@ bool StaticMeshRenderer::BuildGraphMaterial(ixrhi::IXRHIDevice& rhi, const std::
         error = "cannot create the shader modules";
         return false;
     }
-    const std::vector<const ixrhi::IXRHIBindGroupLayout*> layouts = {m_bindLayout.get(), graph.layout.get()};
+    graph.readsSceneDepth = GraphShaderReadsSceneDepth(package.maskedSpirv);
+    const std::vector<const ixrhi::IXRHIBindGroupLayout*> layouts = {m_bindLayout.get(), graph.layout.get(),
+        s_graphEnvironment->Layout()};
     ixrhi::IXRHIGraphicsPipelineDesc desc = *m_graphPipelineBase;
     desc.bindGroupLayouts = layouts;
     desc.fragmentShader = opaque;
@@ -3492,8 +3500,9 @@ bool StaticMeshRenderer::BuildGraphMaterial(ixrhi::IXRHIDevice& rhi, const std::
     return true;
 }
 
-void StaticMeshRenderer::BindGraphMaterial(ixrhi::IXRHICommandList& cmd, GraphMaterial& graph, std::uint32_t frameIndex)
+void StaticMeshRenderer::BindGraphMaterial(ixrhi::IXRHICommandList& cmd, GraphMaterial& graph, const ixrhi::IXRHIFrameInfo& frame)
 {
+    const std::uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     // Same values every draw of a frame (both views, reflections); a change lands with the next frame.
     graph.uniforms[frameIndex]->Write(0, graph.values.data(), graph.values.size() * sizeof(graph.values[0]));
     for (std::size_t i = 0; i < graph.textures.size() && i < graph.resident.size(); ++i)
@@ -3505,6 +3514,7 @@ void StaticMeshRenderer::BindGraphMaterial(ixrhi::IXRHICommandList& cmd, GraphMa
         graph.bound[frameIndex][i] = texture.image.get();
     }
     cmd.BindGroup(1, *graph.group, frameIndex);
+    s_graphEnvironment->Bind(cmd, frame);  // set when the graph was built
 }
 
 void StaticMeshRenderer::UpdateMaterialTextureDescriptors(const BindSlot& slot, const MaterialTextureViews& textures)
@@ -4725,7 +4735,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
                     continue;
                 cmd.BindGroup(0, *kept->page->group, kept->set);
                 if (graph)
-                    BindGraphMaterial(cmd, *graph, frameIndex);
+                    BindGraphMaterial(cmd, *graph, frame);
                 if (!culler || capturing || !culler->Draw(cmd, indexCount, draw.instanceCount, firstIndex, 0, draw.firstInstance))
                 cmd.DrawIndexed(indexCount, draw.instanceCount, firstIndex, 0, draw.firstInstance);
                 ++m_lastSubmittedDrawCalls;
@@ -4767,7 +4777,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
             ++m_lastMaterialUniformUpdates;
             cmd.BindGroup(0, *slot->page->group, slot->set);
             if (graph)
-                BindGraphMaterial(cmd, *graph, frameIndex);
+                BindGraphMaterial(cmd, *graph, frame);
             const auto inRun = [&](std::size_t index) {
                 const std::size_t first = draw.firstInstance - command.firstInstance;
                 return index >= first && index < first + draw.instanceCount;
@@ -5033,7 +5043,11 @@ void StaticMeshRenderer::RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
         cmd.SetGraphicsPipeline(*sides[0]);  // back faces
         cmd.BindGroup(0, *slot->page->group, slot->set);
         if (textures.graph)
-            BindGraphMaterial(cmd, *textures.graph, frameIndex);
+        {
+            BindGraphMaterial(cmd, *textures.graph, frame);
+            if (textures.graph->readsSceneDepth)
+                s_graphEnvironment->NoteSceneDepthRead();
+        }
         cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, *base + static_cast<std::uint32_t>(i));
         cmd.SetGraphicsPipeline(*sides[1]);  // front faces
         cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, *base + static_cast<std::uint32_t>(i));

@@ -185,10 +185,11 @@ bool ValidateGraphShaderBindings(const std::vector<std::uint32_t>& words, std::s
     for (const auto& b : bindings)
     {
         const bool staticMesh = b.set == 0 && b.binding <= 6;
+        const bool environment = b.set == kGraphEnvironmentSet && b.binding <= kGraphSkyPanoramaBinding;
         const bool graph = b.set == kGraphDescriptorSet && (b.binding == kGraphUniformBinding ||
             (geometryMap && b.binding == kGraphGeometryBinding) ||
             (b.binding >= kGraphFirstTextureBinding && b.binding < kGraphFirstTextureBinding + textureCount));
-        if (!staticMesh && !graph)
+        if (!staticMesh && !graph && !environment)
         {
             error = "Graph shader uses descriptor set " + std::to_string(b.set) + " binding " + std::to_string(b.binding) +
                 (b.name.empty() ? std::string{} : " (" + b.name + ")") + ", which the static mesh renderer does not provide";
@@ -198,12 +199,67 @@ bool ValidateGraphShaderBindings(const std::vector<std::uint32_t>& words, std::s
     error.clear(); return true;
 }
 
+bool GraphShaderReadsSceneDepth(const std::vector<std::uint32_t>& words)
+{
+    std::vector<SpirvBinding> bindings; std::string error;
+    return ReflectSpirvBindings(words, bindings, error) && std::any_of(bindings.begin(), bindings.end(),
+        [](const auto& b) { return b.set == kGraphEnvironmentSet && b.binding == kGraphSceneDepthBinding; });
+}
+
 std::string BuildGraphPixelShader(const MaterialGraphProgram& program)
 {
     const bool geometry = program.Layout().needsGeometryData;
+    const auto uses = [&](NodeKind kind) {
+        return std::any_of(program.Instructions().begin(), program.Instructions().end(), [&](const auto& i) { return i.node.kind == kind; });
+    };
+    const bool sceneDepth = uses(NodeKind::SceneDepth), sky = uses(NodeKind::SkyReflection);
     HlslOptions options; options.vulkanDescriptorSet = true;
     std::ostringstream h;
-    h << "#include \"StaticMeshCommon.hlsli\"\n" << program.GenerateHlsl(options);
+    const auto binding = [&](std::uint32_t b) { return "[[vk::binding(" + std::to_string(b) + ", " + std::to_string(kGraphEnvironmentSet) + ")]]"; };
+    h << R"HLSL(#include "StaticMeshCommon.hlsli"
+#include "SkyFunctions.hlsli"
+// The scene the material is drawn in (GraphEnvironment): the graph's Time, Scene Depth and Sky Reflection.
+#define GRAPH_ENVIRONMENT 1
+)HLSL" << binding(kGraphEnvironmentUniformBinding) << R"HLSL( cbuffer GraphEnvironmentConstants
+{
+    float4 u_graphFrame;     // x seconds, y camera near, z camera far, w 1 when the scene depth is bound
+    float4 u_graphViewport;  // x width, y height, z 1/width, w 1/height
+    float4 u_graphSky[7];    // SkyParameters, in order
+};
+)HLSL";
+    const auto image = [&](std::uint32_t b, const char* type, const char* name) {
+        h << "[[vk::combinedImageSampler]] " << binding(b) << " " << type << " " << name << ";\n"
+          << "[[vk::combinedImageSampler]] " << binding(b) << " SamplerState " << name << "Sampler;\n";
+    };
+    if (sceneDepth)
+        image(kGraphSceneDepthBinding, "Texture2D<float4>", "u_graphSceneDepth");
+    if (sky)
+    {
+        image(kGraphSkyCubeBinding, "TextureCube<float4>", "u_graphSkyCube");
+        image(kGraphSkyPanoramaBinding, "Texture2D<float4>", "u_graphSkyPanorama");
+    }
+    h << "float3 GraphSkyColor(float3 d)\n{\n" << (sky ? R"HLSL(    SkyParameters sky;
+    sky.zenith = u_graphSky[0]; sky.horizon = u_graphSky[1]; sky.ground = u_graphSky[2]; sky.sunDir = u_graphSky[3];
+    sky.sunColor = u_graphSky[4]; sky.tint = u_graphSky[5]; sky.color = u_graphSky[6];
+    return SkyColor(sky, u_graphSkyCube, u_graphSkyCubeSampler, u_graphSkyPanorama, u_graphSkyPanoramaSampler,
+        dot(d, d) < 1e-12 ? float3(0, 1, 0) : normalize(d));
+)HLSL" : "    return 0;\n") << R"HLSL(}
+// The tangent-space normal in the mesh's UV frame, as the lighting uses it.
+float3 GraphTangentToWorld(float3 worldNormal, float3 worldPosition, float2 uv, float3 tangentNormal)
+{
+    return PerturbNormal(worldNormal, worldPosition, uv, tangentNormal);
+}
+// Metres of scene behind the pixel along the view (view-space depths apart), or -1 without a depth copy.
+float GraphSceneDepthBehind(float4 position)
+{
+)HLSL" << (sceneDepth ? R"HLSL(    if (u_graphFrame.w < 0.5)
+        return -1.0;
+    const float nearPlane = max(u_graphFrame.y, 0.0001);
+    const float farPlane = max(u_graphFrame.z, nearPlane + 0.001);
+    const float a = farPlane / (farPlane - nearPlane), b = nearPlane * farPlane / (farPlane - nearPlane);
+    const float scene = u_graphSceneDepth.SampleLevel(u_graphSceneDepthSampler, position.xy * u_graphViewport.zw, 0).r;
+    return max(0.0, b / max(a - saturate(scene), 1e-6) - b / max(a - saturate(position.z), 1e-6));
+)HLSL" : "    return -1.0;\n") << "}\n" << program.GenerateHlsl(options);
     if (geometry)
         h << "[[vk::combinedImageSampler]] [[vk::binding(" << kGraphGeometryBinding << ", " << kGraphDescriptorSet << ")]] Texture2D<float4> graphGeometry;\n"
           << "[[vk::combinedImageSampler]] [[vk::binding(" << kGraphGeometryBinding << ", " << kGraphDescriptorSet << ")]] SamplerState graphGeometrySampler;\n";
@@ -224,7 +280,8 @@ float4 PSMain(VSOutput input) : SV_Target0
     c.worldNormal = geometricNormal;
     c.viewDirection = normalize(u_cameraPosition.xyz - input.worldPos);
     c.ao = 1.0; c.curvature = 0.5; c.cavity = 0.0;
-    c.time = 0.0; c.sceneDepth = -1.0;
+    c.time = u_graphFrame.x;
+    c.sceneDepth = GraphSceneDepthBehind(input.position);
 )HLSL";
     if (geometry)
         h << "    const float3 geometryMap = graphGeometry.Sample(graphGeometrySampler, input.uv).rgb;\n"
@@ -324,6 +381,7 @@ bool CompileGraphShader(const MaterialGraphProgram& program, GraphShaderPackage&
     const auto source = folder / "graph.hlsl";
     if (!WriteText(folder / "StaticMeshCommon.hlsli", graph_shader_sources::staticMeshCommon) ||
         !WriteText(folder / "SunShadow.hlsli", graph_shader_sources::sunShadow) ||
+        !WriteText(folder / "SkyFunctions.hlsli", graph_shader_sources::skyFunctions) ||
         !WriteText(source, BuildGraphPixelShader(program)))
     { error = "Cannot write the graph shader source"; return false; }
     const std::size_t textures = program.Layout().textures.size();

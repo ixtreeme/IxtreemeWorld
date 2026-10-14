@@ -48,6 +48,7 @@ class IAssetReader;
 namespace tree_tool { struct TreeImpostorSettings; }
 
 struct MaterialAsset;
+class GraphEnvironment;
 
 class StaticMeshRenderer
 {
@@ -278,6 +279,11 @@ public:
     bool CopyPhysicsMesh(std::vector<std::array<float, 3>>& outVertices, std::vector<std::uint32_t>& outIndices) const;
     bool RaycastSurface(WorldVec3 origin, WorldVec3 direction, const Instance& instance, float& outDistance) const;
     // Bake a static model with any number of native default materials, preserving mesh bytes/GUID.
+    // The scene inputs of material graph shaders (descriptor set 2), shared by every renderer and
+    // owned by the frame owner, which must keep it alive while any renderer exists. Without one,
+    // published graph materials are drawn from their baked textures.
+    static void SetGraphEnvironment(GraphEnvironment* environment) { s_graphEnvironment = environment; }
+    static GraphEnvironment* GetGraphEnvironment() { return s_graphEnvironment; }
     static bool BakeMeshImpostorAsset(client::asset::IAssetReader& assets, const std::filesystem::path& modelPath,
         const tree_tool::TreeImpostorSettings& settings, std::string& error);
     // Backward-compatible name used by the tree generator and existing callers.
@@ -407,6 +413,7 @@ private:
         std::uint64_t materialRevision = 0;
         std::uint64_t liveRevision = 0;  // GraphLiveValues applied to values
         bool failed = false;
+        bool readsSceneDepth = false;  // a Scene Depth node: transparent draws want the view's depth copy
         std::unique_ptr<ixrhi::IXRHIBindGroupLayout> layout;
         std::unique_ptr<ixrhi::IXRHIBindGroup> group;  // one set per frame in flight
         std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> uniforms{};
@@ -521,7 +528,8 @@ private:
         bool withGraph = false);
     GraphMaterial* EnsureGraphMaterial(ixrhi::IXRHIDevice& rhi, const MaterialAsset& material);
     bool BuildGraphMaterial(ixrhi::IXRHIDevice& rhi, const std::string& bytes, GraphMaterial& graph, std::string& error);
-    void BindGraphMaterial(ixrhi::IXRHICommandList& cmd, GraphMaterial& graph, std::uint32_t frameIndex);
+    void BindGraphMaterial(ixrhi::IXRHICommandList& cmd, GraphMaterial& graph, const ixrhi::IXRHIFrameInfo& frame);
+    static inline GraphEnvironment* s_graphEnvironment = nullptr;
     // Textures/samplers each bind set's descriptors point at (baseColor, normal, orm), so a draw
     // re-binding the same material skips the descriptor writes. A bind group keeps every resource
     // ever bound to it alive, so a stored pointer cannot be reused by another texture meanwhile.

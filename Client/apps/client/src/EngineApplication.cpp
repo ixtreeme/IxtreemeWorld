@@ -58,6 +58,7 @@
 #include "SelectionSystem.h"
 #include "SelectionOutlineRenderer.h"
 #include "SkyRenderer.h"
+#include "GraphEnvironment.h"
 #include "GodRayRenderer.h"
 #include "SpatialIndex.h"
 #include "StaticMeshRenderer.h"
@@ -2642,6 +2643,13 @@ int RunGame(NativeWindow& window,
         skyRenderer.Destroy();
     }
     SkySettings sceneSky;
+    // What material graph shaders read from the scene (Time, Scene Depth, Sky Reflection), shared by
+    // every static mesh renderer: one descriptor set per view, begun before the view's draws.
+    GraphEnvironment graphEnvironment;
+    if (graphEnvironment.Create(*rhiDevice))
+        StaticMeshRenderer::SetGraphEnvironment(&graphEnvironment);
+    else
+        Tracenf("[MAIN] GraphEnvironment failed to initialize - graph materials are drawn from their baked textures");
     // God rays (Scene Settings > God rays): light shafts from the Sun, over the Scene and Game views.
     GodRayRenderer godRays;
     bool godRaysOk = godRays.Create(*rhiDevice, assets);
@@ -13084,6 +13092,7 @@ int RunGame(NativeWindow& window,
                     frameSunLighting,
                     ProjectManager::Instance().HasProject() ? ProjectManager::Instance().ProjectRoot()
                                                             : std::filesystem::path{});
+                graphEnvironment.SetSky(skyRenderer.GetLookup());
             }
             // Sculpted terrain vertices reach the drawn vertex buffer before any pass draws the terrain
             // (outside render passes: nothing is open yet here).
@@ -13629,6 +13638,8 @@ int RunGame(NativeWindow& window,
                     mainPassOpen = true;
                 }
             };
+            // Graph materials of the Scene view's opaque draws: this frame's time, no depth (being drawn).
+            graphEnvironment.Begin(frameInfo, seconds, camera, renderSize.width, renderSize.height);
             // A hidden Scene View draws nothing: skip its whole pass (full-res clear + tone map) —
             // the panel keeps showing its last image until it is shown again.
             if (useOffscreenScene && drawSceneView)
@@ -14282,7 +14293,9 @@ int RunGame(NativeWindow& window,
                     [](const TransparentDraw& draw) {
                         return draw.particleRenderer != nullptr && draw.particleBatch.softParticles;
                     });
-                sceneSnapshotPass = useOffscreenScene && sceneWaterPass;
+                // Transparent graph materials reading the scene depth (Scene Depth) need the same copy.
+                sceneSnapshotPass = useOffscreenScene &&
+                    (sceneWaterPass || graphEnvironment.SceneDepthReadRecently(frameInfo.frameNumber));
                 // Transparent draws over the sky: those under water now; the rest after the water (its
                 // pass, or right below in direct mode), or now when no water follows.
                 sortTransparentDraws(sceneTransparentDraws);
@@ -14546,7 +14559,10 @@ int RunGame(NativeWindow& window,
                         particleRenderer.SetSceneDepth(offscreenScene.GetDepthSnapshotTexture(),
                             offscreenScene.GetSampler(), camera.nearPlane, camera.farPlane);
                         offscreenScene.BeginMainPass(*frameInfo.commandList, frameInfo, false);
-                        terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
+                        graphEnvironment.Begin(frameInfo, seconds, camera, offscreenScene.Width(), offscreenScene.Height(),
+                            offscreenScene.GetDepthSnapshotTexture());
+                        if (sceneWaterPass)
+                            terrain.RenderWater(*frameInfo.commandList, frameInfo, camera, seconds, renderSize.width, renderSize.height);
                         // The transparent draws above the water (and the soft particles), over it.
                         drawTransparents(sceneTransparentDraws, /*underWater=*/false, camera, renderSize.width, renderSize.height);
                         offscreenScene.EndMainPass(*frameInfo.commandList);
@@ -14618,6 +14634,7 @@ int RunGame(NativeWindow& window,
                         const VkExtent2D gameExtent{gameView.Width(), gameView.Height()};
                         const WorldCamera& gameCamera = *gameViewCamera;
                         viewImpostors.BeginView(gameView, *frameInfo.commandList, frameInfo, gameCamera, seconds, 1, viewLightingRevision);
+                        graphEnvironment.Begin(frameInfo, seconds, gameCamera, gameExtent.width, gameExtent.height);
                         gameView.BeginMainPass(*frameInfo.commandList, frameInfo);
                         const auto gameOccluders = prepareOcclusion(gameView, gameCamera, gameExtent.width, gameExtent.height, 1);
                         // Terrain is drawn from the project Main Camera using the secondary
@@ -14721,7 +14738,7 @@ int RunGame(NativeWindow& window,
                         sortTransparentDraws(gameTransparentDraws);
                         drawTransparents(gameTransparentDraws, /*underWater=*/true, gameCamera, gameExtent.width, gameExtent.height);
                         const bool gameWaterVisible = hasSceneTerrain && terrain.AnyWaterBodyInView(gameCamera);
-                        if (gameWaterVisible)
+                        if (gameWaterVisible || graphEnvironment.SceneDepthReadRecently(frameInfo.frameNumber))
                         {
                             gameView.EndMainPass(*frameInfo.commandList);
                             gameView.SnapshotScene(*frameInfo.commandList, frameInfo);
@@ -14729,8 +14746,11 @@ int RunGame(NativeWindow& window,
                                 gameView.GetDepthSnapshotTexture(), gameView.GetSampler(),
                                 gameExtent.width, gameExtent.height, 1);
                             gameView.BeginMainPass(*frameInfo.commandList, frameInfo, false);
-                            terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds,
-                                gameExtent.width, gameExtent.height, 1);
+                            graphEnvironment.Begin(frameInfo, seconds, gameCamera, gameView.Width(), gameView.Height(),
+                                gameView.GetDepthSnapshotTexture());
+                            if (gameWaterVisible)
+                                terrain.RenderWater(*frameInfo.commandList, frameInfo, gameCamera, seconds,
+                                    gameExtent.width, gameExtent.height, 1);
                         }
                         drawTransparents(gameTransparentDraws, /*underWater=*/false, gameCamera, gameExtent.width, gameExtent.height);
                         // God rays over the game image, under the game's UI: after the pass, from its depth;
@@ -15343,6 +15363,8 @@ int RunGame(NativeWindow& window,
 #endif
     rmlUi.Destroy();
     runtimeSession->Destroy();
+    StaticMeshRenderer::SetGraphEnvironment(nullptr);
+    graphEnvironment.Destroy();
     // Backend frame authority teardown BEFORE legacy device teardown (§70):
     // releases frame contexts, swapchain object, query pool and upload pool.
     rhiDevice->Shutdown();

@@ -6,4 +6,5 @@ namespace material_tool::graph_shader_sources
 {
 inline constexpr std::string_view staticMeshCommon = R"IXHLSL(@IX_GRAPH_STATIC_MESH_COMMON@)IXHLSL";
 inline constexpr std::string_view sunShadow = R"IXHLSL(@IX_GRAPH_SUN_SHADOW@)IXHLSL";
+inline constexpr std::string_view skyFunctions = R"IXHLSL(@IX_GRAPH_SKY_FUNCTIONS@)IXHLSL";
 }

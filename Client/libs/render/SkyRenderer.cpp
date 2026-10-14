@@ -540,6 +540,17 @@ void SkyRenderer::LoadImages(const SkySettings& sky, const std::filesystem::path
     BindTextures();
 }
 
+SkyRenderer::Lookup SkyRenderer::GetLookup() const
+{
+    Lookup lookup;
+    lookup.parameters = m_parameters;
+    lookup.cube = m_cube ? m_cube : m_fallbackCube;
+    lookup.panorama = m_panorama ? m_panorama : m_fallbackPanorama;
+    lookup.cubeSampler = m_cubeSampler;
+    lookup.panoramaSampler = m_panoramaSampler;
+    return lookup;
+}
+
 void SkyRenderer::Update(const ixrhi::IXRHIFrameInfo& frame,
                          const SkySettings& sky,
                          const LightingState& lighting,
@@ -598,6 +609,8 @@ void SkyRenderer::Update(const ixrhi::IXRHIFrameInfo& frame,
     const std::uint32_t frameIndex = frame.frameIndex % kFramesInFlight;
     if (m_uniformBuffers[frameIndex])
         m_uniformBuffers[frameIndex]->Write(0, &uniform, sizeof(uniform));
+    static_assert(sizeof(UniformBlock) == sizeof(m_parameters));
+    std::memcpy(m_parameters.data(), &uniform, sizeof(uniform));
 
     // The average colour, matching what the shader draws (mode after the fallback above).
     std::array<float, 3> average{};

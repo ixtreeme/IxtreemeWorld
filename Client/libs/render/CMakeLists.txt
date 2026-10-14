@@ -63,6 +63,8 @@ add_library(IXEngineRender STATIC
     SkinnedMeshRenderer.cpp
     SkinnedMeshRenderer.h
     SkyRenderer.cpp
+    GraphEnvironment.cpp
+    GraphEnvironment.h
     SkyRenderer.h
     GodRayRenderer.cpp
     GodRayRenderer.h
@@ -106,8 +108,9 @@ target_compile_features(IXMaterialGraph PUBLIC cxx_std_20)
 target_link_libraries(IXMaterialGraph PUBLIC IXGeometryBaker PRIVATE IXEnginePlatform)
 # Graph pixel shaders are compiled against the engine's own static mesh shading, embedded here.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-    "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli")
+    "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" "${CLIENT_ROOT}/shaders/SunShadow.hlsli" "${CLIENT_ROOT}/shaders/SkyFunctions.hlsli")
 file(READ "${CLIENT_ROOT}/shaders/StaticMeshCommon.hlsli" IX_GRAPH_STATIC_MESH_COMMON)
+file(READ "${CLIENT_ROOT}/shaders/SkyFunctions.hlsli" IX_GRAPH_SKY_FUNCTIONS)
 file(READ "${CLIENT_ROOT}/shaders/SunShadow.hlsli" IX_GRAPH_SUN_SHADOW)
 configure_file(tools/material/GraphShaderSources.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/GraphShaderSources.h" @ONLY)
 target_include_directories(IXMaterialGraph PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")

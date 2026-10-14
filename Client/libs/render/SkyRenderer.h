@@ -51,6 +51,18 @@ public:
                 std::uint32_t targetWidth,
                 std::uint32_t targetHeight,
                 const ixrhi::IXRHIRenderPass* renderPass = nullptr, uint32_t viewIndex = 0);
+    // What the sky shows, for shaders that look it up themselves (material graph Sky Reflection,
+    // SkyFunctions.hlsli): the last Update's parameters (SkyParameters order) and the images, or
+    // their fallbacks while none is loaded.
+    struct Lookup
+    {
+        std::array<float, 28> parameters{};
+        std::shared_ptr<ixrhi::IXRHITexture> cube;
+        std::shared_ptr<ixrhi::IXRHITexture> panorama;
+        std::shared_ptr<ixrhi::IXRHISampler> cubeSampler;
+        std::shared_ptr<ixrhi::IXRHISampler> panoramaSampler;
+    };
+    Lookup GetLookup() const;
     // The sky's average colour (linear, exposure and tint included) — for "ambient from sky".
     std::array<float, 3> AverageColor() const { return m_averageColor; }
     // Empty while the sky draws as set; otherwise why it cannot (a missing or unreadable image).
@@ -107,6 +119,7 @@ private:
     std::array<float, 3> m_panoramaAverage{};  // linear, before exposure/tint
 
     std::array<float, 3> m_averageColor{};
+    std::array<float, 28> m_parameters{};  // the last Update's UniformBlock
     std::string m_cubeStatus;
     std::string m_panoramaStatus;
     std::string m_status;
