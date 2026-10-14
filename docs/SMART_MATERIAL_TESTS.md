@@ -100,6 +100,22 @@ old shader; it waits for the edits to pause, then compiles in the background int
 the same package (new SPIR-V carrying the current values, live values dropped, the
 material revision moved), after which parameter edits are live again. Opening
 another graph ends the link without compiling it into the published material.
+Scene inputs: `MaterialGraphCompilerTest` checks Time, Scene Depth (with and without a
+scene, negative fallback), Sky Reflection (zenith looking down, horizon at a
+grazing view, turned by the normal), Noise Normal (flat at strength 0, slope
+scaling with strength, leaning against the rising noise, computed only when read)
+and the Water template (all 67 connections, nine parameters, more foam at the
+shore, opaque deep water and clear shallows, stronger reflection at grazing
+angles, waves moving with time); every scene node compiles through DXC.
+`GraphShaderTest` checks that only a graph with the nodes binds the scene depth
+and sky images. `GraphMaterialRenderTest` draws a graph whose emissive colour
+carries the time, the depth behind the quad and the sky through the real
+renderer, opaque and transparent, with and without a depth copy, and without a
+Begin; `GraphMaterialRenderTest --water <out.png> [seconds]` draws the Water
+template over a sloping shore as the engine draws a view (sky, depth copy,
+transparent pass). Both ran with an empty Vulkan validation log, sync validation
+included.
+
 Earlier core geometry-context test values are explicitly supplied. The separate
 geometry fixtures and native OBJ/cache tests execute actual baking. GPU resource
 lifetime and runtime shader cache tests are future work. Mesh preview is a CPU UV

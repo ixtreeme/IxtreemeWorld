@@ -4,6 +4,7 @@
 #include "StaticMeshRenderer.h"
 #include "OffscreenSceneRenderer.h"
 #include "GraphEnvironment.h"
+#include "SkyRenderer.h"
 #include <functional>
 #include "tools/material/GraphShader.h"
 #include "asset/AssetDatabase.h"
@@ -201,6 +202,196 @@ struct GraphMaterialRenderTestAccess
                 }
         std::cout << "graph vs baked: mean absolute difference " << sum / (double(size) * size * 3) << ", largest " << worst << " (linear HDR)\n";
         Check(stbi_write_png(output.string().c_str(), size * 2, size, 3, png.data(), size * 2 * 3) != 0, "comparison image is written");
+    }
+
+    // --water <out.png> [seconds]: the Water template on a water plane over a sloping sandy shore,
+    // drawn as the engine draws a view: the shore, the sky, a copy of the scene depth, then the water in
+    // the transparent pass, under a low sun. Writes the tone-mapped image.
+    static void WaterScene(const std::filesystem::path& outputPath, double seconds)
+    {
+        constexpr std::uint32_t width = 640, height = 360;
+        std::error_code ec;
+#if defined(IX_GRAPH_DXC)
+        const std::filesystem::path compiler = IX_GRAPH_DXC;
+#else
+        const std::filesystem::path compiler = FindShaderCompiler();
+#endif
+        const auto root = std::filesystem::temp_directory_path() / ("ix-graph-water-" +
+            std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+        std::filesystem::create_directories(root);
+        AssetDatabase::Instance().scan(root);
+        MaterialGraphProgram program; GraphShaderPackage package; std::string error, bytes;
+        const bool published = program.Compile(MaterialGraphDocument::Water(), error) && CompileGraphShader(program, package, error, compiler) &&
+            program.BuildRuntimeUniforms({}, {}, package.uniforms, error) && EncodeGraphShaderPackage(package, bytes, error) &&
+            WriteFile(root / "Water" / "graph.ixgraphshader", bytes) &&
+            WriteFile(root / "Water" / "Water.material", MaterialJson("Water", "graph.ixgraphshader", {}, "Blend")) &&
+            WriteFile(root / "Sand" / "Sand.material", MaterialJson("Sand", ""));
+        Check(published, "the Water template is published: " + error);
+        if (!published) return;
+        const auto waterMaterial = AssetDatabase::Instance().getOrCreateGuid(root / "Water" / "Water.material").toString();
+        const auto sandMaterial = AssetDatabase::Instance().getOrCreateGuid(root / "Sand" / "Sand.material").toString();
+
+        NativeWindow_Win32 window;
+        if (!window.Create(GetModuleHandle(nullptr), "Graph water scene", 96, 64)) { Check(false, "hidden GPU window"); return; }
+        ShowWindow(window.GetHwnd(), SW_HIDE);
+        VulkanDevice native;
+        if (!native.Create(window, 96, 64)) { Check(false, "GPU device"); window.Destroy(); return; }
+        auto rhi = ixvulkan::CreateDevice(native);
+        client::asset::FileAssetReader assets(IX_GRAPH_RENDER_TEST_ASSETS_ROOT);
+        GraphEnvironment environment;
+        environment.Create(*rhi);
+        StaticMeshRenderer::SetGraphEnvironment(&environment);
+        std::vector<std::array<float, 4>> image;
+        {
+            OffscreenSceneRenderer scene;
+            const bool target = scene.Create(*rhi, assets, width, height, OffscreenSceneRenderer::kSceneColorFormat,
+                rhi->GetMainSwapchain().DepthFormat(), "GraphWaterScene");
+            // The shore: rises towards the camera, the waterline curving with the bumps.
+            const auto groundHeight = [](float x, float z) { return -0.28f * z - 1.2f + 0.6f * std::sin(x * 0.45f) + 0.25f * std::sin(z * 0.9f + x * 0.3f); };
+            StaticMeshRenderer ground, water;
+            constexpr int cells = 96; constexpr float extent = 40.0f;
+            for (int j = 0; j <= cells; ++j)
+                for (int i = 0; i <= cells; ++i)
+                {
+                    const float x = -extent + 2 * extent * i / cells, z = -extent + 2 * extent * j / cells, e = 0.05f;
+                    StaticMeshRenderer::Vertex vertex{};
+                    vertex.position[0] = x; vertex.position[1] = groundHeight(x, z); vertex.position[2] = z;
+                    const float dx = (groundHeight(x + e, z) - groundHeight(x - e, z)) / (2 * e), dz = (groundHeight(x, z + e) - groundHeight(x, z - e)) / (2 * e);
+                    const float length = std::sqrt(dx * dx + 1 + dz * dz);
+                    vertex.normal[0] = -dx / length; vertex.normal[1] = 1 / length; vertex.normal[2] = -dz / length;
+                    vertex.uv[0] = static_cast<float>(i) / cells; vertex.uv[1] = static_cast<float>(j) / cells;
+                    ground.m_vertices.push_back(vertex);
+                }
+            for (int j = 0; j < cells; ++j)
+                for (int i = 0; i < cells; ++i)
+                {
+                    const std::uint32_t a = j * (cells + 1) + i, b = a + 1, c = a + cells + 1, d = c + 1;
+                    ground.m_indices.insert(ground.m_indices.end(), {a, c, b, b, c, d});
+                }
+            ground.m_draws.push_back({0, static_cast<std::uint32_t>(ground.m_indices.size()), 0, static_cast<std::uint32_t>(ground.m_vertices.size())});
+            const float plane[4][2] = {{-extent, -extent}, {extent, -extent}, {extent, extent}, {-extent, extent}};
+            for (const auto& corner : plane)
+            {
+                StaticMeshRenderer::Vertex vertex{};
+                vertex.position[0] = corner[0]; vertex.position[2] = corner[1]; vertex.normal[1] = 1;
+                vertex.uv[0] = (corner[0] + extent) / (2 * extent); vertex.uv[1] = (corner[1] + extent) / (2 * extent);
+                water.m_vertices.push_back(vertex);
+            }
+            water.m_indices = {0, 2, 1, 0, 3, 2};
+            water.m_draws.push_back({0, 6, 0, 4});
+            for (StaticMeshRenderer* renderer : {&ground, &water})
+            {
+                renderer->m_assets = &assets;
+                renderer->m_materialDefaults.resize(1);
+                renderer->DecodeTextures("");
+                renderer->SetTargetPass(scene.GetTargetPass());
+            }
+            const bool ready = target && ground.FinishGpu(*rhi) && water.FinishGpu(*rhi);
+            ixrhi::IXRHITextureDesc shadowDesc;
+            shadowDesc.width = shadowDesc.height = 1; shadowDesc.arrayLayers = 4;
+            shadowDesc.format = ixrhi::IXRHIFormat::D32Float;
+            shadowDesc.usage = ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
+            SunShadowReceive shadow;
+            shadow.texture = rhi->CreateTexture(shadowDesc, nullptr, 0);
+            ixrhi::IXRHISamplerDesc shadowSampler; shadowSampler.compareEnable = true; shadowSampler.compareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+            shadow.sampler = rhi->CreateSampler(shadowSampler);
+            LightingState lighting;
+            lighting.sunShadowsEnabled = false;
+            lighting.directional.azimuthDegrees = 200; lighting.directional.elevationDegrees = 28; lighting.directional.intensity = 2.2f;
+            lighting.ambient.r = .55f; lighting.ambient.g = .65f; lighting.ambient.b = .8f; lighting.ambient.intensity = .55f;
+            for (StaticMeshRenderer* renderer : {&ground, &water}) { renderer->SetSunShadow(shadow); renderer->SetLightingState(lighting); }
+            SkyRenderer sky;
+            sky.SetTargetPass(scene.GetTargetPass());
+            const bool skyReady = sky.Create(*rhi, assets);
+            using B = ixrhi::IXRHIBindingType; using S = ixrhi::IXRHIShaderStage; using U = ixrhi::IXRHIBufferUsage;
+            std::ifstream file(std::filesystem::path(IX_GRAPH_RENDER_TEST_SHADER_ROOT) / "graph_render_test_CopyCS.spv", std::ios::binary);
+            const std::string code((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            ixrhi::IXRHIShaderDesc copyShader; copyShader.stage = S::Compute; copyShader.entryPoint = "CopyCS";
+            copyShader.spirv.resize(code.size() / 4); std::memcpy(copyShader.spirv.data(), code.data(), copyShader.spirv.size() * 4);
+            auto layout = rhi->CreateBindGroupLayout({{0, B::StorageBuffer, S::Compute}, {1, B::SampledTexture, S::Compute}});
+            auto group = layout ? rhi->CreateBindGroup(*layout, 1) : nullptr;
+            ixrhi::IXRHIComputePipelineDesc computeDesc; computeDesc.computeShader = rhi->CreateShader(copyShader);
+            computeDesc.bindGroupLayouts = {layout.get()};
+            auto pipeline = computeDesc.computeShader ? rhi->CreateComputePipeline(computeDesc) : nullptr;
+            const std::uint64_t imageBytes = std::uint64_t(width) * height * 16;
+            ixrhi::IXRHIBufferDesc outDesc; outDesc.sizeBytes = imageBytes; outDesc.usage = U::Storage | U::TransferSrc;
+            ixrhi::IXRHIBufferDesc readDesc; readDesc.sizeBytes = imageBytes; readDesc.usage = U::TransferDst; readDesc.cpuAccess = ixrhi::IXRHICpuAccess::Write;
+            auto out = rhi->CreateBuffer(outDesc, nullptr, 0), readback = rhi->CreateBuffer(readDesc, nullptr, 0);
+            auto sampler = rhi->CreateSampler({});
+            Check(ready && skyReady && pipeline && group && out && readback, "water scene renderers and read-back pass");
+            if (ready && skyReady && pipeline && group && out && readback)
+            {
+                group->UpdateBuffer(0, 0, out, 0, imageBytes);
+                group->UpdateTexture(0, 1, scene.GetColorTexture(), sampler);
+                WorldCamera camera{};
+                camera.eye = {-3, 5.5f, -16};
+                camera.target = {2, -1.5f, 6};
+                camera.nearPlane = 0.1f; camera.farPlane = 400;
+                camera.viewProjection = WorldMultiply(WorldLookAt(camera.eye, camera.target, {0, 1, 0}),
+                    WorldPerspective(ixtreeme::math::DegreesToRadians(50.0f), static_cast<float>(width) / height, camera.nearPlane, camera.farPlane));
+                StaticMeshRenderer::Instance groundInstance{}, waterInstance{};
+                groundInstance.entityId = 1; groundInstance.tint = {.62f, .52f, .36f, 1}; groundInstance.materialSlots = {sandMaterial};
+                waterInstance.entityId = 2; waterInstance.materialSlots = {waterMaterial};
+                const SkySettings skySettings;
+                bool shadowReady = false;
+                using State = ixrhi::IXRHIBufferState;
+                auto outState = State::Undefined, readState = State::Undefined;
+                for (int frameNumber = 0; frameNumber < 12; ++frameNumber)
+                {
+                    auto frame = rhi->BeginFrame();
+                    if (!frame) break;
+                    auto& cmd = *frame.info.commandList;
+                    if (!shadowReady)
+                    {
+                        cmd.TransitionTexture(*shadow.texture, ixrhi::IXRHIImageLayout::Undefined, ixrhi::IXRHIImageLayout::ShaderReadOnly);
+                        shadowReady = true;
+                    }
+                    ground.RecordPendingUploads(cmd, frame.info);
+                    water.RecordPendingUploads(cmd, frame.info);
+                    sky.Update(frame.info, skySettings, lighting, {});
+                    environment.SetSky(sky.GetLookup());
+                    environment.Begin(frame.info, seconds, camera, width, height);
+                    scene.BeginMainPass(cmd, frame.info);
+                    ground.RenderBatchInWorld(cmd, frame.info, seconds, camera, {&groundInstance}, width, height);
+                    sky.Render(cmd, frame.info, camera, width, height);
+                    scene.EndMainPass(cmd);
+                    scene.SnapshotScene(cmd, frame.info);
+                    scene.BeginMainPass(cmd, frame.info, false);
+                    environment.Begin(frame.info, seconds, camera, width, height, scene.GetDepthSnapshotTexture());
+                    water.RenderTransparentInWorld(cmd, frame.info, seconds, camera, waterInstance, width, height);
+                    scene.EndMainPass(cmd);
+                    cmd.TransitionBuffer(*out, outState, State::ShaderWrite); outState = State::ShaderWrite;
+                    cmd.SetComputePipeline(*pipeline); cmd.BindGroup(0, *group, 0); cmd.Dispatch((width + 7) / 8, (height + 7) / 8, 1);
+                    cmd.TransitionBuffer(*out, outState, State::TransferSrc); outState = State::TransferSrc;
+                    cmd.TransitionBuffer(*readback, readState, State::TransferDst);
+                    cmd.CopyBuffer(*out, *readback, imageBytes);
+                    cmd.TransitionBuffer(*readback, State::TransferDst, State::HostRead); readState = State::HostRead;
+                    rhi->GetMainRenderTarget()->Begin(cmd); rhi->GetMainRenderTarget()->End(cmd);
+                    rhi->EndFrame(frame); rhi->WaitIdle();
+                }
+                image.resize(std::size_t(width) * height);
+                readback->Read(0, image.data(), imageBytes);
+            }
+            rhi->WaitIdle();
+            sky.Destroy();
+            ground.Destroy();
+            water.Destroy();
+            scene.Destroy();
+            shadow = {};
+        }
+        StaticMeshRenderer::SetGraphEnvironment(nullptr);
+        environment.Destroy();
+        rhi->Shutdown(); rhi.reset(); native.Destroy(); window.Destroy();
+        std::filesystem::remove_all(root, ec);
+        if (image.empty()) return;
+        // ACES-style tone curve, then sRGB.
+        const auto tone = [](float x) { x = std::max(x, 0.0f); return std::clamp(x * (2.51f * x + 0.03f) / (x * (2.43f * x + 0.59f) + 0.14f), 0.0f, 1.0f); };
+        std::vector<unsigned char> png(std::size_t(width) * height * 3);
+        for (std::uint32_t y = 0; y < height; ++y)
+            for (std::uint32_t x = 0; x < width; ++x)
+                for (int c = 0; c < 3; ++c)
+                    png[(std::size_t(y) * width + x) * 3 + c] = static_cast<unsigned char>(std::lround(LinearToSrgb(tone(image[std::size_t(y) * width + x][c])) * 255));
+        Check(stbi_write_png(outputPath.string().c_str(), width, height, 3, png.data(), width * 3) != 0, "water scene image is written");
     }
 
     static void Run()
@@ -507,6 +698,12 @@ struct GraphMaterialRenderTestAccess
 int main(int argc, char** argv)
 {
 #if defined(_WIN32)
+    if ((argc == 3 || argc == 4) && std::string(argv[1]) == "--water")
+    {
+        GraphMaterialRenderTestAccess::WaterScene(argv[2], argc == 4 ? std::atof(argv[3]) : 0.0);
+        std::cout << "Graph water scene failures: " << failures << '\n';
+        return failures ? 1 : 0;
+    }
     if (argc == 6 && std::string(argv[1]) == "--compare")
     {
         GraphMaterialRenderTestAccess::Compare(argv[2], argv[3], argv[4], argv[5]);

@@ -279,6 +279,42 @@ The static mesh shader also samples a material's emissive map now (set 0 binding
 with emissive maps added their emissive colour as uniform light and looked white;
 already published materials are drawn correctly without republishing.
 
+### Scene inputs and the Water template
+
+Three nodes in the **Scene** category read what a live graph material is drawn in:
+**Time** (seconds, wrapping once a day), **Scene Depth** (metres of scene behind a
+transparent surface along the view, or the node's fallback depth) and **Sky
+Reflection** (the scene sky mirrored by a tangent-space normal, linear HDR). The
+CPU evaluator, baking and the editor preview use stand-ins: the preview time
+(**Preview time**, **Animate preview**), the fallback depth and the default
+procedural sky gradient. **Noise** has a **Normal** output: the noise as a height
+field over its input's X and Y, by finite differences, scaled by **Normal
+strength**; it is only evaluated when read.
+
+At run time graph pipelines have descriptor set 2 from `GraphEnvironment`: a
+uniform block (time, camera planes, viewport, the sky's parameters), the view's
+scene depth copy, and the sky cube map and panorama. The frame owner begins a set
+per view before its opaque draws and again, with the depth copy, before its
+transparent draws (Scene and Game views); a frame drawn without a Begin gets one
+with the last view's time. A shader declares the depth and sky images only when
+its graph has the nodes; the renderer reads that from the SPIR-V, and a
+transparent graph reading the depth makes the view keep its scene snapshot pass
+even without water (the same copy the water uses). Opaque draws and baking get the
+fallback depth: Scene Depth only means something on a transparent material
+(Opacity below 1). The sky function is shared with the background in
+`Client/shaders/SkyFunctions.hlsli`.
+
+**Templates > Water** builds a transparent water surface from them: two drifting
+noise layers as wave normals (flattened at grazing angles), shallow/deep colour
+and clarity by Scene Depth, foam along the shore and on crests, and Sky Reflection
+weighted by Fresnel in Emissive. Its nine parameters (wave speed, scale and
+height, depth range, shallow and deep colours, shore foam width, foam amount,
+reflection strength) are live. It is drawn on a mesh (a plane at the water level);
+the engine's Water Body remains the tool for terrain water with planar reflection,
+refraction and caustics.
+
+![The Water template over a sloping shore, drawn by the engine](images/water-template-20261014.png)
+
 Not covered: skinned meshes and terrain still use baked textures; the graph is
 evaluated per pixel (Weathered Metal over the whole screen: +0.19 ms scene GPU on an
 RTX 2060 at 2560 x 1369, see the performance document);

@@ -31,7 +31,10 @@ maradnak tartaléknak, a paraméterek pedig a Material Graph panelből élőben
 állíthatók. A gráf szerkezeti módosítása (node, kapcsolat, réteg, textúra) a
 háttérben újrafordul ugyanabba a csomagba, új Bake & Apply nélkül. Részletek:
 `SMART_MATERIAL_IMPLEMENTATION.md`, 5. mérföldkő; GPU-költség:
-`SMART_MATERIAL_PERFORMANCE.md`.
+`SMART_MATERIAL_PERFORMANCE.md`. Ugyanazon a napon a gráf Scene node-okat kapott
+(Time, Scene Depth, Sky Reflection, Noise Normal), a renderer pedig nézetenkénti
+környezet-setet (idő, mélységmásolat, égbolt); ezekből épül a Templates > Water
+sablon.
 
 Az Asset Browser katalógus/preview thumbnail, a jelenetkijelöléshez kötött 3D mesh
 preview, terrain/skinned bake, valamint a skinned modellek és a terrain élő

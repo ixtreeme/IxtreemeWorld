@@ -93,6 +93,7 @@ void Shaders() {
     writePreview(MaterialGraphDocument::WeatheredMetal(),"weathered-metal.rgba");
     writePreview(MaterialGraphDocument::MossyRock(),"mossy-rock.rgba");
     writePreview(MaterialGraphDocument::WeatheredStone(),"weathered-stone.rgba");
+    writePreview(MaterialGraphDocument::Water(),"water.rgba");
     for(const auto kind:AllNodeKinds()) {
         if (IsSubgraphNode(kind)) continue; // declaration/call nodes are tested through real expansion
         MaterialGraphDocument d;const auto id=d.AddNode(kind,{});std::string error;MaterialGraphProgram program;
@@ -155,4 +156,31 @@ void SceneNodes() {
     const auto root=std::filesystem::path(IX_GRAPH_SHADER_OUTPUT);std::filesystem::create_directories(root);
     const auto file=root/"scene-nodes.hlsl";std::ofstream(file)<<program.GenerateHlsl();CompileShader(file);
 }
-int main(){Numbers();SpatialAndTextures();LayersAndBaking();DeepGraph();Shaders();SceneNodes();std::cout<<"Material graph compiler failures: "<<failures<<'\n';return failures?1:0;}
+// The Water template: shore foam where little water lies behind the surface, clearer shallows,
+// waves that move with time and the sky mirrored at grazing angles.
+void WaterTemplate() {
+    const auto water=MaterialGraphDocument::Water();
+    Check(water.links.size()==67,"every connection of the Water template is made");
+    MaterialGraphProgram program;std::string error;
+    Check(program.Compile(water,error) && program.Layout().parameters.size()==9,"the Water template compiles with its nine parameters");
+    std::vector<std::array<GraphValue,14>> work;
+    struct Sample { float foam=0, opacity=0, minimumOpacity=1, reflection=0; };
+    const auto sample=[&](float depth,float time,Float4 view) {
+        Sample result;int count=0;
+        for(float x=0;x<20;x+=1.3f)for(float z=0;z<20;z+=1.3f) {
+            EvaluationContext c;c.worldPosition={x,0,z,0};c.worldNormal={0,1,0,0};c.viewDirection=Normalize3(view);c.sceneDepth=depth;c.time=time;
+            const auto s=program.Evaluate(c,{},{},work);
+            result.foam+=s.color[0]>.5f?1.0f:0.0f;result.opacity+=s.opacity;result.minimumOpacity=std::min(result.minimumOpacity,s.opacity);
+            result.reflection+=s.emissive[0]+s.emissive[1]+s.emissive[2];++count;
+        }
+        result.foam/=count;result.opacity/=count;result.reflection/=count;return result;
+    };
+    const auto shore=sample(.05f,0,{0,1,0,0}),deep=sample(10,0,{0,1,0,0}),grazing=sample(10,0,{1,.08f,0,0});
+    Check(shore.foam>deep.foam+.2f,"foam gathers where little water lies behind the surface");
+    Check(deep.opacity>.9f && shore.minimumOpacity<.5f,"deep water hides the bottom, clear shallows show it");
+    Check(grazing.reflection>deep.reflection*3+.05f,"the sky is mirrored at grazing angles");
+    EvaluationContext c;c.worldPosition={3.7f,0,5.2f,0};c.worldNormal={0,1,0,0};c.viewDirection={0,1,0,0};c.sceneDepth=10;
+    const auto still=program.Evaluate(c,{},{},work).normal;c.time=1.5f;const auto moved=program.Evaluate(c,{},{},work).normal;
+    Check(still!=moved && still[2]<1 && still[2]>0,"the waves tilt the normal and move with time");
+}
+int main(){Numbers();SpatialAndTextures();LayersAndBaking();DeepGraph();Shaders();SceneNodes();WaterTemplate();std::cout<<"Material graph compiler failures: "<<failures<<'\n';return failures?1:0;}

@@ -98,6 +98,7 @@ struct MaterialGraphDocument
     static MaterialGraphDocument WeatheredMetal();
     static MaterialGraphDocument MossyRock();
     static MaterialGraphDocument WeatheredStone();
+    static MaterialGraphDocument Water();
     GraphNode* FindNode(std::uint32_t id);
     const GraphNode* FindNode(std::uint32_t id) const;
     std::optional<GraphPin> FindPin(std::uint32_t id) const;

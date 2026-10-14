@@ -18,7 +18,8 @@ int main()
 {
     struct Preset { const char* name; MaterialGraphDocument document; };
     const Preset presets[] = {{"Example", MaterialGraphDocument::Example()}, {"Weathered Metal", MaterialGraphDocument::WeatheredMetal()},
-        {"Mossy Rock", MaterialGraphDocument::MossyRock()}, {"Weathered Stone", MaterialGraphDocument::WeatheredStone()}};
+        {"Mossy Rock", MaterialGraphDocument::MossyRock()}, {"Weathered Stone", MaterialGraphDocument::WeatheredStone()},
+        {"Water", MaterialGraphDocument::Water()}};
     std::error_code ec;
 #if defined(IX_GRAPH_DXC)
     const std::filesystem::path compiler = IX_GRAPH_DXC;
@@ -57,6 +58,10 @@ int main()
               std::string(preset.name) + " uniform block is bound exactly when it has values");
         Check(HasBinding(bindings, kGraphDescriptorSet, kGraphGeometryBinding) == layout.needsGeometryData,
               std::string(preset.name) + " geometry map binding matches its geometry needs");
+        const bool scene = std::string(preset.name) == "Water";
+        Check(GraphShaderReadsSceneDepth(package.maskedSpirv) == scene &&
+              HasBinding(bindings, kGraphEnvironmentSet, kGraphSkyCubeBinding) == scene && HasBinding(bindings, kGraphEnvironmentSet, kGraphSkyPanoramaBinding) == scene,
+              std::string(preset.name) + " binds the scene depth and sky images exactly when its graph reads them");
         std::vector<SpirvBinding> opaque;
         Check(ReflectSpirvBindings(package.opaqueSpirv, opaque, error) && package.opaqueSpirv != package.maskedSpirv,
               std::string(preset.name) + " opaque variant is a distinct module");

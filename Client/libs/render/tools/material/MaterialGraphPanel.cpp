@@ -161,7 +161,7 @@ void MaterialGraphPanel::RequestReplace(bool openFile)
         SmartGenerator preset;
         if(generator && !SmartGenerator::Create(SmartGeneratorPresets()[pendingPreset_-10].kind,preset,status_))return;
         generatorMode_=generator;generator_=std::move(preset);subgraphMode_=generator || pendingPreset_==4; subgraphVersion_=1;
-        document_ = generator?generator_.definition.graph:(subgraphMode_?MaterialSubgraph::Example().graph:(pendingPreset_==1?MaterialGraphDocument::WeatheredMetal():(pendingPreset_==2?MaterialGraphDocument::MossyRock():(pendingPreset_==3?MaterialGraphDocument::WeatheredStone():MaterialGraphDocument::Example())))); pendingPreset_=0; saved_ = MaterialGraphDocument::Example(); path_.clear();
+        document_ = generator?generator_.definition.graph:(subgraphMode_?MaterialSubgraph::Example().graph:(pendingPreset_==1?MaterialGraphDocument::WeatheredMetal():(pendingPreset_==2?MaterialGraphDocument::MossyRock():(pendingPreset_==3?MaterialGraphDocument::WeatheredStone():(pendingPreset_==5?MaterialGraphDocument::Water():MaterialGraphDocument::Example()))))); pendingPreset_=0; saved_ = MaterialGraphDocument::Example(); path_.clear();
         undo_.clear(); redo_.clear(); selected_ = 0; parameters_={}; previewDirty_=true; ResetContext(); fitPending_ = true; status_.clear();
         UnlinkLiveMaterial();
         subgraphs_.Clear(); forceCompile_=true;
@@ -215,6 +215,7 @@ void MaterialGraphPanel::RenderToolbar()
         if(ImGui::MenuItem("Weathered metal (UV)")){pendingPreset_=1;RequestReplace(false);}
         if(ImGui::MenuItem("Mossy rock (world)")){pendingPreset_=2;RequestReplace(false);}
         if(ImGui::MenuItem("Smart Weathered Stone")){pendingPreset_=3;RequestReplace(false);}
+        if(ImGui::MenuItem("Water (waves, depth, foam, sky reflection)")){pendingPreset_=5;RequestReplace(false);}
         if(ImGui::MenuItem("New reusable subgraph")){pendingPreset_=4;RequestReplace(false);}
         if(ImGui::BeginMenu("Smart Generators")){int index=0;for(const auto& preset:SmartGeneratorPresets()){if(ImGui::MenuItem(preset.name)){pendingPreset_=10+index;RequestReplace(false);}++index;}ImGui::EndMenu();}
         ImGui::EndPopup();
