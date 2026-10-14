@@ -970,8 +970,14 @@ void MaterialGraphPanel::RenderPreview()
     if(UI::Prop::Combo("Channel",&channel,channels,17)){previewSettings_.channel=static_cast<PreviewChannel>(channel);if(previewSettings_.channel>=PreviewChannel::GeometryAO)geometryPreview_=true;}
     RenderApplyMaterial();
     RenderGeometryBake();
+    // Where the material is evaluated: an analytic sphere or plane, or the selected mesh's UV atlas
+    // (which Bake & Apply and a geometry bake switch to).
+    int shape=geometryPreview_?2:(previewSettings_.sphere?0:1);const char* shapes[]={"Sphere","Plane","Mesh UV atlas"};
+    if(UI::Prop::Combo("Preview shape",&shape,shapes,geometryPreview_ || !geometry_.MeshGuid().empty()?3:2)) {
+        geometryPreview_=shape==2;if(shape<2)previewSettings_.sphere=shape==0;previewDirty_=true;
+        if(!geometryPreview_ && previewSettings_.channel>=PreviewChannel::GeometryAO)previewSettings_.channel=PreviewChannel::Shaded;
+    }
     ImGui::BeginDisabled(geometryPreview_);
-    UI::Prop::Checkbox("Sphere",&previewSettings_.sphere);
     UI::Prop::DragFloat("World size (m)",&previewSettings_.worldSize,.1f,.01f,10000.0f,"%.2f");
     UI::Prop::DragFloat("Height offset (m)",&previewSettings_.heightOffset,.1f,-10000.0f,10000.0f,"%.2f");
     ImGui::EndDisabled();
@@ -990,6 +996,8 @@ void MaterialGraphPanel::RenderPreview()
     if(ImGui::SmallButton("Reload textures")){textures_.Clear();previewDirty_=true;}
     ImGui::SameLine(); if(ImGui::SmallButton("Reload subgraphs")){subgraphs_.Clear();forceCompile_=true;previewDirty_=true;}
     UpdatePreview();
+    if(geometryPreview_ && !previewPixels_.empty())
+        ImGui::TextWrapped("Mesh UV atlas of %s: the material laid out flat as the model's UVs map it, not a 3D view.",geometry_.Name().empty()?"the baked mesh":geometry_.Name().c_str());
     if(!previewPixels_.empty()) {
         const auto at=ImGui::GetCursorScreenPos();const float size=std::clamp(ImGui::GetContentRegionAvail().x,96.0f,256.0f);
         const auto texture=provider_?provider_->GetPreviewTexture(previewTexture_):nullptr;
