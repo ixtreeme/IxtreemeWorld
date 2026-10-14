@@ -43,8 +43,9 @@ stable interface IDs, instance scoping, bounds, dependencies and editor integrat
 `MaterialCompileResult` publishes a deterministic **HLSL source layout**:
 numeric parameters ordered by node ID, one aligned float4 per parameter; texture
 binding declarations; sorted unique reachable GUID dependencies; context needs.
-This is not DXC/SPIR-V reflection and must be checked against actual reflection
-when Phase 7 introduces a runtime shader owner.
+The Vulkan target (`HlslOptions`) places these in descriptor set 1 and every
+compiled module is checked against its actual SPIR-V reflection
+(`ReflectSpirvBindings`, `ValidateGraphShaderBindings`) before it is accepted.
 
 `MaterialInstance` serializes the definition GUID, optional geometry-bake GUID,
 and only numeric/texture overrides. Numeric overrides currently use published
@@ -52,7 +53,9 @@ names; node IDs identify layout fields. A published-name rename deliberately
 reports stale overrides rather than applying them to a different parameter.
 `MaterialInstanceBinding` shares a const program and owns only instance data and
 its packed float4 values. It validates changes before replacement and never calls
-Compile for dynamic override updates. GPU upload/variant selection is future work.
+Compile for dynamic override updates. On the GPU, a published material's uniform
+block is uploaded per frame in flight; editor parameter edits replace it through
+`GraphLiveValues` without recompiling.
 
 Texture overrides support `guid:<uuid>`, legacy paths and library IDs. A specified
 GUID is authoritative: missing GUIDs cannot accidentally resolve a stale path to
@@ -84,7 +87,8 @@ selection yet. Specialized additive/multiply modes and layer groups are planned.
 | `GeometryAssets.*` / `GraphGeometryCache` | Existing Assimp import, native model/cache GUID dependencies, content validation and invalidation; editor thread only. |
 | `MaterialSubgraph.*` / `GraphSubgraphCache` | Versioned typed assets, GUID resolution, bounded expansion, cycle checks, caller scopes and file invalidation. |
 | `SmartGenerator.*` | Six editable subgraph presets, metadata wrapper, Scalar mask validation and canonical layer insertion; existing IR/backends. |
-| Future runtime shader owner | DXC/reflection/cache/IXRHI bindings/lifetime and renderer assignment. |
+| `GraphShader.*` | Vulkan-target pixel shader source over `StaticMeshCommon.hlsli`, dxc compilation of the opaque and masked variants, SPIR-V binding reflection and validation, the `GraphShaderPackage` codec and `GraphLiveValues`. |
+| `StaticMeshRenderer` graph materials | Loads a material's package, builds descriptor set 1 and its pipelines, binds them in the lit colour passes, falls back to baked textures and keeps the last working shader. |
 
 No independent evaluator, renderer replacement or new third-party dependency is
 introduced. Atomic material IO uses unique exclusive temporary files in the

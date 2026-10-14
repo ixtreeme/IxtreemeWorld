@@ -12,6 +12,8 @@ All tests use real production classes. Final validation date: 2026-10-12.
 | `GeometryBakerTest` | Actual plane/convex and inward boxes/concave corner; barycentric maps, seam topology, AO/thickness references, independent curvature/cavity, nonuniform/reflected positions/normals/thickness, padding/source UV, deterministic seed, malformed/overlap cases, cancellation, portable corruption-safe codec and real shared-evaluator/material/raw map preview values; worker completion/cancel. |
 | `SmartGeneratorTest` | Six editable preset wrappers/reference values, geometry/context needs, seed determinism/variation, amount/contrast/growth/height controls, gravity rotation anisotropy, zero sizes/directions and large allowed inputs, transactional errors, real geometry mask preview/material bake, canonical layers, repeated call scopes/shared instances; actual DXIL/SPIR-V for every expanded recipe. |
 | `MaterialGraphEditorTest` | Production panel/headless ImGui and existing synthetic mouse/key workflow; stack/history; graph/instance/subgraph files, GUID rescan/moves, dependency metadata, changed/malformed/fixed subgraph preview, standalone output, scoped instances; full 256-asset cache and dependency-set replacement. Real OBJ selection/async geometry job/atlas preview/cache save, geometry-bound instance/dependencies and invalid cache preview/reload. New binding dialogs and layer drag-and-drop pixel interactions are not independently automated. |
+| `GraphShaderTest` | The four presets compile to SPIR-V in both variants with actual dxc; reflected bindings (static mesh set 0, uniform block, geometry map exactly when geometry data is read); a module rewritten to reach set 3 or an undeclared geometry map is refused; package round-trip, checksum, truncation, foreign file, duplicate bindings and missing variant. |
+| `GraphMaterialRenderTest` | Real Vulkan device and the real `StaticMeshRenderer`: a quad with a graph material is drawn into an offscreen scene and the pixel read back. Checks an albedo parameter lit by ambient plus a sampled texture as emissive, the graph pipeline name, a live value from `GraphLiveValues`, a mismatched live block being ignored, a material without a graph drawn from textures, a broken republished package keeping the last shader and a fixed one replacing it. Clean under the Vulkan validation layer with synchronization validation. |
 | `MaterialGraphBakingTest` | Actual UV images, native material/ORM and manifest reload; texture imports/moves/renames, bilinear filtering and native GUID lookup with/without a library; missing GUID cannot select a stale path; subgraph authored/effective source snapshots and scoped overrides; geometry-dependent UV export refusal. Actual Assimp OBJ/geometry cache/native source dependency, mesh Weathered Stone images/material/exact cache snapshot, cache/model moves, corruption/recovery and stale source rejection before publication. |
 
 The native baking test also covers existing Assets/Smart files, all six supported
@@ -69,8 +71,12 @@ that request. It also cancels after the automatic UV model was written and check
 that the model is removed and the preview returns to its source. The pinned MIT xatlas source and license are included under
 `Client/third_party/xatlas` for offline builds.
 
-No test currently reads graph shading back from the GPU. DXC compilation checks
-syntax/types/backends, **not CPU/GPU numerical parity or SPIR-V reflection**.
+`GraphMaterialRenderTest` reads one graph material's shading back from the GPU and
+matches it to the expected lit value; it is not a CPU/GPU parity sweep over every
+node kind or preset. The baking and editor tests also check that published
+materials carry their compiled package and geometry map, and that a Bake & Apply
+material accepts a live parameter edit (exactly one uniform changes, live and in
+the saved package) but not a structural one.
 Earlier core geometry-context test values are explicitly supplied. The separate
 geometry fixtures and native OBJ/cache tests execute actual baking. GPU resource
 lifetime and runtime shader cache tests are future work. Mesh preview is a CPU UV

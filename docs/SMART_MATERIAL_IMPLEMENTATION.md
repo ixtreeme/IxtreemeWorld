@@ -97,7 +97,7 @@ remains planned.
 | 4 Geometry | CPU/editor reference implemented | Static submesh atlas, maps, checked cache/GUID invalidation, async/cancel and material integration implemented. Selected scene model Bake & Apply uses the renderer's actual model matrix and assigns the captured material slot. Terrain, skinned baking, 3D mesh preview and broader stress profiling remain. |
 | 5 Generators | Core/editor implemented | Six editable subgraph presets, native files/GUIDs, layer-mask insertion, scoped instances and real mesh bake integration. Dedicated browser catalog/thumbnails and GPU numeric parity remain. |
 | 6 Assets | Partial | Graph/instance/subgraph/generator/geometry GUID registration, files and native dependencies implemented; geometry content hashes/invalidation implemented. Browser discovery/import/categories/manifest persistence, immediate save refresh and graph/subgraph/generator opening implemented. Catalog/thumbnails and runtime invalidation remain. |
-| 7 Runtime | Planned | DXC runtime owner, actual reflection, texture/sampler/parameter uploads, variant/pipeline cache, assignment and failure recovery through IXRHI. |
+| 7 Runtime | Static meshes implemented | Graphs compile to SPIR-V when a material is published, with reflected bindings; the static mesh renderer draws them through IXRHI with descriptor set 1, texture/sampler/parameter uploads, per-material pipelines, baked-texture fallback and last-good recovery; parameter edits are live. Skinned meshes, terrain, depth/shadow passes and GPU cost measurement remain. |
 | 8 Optimization | Partial | CPU benchmarks and cancellable async geometry jobs implemented. Material preview/export still synchronous; GPU baking/performance, sample deduplication, folding/CSE and broader stress/lifetime tests remain. |
 
 There is no external approval blocker or renderer replacement requirement.
@@ -226,3 +226,46 @@ returns to shading. No test or loader bounds were weakened to accept these issue
 All six recipes have actual DXIL/SPIR-V compilation tests. GPU numeric parity,
 runtime reflection/assignment and dedicated browser catalog remain planned.
 See SMART_MATERIAL_GENERATORS.md and the validation/performance documents.
+
+## Milestone 5 — runtime GPU graph (Phase 7), 2026-10-14
+
+Compilation happens when a material is published, not in the game. `GenerateHlsl`
+has a Vulkan target that puts every graph resource in descriptor set 1: binding 0
+is one uniform block (numeric parameters in layout order, then one float4 per
+texture whose x marks linear RGB sources), binding 1 an optional geometry map
+(AO, curvature, cavity) and binding 2+n each texture with its own sampler.
+`BuildGraphPixelShader` wraps it with `Client/shaders/StaticMeshCommon.hlsli`,
+embedded at configure time, so the graph surface gets the same coverage, alpha
+test, normal frame and lighting as `StaticMesh.hlsl`; `StaticMesh.hlsl` itself was
+split onto that header without changing its SPIR-V. Opaque (no discard) and
+masked variants are compiled with dxc, found through `IX_DXC`, the Vulkan SDK, the
+engine's own build or PATH. Both modules' bindings are read back from the SPIR-V
+and refused unless the renderer provides them. A built game only loads SPIR-V.
+
+Publishing writes `graph.ixgraphshader` (both variants, the uniform values and
+texture GUIDs, checksummed) beside the baked textures and records it in the
+material's `graphShader` field. Unbound texture parameters get a small texture of
+their node value, which is what the CPU sampler returns; graphs that read geometry
+data get `geometry.png` from the mesh bake in the baked images' texel order. When
+the shader cannot be made (no compiler, a texture outside the project, geometry
+data without a mesh bake) the panel says why and the material is still published.
+
+`StaticMeshRenderer` draws such a material with its own pipelines (opaque, mask,
+the colour step of the masked prepass, both transparent sides) and set 1 next to
+set 0; depth, shadow, outline and impostor-atlas passes keep the baked alpha. The
+baked textures remain the fallback while graph textures load, and when a package
+or pipeline fails. Packages are re-read only after the material manager's revision
+moves; a failed reload keeps the last working shader and a replaced one is freed
+after the frames that may use it.
+
+The Material Graph panel keeps the last material it published linked: parameter
+edits reach every renderer drawing it for the next frame (`GraphLiveValues`) and
+are saved into its package once the value settles. A structural edit cannot reuse
+the compiled shader; the panel says so and a new Bake & Apply is needed. Live
+values do not update the baked fallback textures.
+
+Not covered: skinned meshes and terrain still use baked textures; the graph is
+evaluated per pixel, and its GPU cost against baked textures was not measured;
+there is no global pipeline cache shared between models (each model builds its
+pipelines once per graph material); compilation runs on the editor thread when
+publishing (about 0.33 s per material on the test machine).

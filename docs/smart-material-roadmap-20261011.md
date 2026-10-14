@@ -24,9 +24,15 @@ beköthető a kiválasztott statikus modell Material Slotjába: az aktuális mod
 automatikus geometry bake, mentett natív anyag és slotbeállítás ugyanabban a folyamatban
 van, a közben módosult modell/transzformáció/anyaghely védelmével.
 
+2026. október 14.: a 7. fázis statikus modellekre elkészült. A közzétett anyag gráfja
+SPIR-V shaderré fordul (a fordítás a szerkesztőben, közzétételkor történik, a játék
+csak a kész shadert tölti be), a renderer pixelenként ezzel rajzolja, a sült textúrák
+maradnak tartaléknak, a paraméterek pedig a Material Graph panelből élőben
+állíthatók. Részletek: `SMART_MATERIAL_IMPLEMENTATION.md`, 5. mérföldkő.
+
 Az Asset Browser katalógus/preview thumbnail, a jelenetkijelöléshez kötött 3D mesh
-preview, terrain/skinned bake, GPU reflection/binding/cache és dinamikus játékbeli
-materialgráf-renderelés továbbra is hátravan. Az alábbi eredeti állapotfelmérés a
+preview, terrain/skinned bake, a skinned modellek és a terrain élő gráf-shadere,
+valamint a gráf-shaderek GPU-költségének mérése továbbra is hátravan. Az alábbi eredeti állapotfelmérés a
 2026. október 11-i helyzetet rögzíti; a friss státuszhoz a fenti dokumentumokat használd.
 
 ## Korábbi állapotfelmérés

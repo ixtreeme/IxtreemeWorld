@@ -105,9 +105,13 @@ before larger interactive bakes. The independent geometry baker now has a
 cancellable worker; material previews and exports remain synchronous. GPU baking
 is still unimplemented.
 
-GPU material cost, GPU readback parity, total allocated instance memory, cache
-hit/miss rate and real texture fetch count are not measured. Runtime graph shader/
-variant cache is still unimplemented. The fixture timing below does not establish
+GPU material cost, total allocated instance memory, cache hit/miss rate and real
+texture fetch count are not measured. Graph shaders are evaluated per pixel; their
+cost against the baked textures is not measured either.
+
+Graph shader compilation (2026-10-14, `GraphShaderTest`, three runs): the four
+presets, each compiled to both variants with dxc and reflected, took 1329, 1342 and
+1333 ms, about 0.33 s per material. Publishing pays this once on the editor thread. The fixture timing below does not establish
 performance on large production meshes or runtime GPU performance.
 
 ## Geometry reference timing — 2026-10-12
