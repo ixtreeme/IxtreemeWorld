@@ -1222,10 +1222,11 @@ void ReadWaterConfig(const JsonValue& object, WaterConfig& config)
         std::clamp<int>(static_cast<int>(ReadFloat(*water, "edge_fade_curve", static_cast<float>(config.edgeFadeCurve))), 0, 2));
 }
 
-void WritePaletteSlot(std::ostream& out, const MapEditorPaletteSlot& slot, bool comma)
+// The array position is the slot; an unauthored slot's own index is the default 0.
+void WritePaletteSlot(std::ostream& out, const MapEditorPaletteSlot& slot, std::uint32_t index, bool comma)
 {
     out << "    {\n";
-    out << "      \"slot\": " << slot.slot << ",\n";
+    out << "      \"slot\": " << index << ",\n";
     out << "      \"asset_id\": \"" << EscapeJson(slot.assetId) << "\",\n";
     out << "      \"display_name\": \"" << EscapeJson(slot.displayName) << "\",\n";
     out << "      \"texture_path\": \"" << EscapeJson(slot.texturePath) << "\",\n";
@@ -2879,13 +2880,30 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
     }
     if (const JsonValue* palette = Find(root, "terrain_palette"); palette && palette->type == JsonValue::Type::Array)
     {
+        std::vector<MapEditorPaletteSlot> slots;
         for (const JsonValue& slotJson : palette->array)
+            slots.push_back(ReadPaletteSlot(slotJson));
+        // Older saves wrote every unauthored slot as "slot": 0, so later entries
+        // overwrote slot 0. Repeated indices mean the array order is the slot order.
+        std::array<bool, 8> seen{};
+        bool arrayOrder = false;
+        for (const MapEditorPaletteSlot& slot : slots)
         {
-            MapEditorPaletteSlot slot = ReadPaletteSlot(slotJson);
-            if (slot.slot < scene.paletteSlots.size())
-                scene.paletteSlots[slot.slot] = slot;
+            if (slot.slot < seen.size())
+            {
+                arrayOrder = arrayOrder || seen[slot.slot];
+                seen[slot.slot] = true;
+            }
+        }
+        for (size_t i = 0; i < slots.size(); ++i)
+        {
+            const size_t index = arrayOrder ? i : slots[i].slot;
+            if (index < scene.paletteSlots.size())
+                scene.paletteSlots[index] = slots[i];
         }
     }
+    for (std::uint32_t i = 0; i < scene.paletteSlots.size(); ++i)
+        scene.paletteSlots[i].slot = i;
     if (const JsonValue* preload = Find(root, "preload_assets"); preload && preload->type == JsonValue::Type::Array)
     {
         for (const JsonValue& value : preload->array)
@@ -3097,7 +3115,7 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
     out << "  ],\n";
     out << "  \"terrain_palette\": [\n";
     for (size_t i = 0; i < scene.paletteSlots.size(); ++i)
-        WritePaletteSlot(out, scene.paletteSlots[i], i + 1 < scene.paletteSlots.size());
+        WritePaletteSlot(out, scene.paletteSlots[i], static_cast<std::uint32_t>(i), i + 1 < scene.paletteSlots.size());
     out << "  ],\n";
     out << "  \"preload_assets\": [";
     for (size_t i = 0; i < scene.preloadAssets.size(); ++i)

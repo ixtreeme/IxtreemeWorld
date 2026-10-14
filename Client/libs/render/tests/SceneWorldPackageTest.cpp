@@ -1,5 +1,6 @@
 #include "SceneWorldPackage.h"
 #include "TerrainRenderer.h"
+#include "map/MapData.h"
 #include "map/WorldPackage.h"
 #include "physics/PhysicsWorld.h"
 
@@ -14,7 +15,9 @@
 #include <iterator>
 #include <latch>
 #include <limits>
+#include <regex>
 #include <stdexcept>
+#include <string>
 #include <thread>
 
 namespace {
@@ -630,6 +633,111 @@ void TestExactScenePersistence(const TemporaryWorkspace& workspace)
     manager.CloseScene();
 }
 
+std::string ReadText(const fs::path& path)
+{
+    std::ifstream stream(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>()};
+}
+
+void WriteText(const fs::path& path, const std::string& text)
+{
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    stream << text;
+    if (!stream) throw std::runtime_error("cannot write test text");
+}
+
+// An authored scene that declares only exact heights and a textured slot 0 is
+// what the editor autosave rewrites into a chunk manifest. Slot 0's texture and
+// tiling must survive that save and every reload after it.
+void TestPaletteScenePersistence(const TemporaryWorkspace& workspace)
+{
+    const auto dir = workspace.root / "palette_round_trip";
+    fs::create_directories(dir);
+    const auto terrain = Fixture(false).terrain;
+    std::vector<std::uint8_t> exact{'I','W','T','E','R','R','H','G','R','I','D','1'};
+    const auto append = [&exact](const void* value, std::size_t size) {
+        const auto* bytes = static_cast<const std::uint8_t*>(value);
+        exact.insert(exact.end(), bytes, bytes + size);
+    };
+    const std::uint32_t version = 1;
+    const std::uint64_t count = terrain.heightCmGrid.size();
+    append(&version, sizeof(version));
+    append(&terrain.cellsX, sizeof(terrain.cellsX));
+    append(&terrain.cellsZ, sizeof(terrain.cellsZ));
+    append(&terrain.cellSizeMeters, sizeof(terrain.cellSizeMeters));
+    append(&count, sizeof(count));
+    append(terrain.heightCmGrid.data(), terrain.heightCmGrid.size() * sizeof(float));
+    WriteBytes(dir / "authored_exact.height", exact);
+
+    const std::string texture = (dir / "Assets" / "textures" / "terrain_grid_8m.png").generic_string();
+    const auto path = dir / "palette.scene";
+    WriteText(path, R"({
+  "version": 1,
+  "metadata": { "name": "palette round trip" },
+  "terrain": {
+    "exists": true,
+    "name": "Textured flat terrain",
+    "width_m": 12,
+    "depth_m": 8,
+    "cell_size_m": 2,
+    "cells_x": 6,
+    "cells_z": 4,
+    "chunk_size_cells": 32,
+    "chunk_manifest_ref": "",
+    "heightmap_ref": "",
+    "exact_heightmap_ref": "authored_exact.height",
+    "splat_ref": "",
+    "mask_ref": ""
+  },
+  "entities": [],
+  "terrain_palette": [
+    { "slot": 0, "display_name": "Grid 8 m", "texture_path": ")" + texture + R"(", "tiling": [0.125, 0.125] }
+  ]
+}
+)");
+
+    auto& manager = SceneManager::Instance();
+    const auto slotZeroKept = [&]() {
+        const auto& slots = manager.GetCurrentScene().paletteSlots;
+        bool indexed = true;
+        for (std::uint32_t i = 0; i < slots.size(); ++i) indexed = indexed && slots[i].slot == i;
+        return indexed && slots[0].texturePath == texture &&
+            Near(slots[0].tilingScaleX, 0.125) && Near(slots[0].tilingScaleY, 0.125);
+    };
+    const auto reload = [&]() {
+        manager.CloseScene();
+        return manager.LoadScene(path.string());
+    };
+    manager.CloseScene();
+    Check("authored-exact-height-scene-loads-textured-slot", manager.LoadScene(path.string()) && slotZeroKept());
+
+    const bool autosaved = manager.SaveScene();
+    Check("autosave-rewrites-exact-height-scene-to-chunk-manifest", autosaved &&
+        manager.GetCurrentScene().terrain.chunkManifestRef == "palette_terrain_map/map.manifest");
+    const auto manifest = map::LoadManifest([&dir](std::string_view asset) -> std::optional<std::vector<std::uint8_t>> {
+        auto bytes = ReadBytes(dir / fs::path(asset));
+        if (bytes.empty()) return std::nullopt;
+        return bytes;
+    }, "palette_terrain_map");
+    Check("autosaved-chunk-manifest-records-palette-texture-and-tiling", manifest &&
+        !manifest->texture_palette_paths.empty() && manifest->texture_palette_paths[0] == texture &&
+        !manifest->texture_palette_tiling_x.empty() && Near(manifest->texture_palette_tiling_x[0], 0.125) &&
+        !manifest->texture_palette_tiling_y.empty() && Near(manifest->texture_palette_tiling_y[0], 0.125));
+    Check("autosaved-scene-reload-keeps-palette-texture-and-tiling", autosaved && reload() && slotZeroKept());
+    Check("second-autosave-reload-keeps-palette-texture-and-tiling",
+        manager.SaveScene() && reload() && slotZeroKept());
+
+    const std::string saved = ReadText(path);
+    // Older saves wrote every unauthored slot as "slot": 0; their array order is the slot order.
+    WriteText(path, std::regex_replace(saved, std::regex(R"("slot": [0-9]+)"), R"("slot": 0)"));
+    Check("legacy-duplicate-slot-indices-reload-by-array-order", reload() && slotZeroKept());
+    // Without a scene palette the chunk manifest alone must still carry the slot.
+    WriteText(path, std::regex_replace(saved, std::regex(R"("terrain_palette")"), R"("unused_palette")"));
+    Check("chunk-manifest-alone-restores-palette-texture-and-tiling", reload() && slotZeroKept());
+    WriteText(path, saved);
+    manager.CloseScene();
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -654,6 +762,7 @@ int main(int argc, char** argv)
         TestFractionalPitchOracle(workspace);
         TestPublication(workspace);
         TestExactScenePersistence(workspace);
+        TestPaletteScenePersistence(workspace);
     } catch (const std::exception& exception) {
         Check("unexpected-test-exception",false);
         std::cout << "test exception: " << exception.what() << '\n';
