@@ -10,8 +10,10 @@ Renderers that will depend on IXRHI in Phase 2 (exact audited names):
 - WorldLabelRenderer (libs/render/WorldLabelRenderer.*, shaders/WorldLabel.hlsl)
 - OffscreenSceneRenderer (libs/render/OffscreenSceneRenderer.* — scene color/depth for refraction + Scene/Game view)
 - Shadow rendering (shaders/ShadowDepth.hlsl, inside StaticMesh/Terrain passes)
-- CubeRenderer (libs/render/CubeRenderer.*, shaders/Cube.hlsl — debug/smoke)
 - Composite (shaders/Composite.hlsl), RmlUi (libs/render/RmlUiLayer.*, shaders/RmlUi.hlsl)
+
+(CubeRenderer was deleted in Phase 3A; its stale `shaders/Cube.hlsl` source,
+compiled SPIR-V and build rules were removed in Phase 3H — no owner/test.)
 
 Phase 1: only relocation-safe dependency cleanup (none required — no moves).
 Phase 2: see docs/architecture/phase2-ixrhi-scope.md for the per-class migration inventory.

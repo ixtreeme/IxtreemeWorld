@@ -15,6 +15,7 @@ target_link_libraries(IXEnginePhysics
         IXEngineMath
     PRIVATE
         IXEngineDebug
+        IXEngineJobs
 )
 
 if(IXENGINE_PHYSICS_WITH_JOLT AND TARGET Jolt::Jolt)

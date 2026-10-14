@@ -10,12 +10,13 @@ std::uint64_t HashLodConfig(const LodConfig& config)
         hash ^= value;
         hash *= 1099511628211ull;
     };
+    mix(3u); // Generation algorithm version: invalidate the old error-limited results.
     mix(std::clamp(config.levelCount, 1u, LodConfig::MaxLevels));
-    mix(static_cast<std::uint32_t>(std::max(0.0f, config.hysteresisMeters) * 100.0f));
-    for (std::uint32_t i = 0; i < LodConfig::MaxLevels; ++i)
+    // This is a geometry/cache key. Camera thresholds and hysteresis do not
+    // change the generated indices, and must not start new builds while dragged.
+    for (std::uint32_t i = 1; i < std::clamp(config.levelCount, 1u, LodConfig::MaxLevels); ++i)
     {
         mix(static_cast<std::uint32_t>(std::clamp(config.targetRatios[i], 0.001f, 1.0f) * 100000.0f));
-        mix(static_cast<std::uint32_t>(std::max(0.0f, config.distances[i]) * 100.0f));
     }
     return hash == 0 ? 1 : hash;
 }
@@ -23,6 +24,11 @@ std::uint64_t HashLodConfig(const LodConfig& config)
 float DistanceToAabb(const WorldVec3& point, const SpatialIndex::Aabb& bounds)
 {
     return ixtreeme::math::Distance(point, ixtreeme::math::ClosestPoint(bounds, point));
+}
+
+float MeshLodDistance(const WorldVec3& point, const SpatialIndex::Aabb& bounds)
+{
+    return ixtreeme::math::Distance(point, (bounds.min + bounds.max) * 0.5f);
 }
 
 std::uint32_t SelectLodLevel(const LodConfig& config, float distanceMeters, std::uint32_t previousLevel)

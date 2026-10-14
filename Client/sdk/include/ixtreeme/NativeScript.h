@@ -95,10 +95,48 @@ protected:
         return api->Raycast(ox, oy, oz, dx, dy, dz, maxDist);
     }
 
+    RaycastHit RaycastFiltered(float ox,float oy,float oz,float dx,float dy,float dz,float maxDist,
+        const QueryFilter& filter) { return api->RaycastFiltered(ox,oy,oz,dx,dy,dz,maxDist,&filter); }
+    std::uint32_t OverlapSphere(float x,float y,float z,float radius,const QueryFilter& filter,
+        SphereOverlapHit* output,std::uint32_t capacity,std::uint32_t* truncated) {
+        return api->OverlapSphere(x,y,z,radius,&filter,output,capacity,truncated);
+    }
+    void SetEntityEnabled(std::uint32_t id,bool enabled) { api->SetEntityEnabled(id,enabled); }
+
     // --- animator parameters (operate on THIS entity's animator) ---
     void SetAnimatorFloat(const std::string& name, float v) { api->SetAnimatorFloat(entityId, name, v); }
     void SetAnimatorBool(const std::string& name, bool v) { api->SetAnimatorBool(entityId, name, v); }
     void SetAnimatorTrigger(const std::string& name) { api->SetAnimatorTrigger(entityId, name); }
+
+    // Generic TCP transport + text prompt (see IScriptApi; v4).
+    std::uint32_t NetConnect(const std::string& host, std::uint32_t port) { return api->NetConnect(host, port); }
+    int NetState(std::uint32_t handle) { return api->NetState(handle); }
+    bool NetSend(std::uint32_t handle, const std::uint8_t* data, std::uint32_t size) { return api->NetSend(handle, data, size); }
+    std::uint32_t NetReceive(std::uint32_t handle, std::uint8_t* out, std::uint32_t capacity) { return api->NetReceive(handle, out, capacity); }
+    void NetClose(std::uint32_t handle) { api->NetClose(handle); }
+    std::uint32_t PromptText(const std::string& title, const std::string& label, bool secret) { return api->PromptText(title, label, secret); }
+    int PromptResult(std::uint32_t promptId, char* out, std::uint32_t capacity) { return api->PromptResult(promptId, out, capacity); }
+    // Material slot of THIS entity (see IScriptApi::SetMaterial; v5). Other entities: api->SetMaterial(id, ...).
+    void SetMaterial(std::uint32_t slot, const std::string& materialAssetId) { api->SetMaterial(entityId, slot, materialAssetId); }
+
+    // THIS entity's player CharacterController (v6). Other entities: api->GetCharacterState(id, ...).
+    bool GetCharacterState(CharacterState& out) { return api->GetCharacterState(entityId, out); }
+    void SetCharacterAbilities(bool canRun, bool canJump) { api->SetCharacterAbilities(entityId, canRun, canJump); }
+
+    // Game UI documents (v6; see IScriptApi::UiOpen).
+    std::uint32_t UiOpen(const std::string& documentPath) { return api->UiOpen(documentPath); }
+    void UiClose(std::uint32_t document) { api->UiClose(document); }
+    void UiSetVisible(std::uint32_t document, bool visible) { api->UiSetVisible(document, visible); }
+    void UiSetText(std::uint32_t document, const std::string& elementId, const std::string& text) { api->UiSetText(document, elementId, text); }
+    void UiSetProperty(std::uint32_t document, const std::string& elementId, const std::string& property, const std::string& value)
+    {
+        api->UiSetProperty(document, elementId, property, value);
+    }
+    void UiSetClass(std::uint32_t document, const std::string& elementId, const std::string& className, bool enabled)
+    {
+        api->UiSetClass(document, elementId, className, enabled);
+    }
+    bool UiConsumeClick(std::uint32_t document, const std::string& elementId) { return api->UiConsumeClick(document, elementId); }
 
     void Log(const std::string& msg) { api->Log(msg); }
     void LogError(const std::string& msg) { api->LogError(msg); }

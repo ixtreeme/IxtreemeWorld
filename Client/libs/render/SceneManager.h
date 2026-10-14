@@ -16,6 +16,7 @@ struct SceneData
     std::vector<CameraEntity> cameras;
     std::uint32_t mainCameraId = 0;
     LightingState lighting;
+    SkySettings sky;
     PhysicsSceneSettings physics;
     TerrainSceneData terrain;
     std::vector<WaterBody> waterBodies;
@@ -39,6 +40,11 @@ public:
     void RestoreSceneSnapshot(const SceneData& scene, const std::string& path, bool dirty);
 
     void SetCurrentSceneSnapshot(const SceneData& scene);
+    // Called before a save to complete the current scene snapshot: the editor's per-frame snapshot
+    // leaves out the terrain grids (megabytes) and the refresher sets the full one.
+    void SetSnapshotRefresher(std::function<void()> refresher);
+    // Whether a loaded scene waits for ConsumePendingScene (asked every frame: no SceneData to build).
+    bool HasPendingScene() const { return m_hasPendingScene; }
     bool ConsumePendingScene(SceneData& outScene);
     void SetWindowTitleCallback(std::function<void(const std::string&)> callback);
     void SetWindowTitleSuffix(std::string suffix);
@@ -60,6 +66,7 @@ private:
     bool LoadSceneInternal(const std::string& path);
     bool SaveSceneInternal(const std::string& path);
     bool PromptSaveBeforeAction(const std::string& actionName);
+    void RefreshSnapshotForSave();
     void UpdateRecentList(const std::string& path);
     std::string OpenSceneDialog() const;
     std::string SaveSceneDialog() const;
@@ -72,5 +79,6 @@ private:
     bool m_isDirty = false;
     std::vector<std::string> m_recentScenes;
     std::function<void(const std::string&)> m_windowTitleCallback;
+    std::function<void()> m_snapshotRefresher;
     std::string m_windowTitleSuffix;
 };

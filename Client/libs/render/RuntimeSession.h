@@ -13,8 +13,6 @@
 #include <utility>
 #include <vector>
 
-class VulkanDevice;
-
 namespace client::asset
 {
 class IAssetReader;
@@ -53,14 +51,14 @@ class RuntimeSession
 public:
     virtual ~RuntimeSession() = default;
 
-    virtual bool Create(VulkanDevice& device, client::asset::IAssetReader& assets, uint32_t width, uint32_t height) = 0;
+    virtual bool Create(client::asset::IAssetReader& assets, uint32_t width, uint32_t height) = 0;
     virtual void Destroy() = 0;
     virtual void SetQuitCallback(std::function<void()> callback) = 0;
     virtual void Update(double timeSeconds) = 0;
     virtual void UpdateNetwork() = 0;
     virtual void SendMoveInput(float directionAngle, RuntimeMoveState moveState) = 0;
     virtual void SendAttackTarget(std::uint32_t netId) = 0;
-    virtual void OnRenderPassChanged(VulkanDevice& device) = 0;
+    virtual void OnRenderPassChanged() = 0;
     virtual void Resize(uint32_t width, uint32_t height) = 0;
 
     virtual void Start(const SceneData& openScene) = 0;

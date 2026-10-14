@@ -20,6 +20,7 @@ IXVulkanRenderTarget::IXVulkanRenderTarget(IXVulkanDevice& device,
                                            VkRenderPass pass,
                                            bool ownPass,
                                            VkFramebuffer framebuffer,
+                                           VkImageView ownedDepthLayerView,
                                            std::unique_ptr<IXVulkanRenderPass> passToken,
                                            float clearColor[4],
                                            float clearDepth,
@@ -31,6 +32,7 @@ IXVulkanRenderTarget::IXVulkanRenderTarget(IXVulkanDevice& device,
     , m_pass(pass)
     , m_ownPass(ownPass)
     , m_framebuffer(framebuffer)
+    , m_ownedDepthLayerView(ownedDepthLayerView)
     , m_passToken(std::move(passToken))
     , m_clearDepth(clearDepth)
     , m_clearStencil(clearStencil)
@@ -42,6 +44,11 @@ IXVulkanRenderTarget::IXVulkanRenderTarget(IXVulkanDevice& device,
         m_width = m_color->Width();
         m_height = m_color->Height();
     }
+    else if (m_depth)
+    {
+        m_width = m_depth->Width();
+        m_height = m_depth->Height();
+    }
 }
 
 IXVulkanRenderTarget::~IXVulkanRenderTarget()
@@ -51,6 +58,8 @@ IXVulkanRenderTarget::~IXVulkanRenderTarget()
     const VkDevice native = m_device->NativeDevice();
     if (m_framebuffer != VK_NULL_HANDLE)
         vkDestroyFramebuffer(native, m_framebuffer, nullptr);
+    if (m_ownedDepthLayerView != VK_NULL_HANDLE)
+        vkDestroyImageView(native, m_ownedDepthLayerView, nullptr);
     if (m_ownPass && m_pass != VK_NULL_HANDLE)
         vkDestroyRenderPass(native, m_pass, nullptr);
 }
@@ -60,12 +69,23 @@ void IXVulkanRenderTarget::Begin(ixrhi::IXRHICommandList& cmd) const
     auto* native = dynamic_cast<IXVulkanCommandList*>(&cmd);
     if (native == nullptr)
         return;
+    // Clear-value order mirrors the framebuffer attachments (color first
+    // when present, then depth) — depth-only targets clear values[0] as depth.
     VkClearValue clearValues[2]{};
-    clearValues[0].color.float32[0] = m_clearColor[0];
-    clearValues[0].color.float32[1] = m_clearColor[1];
-    clearValues[0].color.float32[2] = m_clearColor[2];
-    clearValues[0].color.float32[3] = m_clearColor[3];
-    clearValues[1].depthStencil = {m_clearDepth, m_clearStencil};
+    std::uint32_t clearValueCount = 0;
+    if (m_color)
+    {
+        clearValues[clearValueCount].color.float32[0] = m_clearColor[0];
+        clearValues[clearValueCount].color.float32[1] = m_clearColor[1];
+        clearValues[clearValueCount].color.float32[2] = m_clearColor[2];
+        clearValues[clearValueCount].color.float32[3] = m_clearColor[3];
+        ++clearValueCount;
+    }
+    if (m_depth)
+    {
+        clearValues[clearValueCount].depthStencil = {m_clearDepth, m_clearStencil};
+        ++clearValueCount;
+    }
 
     VkRenderPassBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
@@ -73,7 +93,8 @@ void IXVulkanRenderTarget::Begin(ixrhi::IXRHICommandList& cmd) const
     begin.framebuffer = m_framebuffer;
     begin.renderArea.offset = {0, 0};
     begin.renderArea.extent = {m_width, m_height};
-    begin.clearValueCount = m_depth ? 2u : 1u;
+    // Attachment order mirrors CreateRenderTarget: color first when present.
+    begin.clearValueCount = clearValueCount;
     begin.pClearValues = clearValues;
     vkCmdBeginRenderPass(native->Native(), &begin, VK_SUBPASS_CONTENTS_INLINE);
     native->SetViewport(0.0f, 0.0f, static_cast<float>(m_width), static_cast<float>(m_height));
@@ -91,29 +112,71 @@ void IXVulkanRenderTarget::End(ixrhi::IXRHICommandList& cmd) const
 std::unique_ptr<ixrhi::IXRHIRenderTarget> IXVulkanDevice::CreateRenderTarget(
     const ixrhi::IXRHIRenderTargetDesc& desc)
 {
-    if (!desc.color || desc.color->Width() == 0 || desc.color->Height() == 0)
+    auto* color = desc.color ? dynamic_cast<IXVulkanTexture*>(desc.color.get()) : nullptr;
+    if (desc.color && color == nullptr)
         return nullptr;
-    auto* color = dynamic_cast<IXVulkanTexture*>(desc.color.get());
-    if (color == nullptr)
-        return nullptr;
-    auto* depth = dynamic_cast<IXVulkanTexture*>(desc.depth.get());
+    auto* depth = desc.depth ? dynamic_cast<IXVulkanTexture*>(desc.depth.get()) : nullptr;
     if (desc.depth && depth == nullptr)
         return nullptr;
+    if (color && (color->Width() == 0 || color->Height() == 0))
+        return nullptr;
+    if (depth && (depth->Width() == 0 || depth->Height() == 0))
+        return nullptr;
+    if (color == nullptr && depth == nullptr)
+        return nullptr;
+    if (depth && depth->ArrayLayers() > 1 && desc.depthLayer >= depth->ArrayLayers())
+        return nullptr;
 
+    const bool hasColor = color != nullptr;
     const bool hasDepth = depth != nullptr;
-    VkRenderPass pass = CreateCompatRenderPass(desc.color->Format(),
+    VkRenderPass pass = CreateCompatRenderPass(hasColor ? desc.color->Format() : ixrhi::IXRHIFormat::Undefined,
         hasDepth ? desc.depth->Format() : ixrhi::IXRHIFormat::Undefined,
         desc.colorLoad,
         desc.colorStore,
         desc.depthLoad,
         desc.depthStore,
         desc.debugName.c_str());
+    if (pass == VK_NULL_HANDLE)
+        return nullptr;
 
+    // Layered depth (shadow cascades) needs a per-slice 2D view owned by the
+    // target; the texture keeps its full-array sampling view.
+    VkImageView ownedDepthLayerView = VK_NULL_HANDLE;
+    VkImageView depthView = VK_NULL_HANDLE;
+    if (depth)
+    {
+        if (depth->ArrayLayers() > 1)
+        {
+            VkImageViewCreateInfo layerView{};
+            layerView.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            layerView.image = depth->Native();
+            layerView.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            layerView.format = ToVkFormat(depth->Format());
+            layerView.subresourceRange.aspectMask = ToVkAspectMask(depth->Format());
+            layerView.subresourceRange.baseArrayLayer = desc.depthLayer;
+            layerView.subresourceRange.levelCount = 1;
+            layerView.subresourceRange.layerCount = 1;
+            CheckVk(vkCreateImageView(NativeDevice(), &layerView, nullptr, &ownedDepthLayerView),
+                "vkCreateImageView(depthLayer)",
+                __FILE__,
+                __LINE__);
+            depthView = ownedDepthLayerView;
+        }
+        else
+        {
+            depthView = depth->NativeView();
+        }
+    }
+
+    const std::uint32_t width = hasColor ? desc.color->Width() : desc.depth->Width();
+    const std::uint32_t height = hasColor ? desc.color->Height() : desc.depth->Height();
+    // Depth-only targets bind the depth view in attachment slot 0 (the pass
+    // has no color attachment); color targets keep the color/depth ordering.
     VkFramebuffer framebuffer = CreateFramebufferFor(pass,
-        color->NativeView(),
-        hasDepth ? depth->NativeView() : VK_NULL_HANDLE,
-        desc.color->Width(),
-        desc.color->Height());
+        hasColor ? color->NativeView() : depthView,
+        hasColor ? depthView : VK_NULL_HANDLE,
+        width,
+        height);
 
     auto token = IXVulkanRenderPass::Borrow(*this, pass);
     float clearColor[4] = {
@@ -124,6 +187,7 @@ std::unique_ptr<ixrhi::IXRHIRenderTarget> IXVulkanDevice::CreateRenderTarget(
         pass,
         /*ownPass=*/true,
         framebuffer,
+        ownedDepthLayerView,
         std::move(token),
         clearColor,
         desc.clearDepth,
@@ -144,64 +208,97 @@ VkRenderPass IXVulkanDevice::CreateCompatRenderPass(ixrhi::IXRHIFormat colorForm
     // (sampled by composite/editor), depth final ATTACHMENT; initial layouts
     // follow the load ops. Subpass dependencies preserve the old ordering
     // (fragment-shader reads before attachment writes and vice versa).
+    // Depth-only shape (shadow maps): single depth attachment, no color
+    // reference; the same dependency pattern with depth stages.
+    const bool hasColor = colorFormat != ixrhi::IXRHIFormat::Undefined;
     const bool hasDepth = depthFormat != ixrhi::IXRHIFormat::Undefined;
+    if (!hasColor && !hasDepth)
+        return VK_NULL_HANDLE;
     VkAttachmentDescription attachments[2]{};
-    attachments[0].format = ToVkFormat(colorFormat);
-    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-    attachments[0].loadOp = ToVkLoadOp(colorLoad);
-    attachments[0].storeOp = ToVkStoreOp(colorStore);
-    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachments[0].initialLayout = colorLoad == ixrhi::IXRHILoadOp::Clear
-        ? VK_IMAGE_LAYOUT_UNDEFINED
-        : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    attachments[0].finalLayout = forPresent ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
-                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    VkAttachmentReference colorRef{};
-    colorRef.attachment = 0;
+    uint32_t attachmentCount = 0;    VkAttachmentReference colorRef{};
     colorRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
     VkAttachmentReference depthRef{};
-    depthRef.attachment = 1;
     depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
     VkSubpassDescription subpass{};
     subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &colorRef;
+    if (hasColor)
+    {
+        attachments[attachmentCount].format = ToVkFormat(colorFormat);
+        attachments[attachmentCount].samples = VK_SAMPLE_COUNT_1_BIT;
+        attachments[attachmentCount].loadOp = ToVkLoadOp(colorLoad);
+        attachments[attachmentCount].storeOp = ToVkStoreOp(colorStore);
+        attachments[attachmentCount].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        attachments[attachmentCount].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[attachmentCount].initialLayout = colorLoad == ixrhi::IXRHILoadOp::Clear
+            ? VK_IMAGE_LAYOUT_UNDEFINED
+            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        attachments[attachmentCount].finalLayout = forPresent ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR
+                                                              : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        colorRef.attachment = attachmentCount;
+        ++attachmentCount;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &colorRef;
+    }
 
+    // The pass waits for whatever came before on its attachments: their sampling, their earlier use as
+    // attachments (and, for a swapchain image, its acquire, which the submit waits for at the colour
+    // output stage), before it loads, clears or tests them.
     std::array<VkSubpassDependency, 2> dependencies{};
-    dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-    dependencies[0].dstSubpass = 0;
-    dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-        VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-        VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dependencies[1].srcSubpass = 0;
-    dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    if (hasColor)
+    {
+        dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependencies[0].dstSubpass = 0;
+        dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+            VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dependencies[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependencies[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependencies[1].srcSubpass = 0;
+        dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        dependencies[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dependencies[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    }
+    else
+    {
+        dependencies[0].srcSubpass = VK_SUBPASS_EXTERNAL;
+        dependencies[0].dstSubpass = 0;
+        dependencies[0].srcStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dependencies[0].dstStageMask = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dependencies[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependencies[0].dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependencies[1].srcSubpass = 0;
+        dependencies[1].dstSubpass = VK_SUBPASS_EXTERNAL;
+        dependencies[1].srcStageMask = VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+        dependencies[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+        dependencies[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        dependencies[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    }
 
-    uint32_t attachmentCount = 1;
     if (hasDepth)
     {
-        attachments[1].format = ToVkFormat(depthFormat);
-        attachments[1].samples = VK_SAMPLE_COUNT_1_BIT;
-        attachments[1].loadOp = ToVkLoadOp(depthLoad);
-        attachments[1].storeOp = forPresent ? VK_ATTACHMENT_STORE_OP_DONT_CARE : ToVkStoreOp(depthStore);
-        attachments[1].stencilLoadOp = ToVkLoadOp(depthLoad);
-        attachments[1].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        attachments[1].initialLayout = depthLoad == ixrhi::IXRHILoadOp::Clear
+        attachments[attachmentCount].format = ToVkFormat(depthFormat);
+        attachments[attachmentCount].samples = VK_SAMPLE_COUNT_1_BIT;
+        attachments[attachmentCount].loadOp = ToVkLoadOp(depthLoad);
+        attachments[attachmentCount].storeOp = forPresent ? VK_ATTACHMENT_STORE_OP_DONT_CARE : ToVkStoreOp(depthStore);
+        attachments[attachmentCount].stencilLoadOp = ToVkLoadOp(depthLoad);
+        attachments[attachmentCount].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+        attachments[attachmentCount].initialLayout = depthLoad == ixrhi::IXRHILoadOp::Clear
             ? VK_IMAGE_LAYOUT_UNDEFINED
             : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-        attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        attachments[attachmentCount].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+        depthRef.attachment = attachmentCount;
+        ++attachmentCount;
         subpass.pDepthStencilAttachment = &depthRef;
-        attachmentCount = 2;
     }
 
     VkRenderPassCreateInfo passInfo{};
@@ -246,6 +343,7 @@ VkFramebuffer IXVulkanDevice::CreateFramebufferFor(VkRenderPass pass,
 
 void IXVulkanDevice::WaitIdle()
 {
+    WaitForAsyncPresentIdle();
     CheckVk(vkDeviceWaitIdle(NativeDevice()), "vkDeviceWaitIdle", __FILE__, __LINE__);
 }
 

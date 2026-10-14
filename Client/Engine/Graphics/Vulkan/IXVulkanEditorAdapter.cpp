@@ -21,6 +21,9 @@
 #include <windows.h>
 #endif
 
+#include <array>
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 
@@ -61,6 +64,114 @@ int CreateAdapterVkSurface(ImGuiViewport* viewport,
         reinterpret_cast<VkSurfaceKHR*>(outVkSurface)));
 }
 #endif
+
+// The platform backend's viewport DPI scale (ImGuiPlatformIO::Platform_GetWindowDpiScale), asked for
+// every viewport every frame. The Win32 one asks the OS each time (a version check, a monitor query).
+// A viewport's scale only changes when it moves to another monitor or the display scale is changed,
+// so it is asked again when the viewport moves or resizes, and otherwise every half second.
+float (*g_backendWindowDpiScale)(ImGuiViewport*) = nullptr;
+struct ViewportDpi
+{
+    ImGuiID id = 0;  // 0 = free
+    ImVec2 pos;
+    ImVec2 size;
+    std::chrono::steady_clock::time_point asked;
+    float scale = 1.0f;
+};
+std::array<ViewportDpi, 16> g_viewportDpi{};
+
+float CachedWindowDpiScale(ImGuiViewport* viewport)
+{
+    if (g_backendWindowDpiScale == nullptr || viewport == nullptr)
+        return 1.0f;
+    const auto now = std::chrono::steady_clock::now();
+    ViewportDpi* entry = nullptr;
+    for (ViewportDpi& candidate : g_viewportDpi)
+    {
+        if (candidate.id == viewport->ID)
+        {
+            entry = &candidate;
+            break;
+        }
+    }
+    if (entry != nullptr && entry->pos.x == viewport->Pos.x && entry->pos.y == viewport->Pos.y &&
+        entry->size.x == viewport->Size.x && entry->size.y == viewport->Size.y &&
+        now - entry->asked < std::chrono::milliseconds(500))
+        return entry->scale;
+    if (entry == nullptr)
+    {
+        // A free entry, or else the one asked longest ago.
+        entry = &g_viewportDpi[0];
+        for (ViewportDpi& candidate : g_viewportDpi)
+        {
+            if (candidate.id == 0 || candidate.asked < entry->asked)
+                entry = &candidate;
+            if (candidate.id == 0)
+                break;
+        }
+    }
+    entry->id = viewport->ID;
+    entry->pos = viewport->Pos;
+    entry->size = viewport->Size;
+    entry->asked = now;
+    entry->scale = g_backendWindowDpiScale(viewport);
+    return entry->scale;
+}
+
+// Editor colors (the style and every color written in the panels) are sRGB values. An sRGB
+// render target treats what the shader writes as linear and encodes it, which would show each of
+// them lighter than written: decode the vertex colors to linear first. Alpha is coverage and stays.
+//
+// The UI uses a small set of RGB values (style colours, text), so a direct-mapped memo cache turns
+// the per-vertex work into one lookup after the first frame instead of three table reads + shifts.
+namespace
+{
+constexpr std::size_t kColorDecodeCacheSize = 1024;
+std::array<std::uint32_t, kColorDecodeCacheSize> g_colorDecodeKeys{};    // source RGB (0 = empty)
+std::array<std::uint32_t, kColorDecodeCacheSize> g_colorDecodeValues{};  // decoded RGB
+} // namespace
+
+void DecodeDrawDataColorsToLinear(ImDrawData* drawData)
+{
+    static const std::array<std::uint8_t, 256> kSrgbToLinear = [] {
+        std::array<std::uint8_t, 256> table{};
+        for (int i = 0; i < 256; ++i)
+        {
+            const double srgb = static_cast<double>(i) / 255.0;
+            const double linear = srgb <= 0.04045 ? srgb / 12.92 : std::pow((srgb + 0.055) / 1.055, 2.4);
+            table[static_cast<std::size_t>(i)] = static_cast<std::uint8_t>(linear * 255.0 + 0.5);
+        }
+        return table;
+    }();
+    if (!drawData)
+        return;
+    for (int listIndex = 0; listIndex < drawData->CmdListsCount; ++listIndex)
+    {
+        ImVector<ImDrawVert>& vertices = drawData->CmdLists[listIndex]->VtxBuffer;
+        for (ImDrawVert& vertex : vertices)
+        {
+            const ImU32 color = vertex.col;
+            const ImU32 rgb = color & 0x00FFFFFFu;
+            const std::size_t index = ((rgb * 2654435761u) >> 22) & (kColorDecodeCacheSize - 1u);
+            ImU32 decoded = g_colorDecodeValues[index];
+            if (g_colorDecodeKeys[index] != rgb)
+            {
+                const ImU32 r = kSrgbToLinear[(rgb >> IM_COL32_R_SHIFT) & 0xFFu];
+                const ImU32 g = kSrgbToLinear[(rgb >> IM_COL32_G_SHIFT) & 0xFFu];
+                const ImU32 b = kSrgbToLinear[(rgb >> IM_COL32_B_SHIFT) & 0xFFu];
+                decoded = (r << IM_COL32_R_SHIFT) | (g << IM_COL32_G_SHIFT) | (b << IM_COL32_B_SHIFT);
+                g_colorDecodeKeys[index] = rgb;
+                g_colorDecodeValues[index] = decoded;
+            }
+            vertex.col = decoded | (color & IM_COL32_A_MASK);
+        }
+    }
+}
+
+bool IsSrgbFormat(ixrhi::IXRHIFormat format)
+{
+    return format == ixrhi::IXRHIFormat::R8G8B8A8Srgb || format == ixrhi::IXRHIFormat::B8G8R8A8Srgb;
+}
 
 std::uint32_t CountAdapterDrawCommands(const ImDrawData* drawData)
 {
@@ -120,6 +231,14 @@ bool IXVulkanEditorAdapter::CreateBackend(void* windowHandle)
 #if defined(_WIN32)
     ImGui::GetPlatformIO().Platform_CreateVkSurface = CreateAdapterVkSurface;
 #endif
+    // The platform backend's DPI query, asked again only when a viewport moves (see CachedWindowDpiScale).
+    ImGuiPlatformIO& platformIO = ImGui::GetPlatformIO();
+    if (platformIO.Platform_GetWindowDpiScale != nullptr && platformIO.Platform_GetWindowDpiScale != CachedWindowDpiScale)
+    {
+        g_backendWindowDpiScale = platformIO.Platform_GetWindowDpiScale;
+        g_viewportDpi = {};
+        platformIO.Platform_GetWindowDpiScale = CachedWindowDpiScale;
+    }
 
     ImGui_ImplVulkan_InitInfo init{};
     init.ApiVersion = VK_API_VERSION_1_2;
@@ -168,6 +287,7 @@ void IXVulkanEditorAdapter::ShutdownBackend()
     }
 #if defined(_WIN32)
     ImGui_ImplWin32_Shutdown();
+    g_backendWindowDpiScale = nullptr;
 #endif
     if (ImGui::GetCurrentContext() != nullptr)
         ImGui::DestroyContext();
@@ -260,6 +380,8 @@ void IXVulkanEditorAdapter::DrawFrame(ixrhi::IXRHICommandList& cmd, std::uint64_
             drawData ? drawData->CmdListsCount : 0,
             CountAdapterDrawCommands(drawData));
     }
+    if (IsSrgbFormat(m_rhi->GetMainSwapchain().ColorFormat()))
+        DecodeDrawDataColorsToLinear(drawData);
     ImGui_ImplVulkan_RenderDrawData(drawData, native->Native());
 
     static std::uint32_t lastLoggedDrawCommands = std::numeric_limits<std::uint32_t>::max();

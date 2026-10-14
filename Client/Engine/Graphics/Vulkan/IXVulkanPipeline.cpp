@@ -102,12 +102,14 @@ IXVulkanComputePipeline::~IXVulkanComputePipeline()
 std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> IXVulkanDevice::CreateGraphicsPipeline(
     const ixrhi::IXRHIGraphicsPipelineDesc& desc)
 {
-    if (!desc.vertexShader || !desc.fragmentShader)
+    if (!desc.vertexShader)
         return nullptr;
     auto* vs = dynamic_cast<IXVulkanShader*>(desc.vertexShader.get());
-    auto* ps = dynamic_cast<IXVulkanShader*>(desc.fragmentShader.get());
-    if (vs == nullptr || ps == nullptr)
+    auto* ps = desc.fragmentShader ? dynamic_cast<IXVulkanShader*>(desc.fragmentShader.get()) : nullptr;
+    if (vs == nullptr || (desc.fragmentShader && ps == nullptr))
         return nullptr;
+    // Depth-only pipelines (shadow maps) carry no fragment shader and no
+    // color attachments; color state is omitted entirely.
 
     const VkRenderPass renderPass = ResolveRenderPass(desc.targetRenderPass);
     if (renderPass == VK_NULL_HANDLE)
@@ -118,10 +120,15 @@ std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> IXVulkanDevice::CreateGraphicsPipe
     stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
     stages[0].module = vs->Native();
     stages[0].pName = vs->EntryPoint().c_str();
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = ps->Native();
-    stages[1].pName = ps->EntryPoint().c_str();
+    std::uint32_t stageCount = 1;
+    if (ps)
+    {
+        stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+        stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = ps->Native();
+        stages[1].pName = ps->EntryPoint().c_str();
+        stageCount = 2;
+    }
 
     std::vector<VkVertexInputBindingDescription> bindings;
     bindings.reserve(desc.vertexBindings.size());
@@ -165,6 +172,9 @@ std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> IXVulkanDevice::CreateGraphicsPipe
     raster.polygonMode = VK_POLYGON_MODE_FILL;
     raster.cullMode = ToVkCullMode(desc.cullMode);
     raster.frontFace = ToVkFrontFace(desc.frontFace);
+    raster.depthBiasEnable = desc.depthBias.enable ? VK_TRUE : VK_FALSE;
+    raster.depthBiasConstantFactor = desc.depthBias.constantFactor;
+    raster.depthBiasSlopeFactor = desc.depthBias.slopeFactor;
     raster.lineWidth = 1.0f;
 
     VkPipelineMultisampleStateCreateInfo msaa{};
@@ -182,8 +192,9 @@ std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> IXVulkanDevice::CreateGraphicsPipe
     for (const auto& blend : desc.blendAttachments)
     {
         VkPipelineColorBlendAttachmentState entry{};
-        entry.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        entry.colorWriteMask = blend.writeColor
+            ? (VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT)
+            : 0u;
         entry.blendEnable = blend.blendEnable ? VK_TRUE : VK_FALSE;
         entry.srcColorBlendFactor = ToVkBlendFactor(blend.srcColor);
         entry.dstColorBlendFactor = ToVkBlendFactor(blend.dstColor);
@@ -209,7 +220,7 @@ std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> IXVulkanDevice::CreateGraphicsPipe
 
     VkGraphicsPipelineCreateInfo pipeline{};
     pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    pipeline.stageCount = 2;
+    pipeline.stageCount = stageCount;
     pipeline.pStages = stages;
     pipeline.pVertexInputState = &vertex;
     pipeline.pInputAssemblyState = &assembly;
@@ -217,7 +228,7 @@ std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> IXVulkanDevice::CreateGraphicsPipe
     pipeline.pRasterizationState = &raster;
     pipeline.pMultisampleState = &msaa;
     pipeline.pDepthStencilState = &depth;
-    pipeline.pColorBlendState = &blend;
+    pipeline.pColorBlendState = attachments.empty() ? nullptr : &blend;
     pipeline.pDynamicState = &dynamic;
     pipeline.layout = layout;
     pipeline.renderPass = renderPass;

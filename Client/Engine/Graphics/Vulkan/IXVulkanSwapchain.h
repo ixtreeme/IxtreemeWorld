@@ -48,6 +48,8 @@ public:
 
     std::uint32_t Width() const override { return m_width; }
     std::uint32_t Height() const override { return m_height; }
+    std::uint32_t MipLevels() const override { return 1; }
+    std::uint32_t ArrayLayers() const override { return 1; }
     ixrhi::IXRHIFormat Format() const override { return m_format; }
     const std::string& DebugName() const override { return m_debugName; }
 
@@ -90,6 +92,9 @@ public:
     void Rebuild();
     void Teardown();
     const ixrhi::IXRHIRenderPass* MainPass() const;
+    // Native main pass for backend-internal baking fallback (null = torn
+    // down; callers defer). Owned here; never exposed to generic code.
+    VkRenderPass NativeMainPass() const { return m_mainPass; }
     ixrhi::IXRHIRenderTarget* MainTarget(std::uint32_t imageIndex);
     const ixrhi::IXRHITexture* Backbuffer(std::uint32_t imageIndex) const;
 

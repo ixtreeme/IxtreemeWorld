@@ -1,0 +1,238 @@
+/* Player HUD. Sizes are in dp: one dp is one pixel at 1080 lines and scales with the screen. */
+
+body
+{
+    width: 100%;
+    height: 100%;
+    font-family: Roboto;
+    font-size: 15dp;
+    color: #e8ecf2;
+}
+
+div { display: block; }
+span { display: inline; }
+
+/* ---------- bars (shared) ---------- */
+
+.bar
+{
+    position: relative;
+    height: 16dp;
+    margin-top: 6dp;
+    background-color: #0b0f16d8;
+    border: 1dp #000000a0;
+    border-radius: 4dp;
+}
+
+.fill
+{
+    position: absolute;
+    left: 0dp;
+    top: 0dp;
+    bottom: 0dp;
+    width: 100%;
+    border-radius: 3dp;
+}
+
+.bar-text
+{
+    position: absolute;
+    left: 0dp;
+    right: 0dp;
+    top: 0dp;
+    text-align: center;
+    font-size: 11dp;
+    line-height: 16dp;
+    color: #ffffffe6;
+}
+
+.hp .fill { background-color: #c43a3f; }
+.mp .fill { background-color: #2f6ad0; }
+
+/* ---------- player frame ---------- */
+
+#player-frame
+{
+    position: absolute;
+    left: 28dp;
+    top: 28dp;
+    width: 340dp;
+    height: 90dp;
+    pointer-events: none;
+}
+
+#portrait
+{
+    position: absolute;
+    left: 0dp;
+    top: 0dp;
+    width: 84dp;
+    height: 84dp;
+    border: 3dp #c9a24a;
+    border-radius: 45dp;
+    background-color: #1a2130e8;
+}
+
+#portrait-initial
+{
+    text-align: center;
+    font-size: 40dp;
+    line-height: 84dp;
+    color: #c9a24a;
+}
+
+#player-level
+{
+    position: absolute;
+    right: -6dp;
+    bottom: -6dp;
+    width: 30dp;
+    height: 30dp;
+    border: 2dp #c9a24a;
+    border-radius: 16dp;
+    background-color: #10151f;
+    text-align: center;
+    line-height: 26dp;
+    font-size: 13dp;
+}
+
+#player-info
+{
+    position: absolute;
+    left: 100dp;
+    top: 8dp;
+    right: 0dp;
+}
+
+#player-name
+{
+    font-size: 18dp;
+    color: #f4e7c4;
+}
+
+/* ---------- bottom: stamina + action bar ---------- */
+
+#bottom
+{
+    position: absolute;
+    left: 0dp;
+    right: 0dp;
+    bottom: 24dp;
+    height: 190dp;
+}
+
+#message
+{
+    width: 600dp;
+    margin: 0dp auto;
+    height: 30dp;
+    text-align: center;
+    font-size: 20dp;
+    color: #ffcf6b;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.25s cubic-out;
+}
+#message.show { opacity: 1; }
+
+#stamina
+{
+    width: 440dp;
+    margin: 6dp auto 0dp auto;
+    pointer-events: none;
+}
+
+#stamina-header { height: 18dp; font-size: 12dp; }
+#stamina-label { color: #e9c23b; }
+#stamina-state { color: #9fb3c8; margin-left: 10dp; }
+
+#stamina-bar { height: 22dp; }
+#stamina-bar .bar-text { line-height: 22dp; font-size: 13dp; }
+
+#stamina-fill
+{
+    background-color: #e9c23b;
+    transition: background-color 0.3s cubic-in-out;
+}
+#stamina-bar.recovering #stamina-fill { background-color: #f0d460; }
+#stamina-bar.low #stamina-fill { background-color: #e8812c; }
+#stamina-bar.exhausted #stamina-fill { background-color: #c43a3f; }
+#stamina-bar.exhausted { animation: 0.45s cubic-in-out infinite alternate tired-pulse; }
+
+@keyframes tired-pulse
+{
+    from { opacity: 1; }
+    to { opacity: 0.55; }
+}
+
+#actionbar
+{
+    margin: 12dp auto 0dp auto;
+    width: 320dp;
+    height: 58dp;
+    display: flex;
+    justify-content: center;
+}
+
+.slot
+{
+    position: relative;
+    width: 54dp;
+    height: 54dp;
+    margin: 0dp 4dp;
+    background-color: #121823e6;
+    border: 2dp #3b4558;
+    border-radius: 6dp;
+}
+.slot:hover { border-color: #c9a24a; }
+.slot:active { background-color: #223047; }
+.slot.empty { background-color: #0d1118b0; border-color: #262d3a; }
+.slot.empty:hover { border-color: #262d3a; }
+.slot.no-charges .slot-icon { color: #4c5566; }
+.slot.used { border-color: #6fe08a; }
+
+.slot-icon
+{
+    text-align: center;
+    font-size: 30dp;
+    line-height: 50dp;
+    color: #6fe08a;
+}
+
+.slot-cooldown
+{
+    position: absolute;
+    left: 0dp;
+    right: 0dp;
+    bottom: 0dp;
+    height: 0%;
+    background-color: #000000a8;
+    border-radius: 4dp;
+}
+
+.slot-key
+{
+    position: absolute;
+    left: 4dp;
+    top: 1dp;
+    font-size: 11dp;
+    color: #a9b4c4;
+}
+
+.slot-count
+{
+    position: absolute;
+    right: 4dp;
+    bottom: 1dp;
+    font-size: 13dp;
+    color: #ffffff;
+}
+
+#hints
+{
+    margin-top: 10dp;
+    text-align: center;
+    font-size: 12dp;
+    color: #c8d0dcb0;
+    pointer-events: none;
+}

@@ -1,6 +1,8 @@
 add_library(IXEngineAsset STATIC
     AssetDatabase.cpp
     AssetDatabase.h
+    ExrImage.cpp
+    ExrImage.h
     AssetLibrary.cpp
     AssetLibrary.h
     AssetWatcher.cpp
@@ -30,6 +32,7 @@ target_link_libraries(IXEngineAsset
         IXEngineCommon
         IXEngineDebug
         efsw::efsw
+        OpenEXR::OpenEXR
 )
 
 target_include_directories(IXEngineAsset

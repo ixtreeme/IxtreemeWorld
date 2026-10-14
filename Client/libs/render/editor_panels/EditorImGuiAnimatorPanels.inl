@@ -10,7 +10,7 @@ void EditorImGui::RenderAnimatorPanel()
     if (!m_animatorPanelOpen)
         return;
 
-    if (!ImGui::Begin(ICON_FA_PERSON_RUNNING " Animator", &m_animatorPanelOpen,
+    if (!ImGui::Begin(EditorWindow::Animator, &m_animatorPanelOpen,
             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse))
     {
         m_animatorGraphVisible = false;

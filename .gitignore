@@ -1,4 +1,8 @@
 build/
+# The editor-less runtime player build ("Build Game" creates it next to the engine sources).
+build-runtime/
+# Source, not a build tree: "build/" above matches it on case-insensitive file systems.
+!Client/Editor/Build/
 .vs/
 .vscode/
 .idea/
@@ -12,3 +16,5 @@ install/
 logs/
 vcpkg_installed/
 *.log
+# Editor recent-projects list (machine-specific absolute paths)
+editor_recent_projects.txt

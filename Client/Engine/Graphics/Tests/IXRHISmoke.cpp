@@ -141,6 +141,8 @@ class StubTexture final : public ixrhi::IXRHITexture
 public:
     std::uint32_t Width() const override { return 4; }
     std::uint32_t Height() const override { return 4; }
+    std::uint32_t MipLevels() const override { return 1; }
+    std::uint32_t ArrayLayers() const override { return 1; }
     ixrhi::IXRHIFormat Format() const override { return ixrhi::IXRHIFormat::R8G8B8A8Unorm; }
     const std::string& DebugName() const override { return m_name; }
 

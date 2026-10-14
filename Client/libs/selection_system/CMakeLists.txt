@@ -16,3 +16,13 @@ target_link_libraries(IXEngineSelectionSystem
 )
 
 target_compile_features(IXEngineSelectionSystem PUBLIC cxx_std_20)
+
+if(BUILD_TESTING AND NOT ANDROID)
+    add_executable(MeshSelectionTest tests/MeshSelectionTest.cpp)
+    target_link_libraries(MeshSelectionTest PRIVATE IXEngineSelectionSystem)
+    if(MSVC)
+        set_target_properties(MeshSelectionTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME MeshSelectionTest COMMAND MeshSelectionTest)
+endif()

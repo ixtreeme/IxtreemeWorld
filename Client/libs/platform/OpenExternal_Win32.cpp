@@ -16,8 +16,12 @@ bool OpenInDefaultApp(const std::filesystem::path& path, std::string* errorOut)
 {
     std::error_code ec;
     std::filesystem::path abs = std::filesystem::absolute(path, ec);
-    const std::wstring wpath = (ec ? path : abs).wstring();
-    const HINSTANCE rc = ::ShellExecuteW(nullptr, L"open", wpath.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    const std::filesystem::path target = ec ? path : abs;
+    const std::wstring wpath = target.wstring();
+    // Started in its own folder, as a double-click in Explorer does (a program finds its files there).
+    const std::wstring wdir = target.parent_path().wstring();
+    const HINSTANCE rc = ::ShellExecuteW(nullptr, L"open", wpath.c_str(), nullptr,
+        wdir.empty() ? nullptr : wdir.c_str(), SW_SHOWNORMAL);
     // ShellExecute returns a value > 32 on success.
     if (reinterpret_cast<INT_PTR>(rc) > 32)
         return true;

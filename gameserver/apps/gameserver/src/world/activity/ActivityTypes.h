@@ -1,0 +1,156 @@
+#pragma once
+
+#include <cfloat>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+
+#include "../components/SimulationLod.h"
+
+// Spatial Activity Field: shared vocabulary.
+//
+// The field answers ONE question in world space: "how much compute
+// relevance does anything radiate HERE?" It is DERIVED DATA, never gameplay
+// authority: authoritative state stays in flecs (positions, combat, ...);
+// the field is disposable and rebuildable at any time. Never treat a field
+// sample as authority for gameplay writes.
+//
+// Channels: plain enum, no virtual provider/consumer forest. Only
+// PlayerInfluence is produced today; the enum + per-source channel tag keep
+// every later channel (Combat, Replication, Navigation, Event, Predicted
+// Movement, ...) a data addition instead of an architecture change.
+namespace gs::game {
+
+enum class ActivityChannel : std::uint8_t {
+    PlayerInfluence = 0,
+    // Future (Adaptive Simulation Fabric): Combat, ReplicationPressure,
+    // NavigationCost, EventInfluence, ShipInfluence, PredictedMovement.
+    // Each becomes a producer writing tagged sources + consumers reading
+    // per-channel queries. No redesign of this header is needed for that.
+};
+
+// Which resolution level a snapshot represents. Only Local exists today;
+// ZoneScale/RegionScale aggregates slot in as new query levels over the
+// same cell storage without touching producers.
+enum class ActivityLevel : std::uint8_t {
+    Local = 0,
+};
+
+// Explicit world rectangle for world-indexed derived fields. Replaces the
+// earlier implicit "the world is [0, extent]^2" assumption, so a world with a
+// non-zero origin (e.g. -50 km .. +50 km) or non-square extents indexes
+// correctly instead of silently folding every negative coordinate into cell 0.
+//
+// Production coordinates are unchanged: FromExtent(e) reproduces the old
+// [0, e] x [0, e] box exactly, bit for bit.
+struct WorldBounds {
+    float min_x = 0.0f;
+    float min_y = 0.0f;
+    float max_x = 0.0f;
+    float max_y = 0.0f;
+
+    // Back-compatible helper for the historic origin-at-zero square world.
+    static WorldBounds FromExtent(float extent) noexcept
+    {
+        return WorldBounds{0.0f, 0.0f, extent, extent};
+    }
+
+    float ExtentX() const noexcept
+    {
+        return max_x - min_x;
+    }
+    float ExtentY() const noexcept
+    {
+        return max_y - min_y;
+    }
+    bool IsValid() const noexcept
+    {
+        return ExtentX() > 0.0f && ExtentY() > 0.0f;
+    }
+};
+
+// Cell size of the world-space activity grid. Deliberately INDEPENDENT of
+// SpatialGrid's cell size (AOI radius): the activity grid trades query box
+// visits against aggregation cost, while the spatial index trades AOI
+// fanout. Never unify the two concepts.
+inline constexpr float kActivityCellSizeMeters = 500.0f;
+
+// Shared origin-aware axis mapping: world coordinate -> clamped cell index.
+// Single source of truth for every world-indexed derived field (activity
+// field, continuous load field): subtracting the origin is what makes a
+// non-zero world origin (e.g. -50km..+50km) index correctly, and the clamp
+// keeps out-of-bounds samples on the edge cell instead of folding every
+// negative coordinate into cell 0.
+inline std::uint32_t ClampedAxisCellFor(float world_v,
+                                        float origin_v,
+                                        float cell_size,
+                                        std::uint32_t dim) noexcept
+{
+    if (dim == 0 || !(cell_size > 0.0f)) {
+        return 0;
+    }
+    const int c = static_cast<int>(std::floor((world_v - origin_v) / cell_size));
+    if (c < 0) {
+        return 0;
+    }
+    const auto last = static_cast<int>(dim) - 1;
+    return static_cast<std::uint32_t>(c > last ? last : c);
+}
+
+// Minimal derived datum for cross-zone influence: stable identity +
+// world position + origin metadata. NO health/inventory/stats/session —
+// none of that is needed to answer "how relevant is HERE?".
+struct PlayerInfluenceSource {
+    std::uint32_t net_id = 0; // stable cross-zone identity (never reused)
+    float x = 0.0f;
+    float y = 0.0f;
+    // Origin zone: metrics + validator provenance ONLY. The field is indexed
+    // by world position, never by zone (compute topology != activity
+    // topology); nothing routes on this value.
+    std::uint32_t zone_id = 0;
+    // Source zone tick at publish. Bounds snapshot staleness for auditing;
+    // readers never branch gameplay on it.
+    std::uint32_t tick = 0;
+    std::uint64_t commit_sequence = 0; // scoped to stable zone incarnation
+    std::uint64_t commit_steady_ns = 0;
+    std::uint32_t commit_world_tick = 0;
+    std::uint64_t pending_since_ns = 0; // first unconsumed update, never reset by repeats
+};
+
+// Radii snapshot carried by every immutable field generation, so queries
+// always agree with the config that built them (config stays authority).
+struct ActivityRadii {
+    float full_radius_m = 150.0f;
+    float reduced_radius_m = 500.0f;
+    float low_radius_m = 1500.0f;
+};
+
+// Exact tier mapping shared by the field query, the LOD consumer and the
+// rebuild validator: single source of truth, strict less-than on squared
+// distances (matches LodSystem bubble semantics bit-for-bit, so static
+// entities resolve identically through either path).
+inline SimulationTier TierForPlayerDistanceSq(float distance_sq, const ActivityRadii& radii) noexcept
+{
+    const float full_sq = radii.full_radius_m * radii.full_radius_m;
+    const float reduced_sq = radii.reduced_radius_m * radii.reduced_radius_m;
+    const float low_sq = radii.low_radius_m * radii.low_radius_m;
+    return distance_sq < full_sq
+               ? SimulationTier::Full
+               : distance_sq < reduced_sq ? SimulationTier::Reduced
+                                          : distance_sq < low_sq ? SimulationTier::Low
+                                                                 : SimulationTier::Dormant;
+}
+
+// One field sample: exact nearest-player influence at a world position.
+struct InfluenceSample {
+    SimulationTier tier = SimulationTier::Dormant;
+    float nearest_sq = FLT_MAX;
+    // A source exists within low radius.
+    bool has_influence = false;
+    // The nearest source lives in another zone (joint-contribution
+    // semantics: a local source at equal distance does not clear this;
+    // first-minimum wins ties deterministically).
+    bool cross_zone = false;
+};
+
+} // namespace gs::game

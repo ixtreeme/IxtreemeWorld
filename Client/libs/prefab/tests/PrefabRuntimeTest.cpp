@@ -1,0 +1,166 @@
+#include "PrefabDocument.h"
+#include <cmath>
+#include <iostream>
+#include <sstream>
+
+namespace pf = ixtreeme::prefab;
+int main()
+{
+    int failures = 0;
+    const auto check = [&](bool ok, const char* message) {
+        if (!ok) { std::cerr << message << '\n'; ++failures; }
+    };
+    pf::PrefabDocument document;
+    pf::PrefabEntity root;
+    root.kind = pf::PrefabTemplate::Kind::Mesh;
+    root.localId = 1;
+    root.name = "Root";
+    root.mesh.position[0] = 10;
+    root.mesh.animatorControllerId = "controller_\"test\"";
+    root.mesh.skinned = true;
+    root.mesh.enabled = false;
+    root.mesh.hasCollider = true;
+    root.mesh.hasParticleSystem = true;
+    root.mesh.particleSystem.turbulenceEnabled = true;
+    root.mesh.particleSystem.turbulenceStrength = 0.0375f;
+    root.mesh.particleSystem.turbulenceScale = 3.25f;
+    root.mesh.particleSystem.turbulenceSpeed = 0.42f;
+    root.mesh.lod.enabled = true;
+    root.mesh.lod.overrideAssetDefault = true;
+    root.mesh.lod.config.levelCount = 3;
+    root.mesh.lod.config.distances[1] = 42.5f;
+    root.mesh.lod.config.targetRatios[2] = 0.125f;
+    root.mesh.lod.config.hysteresisMeters = 2.5f;
+    root.mesh.editorComponents.push_back({"rendering.lod", "LOD Group", "Rendering", {}});
+    document.entities.push_back(root);
+    pf::PrefabEntity child = root;
+    child.localId = 3;
+    child.parentLocalId = 2; // parent follows child in the file
+    child.mesh.position[0] = 13;
+    child.mesh.hasFixedJoint = true;
+    child.mesh.fixedJoint.enabled = true;
+    child.mesh.fixedJoint.connectedEntityId = 1;
+    document.entities.push_back(child);
+    pf::PrefabEntity point;
+    point.kind = pf::PrefabTemplate::Kind::PointLight;
+    point.localId = 2;
+    point.parentLocalId = 1;
+    point.point.position[0] = 12;
+    document.entities.push_back(point);
+    pf::PrefabEntity spot = point;
+    spot.kind = pf::PrefabTemplate::Kind::SpotLight;
+    spot.localId = 4;
+    spot.spot.position[0] = 14;
+    document.entities.push_back(spot);
+    std::ostringstream output;
+    pf::WriteDocument(output, document);
+    auto roundtrip = pf::ParseDocument(output.str(), "fixture");
+    check(roundtrip.entities.size() == 4, "multi-entity roundtrip");
+    check(!roundtrip.entities[0].mesh.enabled, "prefab local enabled roundtrip");
+    const auto& turbulence = roundtrip.entities[0].mesh.particleSystem;
+    check(roundtrip.entities[0].mesh.hasParticleSystem && turbulence.turbulenceEnabled &&
+        turbulence.turbulenceStrength == 0.0375f && turbulence.turbulenceScale == 3.25f &&
+        turbulence.turbulenceSpeed == 0.42f, "prefab turbulence survives document roundtrip");
+    const auto& lod = roundtrip.entities[0].mesh.lod;
+    check(lod.enabled && lod.overrideAssetDefault && lod.config.levelCount == 3 &&
+        lod.config.distances[1] == 42.5f && lod.config.targetRatios[2] == 0.125f && lod.config.hysteresisMeters == 2.5f,
+        "prefab LOD settings survive document roundtrip");
+    check(roundtrip.entities[0].mesh.editorComponents.size() == 1 &&
+        roundtrip.entities[0].mesh.editorComponents[0].type == "rendering.lod", "LOD inspector component restored");
+    check(roundtrip.entities[0].mesh.animatorControllerId == root.mesh.animatorControllerId,
+        "escaped animator controller roundtrip");
+    std::ostringstream legacy;
+    pf::WriteMesh(legacy, root.mesh, "Root");
+    check(pf::ParseTemplate(legacy.str(), "fixture").mesh.animatorControllerId == root.mesh.animatorControllerId,
+        "legacy single-entity animator roundtrip");
+    check(pf::ParseTemplate(legacy.str(), "fixture").mesh.particleSystem.turbulenceEnabled,
+        "single-entity prefab preserves turbulence");
+    check(!pf::ParseTemplate("{\"type\":\"mesh_entity\",\"particle_system\":{}}", "old")
+        .mesh.particleSystem.turbulenceEnabled, "old prefab does not enable turbulence");
+    check(pf::ParseTemplate("{\"type\":\"mesh_entity\"}", "old").mesh.animatorControllerId.empty(),
+        "old prefab has no controller");
+    check(pf::ParseTemplate("{\"type\":\"mesh_entity\"}", "old").mesh.enabled, "old prefab enabled by default");
+    check(!pf::ParseTemplate("{\"type\":\"mesh_entity\"}", "old").mesh.lod.enabled, "old prefab LOD remains opt-out");
+    auto disabledLod = root.mesh;
+    disabledLod.lod.enabled = false;
+    std::ostringstream disabledLodText; pf::WriteMesh(disabledLodText, disabledLod, "Disabled LOD");
+    const auto disabledLodRead = pf::ParseTemplate(disabledLodText.str(), "fixture").mesh;
+    check(!disabledLodRead.lod.enabled && disabledLodRead.editorComponents.size() == 1 &&
+        disabledLodRead.lod.config.distances[1] == 42.5f, "disabled LOD component and settings survive legacy prefab roundtrip");
+    auto captured=document;
+    captured.entities[0].mesh.id=900;
+    captured.entities[1].mesh.id=901;
+    captured.entities[1].mesh.fixedJoint.connectedEntityId=900;
+    std::ostringstream capturedText; pf::WriteDocument(capturedText,captured);
+    check(pf::ParseDocument(capturedText.str(),"captured").entities[1].mesh.fixedJoint.connectedEntityId==1,
+        "scene joint target converted to prefab local id");
+    std::uint32_t meshId = 101, lightId = 10;
+    const auto meshAllocator = [&] { return meshId++; };
+    const auto lightAllocator = [&] { return lightId++; };
+    const float position[3] = {100, 20, 30};
+    pf::RuntimePrefabInstance instance;
+    std::string error;
+    check(pf::InstantiateRuntime(roundtrip, "prefab_test", 100, position, meshAllocator, lightAllocator,
+        instance, error), "valid runtime instantiation");
+    if (instance.meshes.size() == 2 && instance.points.size() == 1 && instance.spots.size() == 1)
+    {
+        check(instance.meshes[0].id == 100, "preallocated root id reused");
+        check(instance.meshes[1].position[0] == 103 && instance.meshes[1].position[1] == 20, "world offset preserved");
+        check(instance.meshes[1].parent.id == instance.points[0].id &&
+            instance.meshes[1].parent.type == "point_light", "forward parent reference remapped");
+        check(instance.meshes[1].fixedJoint.connectedEntityId == 100, "joint target remapped");
+        check(instance.meshes[0].prefabInstance.linked && instance.meshes[1].prefabInstance.localId == 3,
+            "prefab links preserved");
+        check(instance.meshes[0].lod.enabled && instance.meshes[1].lod.config.distances[1] == 42.5f &&
+            instance.meshes[1].editorComponents.size() == 1, "LOD survives runtime prefab instantiation");
+        check(instance.meshes[1].renderRecordSlot == 0xffffffffu, "no borrowed render slot");
+        check(instance.meshes[0].particleSystem.turbulenceEnabled &&
+            instance.meshes[1].particleSystem.turbulenceScale == 3.25f,
+            "turbulence survives runtime prefab instantiation");
+    }
+    else check(false, "all meshes and lights instantiated");
+    const auto expectInvalid = [&](pf::PrefabDocument invalid) {
+        const auto beforeMesh = meshId, beforeLight = lightId;
+        check(!pf::InstantiateRuntime(invalid, "bad", 200, position, meshAllocator, lightAllocator,
+            instance, error), "invalid document rejected");
+        check(!error.empty() && instance.meshes.empty() && meshId == beforeMesh && lightId == beforeLight,
+            "invalid document has no partial output/allocations");
+    };
+    auto bad = roundtrip; bad.entities[2].parentLocalId = 3; expectInvalid(bad); // cycle
+    bad = roundtrip; bad.entities[1].parentLocalId = 999; expectInvalid(bad);
+    bad = roundtrip; bad.entities[1].localId = 1; expectInvalid(bad);
+    bad = roundtrip; bad.entities[1].mesh.fixedJoint.connectedEntityId = 999; expectInvalid(bad);
+    bad = roundtrip; bad.entities[0].kind = pf::PrefabTemplate::Kind::PointLight; expectInvalid(bad);
+    auto empty = MakeEmptySceneEntity(55, "Empty emitter", position);
+    empty.hasParticleSystem = true;
+    empty.particleSystem.turbulenceEnabled = true;
+    empty.hasFogVolume = true;
+    empty.fogVolume.shape = FogVolumeComponent::Shape::Sphere;
+    empty.fogVolume.radius = 7;
+    empty.fogVolume.edgeFade = 2;
+    empty.fogVolume.color[1] = 0.33f;
+    std::ostringstream emptyText;
+    pf::WriteMesh(emptyText, empty, "Empty emitter");
+    const auto emptyDocument = pf::ParseDocument(emptyText.str(), "empty fixture");
+    check(emptyDocument.entities.size() == 1 && emptyDocument.entities[0].mesh.hasFogVolume &&
+        emptyDocument.entities[0].mesh.fogVolume.shape == FogVolumeComponent::Shape::Sphere &&
+        emptyDocument.entities[0].mesh.fogVolume.radius == 7 && emptyDocument.entities[0].mesh.fogVolume.edgeFade == 2 &&
+        std::abs(emptyDocument.entities[0].mesh.fogVolume.color[1] - 0.33f) < 0.0001f,
+        "local fog survives prefab serialization");
+    check(emptyDocument.entities.size() == 1 &&
+        !emptyDocument.entities[0].mesh.HasMeshGeometry() &&
+        emptyDocument.entities[0].mesh.scale[0] == 0 &&
+        emptyDocument.entities[0].mesh.scale[1] == 0 &&
+        emptyDocument.entities[0].mesh.scale[2] == 0 &&
+        emptyDocument.entities[0].mesh.hasParticleSystem,
+        "empty zero-scale particle host survives prefab roundtrip");
+    check(pf::InstantiateRuntime(emptyDocument, "empty_prefab", 300, position, meshAllocator, lightAllocator,
+        instance, error) && instance.meshes.size() == 1 &&
+        !instance.meshes[0].HasMeshGeometry() && instance.meshes[0].scale[0] == 0 &&
+        instance.meshes[0].particleSystem.turbulenceEnabled,
+        "empty particle prefab instantiates at runtime without a model");
+    check(instance.meshes.size() == 1 && instance.meshes[0].hasFogVolume &&
+        instance.meshes[0].fogVolume.radius == 7 && instance.meshes[0].scale[0] == 0,
+        "local fog prefab instantiates on a zero-scale host");
+    return failures == 0 ? 0 : 1;
+}

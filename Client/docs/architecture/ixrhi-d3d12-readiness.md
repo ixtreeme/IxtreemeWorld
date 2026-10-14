@@ -1,4 +1,4 @@
-# IXRHI D3D12 readiness review (Phase 3C, §102-103; Phase-3D compute/buffer and Phase-3E UI updates below)
+# IXRHI D3D12 readiness review (Phase 3C, §102-103; Phase-3D compute/buffer, Phase-3E UI, Phase-3F terrain updates below)
 
 No D3D12 implementation. Per-concept mapping feasibility for a future backend.
 Verdict: no Vulkan-shaped contract found that would force a redesign; two
@@ -86,3 +86,30 @@ API at all); all feature paths use `IXRHICapabilities` (§116).
   to shader cooking (recook the same HLSL with the target convention), NOT
   to gameplay UI code — the IXRHI-facing renderer passes viewport pixels
   only, which is backend-neutral.
+
+## Phase-3F additions: terrain workload (no D3D12 implementation)
+
+- Mipmapped texture arrays (`R8G8B8A8Srgb/Unorm`, `R8Unorm`) with tight
+  layer-major creation packing: Vulkan N buffer-image regions; D3D12 N
+  placed footprints + `CopyTextureRegion` per subresource — natural.
+  Array views: SRV with array size (D3D12 `TEXTURE2DARRAY` view) — natural.
+- `UpdateTexture` (full base-level rewrite): default-heap texture +
+  upload staging + per-subresource copies; queue wait is setup/edit-time
+  parity (same stall the old path had), never per-frame.
+- Depth-only render targets + `depthLayer`: DSV per array slice
+  (`TEXTURE2DARRAY` DS-view with FirstArraySlice) — natural; no DSV heap
+  concepts leak into IXRHI.
+- Depth-only pipeline (null fragment shader): PSO with null PS + no
+  render-target blend state — valid D3D12; `IXRHIDepthBias` maps to
+  `DepthBias`/`SlopeScaledDepthBias` directly.
+- Comparison sampler (`compareEnable` + `LessOrEqual`): D3D12
+  `COMPARISON_MIN_MAG_MIP_LINEAR` + `ComparisonFunc` — natural.
+- `ClampToBorder` (opaque-white convention): D3D12
+  `BORDER_COLOR_OPAQUE_WHITE` — natural.
+- `R8Unorm`/`R32Float`: `R8_UNORM`/`R32_FLOAT` — natural.
+- Depth sampled as texture (shadow map, scene-depth refraction input):
+  D3D12 SRV on the depth resource (`R32_FLOAT` view of `R32_TYPELESS`-style
+  depth) — the backend owns this split, generic code just samples.
+- No Vulkan extension became mandatory: anisotropy stays capability-gated;
+  BC-compressed DDS was deleted with its dead upload path (decode-to-RGBA
+  CPU path retained), so no block-compression requirement leaks anywhere.

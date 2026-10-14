@@ -33,7 +33,9 @@ Audio           — libs/audio (miniaudio) — unchanged.
 UI              — libs/render/RmlUiLayer.* (engine capability) vs Hierarchy/Inspector/Build Window (Editor)
                     vs future Auriga HUD (game project).
 Input           — libs/platform/InputEvent.h + apps/client ViewportControls — unchanged.
-Scripting       — libs/script (Lua/Native, IxModuleApi) + sdk/include — unchanged.
+Scripting       — libs/script (AngelScript + Lua project backends, internal Native/IxModuleApi) + sdk/include.
+Particles       — libs/particles (CPU simulator, POD component) + libs/render/ParticleRenderer (instanced
+                    billboards, SSBO + SV_InstanceID; drawn through the transparent queue).
 Networking      — NOT implemented. Seam = RuntimeSession::UpdateNetwork/SendMoveInput/SendAttackTarget
                     (stubs). No Boost.Asio in Phase 1.
 Serialization   — libs/render/SceneManager (JSON + sidecars) + libs/prefab/PrefabDocument — unchanged.

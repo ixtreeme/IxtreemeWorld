@@ -1,13 +1,19 @@
+#include "asset/ExrImage.h"
 #include "MaterialAssetManager.h"
 
 #include "Common.h"
 #include "Debug.h"
 
+#include <stb_image.h>
+#include <stb_image_write.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <vector>
 #include <iomanip>
 #include <sstream>
 
@@ -129,7 +135,10 @@ std::string MaterialJson(const MaterialAsset& material)
          << "    \"normal\": " << GuidOrNull(material.normalTexture) << ",\n"
          << "    \"metallicRoughness\": " << GuidOrNull(material.metallicRoughnessTexture) << ",\n"
          << "    \"ao\": " << GuidOrNull(material.aoTexture) << ",\n"
-         << "    \"emissive\": " << GuidOrNull(material.emissiveTexture) << "\n"
+         << "    \"emissive\": " << GuidOrNull(material.emissiveTexture) << ",\n"
+         << "    \"roughness\": " << GuidOrNull(material.roughnessTexture) << ",\n"
+         << "    \"metallic\": " << GuidOrNull(material.metallicTexture) << ",\n"
+         << "    \"height\": " << GuidOrNull(material.heightTexture) << "\n"
          << "  }\n"
          << "}\n";
     return json.str();
@@ -303,6 +312,9 @@ MaterialAsset* MaterialAssetManager::getOrLoad(const Guid& guid)
     material->metallicRoughnessTexture = JsonGuidOrNull(textures, "metallicRoughness");
     material->aoTexture = JsonGuidOrNull(textures, "ao");
     material->emissiveTexture = JsonGuidOrNull(textures, "emissive");
+    material->roughnessTexture = JsonGuidOrNull(textures, "roughness");
+    material->metallicTexture = JsonGuidOrNull(textures, "metallic");
+    material->heightTexture = JsonGuidOrNull(textures, "height");
 
     Tracenf("[MATERIAL-ASSET] load OK path=%s guid=%s",
         path->generic_string().c_str(),
@@ -310,6 +322,127 @@ MaterialAsset* MaterialAssetManager::getOrLoad(const Guid& guid)
     MaterialAsset* result = material.get();
     cache_[guid] = std::move(material);
     return result;
+}
+
+std::optional<Guid> MaterialAssetManager::packOcclusionRoughnessMetallic(const MaterialAsset& material, bool pruneEarlierPacks)
+{
+    const std::array<std::optional<Guid>, 3> sources = {material.aoTexture, material.roughnessTexture, material.metallicTexture};
+    if (!sources[0] && !sources[1] && !sources[2])
+        return std::nullopt;
+    struct Image
+    {
+        int width = 0;
+        int height = 0;
+        stbi_uc* pixels = nullptr;
+        std::vector<std::uint8_t> exrPixels;
+    };
+    std::array<Image, 3> images{};
+    std::uint64_t hash = 1469598103934665603ull;  // FNV-1a of the sources: the file's name
+    int width = 0;
+    int height = 0;
+    for (std::size_t i = 0; i < sources.size(); ++i)
+    {
+        const std::string key = sources[i] ? sources[i]->toString() : std::string("-");
+        for (const char c : key)
+        {
+            hash ^= static_cast<std::uint8_t>(c);
+            hash *= 1099511628211ull;
+        }
+        hash ^= 0xFFu;
+        hash *= 1099511628211ull;
+        if (!sources[i])
+            continue;
+        const std::optional<std::filesystem::path> path = db_.resolveGuid(*sources[i]);
+        if (!path)
+            continue;
+        int channels = 0;
+        if (client::asset::IsExrPath(*path))
+        {
+            std::string error;
+            auto exr = client::asset::LoadExr(*path, error);
+            if (exr)
+            {
+                images[i].width = exr->width;
+                images[i].height = exr->height;
+                images[i].exrPixels = client::asset::ExrRgba8(*exr, client::asset::ExrByteMode::LinearData);
+                images[i].pixels = images[i].exrPixels.data();
+            }
+            else TraceError("[MATERIAL-EXR] %s", error.c_str());
+        }
+        else images[i].pixels = stbi_load(path->string().c_str(), &images[i].width, &images[i].height, &channels, 4);
+        if (images[i].pixels)
+        {
+            width = std::max(width, images[i].width);
+            height = std::max(height, images[i].height);
+        }
+    }
+    const auto release = [&]() {
+        for (Image& image : images)
+        {
+            if (image.pixels && image.exrPixels.empty())
+                stbi_image_free(image.pixels);
+            image.pixels = nullptr;
+        }
+    };
+    if (width == 0 || height == 0)
+    {
+        release();
+        return std::nullopt;
+    }
+    const std::string stem = material.path.stem().string();
+    char suffix[32];
+    std::snprintf(suffix, sizeof(suffix), "_orm_%08x.png", static_cast<unsigned>((hash ^ (hash >> 32)) & 0xFFFFFFFFu));
+    const std::filesystem::path folder = material.path.parent_path();
+    const std::filesystem::path packedPath = folder / (stem + suffix);
+    std::error_code ec;
+    if (!std::filesystem::exists(packedPath, ec))
+    {
+        // Each map's red channel (they are greyscale), scaled to the largest by the nearest texel.
+        std::vector<std::uint8_t> packed(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 4u, 255u);
+        for (int y = 0; y < height; ++y)
+        {
+            for (int x = 0; x < width; ++x)
+            {
+                std::uint8_t* out = packed.data() + (static_cast<std::size_t>(y) * width + x) * 4u;
+                for (std::size_t channel = 0; channel < images.size(); ++channel)
+                {
+                    const Image& image = images[channel];
+                    if (!image.pixels)
+                        continue;
+                    const int sx = static_cast<int>(static_cast<std::int64_t>(x) * image.width / width);
+                    const int sy = static_cast<int>(static_cast<std::int64_t>(y) * image.height / height);
+                    out[channel] = image.pixels[(static_cast<std::size_t>(sy) * image.width + sx) * 4u];
+                }
+            }
+        }
+        const bool written = stbi_write_png(packedPath.string().c_str(), width, height, 4, packed.data(), width * 4) != 0;
+        if (!written)
+        {
+            release();
+            TraceError("[MATERIAL-ASSET] orm pack failed path=%s reason=write_failed", packedPath.generic_string().c_str());
+            return std::nullopt;
+        }
+    }
+    release();
+    // The material's earlier packs (other sources) are no longer used.
+    const std::string prefix = stem + "_orm_";
+    std::vector<std::filesystem::path> earlierPacks;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(folder, ec))
+    {
+        const std::string name = entry.path().filename().string();
+        if (pruneEarlierPacks && name != packedPath.filename().string() && name.size() == prefix.size() + 12u &&
+            name.compare(0, prefix.size(), prefix) == 0 && name.compare(name.size() - 4u, 4u, ".png") == 0)
+            earlierPacks.push_back(entry.path());
+    }
+    for (const std::filesystem::path& earlier : earlierPacks)
+    {
+        std::error_code removeEc;
+        std::filesystem::remove(earlier, removeEc);
+        std::filesystem::remove(earlier.string() + ".meta", removeEc);
+    }
+    Tracenf("[MATERIAL-ASSET] orm packed path=%s size=%dx%d material=%s",
+        packedPath.generic_string().c_str(), width, height, material.path.generic_string().c_str());
+    return db_.getOrCreateGuid(packedPath);
 }
 
 bool MaterialAssetManager::save(const MaterialAsset& material)
@@ -324,6 +457,7 @@ bool MaterialAssetManager::save(const MaterialAsset& material)
         return false;
     }
     file << MaterialJson(material);
+    ++revision_;
     Tracenf("[MATERIAL-ASSET] save OK path=%s guid=%s",
         material.path.generic_string().c_str(),
         material.guid.toString().c_str());
@@ -352,11 +486,18 @@ Guid MaterialAssetManager::createFromGltfMaterial(const GltfMaterialSource& gltf
         ResolveTextureGuid(db_, gltfMat.metallicRoughnessTexturePath, "metallicRoughness", material.name);
     material.aoTexture = ResolveTextureGuid(db_, gltfMat.aoTexturePath, "ao", material.name);
     material.emissiveTexture = ResolveTextureGuid(db_, gltfMat.emissiveTexturePath, "emissive", material.name);
+    material.roughnessTexture = ResolveTextureGuid(db_, gltfMat.roughnessTexturePath, "roughness", material.name);
+    material.metallicTexture = ResolveTextureGuid(db_, gltfMat.metallicTexturePath, "metallic", material.name);
+    material.heightTexture = ResolveTextureGuid(db_, gltfMat.heightTexturePath, "height", material.name);
 
     std::error_code ec;
     std::filesystem::create_directories(materialFolder, ec);
     const std::string baseFilename = SanitizeName(material.name);
     material.path = materialFolder / (baseFilename + ".material");
+    if (!material.metallicRoughnessTexture && (material.roughnessTexture || material.metallicTexture || material.aoTexture))
+    {
+        material.metallicRoughnessTexture = packOcclusionRoughnessMetallic(material, false);
+    }
 
     std::string content = MaterialJson(material);
     if (std::filesystem::exists(material.path) && SameTextFile(material.path, content))
@@ -422,4 +563,5 @@ Guid MaterialAssetManager::createFromGltfMaterial(const GltfMaterialSource& gltf
 void MaterialAssetManager::invalidate(const Guid& guid)
 {
     cache_.erase(guid);
+    ++revision_;
 }

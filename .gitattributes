@@ -1,2 +1,5 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts run under bash on FreeBSD/Linux and Git Bash: never CRLF.
+*.sh text eol=lf

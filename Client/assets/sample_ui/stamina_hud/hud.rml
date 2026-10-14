@@ -1,0 +1,54 @@
+<rml>
+<head>
+    <title>Player HUD</title>
+    <link type="text/rcss" href="hud.rcss"/>
+</head>
+<body>
+    <!-- Top left: who you are -->
+    <div id="player-frame">
+        <div id="portrait">
+            <div id="portrait-initial">K</div>
+            <div id="player-level">1</div>
+        </div>
+        <div id="player-info">
+            <div id="player-name">Player</div>
+            <div class="bar hp">
+                <div class="fill" id="hp-fill"></div>
+                <div class="bar-text" id="hp-text">100 / 100</div>
+            </div>
+            <div class="bar mp">
+                <div class="fill" id="mp-fill"></div>
+                <div class="bar-text" id="mp-text">80 / 80</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom centre: stamina above the action bar -->
+    <div id="bottom">
+        <div id="message"></div>
+        <div id="stamina">
+            <div id="stamina-header">
+                <span id="stamina-label">STAMINA</span>
+                <span id="stamina-state"></span>
+            </div>
+            <div class="bar" id="stamina-bar">
+                <div class="fill" id="stamina-fill"></div>
+                <div class="bar-text" id="stamina-text">100 / 100</div>
+            </div>
+        </div>
+        <div id="actionbar">
+            <div class="slot" id="slot-potion">
+                <div class="slot-icon">+</div>
+                <div class="slot-cooldown" id="slot-potion-cooldown"></div>
+                <div class="slot-key">1</div>
+                <div class="slot-count" id="slot-potion-count">3</div>
+            </div>
+            <div class="slot empty"><div class="slot-key">2</div></div>
+            <div class="slot empty"><div class="slot-key">3</div></div>
+            <div class="slot empty"><div class="slot-key">4</div></div>
+            <div class="slot empty"><div class="slot-key">5</div></div>
+        </div>
+        <div id="hints">Shift: sprint    Space: jump    1 or click: stamina potion</div>
+    </div>
+</body>
+</rml>

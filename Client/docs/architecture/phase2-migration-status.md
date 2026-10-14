@@ -1,4 +1,4 @@
-# Phase-2/3 migration status (updated at Phase-3E completion)
+# Phase-2/3 migration status (updated at Phase-3H completion)
 
 IXRHI owns the graphics frame contract; IXVulkan implements it. The legacy
 VulkanDevice keeps device/queue/swapchain-handle infrastructure plus synced
@@ -66,16 +66,33 @@ remaining infrastructure migration tracked as debt below).
   with slot reclaim, recording through the frame-owned `IXRHICommandList`.
   New minimal primitives: `SampledImage`/`Sampler` binding types +
   `UpdateSampledImage`/`UpdateSampler` (D3D12: SRV / sampler-heap entries).
+- `TerrainRenderer.*` (Phase 3F) — full terrain + water + shadow + reflection
+  migration, zero `Vk*` (verified by grep): host-visible mesh/uniform VB/IB,
+  CPU-generated mipmapped RGBA8/R8 arrays + 2D textures via staged upload,
+  full-texture splat rewrite via `UpdateTexture`, Read-modify-Write sculpt
+  spans (same GPU bytes as mapped writes), 1 terrain bind layout (UBO + 9
+  combined) with 4 (view, frame) slots + 1 water layout (UBO + 6 combined)
+  with per-(body, view, frame) slots, 4 pipelines (main alpha-blend LEQUAL,
+  front-cull reflection, water depth-test-only, VS-only shadow with bias),
+  depth-only per-cascade shadow targets over a D32 4-layer array with
+  comparison sampler + explicit attachment→read transition, swapchain-format
+  reflection target with real pass token forwarded to skinned guests.
+  Deleted as provably dead (no callers): per-layer DDS diffuse/mask GPU path
+  (sole BC-format consumer), tile/dominant-texture helpers, `DrawTerrainSurface`,
+  vestigial shared water sets, `m_layerDescriptorSets`. New minimal
+  primitives: `R8Unorm`/`R32Float` formats, sampler `mipLodBias` +
+  `compareEnable/compareOp` + `ClampToBorder`, array/mip creation upload,
+  `UpdateTexture`, depth-only + `depthLayer` render targets, optional
+  fragment shader + depth bias.
 
 ## Still native (inventoried, unchanged behavior)
 
 - Legacy `VulkanDevice` infrastructure: instance, debug messenger, surface
   handle, physical/logical device, queues, swapchain handle + images + views +
   depth, formats/extents, validation, FindMemoryType. Its frame loop
-  (Begin/End/BeginSwapchainRenderPass/timestamps/Resize) is dormant.
-- `TerrainRenderer` (+water/shadow/reflection) — frame commands via the
-  synced legacy shim (`GetCommandBuffer`/indices/active); pipelines bake
-  against the backend-mirrored main pass. Migration removes the shim.
+  (Begin/End/BeginSwapchainRenderPass/timestamps/Resize) is dormant. All
+  frame-migration shims deleted in Phase 3F (see below) — no generic native
+  renderer remains.
 - `NativeWindow` surface API retired (Phase 3C): `DescribeNative()` only;
   surface creation lives in backend `IXVulkanSurface`.
 
@@ -85,13 +102,16 @@ remaining infrastructure migration tracked as debt below).
 - E2 `Loop()` — RETIRED as frame authority in Phase 3C. The `Loop()` accessor
   remains as backend-internal infrastructure access only (device/queues/
   swapchain); no generic code drives the loop through it.
-- E3 `WrapFrameCommandList` — DELETED in Phase 3C. Migrated code uses the
-  frame context's owned list; legacy code uses the synced legacy shim
-  (`SetMigrationFrameState`), which is backend-written, explicitly documented,
-  and deleted with the last native renderer.
+- E3 `WrapFrameCommandList` — DELETED in Phase 3C.
+- E4 frame-migration shims (`SetMigrationFrameState`, `SetMigrationMainPass`,
+  `GetCommandBuffer`, `GetFrameIndex`, `IsFrameActive`, `GetSafeFrameNumber`,
+  `GetFrameNumber`, legacy `GetRenderPass` mirror) — DELETED in Phase 3F.
+  Generic legacy frame consumer count = 0 (Terrain was the last). Backend
+  `ResolveRenderPass(null)` now uses its own swapchain pass; the vestigial
+  `m_swapchainDirty` legacy flag is gone too.
 - Bridge-scoped native resolution (`NativeViewOf`/`NativeSamplerOf`/
-  `NativePassOf` in `IXVulkanBridge.h`): backend-private, for in-transition
-  native consumers and the editor adapter's UI registration.
+  `NativePassOf` in `IXVulkanBridge.h`): backend-private, for the editor
+  adapter's UI registration (no renderer uses it anymore).
 
 ## Phase-3C contract additions (all backend-implemented, smoke-tested)
 
@@ -120,15 +140,71 @@ Still contains backend infrastructure that must migrate later: instance,
 physical/logical device, queues, swapchain handle + images + views + depth,
 surface handle, formats, validation, FindMemoryType. Dormant: frame loop,
 frame sync objects, timestamp pool, Resize, render-pass/framebuffer creation.
-Migration shims (`SetMigrationFrameState`, `SetMigrationMainPass`,
-`GetSwapchainImage/View`, `GetPresentQueue`) are backend-written and die with
-the last native renderer. Long-term model: `IXVulkanDevice → Vulkan API`
-(§78 `IXVulkanContext` or equivalent absorbs the remainder).
+Phase-3F deleted all frame shims (`SetMigrationFrameState`,
+`SetMigrationMainPass`, `GetCommandBuffer`, `GetFrameIndex`, `IsFrameActive`,
+`GetSafeFrameNumber`, `GetFrameNumber`, legacy `GetRenderPass` mirror, legacy
+`m_swapchainDirty`); `GetSwapchainImage/View` + `GetPresentQueue` remain as
+backend-internal swapchain plumbing. Long-term model: `IXVulkanDevice →
+Vulkan API` (§78 `IXVulkanContext` or equivalent absorbs the remainder).
 
-## Recommended follow-ups (not 3E scope)
+## Phase-3F contract additions (all backend-implemented, smoke-tested)
 
-- Terrain/Water migration (kills refraction seam + reflection target, and
-  with it the last `SetMigrationFrameState`/`GetSafeFrameNumber` consumers).
-- Legacy `VulkanDevice` deletion after the above ( lapses all shims).
+- `IXRHIFormat::R8Unorm` + `R32Float` (terrain splat/mask arrays, water edge
+  alpha) with conversions + byte sizes.
+- `IXRHISamplerDesc`: `mipLodBias`, `compareEnable` + `compareOp`
+  (shadow comparison sampling), `ClampToBorder` address mode (opaque-white
+  border convention).
+- `IXRHITexture`: `MipLevels()` + `ArrayLayers()`; creation upload covers
+  mipmapped arrays in documented tight layer-major packing;
+  `IXRHIDevice::UpdateTexture` for synchronous full base-level rewrites.
+- `IXRHIRenderTargetDesc`: depth-only targets (null color) + `depthLayer`
+  for layered depth (shadow cascades).
+- `IXRHIGraphicsPipelineDesc`: optional fragment shader (depth-only) +
+  `IXRHIDepthBias` (constant/slope).
+- Backend correctness fixes found by migration: depth-aspect barrier ranges
+  cover full mips/layers; depth sampled as texture uses the depth-read
+  layout in barriers and descriptor writes (also fixes the offscreen depth
+  snapshot path).
+
+## Phase-3G: Water audit + completion (no new IXRHI primitives)
+
+- Audit result: Phase 3F had already migrated ALL water rendering
+  (bodies, water pipeline, water bind group, reflection target, shadow
+  coupling) inside `TerrainRenderer`; `WaterBodyIO` is pure serialization,
+  editor water code and `terrain_editor_system` contain zero Vulkan.
+  BEFORE count for the remaining surface: only the generic
+  `RuntimeSession` interface (`Create`/`OnRenderPassChanged` taking
+  `VulkanDevice&`, stub-ignored) — migrated to device-free signatures.
+- Ownership audit (§30-31): `TerrainRenderer` is the single owner of the
+  water path (terrain-coupled by design: shared reflection target, shared
+  frame flow, terrain UBO carries water globals). No duplicated
+  Terrain-group/Water-group bindings exist; no transitional seam was
+  created in 3F, so none needed finishing. Shared Terrain→Water resources
+  (reflection color, refraction snapshots) are `shared_ptr`-owned by their
+  producers and rebound only on object change (early-out otherwise).
+- Correctness review of the migrated path: slot math identical at write
+  vs draw (`(body*2+view)*2+frame`); uniform buffers selected by the same
+  triple at both sites; shadow attachment→read transition once per shadow
+  render with Clear/UNDEFINED re-open (no transition back needed);
+  reflection color ends in shader-read layout from the target itself;
+  refraction snapshots rebound per frame with pointer-equality early-out.
+  Water animation uses wall/application `seconds`, never the frame count.
+  No per-frame `WaitIdle` on any water path (event-driven paths keep
+  their setup-time waits, same as before).
+- Pipeline compatibility (§63): the water pipeline bakes against the
+  offscreen scene pass token and draws into the offscreen target, the
+  swapchain main pass (direct mode) and the game-view target — all share
+  the swapchain color/depth formats, hence structurally compatible.
+
+## Recommended follow-ups (not 3H scope; see phase3h-audit.md)
+
+- Legacy `VulkanDevice` absorption into the backend (`IXVulkanContext` or
+  equivalent): instance/device/queues/swapchain-handle migration (audited
+  in 3H, deliberately not moved — no duplication exists).
 - Fence-based retirement queue replacing blanket shared ownership.
 - `WaitIdle` in offscreen resize → affected-frame wait or deferred retire.
+- Workstation validation: terrain/water/shadow/reflection visual parity,
+  edit stress (§89), scene reload (§90), resize (§92) — build + contract
+  verified, GPU runtime unverified (§100).
+- Stale `IwSelfTest` source: rewire-or-retire decision (currently unwired,
+  not a gate; do not delete blindly).

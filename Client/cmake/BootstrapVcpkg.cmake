@@ -240,6 +240,8 @@ function(vcpkg_require)
             set(PACKAGE_FIND "ZLIB")
         elseif(PACKAGE_LOWER STREQUAL "stb")
             set(PACKAGE_FIND "Stb")
+        elseif(PACKAGE_LOWER MATCHES "^angelscript")
+            set(PACKAGE_FIND "Angelscript")
         endif()
 
         find_package(${PACKAGE_FIND} QUIET)

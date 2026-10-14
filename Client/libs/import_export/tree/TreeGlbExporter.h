@@ -1,8 +1,12 @@
 #pragma once
 
+#include "AssetDatabase.h"
+#include "TreeImpostor.h"
+
 #include <ixtreemetree/tree_mesh.h>
 
 #include <filesystem>
+#include <optional>
 #include <string>
 
 namespace tree_tool
@@ -14,13 +18,22 @@ struct TreeExportResult
     std::filesystem::path materialFolder;
     std::string error;
     float durationMs = 0.0f;
+    float leafAreaReduction = 0.0f;  // the share of the leaf cards' area trimmed away (0..1)
+    bool impostorBaked = false;
+    std::string impostorWarning;
 };
 
 struct TreeMaterialBinding
 {
+    // The materials the tree is saved with (its default materials). Without one, a material is made
+    // from the built-in texture below and saved beside the model.
+    std::optional<Guid> barkMaterial;
+    std::optional<Guid> leafMaterial;
     std::filesystem::path barkBaseColorTexturePath;
     std::filesystem::path leafBaseColorTexturePath;
-    float leafAlphaCutoff = 0.5f;
+    float leafAlphaCutoff = 0.5f;  // for a made leaf material
+    bool trimTransparentLeafBorders = true;  // see trimLeafCards
+    TreeImpostorSettings impostor;
 };
 
 class TreeGlbExporter

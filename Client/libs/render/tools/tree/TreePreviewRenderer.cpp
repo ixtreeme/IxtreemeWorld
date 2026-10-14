@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace tree_tool
@@ -150,6 +151,17 @@ void PushSurfaceTriangles(std::vector<PreviewTriangle>& triangles,
 }
 }
 
+bool TreePreviewRenderer::SameKey(const CacheKey& a, const CacheKey& b)
+{
+    const auto sameStyle = [](const TreePreviewStyle& x, const TreePreviewStyle& y) {
+        return x.barkColor == y.barkColor && x.leafColor == y.leafColor && x.leafAlphaCutoff == y.leafAlphaCutoff &&
+            x.barkTextured == y.barkTextured && x.leafTextured == y.leafTextured;
+    };
+    return a.meshRevision == b.meshRevision && a.yaw == b.yaw && a.pitch == b.pitch && a.zoom == b.zoom &&
+        a.radius == b.radius && a.center.x == b.center.x && a.center.y == b.center.y && a.center.z == b.center.z &&
+        std::memcmp(a.rect, b.rect, sizeof(a.rect)) == 0 && sameStyle(a.style, b.style);
+}
+
 void TreePreviewRenderer::ResetView()
 {
     yaw_ = -0.65f;
@@ -206,44 +218,80 @@ void TreePreviewRenderer::Render(const ixtreemetree::TreeMesh& mesh, float width
         pitch_ = std::clamp(pitch_ + delta.y * 0.008f, -1.0f, 1.0f);
     }
 
-    std::vector<PreviewTriangle> triangles;
-    triangles.reserve(mesh.bark.indices.size() / 3u + mesh.leaves.indices.size() / 3u);
-    PushSurfaceTriangles(triangles,
-        mesh.bark.vertices,
-        mesh.bark.indices,
-        center_,
-        radius_,
-        min,
-        size,
-        yaw_,
-        pitch_,
-        zoom_,
-        style.barkColor,
-        style.barkTextured,
-        false);
-    std::array<float, 4> leafColor = style.leafColor;
-    leafColor[3] = std::clamp(leafColor[3] * (1.0f - style.leafAlphaCutoff * 0.22f), 0.25f, 0.9f);
-    PushSurfaceTriangles(triangles,
-        mesh.leaves.vertices,
-        mesh.leaves.indices,
-        center_,
-        radius_,
-        min,
-        size,
-        yaw_,
-        pitch_,
-        zoom_,
-        leafColor,
-        style.leafTextured,
-        true);
-    std::sort(triangles.begin(), triangles.end(), [](const PreviewTriangle& a, const PreviewTriangle& b) {
-        return a.depth > b.depth;
-    });
-    for (const PreviewTriangle& tri : triangles)
+    CacheKey key{};
+    key.meshRevision = meshRevision_;
+    key.yaw = yaw_;
+    key.pitch = pitch_;
+    key.zoom = zoom_;
+    key.radius = radius_;
+    key.center = center_;
+    key.rect[0] = min.x;
+    key.rect[1] = min.y;
+    key.rect[2] = size.x;
+    key.rect[3] = size.y;
+    key.style = style;
+    if (!cacheValid_ || !SameKey(key, cachedKey_))
     {
-        draw->AddTriangleFilled(tri.a, tri.b, tri.c, tri.fill);
+        std::vector<PreviewTriangle> triangles;
+        triangles.reserve(mesh.bark.indices.size() / 3u + mesh.leaves.indices.size() / 3u);
+        PushSurfaceTriangles(triangles,
+            mesh.bark.vertices,
+            mesh.bark.indices,
+            center_,
+            radius_,
+            min,
+            size,
+            yaw_,
+            pitch_,
+            zoom_,
+            style.barkColor,
+            style.barkTextured,
+            false);
+        std::array<float, 4> leafColor = style.leafColor;
+        leafColor[3] = std::clamp(leafColor[3] * (1.0f - style.leafAlphaCutoff * 0.22f), 0.25f, 0.9f);
+        PushSurfaceTriangles(triangles,
+            mesh.leaves.vertices,
+            mesh.leaves.indices,
+            center_,
+            radius_,
+            min,
+            size,
+            yaw_,
+            pitch_,
+            zoom_,
+            leafColor,
+            style.leafTextured,
+            true);
+        std::sort(triangles.begin(), triangles.end(), [](const PreviewTriangle& a, const PreviewTriangle& b) {
+            return a.depth > b.depth;
+        });
+        cached_.clear();
+        cached_.reserve(triangles.size());
+        for (const PreviewTriangle& tri : triangles)
+        {
+            CachedTriangle out{};
+            out.a[0] = tri.a.x;
+            out.a[1] = tri.a.y;
+            out.b[0] = tri.b.x;
+            out.b[1] = tri.b.y;
+            out.c[0] = tri.c.x;
+            out.c[1] = tri.c.y;
+            out.fill = tri.fill;
+            out.line = tri.line;
+            out.outline = tri.outline;
+            cached_.push_back(out);
+        }
+        cachedKey_ = key;
+        cacheValid_ = true;
+    }
+    for (const CachedTriangle& tri : cached_)
+    {
+        const ImVec2 a(tri.a[0], tri.a[1]);
+        const ImVec2 b(tri.b[0], tri.b[1]);
+        const ImVec2 c(tri.c[0], tri.c[1]);
+        draw->AddTriangleFilled(a, b, c, tri.fill);
         if (tri.outline)
-            draw->AddTriangle(tri.a, tri.b, tri.c, tri.line, 0.7f);
+            draw->AddTriangle(a, b, c, tri.line, 0.7f);
     }
 
     if (mesh.bark.vertices.empty())

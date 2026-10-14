@@ -105,6 +105,25 @@ struct BranchEnd
     Vec3 direction{0.0f, 1.0f, 0.0f};
 };
 
+// A last-level branch (twig), which the leaves grow along: its section centres and directions, base first.
+struct TerminalBranch
+{
+    std::vector<Vec3> centers;
+    std::vector<Vec3> axes;
+};
+
+// The point a fraction t (0 base .. 1 tip) of the way along a twig, and the twig's direction there.
+Vec3 PointAlong(const TerminalBranch& branch, float t, Vec3& direction)
+{
+    const std::size_t last = branch.centers.size() - 1u;
+    const float position = std::clamp(t, 0.0f, 1.0f) * static_cast<float>(last);
+    const std::size_t index = std::min(static_cast<std::size_t>(position), last > 0u ? last - 1u : 0u);
+    const std::size_t next = std::min(index + 1u, last);
+    const float alpha = position - static_cast<float>(index);
+    direction = Normalize(Mix(branch.axes[index], branch.axes[next], alpha));
+    return Mix(branch.centers[index], branch.centers[next], alpha);
+}
+
 void BuildFrame(Vec3 direction, Vec3& right, Vec3& up)
 {
     const Vec3 axis = Normalize(direction);
@@ -127,7 +146,7 @@ BranchEnd GenerateBranch(const TreeOptions& options,
                          int level,
                          Vec3 origin,
                          Vec3 direction,
-                         std::vector<BranchEnd>& terminalBranches)
+                         std::vector<TerminalBranch>& terminalBranches)
 {
     const int index = std::clamp(level, 0, kMaxBranchLevels - 1);
     const int sections = std::max(1, options.branch.sections[index]);
@@ -203,7 +222,7 @@ BranchEnd GenerateBranch(const TreeOptions& options,
     const int maxLevel = std::clamp(options.branch.levels, 0, kMaxBranchLevels - 1);
     if (level >= maxLevel)
     {
-        terminalBranches.push_back(end);
+        terminalBranches.push_back(TerminalBranch{centers, axes});
         return end;
     }
 
@@ -254,7 +273,7 @@ void AddLeafQuad(TreeMesh& mesh, Vec3 center, Vec3 normal, Vec3 tangent, float s
     IncludeBounds(mesh, p3);
 }
 
-void GenerateLeaves(const TreeOptions& options, Rng& rng, TreeMesh& mesh, const std::vector<BranchEnd>& branches)
+void GenerateLeaves(const TreeOptions& options, Rng& rng, TreeMesh& mesh, const std::vector<TerminalBranch>& branches)
 {
     const int cardsPerCluster = std::clamp(options.leaves.cardsPerCluster, 1, 7);
     const int atlasGridX = std::clamp(options.leaves.atlasGridX, 1, 8);
@@ -262,33 +281,42 @@ void GenerateLeaves(const TreeOptions& options, Rng& rng, TreeMesh& mesh, const 
     const float start = std::clamp(options.leaves.start, 0.0f, 0.98f);
     const float leafTilt = xm::DegreesToRadians(options.leaves.angle);
 
-    for (const BranchEnd& branch : branches)
+    for (const TerminalBranch& branch : branches)
     {
+        if (branch.centers.empty())
+            continue;
         const int count = std::max(0, options.leaves.count);
         for (int i = 0; i < count; ++i)
         {
+            // The clusters spread along the twig, from `start` of its length to its tip, each moved a
+            // little (they all sat at the tip before, on each other).
+            const float clusterT = (static_cast<float>(i) + 0.5f) / std::max(1.0f, static_cast<float>(count));
+            const float spacing = (1.0f - start) / std::max(1.0f, static_cast<float>(count));
+            float along = start + (1.0f - start) * clusterT + rng.uniform(-0.05f, 0.05f);
+            along = std::clamp(along + rng.uniform(-0.5f, 0.5f) * spacing, start, 1.0f);
+            Vec3 direction{};
+            Vec3 center = PointAlong(branch, along, direction);
             Vec3 right{};
             Vec3 up{};
-            BuildFrame(branch.direction, right, up);
-
-            const float clusterT = (static_cast<float>(i) + 0.5f) / std::max(1.0f, static_cast<float>(count));
-            const float along = std::clamp(start + (1.0f - start) * clusterT + rng.uniform(-0.05f, 0.05f), start, 1.0f);
-            Vec3 center = Add(branch.position, Mul(branch.direction, rng.uniform(0.0f, 0.35f) * along));
+            BuildFrame(direction, right, up);
             const float variance = std::clamp(options.leaves.sizeVariance, 0.0f, 1.0f);
             const float size = std::max(0.02f, options.leaves.size * (1.0f + rng.uniform(-variance, variance)));
             center = Add(center, Add(Mul(right, rng.uniform(-0.05f, 0.05f) * size), Mul(up, rng.uniform(-0.05f, 0.05f) * size)));
 
-            const Vec3 clusterAxis = Normalize(Mix(Vec3{0.0f, 1.0f, 0.0f}, branch.direction, 0.25f));
+            const Vec3 clusterAxis = Normalize(Mix(Vec3{0.0f, 1.0f, 0.0f}, direction, 0.25f));
             const float baseAngle = rng.uniform(0.0f, xm::TwoPi);
             const Vec3 baseTangent = Normalize(Add(Mul(right, xm::Cos(baseAngle)), Mul(up, xm::Sin(baseAngle))));
+            // A card turned by half a turn lies in the plane of the first (a "Double" cluster was two
+            // cards in one plane): an even count spreads over half a turn, crossing each other.
+            const float cardTurn = cardsPerCluster % 2 == 0 ? xm::Pi : xm::TwoPi;
             for (int card = 0; card < cardsPerCluster; ++card)
             {
-                const float cardAngle = (static_cast<float>(card) / static_cast<float>(cardsPerCluster)) * xm::TwoPi;
+                const float cardAngle = (static_cast<float>(card) / static_cast<float>(cardsPerCluster)) * cardTurn;
                 Vec3 tangent = RotateAroundAxis(baseTangent, clusterAxis, cardAngle);
                 tangent = RotateAroundAxis(tangent, Normalize(Cross(clusterAxis, tangent)), leafTilt * 0.15f);
                 Vec3 normal = Normalize(Cross(clusterAxis, tangent));
                 if (Length(normal) < 0.001f)
-                    normal = Normalize(Mix(branch.direction, up, 0.65f));
+                    normal = Normalize(Mix(direction, up, 0.65f));
 
                 const int cellX = rng.uniformInt(0, atlasGridX - 1);
                 const int cellY = rng.uniformInt(0, atlasGridY - 1);
@@ -344,7 +372,7 @@ TreeMesh Tree::generate() const
     };
 
     Rng rng(options.seed);
-    std::vector<BranchEnd> terminalBranches;
+    std::vector<TerminalBranch> terminalBranches;
     GenerateBranch(options, rng, mesh, 0, Vec3{0.0f, 0.0f, 0.0f}, Vec3{0.0f, 1.0f, 0.0f}, terminalBranches);
     GenerateLeaves(options, rng, mesh, terminalBranches);
 

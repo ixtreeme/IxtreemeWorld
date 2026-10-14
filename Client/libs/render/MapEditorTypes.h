@@ -3,6 +3,8 @@
 #include "physics/PhysicsComponents.h"
 #include "audio/AudioComponents.h"
 #include "script/ScriptComponent.h"
+#include "particles/ParticleComponents.h"
+#include "FogSettings.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -19,12 +21,6 @@ enum class MapEditorTool
     Smooth,
     Flatten,
     Paint
-};
-
-enum class MapEditorPaintMode
-{
-    Replace,
-    Mix
 };
 
 enum class MapEditorToolMode
@@ -58,7 +54,8 @@ struct MapEditorSettings
     float brushFalloff = 1.0f;
     float flattenTargetY = 0.0f;
     std::uint32_t textureSlot = 4;
-    MapEditorPaintMode paintMode = MapEditorPaintMode::Replace;
+    float paintEdgeSmoothing = 0.5f;
+    float paintCoverage = 1.0f;
     bool waterSculptActive = false;
     bool waterSculptAdd = true;
     float waterSculptRadiusMeters = 3.0f;
@@ -178,6 +175,7 @@ struct PointLight
     float intensity = 3.0f;
     float radius = 10.0f;
     bool enabled = true;
+    bool effectiveEnabled = true; // runtime ancestor gate
     bool editorHidden = false;
 };
 
@@ -198,6 +196,7 @@ struct SpotLight
     float innerConeDegrees = 20.0f;
     float outerConeDegrees = 35.0f;
     bool enabled = true;
+    bool effectiveEnabled = true; // runtime ancestor gate
     bool editorHidden = false;
 };
 
@@ -212,6 +211,7 @@ struct CameraEntity
     std::string prefabAssetId;
     PrefabInstanceState prefabInstance;
     SceneParentRef parent;
+    bool effectiveEnabled = true; // runtime ancestor gate, never serialized
     float position[3] = {0.0f, 8.0f, -18.0f};
     float rotation[3] = {-0.4363323f, 0.0f, 0.0f};
     float fovDegrees = 60.0f;
@@ -238,6 +238,63 @@ struct LightingState
     std::uint32_t numSpotLights = 0;
     std::array<PointLight, kMaxDynamicPointLights> pointLights{};
     std::array<SpotLight, kMaxDynamicSpotLights> spotLights{};
+};
+
+// The scene's sky: what every view shows behind the geometry, and what the water mirrors.
+struct SkySettings
+{
+    // Saved beside the sky as environment.fog; shared by Scene, Game and packaged runtime views.
+    GlobalFogSettings fog;
+    enum class Mode : std::int32_t
+    {
+        Color = 0,       // one flat colour
+        Procedural = 1,  // zenith / horizon / ground gradient with a sun disc that follows the Sun
+        Cubemap = 2,     // six images, one per cube face
+        Panorama = 3     // one equirectangular (360 x 180 degree) image, LDR, .hdr or .exr
+    };
+    static constexpr std::size_t kCubeFaces = 6;  // +X right, -X left, +Y up, -Y down, +Z front, -Z back
+
+    Mode mode = Mode::Procedural;
+    // Colours are stored as picked in the editor (sRGB) and shown exactly like that.
+    float color[3] = {0.22f, 0.25f, 0.33f};  // = the old fixed backdrop
+    float zenithColor[3] = {0.22f, 0.42f, 0.78f};
+    float horizonColor[3] = {0.72f, 0.82f, 0.93f};
+    float groundColor[3] = {0.36f, 0.34f, 0.32f};
+    float sunSizeDegrees = 1.5f;  // angular diameter of the sun disc; 0 hides it
+    float sunGlow = 0.6f;         // strength of the halo around the sun
+    // Images by project-relative path ("Assets/..."), like the terrain palette.
+    std::array<std::string, kCubeFaces> cubeFacePaths;
+    std::string panoramaPath;
+    float exposure = 1.0f;         // brightness multiplier
+    float rotationDegrees = 0.0f;  // turns the image skies around the vertical axis
+    float tint[3] = {1.0f, 1.0f, 1.0f};
+    bool ambientFromSky = false;   // the ambient light takes the sky's average colour
+
+    // God rays: light shafts from the Sun where the sky shows past the geometry (screen space).
+    bool godRays = false;
+    float godRayIntensity = 0.8f;   // brightness of the shafts
+    float godRayLength = 0.8f;      // how far across the screen they reach (0..1)
+    float godRayFalloff = 0.975f;   // how fast they fade along their length (closer to 1: longer)
+    std::int32_t godRayQuality = 1; // 0 low (32 samples), 1 medium (64), 2 high (128, half resolution)
+    // Which god rays: 0 screen space (shafts around the sun on the screen), 1 volumetric (light
+    // scattered in the air along every view ray, shadowed by the sun shadow map: shafts seen from
+    // the side, with the sun anywhere), 2 both.
+    std::int32_t godRayTechnique = 0;
+    float volumetricIntensity = 1.0f;
+    float volumetricDensity = 0.003f;    // how hazy the air is (scattering per metre)
+    float volumetricAnisotropy = 0.4f;   // forward scattering: 0 even in all directions, 0.9 mostly towards the sun
+    float volumetricDistance = 120.0f;   // how far along a view ray light is gathered (m)
+    std::int32_t volumetricQuality = 1;  // 0 low (16 steps), 1 medium (32), 2 high (64, half resolution)
+
+    // Tone mapping: how the views' light (floating point, any brightness) is brought to the screen.
+    // Saved as the environment's "tone_mapping", beside the sky.
+    // 0 none: clipped at white (the look before HDR); 1 neutral: colours as authored up to 0.8, then a
+    // soft roll-off to white; 2 filmic (ACES fit): more contrast, brighter midtones.
+    std::int32_t toneMapping = 1;
+    float exposureEv = 0.0f;  // brightness in stops: +1 doubles the light, -1 halves it
+
+    bool ScreenSpaceGodRays() const { return godRays && godRayTechnique != 1; }
+    bool VolumetricGodRays() const { return godRays && godRayTechnique != 0; }
 };
 
 struct WaterConfig
@@ -353,18 +410,34 @@ struct LodComponent
     LodConfig config;
 };
 
+// Per-instance world semantics for the offline collision-to-layer authoring
+// path. Existing scenes remain opt-out; heights come from collision geometry.
+struct LayerAuthoringSettings
+{
+    bool enabled = false;
+    std::uint32_t tags = 0;
+};
+
 struct MeshSceneEntity
 {
     std::uint32_t id = 0;
+    // Runtime only (never saved): where the renderer keeps this entity's render record, checked
+    // against the id on use (a copied entity carries its original's, and gets one of its own).
+    mutable std::uint32_t renderRecordSlot = 0xffffffffu;
     std::string name;
     std::string prefabAssetId;
     PrefabInstanceState prefabInstance;
     SceneParentRef parent;
     std::string meshAssetId;
     std::string meshAssetPath;
+    bool HasMeshGeometry() const { return !meshAssetId.empty() || !meshAssetPath.empty(); }
+    float MinimumScale() const { return HasMeshGeometry() ? 0.001f : 0.0f; }
     float position[3] = {0.0f, 0.0f, 0.0f};
     float rotation[3] = {0.0f, 0.0f, 0.0f};
     float scale[3] = {1.0f, 1.0f, 1.0f};
+    bool enabled = true; // serialized local flag; descendants retain their own flag
+    bool effectiveEnabled = true; // runtime only, includes ancestors
+    bool activationChanged = false; // runtime reconciliation, never serialized
     bool skinned = false;
     bool editorHidden = false;
 
@@ -381,11 +454,13 @@ struct MeshSceneEntity
         float emissiveIntensity = 0.0f;
         float uvTiling[2] = {1.0f, 1.0f};
         float uvOffset[2] = {0.0f, 0.0f};
+        bool operator==(const MaterialOverride&) const = default;
     };
     std::vector<std::string> materialSlots;
     std::vector<MaterialOverride> materialOverrides;
     std::vector<EditorAttachedComponent> editorComponents;
     LodComponent lod;
+    LayerAuthoringSettings layerAuthoring;
     bool hasRigidbody = false;
     ixtreeme::physics::RigidbodyComponent rigidbody;
     bool hasCollider = false;
@@ -402,13 +477,32 @@ struct MeshSceneEntity
     ixaudio::AudioListenerComponent audioListener;
     bool hasScript = false;
     ixscript::ScriptComponent script;
+    bool hasParticleSystem = false;
+    ixparticle::ParticleSystemComponent particleSystem;
+    bool hasFogVolume = false;
+    FogVolumeComponent fogVolume;
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;
-    // Stage-4 Animator: id of an AnimatorController asset (or empty). Runtime-only for now (full
-    // AnimatorComponent + serialization is a follow-up); takes priority over debugAnimationClipId.
+    // Stage-4 Animator: id of an AnimatorController asset (or empty), saved with the scene
+    // (animator_controller_id); takes priority over debugAnimationClipId.
     std::string animatorControllerId;
 };
+
+// Component host with no geometry, materials or physics. Particle sizes and spawn volumes use
+// their own settings, so the requested zero object scale does not collapse an attached emitter.
+inline MeshSceneEntity MakeEmptySceneEntity(std::uint32_t id, const std::string& name, const float position[3])
+{
+    MeshSceneEntity entity;
+    entity.id = id;
+    entity.name = name;
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        entity.position[axis] = position[axis];
+        entity.scale[axis] = 0.0f;
+    }
+    return entity;
+}
 
 struct TerrainSceneData
 {
@@ -422,9 +516,14 @@ struct TerrainSceneData
     std::uint32_t chunkSizeCells = 64;
     std::string chunkManifestRef;
     std::string heightmapRef;
+    // Optional exact float-centimetre snapshot; declared data is authoritative.
+    std::string exactHeightmapRef;
     std::string splatRef;
     std::string maskRef;
     std::vector<float> heightCmGrid;
+    // Cell attributes in the same north-to-south source rows as heights.
+    // Empty is the legacy all-walkable default.
+    std::vector<std::uint16_t> attributes;
     std::vector<std::uint8_t> splatABytes;
     std::vector<std::uint8_t> splatBBytes;
     bool triplanarEnabled = false;
@@ -470,7 +569,9 @@ enum class EditorComponentType
     CharacterController,
     AudioSource,
     AudioListener,
-    Script
+    Script,
+    ParticleSystem,
+    FogVolume
 };
 
 struct HierarchySceneEntity
@@ -511,6 +612,7 @@ struct MeshRendererEditorState
     std::vector<std::string> prefabOverrides;
     std::string meshAssetId;
     std::string meshAssetPath;
+    bool HasMeshGeometry() const { return !meshAssetId.empty() || !meshAssetPath.empty(); }
     std::string meshDisplayName;
     float position[3] = {0.0f, 0.0f, 0.0f};
     float rotation[3] = {0.0f, 0.0f, 0.0f};
@@ -522,6 +624,20 @@ struct MeshRendererEditorState
     std::vector<MeshSceneEntity::MaterialOverride> materialOverrides;
     std::vector<EditorAttachedComponent> editorComponents;
     LodComponent lod;
+    // Read-only renderer diagnostics for the LOD Group inspector; never serialized to a scene.
+    std::array<std::uint64_t, LodConfig::MaxLevels> lodTriangles{};
+    std::array<bool, LodConfig::MaxLevels> lodTrianglesKnown{};
+    std::uint32_t lodSubmeshCount = 0;
+    float lodObjectSize = 0.0f;
+    float lodCameraDistance = 0.0f;
+    bool lodDiagnosticsAvailable = false;
+    bool lodBuildPending = false;
+    bool lodCpuBuildPending = false;
+    std::uint32_t lodActiveLevel = 0;
+    bool lodGameDiagnosticsAvailable = false;
+    float lodGameCameraDistance = 0.0f;
+    std::uint32_t lodGameActiveLevel = 0;
+    LayerAuthoringSettings layerAuthoring;
     bool hasRigidbody = false;
     ixtreeme::physics::RigidbodyComponent rigidbody;
     bool physicsRuntimeValid = false;
@@ -543,6 +659,10 @@ struct MeshRendererEditorState
     ixaudio::AudioListenerComponent audioListener;
     bool hasScript = false;
     ixscript::ScriptComponent script;
+    bool hasParticleSystem = false;
+    ixparticle::ParticleSystemComponent particleSystem;
+    bool hasFogVolume = false;
+    FogVolumeComponent fogVolume;
     // Stage-3 temporary clip binding (id of an AnimationClip asset, or empty). Runtime-only —
     // not serialized; replaced by the real Animator component in Stage 4.
     std::string debugAnimationClipId;
@@ -709,12 +829,22 @@ struct CameraEditorState
 struct EngineStats
 {
     double fps = 0.0;
+    double gameViewFps = 0.0;
+    // Actual Scene View offscreen render cadence. This excludes frames where the
+    // panel reuses a cached image or is hidden behind another dock tab.
+    double sceneViewFps = 0.0;
+    double sceneViewFrameMs = 0.0;
     double frameMs = 0.0;
     double averageFrameMs = 0.0;
     double minFrameMs = 0.0;
     double maxFrameMs = 0.0;
     double frameBudgetPercent = 0.0;
     double processCpuPercent = 0.0;
+    double gpuUsagePercent = -1.0;
+    bool gpuUsageAvailable = false;
+    double ramUsagePercent = 0.0;
+    double processRamMb = 0.0;
+    std::string renderer;
     std::uint32_t swapchainWidth = 0;
     std::uint32_t swapchainHeight = 0;
     std::uint32_t renderWidth = 0;
@@ -723,6 +853,11 @@ struct EngineStats
     std::size_t sceneEntityCount = 0;
     std::size_t staticMeshSubmitted = 0;
     std::size_t staticMeshDrawCalls = 0;
+    std::uint32_t impostorObjects = 0;
+    std::uint32_t impostorTerrainChunks = 0;
+    std::uint32_t impostorCharacters = 0;
+    std::uint32_t impostorReprojected = 0;
+    double impostorCacheMb = 0;
     // Frame timing breakdown (previous frame's CPU profile + present mode), for the
     // Performance panel so the cost source is visible without a debug-logs build.
     bool presentUncapped = true;
@@ -757,6 +892,19 @@ struct MapEditorCommands
     bool dumpMaterialState = false;
     bool captureGpuFrame = false;
     bool dumpFrameProfile = false;
+    bool generateLayers = false;
+    bool exportLayers = false;
+    bool exportServerWorld = false;
+    std::string serverWorldId;
+    float serverWorldSpawnX = 0;
+    float serverWorldSpawnZ = 0;
+    std::uint32_t serverWorldSpawnVolume = 0; // 3D-5B: 0 = terrain spawn
+    bool placeLayerGround = false;
+    bool moveLayerGround = false;
+    std::uint32_t layerGroundVolume = 1;
+    float layerGroundX = 0;
+    float layerGroundZ = 0;
+    bool showLayerVolumes = false;
     bool debugPerfTogglesChanged = false;
     bool disableShadowPass = false;
     bool disableWaterReflectionPass = false;
@@ -800,10 +948,19 @@ struct MapEditorCommands
     bool pausePlayMode = false;
     bool resumePlayMode = false;
     bool buildGameScripts = false;  // compile <ProjectRoot>/Scripts into the game-module DLL + reload
+    // "Build Game": package the project into a folder that runs without the editor.
+    bool buildGame = false;
+    std::string buildGameName;
+    std::string buildGameOutputDir;
+    std::string buildGameStartupScene;   // project-relative
+    bool buildGameCompileScripts = false;
+    bool buildGameRunWhenDone = false;
     bool addWaterBody = false;
     bool createTerrain = false;
     TerrainSceneData terrainCreate;
     bool addMeshEntity = false;
+    bool addEmptyEntity = false;
+    bool addFogVolume = false;
     std::string meshAssetId;
     bool meshDropScreenPositionValid = false;
     float meshDropScreenPosition[2] = {0.0f, 0.0f};
@@ -835,8 +992,8 @@ struct MapEditorCommands
     bool attachScriptToEntity = false;
     std::uint32_t attachScriptEntityId = 0;  // MeshSceneEntity.id of the dropped-on row
     ixscript::ScriptBackendType attachScriptBackend = ixscript::ScriptBackendType::None;
-    std::string attachScriptAssetId;    // Lua backend: the .lua asset id
-    std::string attachScriptClassName;  // Native backend: the registered class name
+    std::string attachScriptAssetId;    // AngelScript/Lua backend: the .as/.lua asset id
+    std::string attachScriptClassName;  // legacy Native backend: the registered class name
     bool fitSelectedColliderToMesh = false;
     bool lodQualityCommitRequested = false;
     std::uint32_t lodQualityCommitEntityId = 0;

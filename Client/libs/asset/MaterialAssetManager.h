@@ -45,6 +45,12 @@ struct MaterialAsset
     std::optional<Guid> metallicRoughnessTexture;
     std::optional<Guid> aoTexture;
     std::optional<Guid> emissiveTexture;
+    // The material editor's own roughness and metallic maps: with aoTexture, packed into
+    // metallicRoughnessTexture (what the shaders read: R occlusion, G roughness, B metallic) by
+    // packOcclusionRoughnessMetallic. And a height map, kept with them (no shader reads it yet).
+    std::optional<Guid> roughnessTexture;
+    std::optional<Guid> metallicTexture;
+    std::optional<Guid> heightTexture;
     std::uint64_t loadedFromTimestamp = 0;
 };
 
@@ -64,6 +70,9 @@ struct GltfMaterialSource
     std::filesystem::path metallicRoughnessTexturePath;
     std::filesystem::path aoTexturePath;
     std::filesystem::path emissiveTexturePath;
+    std::filesystem::path roughnessTexturePath;
+    std::filesystem::path metallicTexturePath;
+    std::filesystem::path heightTexturePath;
 };
 
 class MaterialAssetManager
@@ -89,8 +98,25 @@ public:
                                 const std::string& materialName,
                                 ImportSummary* summary = nullptr);
     void invalidate(const Guid& guid);
+    // The material's occlusion, roughness and metallic maps (aoTexture, roughnessTexture,
+    // metallicTexture; a missing one reads as white) packed into one texture the way the shaders read
+    // it: R occlusion, G roughness, B metallic, sized as the largest. Saved beside the material and named
+    // by its sources (the same maps: the same file, reused). Earlier packs are removed by default;
+    // imports disable pruning because older material versions can still reference them.
+    // Its GUID, or none when the material has none of the maps or none can be read.
+    std::optional<Guid> packOcclusionRoughnessMetallic(const MaterialAsset& material, bool pruneEarlierPacks = true);
+    // A loaded material's values changed without a save (an editor's live preview): moves Revision.
+    void markChanged() { ++revision_; }
+    // Changes whenever what a material GUID resolves to may have: a material saved (its edits are
+    // applied to the loaded asset, then saved; a generated one is saved too) or dropped. Whoever keeps
+    // values read from the materials keeps this with them and reads them again when it moves on.
+    // Loading one (a first getOrLoad) does not move it: whatever read a GUID loaded it then, so no
+    // kept value can be of one not loaded yet (a load that failed and now works means files changed,
+    // and an asset library refresh reads everything again).
+    std::uint64_t Revision() const { return revision_; }
 
 private:
     AssetDatabase& db_;
     std::unordered_map<Guid, std::unique_ptr<MaterialAsset>> cache_;
+    std::uint64_t revision_ = 1;
 };

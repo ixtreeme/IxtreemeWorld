@@ -26,6 +26,125 @@
 
 namespace ixvulkan
 {
+void IXVulkanDevice::StartAsyncPresent()
+{
+    if (m_asyncPresentEnabled || m_loop == nullptr || NativeDevice() == VK_NULL_HANDLE)
+        return;
+    m_asyncPresentEnabled = true;
+    m_asyncPresentStop = false;
+    m_asyncPresentThread = std::thread(&IXVulkanDevice::AsyncPresentLoop, this);
+    Tracen("[VULKAN] async present scheduler enabled (default, queue_limit=2; use --sync-present to disable)");
+}
+
+void IXVulkanDevice::StopAsyncPresent()
+{
+    if (!m_asyncPresentThread.joinable())
+    {
+        m_asyncPresentEnabled = false;
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_asyncPresentMutex);
+        m_asyncPresentStop = true;
+    }
+    m_asyncPresentWake.notify_all();
+    m_asyncPresentThread.join();
+    m_asyncPresentEnabled = false;
+}
+
+void IXVulkanDevice::WaitForAsyncPresentIdle()
+{
+    if (!m_asyncPresentEnabled)
+        return;
+    std::unique_lock<std::mutex> lock(m_asyncPresentMutex);
+    m_asyncPresentWake.wait(lock, [this] { return m_asyncPresentOutstanding == 0; });
+}
+
+void IXVulkanDevice::WaitForAsyncPresentCapacity()
+{
+    if (!m_asyncPresentEnabled)
+        return;
+    std::unique_lock<std::mutex> lock(m_asyncPresentMutex);
+    m_asyncPresentWake.wait(lock, [this] {
+        return m_asyncPresentStop || m_asyncPresentOutstanding < 2;
+    });
+}
+
+void IXVulkanDevice::EnqueueAsyncPresent(PendingPresent present)
+{
+    {
+        std::lock_guard<std::mutex> lock(m_asyncPresentMutex);
+        if (m_asyncPresentStop)
+            return;
+        m_asyncPresentQueue.push_back(present);
+        ++m_asyncPresentOutstanding;
+    }
+    m_asyncPresentWake.notify_all();
+}
+
+void IXVulkanDevice::AsyncPresentLoop()
+{
+    for (;;)
+    {
+        PendingPresent pending;
+        {
+            std::unique_lock<std::mutex> lock(m_asyncPresentMutex);
+            m_asyncPresentWake.wait(lock, [this] {
+                return m_asyncPresentStop || !m_asyncPresentQueue.empty();
+            });
+            if (m_asyncPresentQueue.empty())
+            {
+                if (m_asyncPresentStop)
+                    break;
+                continue;
+            }
+            pending = m_asyncPresentQueue.front();
+            m_asyncPresentQueue.pop_front();
+        }
+
+        VkPresentInfoKHR present{};
+        present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores = &pending.waitSemaphore;
+        present.swapchainCount = 1;
+        present.pSwapchains = &pending.swapchain;
+        present.pImageIndices = &pending.imageIndex;
+        VkResult result = VK_SUCCESS;
+        {
+            // VkQueue host access is externally synchronized. This also covers the
+            // same-queue case where graphics and present use one VkQueue handle.
+            // The swapchain's too: the frame's acquire runs on the render thread.
+            std::lock_guard<std::mutex> swapchainLock(m_swapchainMutex);
+            std::lock_guard<std::mutex> queueLock(m_queueSubmitPresentMutex);
+            result = vkQueuePresentKHR(m_loop->GetPresentQueue(), &present);
+        }
+        if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
+            m_presentedFrames.fetch_add(1, std::memory_order_relaxed);
+        if (result == VK_ERROR_OUT_OF_DATE_KHR)
+            m_asyncPresentSwapchainDirty.store(true, std::memory_order_release);
+        else if (result == VK_SUBOPTIMAL_KHR)
+        {
+            static bool warnedPresentSuboptimal = false;
+            if (!warnedPresentSuboptimal)
+            {
+                warnedPresentSuboptimal = true;
+                Tracen("[VULKAN] async present: VK_SUBOPTIMAL_KHR (continuing)");
+            }
+        }
+        else if (result != VK_SUCCESS)
+        {
+            CheckVk(result, "vkQueuePresentKHR(async)", __FILE__, __LINE__);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_asyncPresentMutex);
+            if (m_asyncPresentOutstanding > 0)
+                --m_asyncPresentOutstanding;
+        }
+        m_asyncPresentWake.notify_all();
+    }
+    m_asyncPresentWake.notify_all();
+}
 
 bool IXVulkanDevice::EnsureFrameSlot(std::uint32_t slot)
 {
@@ -114,6 +233,7 @@ bool IXVulkanDevice::EnsureSwapchainObjects()
                 tag);
         }
         m_imagesInFlight.assign(imageCount, VK_NULL_HANDLE);
+        m_imageLastFrame.assign(imageCount, 0);
     }
     return true;
 }
@@ -159,26 +279,12 @@ void IXVulkanDevice::TeardownFrameObjects()
         vkDestroySemaphore(NativeDevice(), sem, nullptr);
     m_renderFinished.clear();
     m_imagesInFlight.clear();
+    m_imageLastFrame.clear();
     if (m_queryPool != VK_NULL_HANDLE)
     {
         vkDestroyQueryPool(NativeDevice(), m_queryPool, nullptr);
         m_queryPool = VK_NULL_HANDLE;
     }
-}
-
-void IXVulkanDevice::SyncLegacyFrameState() const
-{
-    // Keeps still-native renderers (terrain/skinned/RmlUi) working unchanged:
-    // they read the active command buffer, indices and numbers from the
-    // legacy object, which mirrors backend authority (deleted with them).
-    // safeFrameNumber mirrors legacy: current frame number once its slot
-    // fence has been waited (all older frames complete).
-    m_loop->SetMigrationFrameState(m_frameActive ? m_slots[m_activeSlot].cmd : VK_NULL_HANDLE,
-        m_tracker.GetSlot(),
-        m_activeImage,
-        m_tracker.GetFrameNumber(),
-        m_tracker.GetFrameNumber(),
-        m_frameActive);
 }
 
 ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
@@ -189,6 +295,8 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
         assert(!m_tracker.IsRecording() && "BeginFrame while a frame is active");
         return frame; // Skip
     }
+    if (m_asyncPresentSwapchainDirty.exchange(false, std::memory_order_acq_rel))
+        m_swapchainDirty = true;
     m_cpuFrameStart = std::chrono::steady_clock::now();
     const bool captureThisFrame = m_captureRequested;
     m_captureRequested = false;
@@ -214,7 +322,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     if (NativeDevice() == VK_NULL_HANDLE)
     {
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         return frame; // Skip
     }
 
@@ -232,11 +339,9 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
         if (!RecreateSwapchainNow(m_requestedWidth, m_requestedHeight))
         {
             m_tracker.OnAbort();
-            SyncLegacyFrameState();
             return frame; // Skip (zero size or legacy failure); retry next frame
         }
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         frame.result = ixrhi::IXRHIFrameResult::SwapchainRecreated;
         frame.info.swapchainGeneration = m_swapchain->Generation();
         return frame;
@@ -246,7 +351,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     if (extent.width == 0 || extent.height == 0)
     {
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         return frame; // Skip
     }
     if (m_swapchain->Generation() == 0)
@@ -257,7 +361,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     if (m_swapchain->Generation() == 0 || m_loop->GetSwapchain() == VK_NULL_HANDLE)
     {
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         return frame; // Skip: no usable swapchain yet
     }
 
@@ -265,7 +368,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     if (!EnsureFrameSlot(slot) || !EnsureSwapchainObjects())
     {
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         return frame; // Skip
     }
     IXVulkanFrameSlot& context = m_slots[slot];
@@ -282,12 +384,46 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
 
     auto acquireStart = std::chrono::steady_clock::now();
     std::uint32_t imageIndex = 0;
-    const VkResult acquire = vkAcquireNextImageKHR(NativeDevice(),
-        m_loop->GetSwapchain(),
-        UINT64_MAX,
-        context.imageAvailable,
-        VK_NULL_HANDLE,
-        &imageIndex);
+    VkResult acquire = VK_NOT_READY;
+    if (!m_asyncPresentEnabled)
+    {
+        acquire = vkAcquireNextImageKHR(NativeDevice(),
+            m_loop->GetSwapchain(),
+            UINT64_MAX,
+            context.imageAvailable,
+            VK_NULL_HANDLE,
+            &imageIndex);
+    }
+    else
+    {
+        // The present thread uses the swapchain too, so the acquire holds its lock. It must not block
+        // while frames still wait to be presented: the image it waits for may come free only after
+        // they are. So, while any are queued, it takes a free image or waits for one more present.
+        // With none queued (only this thread queues them) it may block on the presentation engine.
+        for (;;)
+        {
+            std::size_t outstanding = 0;
+            {
+                std::lock_guard<std::mutex> lock(m_asyncPresentMutex);
+                outstanding = m_asyncPresentOutstanding;
+            }
+            {
+                std::lock_guard<std::mutex> swapchainLock(m_swapchainMutex);
+                acquire = vkAcquireNextImageKHR(NativeDevice(),
+                    m_loop->GetSwapchain(),
+                    outstanding == 0 ? UINT64_MAX : 0,
+                    context.imageAvailable,
+                    VK_NULL_HANDLE,
+                    &imageIndex);
+            }
+            if (outstanding == 0 || (acquire != VK_NOT_READY && acquire != VK_TIMEOUT))
+                break;
+            std::unique_lock<std::mutex> lock(m_asyncPresentMutex);
+            m_asyncPresentWake.wait(lock, [&] {
+                return m_asyncPresentStop || m_asyncPresentOutstanding < outstanding;
+            });
+        }
+    }
     auto acquireEnd = std::chrono::steady_clock::now();
     if (m_activeCpuTiming.valid)
         m_activeCpuTiming.acquireImageMs =
@@ -299,7 +435,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
         if (acquire == VK_ERROR_OUT_OF_DATE_KHR)
             m_swapchainDirty = true;
         m_tracker.OnAbort();
-        SyncLegacyFrameState();
         frame.result = acquireResult; // Skip or DeviceLost; SwapchainRecreated handled next Begin
         if (acquireResult == ixrhi::IXRHIFrameResult::SwapchainRecreated)
             frame.info.swapchainGeneration = m_swapchain->Generation();
@@ -313,7 +448,19 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     }
     m_activeImage = imageIndex;
 
-    if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE)
+    // The image's previous frame must be finished before it is rendered again. Every frame older than
+    // frameNumber - kSlots + 1 is already known finished: the slot fence just waited on belongs to frame
+    // frameNumber - kSlots, and each older one was waited on the same way. The stored fence is a slot's
+    // fence object, reused every kSlots frames: for an image last rendered kSlots or more frames ago it
+    // now belongs to a newer frame, and waiting on it waited for the previous frame instead, which
+    // serialized CPU and GPU (with 3 swapchain images and 2 slots, every frame). So wait only for an
+    // image whose frame may still run, while its fence still belongs to that frame.
+    const std::uint64_t frameNumber = m_tracker.GetFrameNumber();
+    const std::uint64_t lastUsePlusOne = m_imageLastFrame[imageIndex];  // 0 = not rendered yet
+    m_imageLastFrame[imageIndex] = frameNumber + 1u;
+    const bool imageFrameMayRun = lastUsePlusOne != 0 &&
+        (lastUsePlusOne - 1u) + IXVulkanFrameTracker::kSlots > frameNumber;
+    if (m_imagesInFlight[imageIndex] != VK_NULL_HANDLE && imageFrameMayRun)
     {
         waitStart = std::chrono::steady_clock::now();
         CheckVk(vkWaitForFences(NativeDevice(), 1, &m_imagesInFlight[imageIndex], VK_TRUE, UINT64_MAX),
@@ -341,7 +488,6 @@ ixrhi::IXRHIFrame IXVulkanDevice::BeginFrame()
     if (captureThisFrame)
         BeginCaptureForFrame();
 
-    SyncLegacyFrameState();
 
     frame.result = ixrhi::IXRHIFrameResult::Success;
     frame.frameToken = m_activeToken;
@@ -390,48 +536,62 @@ void IXVulkanDevice::EndFrame(const ixrhi::IXRHIFrame& frame)
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &m_renderFinished[m_activeImage];
 
+    if (m_asyncPresentEnabled)
+        WaitForAsyncPresentCapacity();
     auto submitStart = std::chrono::steady_clock::now();
-    CheckVk(vkQueueSubmit(m_loop->GetGraphicsQueue(), 1, &submit, context.fence),
-        "vkQueueSubmit(frame)",
-        __FILE__,
-        __LINE__);
+    {
+        std::lock_guard<std::mutex> queueLock(m_queueSubmitPresentMutex);
+        CheckVk(vkQueueSubmit(m_loop->GetGraphicsQueue(), 1, &submit, context.fence),
+            "vkQueueSubmit(frame)",
+            __FILE__,
+            __LINE__);
+    }
     auto submitEnd = std::chrono::steady_clock::now();
     if (m_activeCpuTiming.valid)
         m_activeCpuTiming.submitMs =
             std::chrono::duration<double, std::milli>(submitEnd - submitStart).count();
 
-    VkPresentInfoKHR present{};
-    present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-    present.waitSemaphoreCount = 1;
-    present.pWaitSemaphores = &m_renderFinished[m_activeImage];
-    present.swapchainCount = 1;
-    VkSwapchainKHR swapchain = m_loop->GetSwapchain();
-    present.pSwapchains = &swapchain;
-    present.pImageIndices = &m_activeImage;
-
-    auto presentStart = std::chrono::steady_clock::now();
-    const VkResult presentResult = vkQueuePresentKHR(m_loop->GetPresentQueue(), &present);
-    auto presentEnd = std::chrono::steady_clock::now();
-    if (m_activeCpuTiming.valid)
-        m_activeCpuTiming.presentMs =
-            std::chrono::duration<double, std::milli>(presentEnd - presentStart).count();
-    if (presentResult == VK_ERROR_OUT_OF_DATE_KHR)
+    const auto presentStart = std::chrono::steady_clock::now();
+    if (m_asyncPresentEnabled)
     {
-        m_swapchainDirty = true;
+        EnqueueAsyncPresent({m_loop->GetSwapchain(), m_renderFinished[m_activeImage], m_activeImage});
     }
-    else if (presentResult == VK_SUBOPTIMAL_KHR)
+    else
     {
-        static bool warnedPresentSuboptimal = false;
-        if (!warnedPresentSuboptimal)
+        VkPresentInfoKHR present{};
+        present.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores = &m_renderFinished[m_activeImage];
+        present.swapchainCount = 1;
+        VkSwapchainKHR swapchain = m_loop->GetSwapchain();
+        present.pSwapchains = &swapchain;
+        present.pImageIndices = &m_activeImage;
+        VkResult presentResult = VK_SUCCESS;
         {
-            warnedPresentSuboptimal = true;
-            Tracen("[VULKAN] present: VK_SUBOPTIMAL_KHR (continuing)");
+            std::lock_guard<std::mutex> queueLock(m_queueSubmitPresentMutex);
+            presentResult = vkQueuePresentKHR(m_loop->GetPresentQueue(), &present);
         }
+        if (presentResult == VK_SUCCESS || presentResult == VK_SUBOPTIMAL_KHR)
+            m_presentedFrames.fetch_add(1, std::memory_order_relaxed);
+        if (presentResult == VK_ERROR_OUT_OF_DATE_KHR)
+            m_swapchainDirty = true;
+        else if (presentResult == VK_SUBOPTIMAL_KHR)
+        {
+            static bool warnedPresentSuboptimal = false;
+            if (!warnedPresentSuboptimal)
+            {
+                warnedPresentSuboptimal = true;
+                Tracen("[VULKAN] present: VK_SUBOPTIMAL_KHR (continuing)");
+            }
+        }
+        else if (presentResult != VK_SUCCESS)
+            CheckVk(presentResult, "vkQueuePresentKHR", __FILE__, __LINE__);
     }
-    else if (presentResult != VK_SUCCESS)
-    {
-        CheckVk(presentResult, "vkQueuePresentKHR", __FILE__, __LINE__);
-    }
+    const auto presentEnd = std::chrono::steady_clock::now();
+    if (m_activeCpuTiming.valid)
+        m_activeCpuTiming.presentMs = m_asyncPresentEnabled
+            ? 0.0
+            : std::chrono::duration<double, std::milli>(presentEnd - presentStart).count();
 
     if (m_activeCpuTiming.valid)
     {
@@ -447,7 +607,6 @@ void IXVulkanDevice::EndFrame(const ixrhi::IXRHIFrame& frame)
         return;
     }
     m_frameActive = false;
-    SyncLegacyFrameState();
 }
 
 bool IXVulkanDevice::RequestResize(std::uint32_t width, std::uint32_t height)
@@ -502,6 +661,7 @@ void IXVulkanDevice::Shutdown()
     if (m_shutDown)
         return;
     m_shutDown = true;
+    StopAsyncPresent();
     if (NativeDevice() == VK_NULL_HANDLE)
     {
         // Legacy device already gone (explicit Shutdown was skipped): release
@@ -511,19 +671,17 @@ void IXVulkanDevice::Shutdown()
         m_slots = {};
         m_renderFinished.clear();
         m_imagesInFlight.clear();
+        m_imageLastFrame.clear();
         m_swapchain.reset();
         m_queryPool = VK_NULL_HANDLE;
         m_uploadPool = VK_NULL_HANDLE;
         return;
     }
     // Documented order (§70): idle first, then frame objects, swapchain
-    // object (pass/targets/backbuffers), query pool, upload pool. Legacy
-    // shims cleared so late native calls observe inactive state.
+    // object (pass/targets/backbuffers), query pool, upload pool.
     vkDeviceWaitIdle(NativeDevice());
     m_tracker.OnAbort();
     m_frameActive = false;
-    SyncLegacyFrameState();
-    m_loop->SetMigrationMainPass(VK_NULL_HANDLE);
     TeardownFrameObjects();
     m_swapchain.reset();
     if (m_uploadPool != VK_NULL_HANDLE)
@@ -535,8 +693,9 @@ void IXVulkanDevice::Shutdown()
 
 void IXVulkanDevice::CreateTimestampPool()
 {
-#if defined(IXTREEME_DEBUG_LOGS)
-    if (m_queryPool != VK_NULL_HANDLE || !m_capabilities.supportsTimestampQueries)
+    // GPU timestamps exist in debug-log builds, and in any build (a Release editor, a shipped game) run
+    // with IX_GPU_PROFILE=1 (m_gpuTimestampsAllowed). Without the pool every capture call is a no-op.
+    if (m_queryPool != VK_NULL_HANDLE || !m_capabilities.supportsTimestampQueries || !m_gpuTimestampsAllowed)
         return;
     VkPhysicalDeviceProperties props{};
     vkGetPhysicalDeviceProperties(m_loop->GetPhysicalDevice(), &props);
@@ -552,12 +711,10 @@ void IXVulkanDevice::CreateTimestampPool()
     SetDebugName(VK_OBJECT_TYPE_QUERY_POOL,
         reinterpret_cast<std::uint64_t>(m_queryPool),
         "TimestampQueryPool");
-#endif
 }
 
 void IXVulkanDevice::BeginCaptureForFrame()
 {
-#if defined(IXTREEME_DEBUG_LOGS)
     if (m_queryPool == VK_NULL_HANDLE || !m_frameActive)
         return;
     IXVulkanFrameSlot& context = m_slots[m_activeSlot];
@@ -566,7 +723,6 @@ void IXVulkanDevice::BeginCaptureForFrame()
     m_captureResultsReady = false;
     m_captureWritten.fill(false);
     WriteTimestamp(static_cast<std::uint32_t>(ixrhi::IXRHITimestampPoint::FrameBegin));
-#endif
 }
 
 void IXVulkanDevice::WriteTimestamp(ixrhi::IXRHITimestampPoint point)
@@ -576,7 +732,6 @@ void IXVulkanDevice::WriteTimestamp(ixrhi::IXRHITimestampPoint point)
 
 void IXVulkanDevice::WriteTimestamp(std::uint32_t pointIndex)
 {
-#if defined(IXTREEME_DEBUG_LOGS)
     if (!m_captureActive || m_queryPool == VK_NULL_HANDLE || !m_frameActive)
         return;
     if (pointIndex >= ixrhi::IXRHI_MAX_TIMESTAMP_POINTS)
@@ -586,25 +741,23 @@ void IXVulkanDevice::WriteTimestamp(std::uint32_t pointIndex)
         m_queryPool,
         pointIndex);
     m_captureWritten[pointIndex] = true;
-#else
-    (void)pointIndex;
-#endif
 }
 
 void IXVulkanDevice::RequestGpuFrameCapture()
 {
-#if defined(IXTREEME_DEBUG_LOGS)
-    m_captureRequested = true;
-#endif
+    if (m_queryPool != VK_NULL_HANDLE)
+        m_captureRequested = true;
 }
 
 void IXVulkanDevice::FinishCaptureAfterSubmit()
 {
-#if defined(IXTREEME_DEBUG_LOGS)
     if (!m_captureActive || m_queryPool == VK_NULL_HANDLE)
         return;
 
-    CheckVk(vkQueueWaitIdle(m_loop->GetGraphicsQueue()), "vkQueueWaitIdle(capture)", __FILE__, __LINE__);
+    {
+        std::lock_guard<std::mutex> queueLock(m_queueSubmitPresentMutex);
+        CheckVk(vkQueueWaitIdle(m_loop->GetGraphicsQueue()), "vkQueueWaitIdle(capture)", __FILE__, __LINE__);
+    }
 
     struct TimestampWithAvailability
     {
@@ -640,24 +793,17 @@ void IXVulkanDevice::FinishCaptureAfterSubmit()
     m_lastResults = results;
     m_captureResultsReady = true;
     m_captureActive = false;
-#endif
 }
 
 bool IXVulkanDevice::TryReadTimestamps(ixrhi::IXRHITimestampResults& gpu,
                                        ixrhi::IXRHICpuFrameTiming& cpu)
 {
-#if defined(IXTREEME_DEBUG_LOGS)
     if (!m_captureResultsReady)
         return false;
     gpu = m_lastResults;
     cpu = m_lastCpuTiming;
     m_captureResultsReady = false;
     return true;
-#else
-    (void)gpu;
-    (void)cpu;
-    return false;
-#endif
 }
 
 } // namespace ixvulkan

@@ -5,8 +5,9 @@
 // Phase 3C authority: frame acquisition, per-frame command ownership,
 // submission, presentation, frames-in-flight sync, GPU timestamps and the main
 // swapchain object live HERE. The legacy VulkanDevice keeps device/queue/
-// swapchain-handle infrastructure (§39 debt) plus per-frame migration shims
-// synced by this backend; its own BeginFrame/EndFrame loop is dormant.
+// swapchain-handle infrastructure (§39 debt); its own BeginFrame/EndFrame
+// loop is dormant. Frame-migration shims were deleted in Phase 3F (no
+// generic native renderer remains).
 //
 // E2 Loop() is RETIRED as frame authority: Loop() remains only as infra
 // access for the backend itself (device/queues/swapchain/images). Generic
@@ -16,15 +17,13 @@
 // Vk* in THIS header is allowed: Engine/Graphics/Vulkan is the backend module.
 // It must not leak further: renderer/editor headers take IXRHI types only.
 
-#pragma once
-
 // IXVulkanDevice — Vulkan backend owning the IXRHI graphics frame contract.
 //
 // Phase 3C authority: frame acquisition, per-frame command ownership,
 // submission, presentation, frames-in-flight sync, GPU timestamps and the main
 // swapchain object live HERE. The legacy VulkanDevice keeps device/queue/
-// swapchain-handle infrastructure (§39 debt) plus migration shims synced by
-// this backend every frame; its own BeginFrame/EndFrame loop is dormant.
+// swapchain-handle infrastructure (§39 debt); its own BeginFrame/EndFrame
+// loop is dormant. Frame-migration shims were deleted in Phase 3F.
 //
 // Vk* in THIS header is allowed: Engine/Graphics/Vulkan is the backend module.
 // It must not leak further: renderer/editor headers take IXRHI types only.
@@ -35,10 +34,15 @@
 #include <vulkan/vulkan.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <mutex>
+#include <thread>
 
 class VulkanDevice;
 
@@ -80,6 +84,7 @@ public:
     std::shared_ptr<ixrhi::IXRHITexture> CreateTexture(const ixrhi::IXRHITextureDesc& desc,
                                                        const void* initialDataOrNull,
                                                        std::size_t initialBytes) override;
+    bool UpdateTexture(ixrhi::IXRHITexture& texture, const void* data, std::size_t byteCount) override;
     std::shared_ptr<ixrhi::IXRHISampler> CreateSampler(const ixrhi::IXRHISamplerDesc& desc) override;
     std::shared_ptr<ixrhi::IXRHIShader> CreateShader(const ixrhi::IXRHIShaderDesc& desc) override;
     std::unique_ptr<ixrhi::IXRHIBindGroupLayout> CreateBindGroupLayout(
@@ -112,6 +117,8 @@ public:
     void RequestGpuFrameCapture() override;
     bool TryReadTimestamps(ixrhi::IXRHITimestampResults& gpu,
                            ixrhi::IXRHICpuFrameTiming& cpu) override;
+    std::unique_ptr<ixrhi::IXRHIOcclusionQueries> CreateOcclusionQueries(std::uint32_t count) override;
+    std::uint64_t GetPresentedFrameCount() const override { return m_presentedFrames.load(std::memory_order_relaxed); }
     const ixrhi::IXRHICapabilities& GetCapabilities() const override { return m_capabilities; }
 
     // Releases ALL backend Vulkan objects (frame contexts, swapchain object,
@@ -122,6 +129,9 @@ public:
 
     // ---- backend-internal helpers (Vulkan module only) ----
     VulkanDevice& Loop() const { return *m_loop; }
+    // Held around every vkQueueSubmit / vkQueuePresentKHR: the present thread presents on a queue that
+    // may be the graphics queue itself (VkQueue host access is externally synchronized).
+    std::mutex& QueueSubmitMutex() const { return m_queueSubmitPresentMutex; }
     VkDevice NativeDevice() const;
     VkRenderPass ResolveRenderPass(const ixrhi::IXRHIRenderPass* pass) const;
     void SetDebugName(VkObjectType type, std::uint64_t handle, const char* name) const;
@@ -155,24 +165,56 @@ public:
                                        std::uint32_t height) const;
 
 private:
+    struct PendingPresent
+    {
+        VkSwapchainKHR swapchain = VK_NULL_HANDLE;
+        VkSemaphore waitSemaphore = VK_NULL_HANDLE;
+        std::uint32_t imageIndex = 0;
+    };
+
     void QueryCapabilities();
-    void UploadTextureBytes(VkImage image,
-                            std::uint32_t width,
-                            std::uint32_t height,
-                            ixrhi::IXRHIFormat format,
-                            const void* bytes,
-                            std::size_t byteCount) const;
+    // Multi-subresource staged upload (tight layer-major/mip-minor packing,
+    // see IXRHITexture.h). initialLayout/finalLayout bracket the copies;
+    // readLayoutFor() picks the sampled layout (depth-aware). Internally
+    // synchronized submit + queue wait (setup/edit-time parity).
+    struct TextureCopyRegion
+    {
+        std::uint32_t mipLevel = 0;
+        std::uint32_t baseArrayLayer = 0;
+        std::uint32_t layerCount = 1;
+        std::uint32_t width = 0;
+        std::uint32_t height = 0;
+        std::uint64_t bufferOffsetBytes = 0;
+    };
+    void UploadTextureRegions(VkImage image,
+                              ixrhi::IXRHIFormat format,
+                              std::uint32_t mipLevels,
+                              std::uint32_t arrayLayers,
+                              const TextureCopyRegion* regions,
+                              std::size_t regionCount,
+                              const void* bytes,
+                              std::size_t byteCount,
+                              VkImageLayout initialLayout,
+                              VkImageLayout finalLayout) const;
+    // Sampled-layout counterpart of ToVkImageLayout(ShaderReadOnly):
+    // depth aspects require the depth-read layout.
+    static VkImageLayout SampledReadLayout(ixrhi::IXRHIFormat format);
     // Frame authority internals.
     bool EnsureFrameSlot(std::uint32_t slot);
     bool EnsureSwapchainObjects();
     void TeardownFrameObjects();
-    void SyncLegacyFrameState() const;
     void BeginCaptureForFrame();
     void FinishCaptureAfterSubmit();
     void CreateTimestampPool();
     // Synchronous backend-driven (re)build for the requested size. Returns
     // false (with dirty set, except for zero size) when nothing was built.
     bool RecreateSwapchainNow(std::uint32_t width, std::uint32_t height);
+    void StartAsyncPresent();
+    void StopAsyncPresent();
+    void WaitForAsyncPresentIdle();
+    void WaitForAsyncPresentCapacity();
+    void EnqueueAsyncPresent(PendingPresent present);
+    void AsyncPresentLoop();
 
     VulkanDevice* m_loop = nullptr; // borrowed device/queue/swapchain infrastructure
     ixrhi::IXRHICapabilities m_capabilities;
@@ -186,6 +228,7 @@ private:
     bool m_slotsReady = false;
     std::vector<VkSemaphore> m_renderFinished; // per swapchain image
     std::vector<VkFence> m_imagesInFlight; // per swapchain image
+    std::vector<std::uint64_t> m_imageLastFrame; // per swapchain image: frame number that last rendered it
     IXVulkanFrameTracker m_tracker;
     bool m_frameActive = false;
     std::uint32_t m_activeSlot = 0;
@@ -212,6 +255,23 @@ private:
     ixrhi::IXRHICpuFrameTiming m_activeCpuTiming{};
     std::chrono::steady_clock::time_point m_cpuFrameStart{};
     std::chrono::steady_clock::time_point m_cpuWorkStart{};
+
+    // Bounded present scheduler. It is enabled by default; --sync-present or
+    // IX_ASYNC_PRESENT=0 keeps the synchronous path available for rollback.
+    bool m_asyncPresentEnabled = false;
+    bool m_asyncPresentStop = false;
+    std::thread m_asyncPresentThread;
+    std::mutex m_asyncPresentMutex;
+    std::condition_variable m_asyncPresentWake;
+    std::deque<PendingPresent> m_asyncPresentQueue;
+    std::size_t m_asyncPresentOutstanding = 0;
+    std::atomic<bool> m_asyncPresentSwapchainDirty{false};
+    std::atomic<std::uint64_t> m_presentedFrames{0};  // successful presents (GetPresentedFrameCount)
+    bool m_gpuTimestampsAllowed = false;  // CreateTimestampPool: debug-log build or IX_GPU_PROFILE=1
+    mutable std::mutex m_queueSubmitPresentMutex;
+    // The swapchain's host access is externally synchronized: the present thread's vkQueuePresentKHR
+    // and the frame's vkAcquireNextImageKHR take this (before m_queueSubmitPresentMutex).
+    std::mutex m_swapchainMutex;
 };
 
 #define IXVULKAN_CHECK(device, call) (device).CheckVk((call), #call, __FILE__, __LINE__)

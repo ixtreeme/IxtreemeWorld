@@ -2,8 +2,8 @@
 
 // The language-agnostic SEAM between scripts and the engine. libs/script defines this pure-virtual
 // facade; apps/client implements it (ScriptApiImpl) against the real engine state (entities, input,
-// audio, ...). BOTH backends (native C++ and Lua) call the engine ONLY through here — so a script
-// can never reach past this surface, and a 3rd backend (C#) would reuse the exact same API.
+// audio, ...). ALL backends (AngelScript, Lua, legacy native C++) call the engine ONLY through here —
+// so a script can never reach past this surface.
 //
 // Rotations are Euler angles in DEGREES at this boundary (script-friendly); the impl converts to/from
 // the radians the engine stores. Entity ids are the editor MeshSceneEntity ids (0 = none/invalid).
@@ -22,7 +22,51 @@ enum class ScriptKey
     W, A, S, D,
     Space, Shift, Ctrl,
     Up, Down, Left, Right,
-    MouseLeft, MouseRight
+    MouseLeft, MouseRight,
+    // v6: action keys (appended, so the values above keep their numbers)
+    Q, E, R, F,
+    Num1, Num2, Num3, Num4, Num5
+};
+
+// String -> ScriptKey, the single source of truth for the script-facing key names. Shared by the
+// backends so Lua and AngelScript accept the exact same strings. Case-sensitive; an unknown name
+// yields false (the caller answers false from IsKeyDown rather than erroring).
+inline bool ParseKeyName(const std::string& name, ScriptKey& out)
+{
+    if (name == "W") { out = ScriptKey::W; return true; }
+    if (name == "A") { out = ScriptKey::A; return true; }
+    if (name == "S") { out = ScriptKey::S; return true; }
+    if (name == "D") { out = ScriptKey::D; return true; }
+    if (name == "Space") { out = ScriptKey::Space; return true; }
+    if (name == "Shift") { out = ScriptKey::Shift; return true; }
+    if (name == "Ctrl") { out = ScriptKey::Ctrl; return true; }
+    if (name == "Up") { out = ScriptKey::Up; return true; }
+    if (name == "Down") { out = ScriptKey::Down; return true; }
+    if (name == "Left") { out = ScriptKey::Left; return true; }
+    if (name == "Right") { out = ScriptKey::Right; return true; }
+    if (name == "MouseLeft") { out = ScriptKey::MouseLeft; return true; }
+    if (name == "MouseRight") { out = ScriptKey::MouseRight; return true; }
+    if (name == "Q") { out = ScriptKey::Q; return true; }
+    if (name == "E") { out = ScriptKey::E; return true; }
+    if (name == "R") { out = ScriptKey::R; return true; }
+    if (name == "F") { out = ScriptKey::F; return true; }
+    if (name == "Num1") { out = ScriptKey::Num1; return true; }
+    if (name == "Num2") { out = ScriptKey::Num2; return true; }
+    if (name == "Num3") { out = ScriptKey::Num3; return true; }
+    if (name == "Num4") { out = ScriptKey::Num4; return true; }
+    if (name == "Num5") { out = ScriptKey::Num5; return true; }
+    return false;
+}
+
+// What a player CharacterController did in its last simulation step (v6). POD: safe by value across
+// the /MT module boundary.
+struct CharacterState
+{
+    bool grounded = false;
+    bool moving = false;       // horizontal movement input this step
+    bool running = false;      // moving at run speed (Shift held and running allowed)
+    bool jumped = false;       // a jump started this step
+    float planarSpeed = 0.0f;  // m/s
 };
 
 struct RaycastHit
@@ -33,6 +77,20 @@ struct RaycastHit
     float distance = 0.0f;
     bool hit = false;
 };
+
+// ABI 7 queries. Layer bits: Default=0, StaticWorld=1, DynamicObject=2,
+// Player=3, Trigger=4, Projectile=5, Foliage=6, NoCollision=7.
+struct QueryFilter {
+    std::uint32_t layerMask = 0xffu;
+    std::uint32_t flags = 1u; // bit 0 includes sensors/triggers
+    std::uint32_t ignoreEntityId = 0;
+    std::uint32_t reserved = 0;
+};
+struct SphereOverlapHit {
+    std::uint32_t entityId = 0; // terrain/non-entity body
+    std::uint32_t flags = 0; // bit 0: trigger
+};
+inline constexpr std::uint32_t kMaxOverlapResults = 1024;
 
 // The SDK-facing facade — the EXACT surface a native game-module DLL may call. Every method is
 // heap-safe across the engine's static-CRT (/MT) DLL boundary: scalars, raw float[3] buffers the
@@ -83,6 +141,77 @@ public:
     virtual void SetAnimatorFloat(std::uint32_t id, const std::string& name, float value) = 0;
     virtual void SetAnimatorBool(std::uint32_t id, const std::string& name, bool value) = 0;
     virtual void SetAnimatorTrigger(std::uint32_t id, const std::string& name) = 0;
+
+    // --- generic TCP transport (v4). A byte stream only: no framing, no protocol -- a game's network
+    //     protocol lives in its scripts. Non-blocking; the engine polls the stream on every call.
+    //     Every stream is closed when Play stops. ---
+    // Starts a connect to host:port (DNS name or IP literal). Returns a handle, 0 if it cannot start.
+    virtual std::uint32_t NetConnect(const std::string& host, std::uint32_t port) = 0;
+    // 0 = connecting, 1 = connected, 2 = closed by the peer / NetClose, 3 = failed or unknown handle.
+    virtual int NetState(std::uint32_t handle) = 0;
+    // Queues bytes (caller-owned buffer, read only). False once the stream is closed/failed.
+    virtual bool NetSend(std::uint32_t handle, const std::uint8_t* data, std::uint32_t size) = 0;
+    // Moves up to `capacity` received bytes into the caller's buffer; returns how many.
+    virtual std::uint32_t NetReceive(std::uint32_t handle, std::uint8_t* out, std::uint32_t capacity) = 0;
+    virtual void NetClose(std::uint32_t handle) = 0;
+
+    // --- text prompt (v4): an engine-drawn dialog asking the player for one line of text (`secret`
+    //     masks the input, e.g. a password). Returns a prompt id (0 = prompts unavailable). ---
+    virtual std::uint32_t PromptText(const std::string& title, const std::string& label, bool secret) = 0;
+    // 0 = still open, 1 = submitted (UTF-8 copied into `out`, NUL-terminated, truncated to capacity-1;
+    // the engine then forgets the text), -1 = cancelled / unknown id.
+    virtual int PromptResult(std::uint32_t promptId, char* out, std::uint32_t capacity) = 0;
+
+    // --- rendering (v5) ---
+    // Assigns a material asset (its GUID as stored in a scene's "materials" slots, or its asset id) to
+    // material slot `slot` of the entity's mesh. DEFERRED like spawn/destroy, so it also applies to an
+    // entity spawned earlier in the same frame. An unknown entity or material is a logged no-op.
+    virtual void SetMaterial(std::uint32_t id, std::uint32_t slot, const std::string& materialAssetId) = 0;
+
+    // --- character controller (v6) ---
+    // The last step of the entity's player CharacterController; false when it has none (or Play is off).
+    virtual bool GetCharacterState(std::uint32_t id, CharacterState& out) = 0;
+    // What the controller may do from now on: run (Shift) and jump. Both are allowed when Play starts.
+    virtual void SetCharacterAbilities(std::uint32_t id, bool canRun, bool canJump) = 0;
+
+    // --- game UI (v6): RmlUi documents (.rml + .rcss) from the project's asset folder ---
+    // Opens and shows a document (path relative to the asset folder, e.g. "ui/hud.rml") over the game
+    // (the Game view in the editor). Returns its handle, 0 if it cannot be loaded. Every document closes
+    // when Play stops.
+    virtual std::uint32_t UiOpen(const std::string& documentPath) = 0;
+    virtual void UiClose(std::uint32_t document) = 0;
+    virtual void UiSetVisible(std::uint32_t document, bool visible) = 0;
+    // An element by its id attribute: its text, one RCSS property ("width", "62%") or a class on/off.
+    virtual void UiSetText(std::uint32_t document, const std::string& elementId, const std::string& text) = 0;
+    virtual void UiSetProperty(std::uint32_t document, const std::string& elementId, const std::string& property,
+                               const std::string& value) = 0;
+    virtual void UiSetClass(std::uint32_t document, const std::string& elementId, const std::string& className,
+                            bool enabled) = 0;
+    // True once per click on the element (or anything inside it) since the last call.
+    virtual bool UiConsumeClick(std::uint32_t document, const std::string& elementId) = 0;
+
+    // --- particles (v7): the entity's Particle System component ---
+    // Starts/resumes emission (creates the emitter's simulator if it has not started). No-op when
+    // the entity has no Particle System component. Live particles from before a Stop keep going
+    // until their lifetimes end.
+    virtual void ParticlePlay(std::uint32_t id) = 0;
+    // Stops emitting; the live particles finish. The emitter stays stopped (a later ParticlePlay
+    // resumes it without clearing).
+    virtual void ParticleStop(std::uint32_t id) = 0;
+    // Clears the live particles and restarts emission (with the component's burst).
+    virtual void ParticleRestart(std::uint32_t id) = 0;
+    // Spawns `count` particles immediately, even while emission is stopped.
+    virtual void ParticleEmit(std::uint32_t id, std::uint32_t count) = 0;
+
+    // --- ABI 7 (appended slots): null filter means all layers, including triggers. ---
+    virtual RaycastHit RaycastFiltered(float ox, float oy, float oz,
+        float dx, float dy, float dz, float maxDistance, const QueryFilter* filter) = 0;
+    // Sorted unique entity ids. capacity is clamped to 1024; truncated is 1 if more exist.
+    // Invalid arguments return zero and clear truncated; output is caller-owned.
+    virtual std::uint32_t OverlapSphere(float x, float y, float z, float radius,
+        const QueryFilter* filter, SphereOverlapHit* output, std::uint32_t capacity,
+        std::uint32_t* truncated) = 0;
+    virtual void SetEntityEnabled(std::uint32_t id, bool enabled) = 0;
 
     // (NEVER add an STL-by-value return here — use a caller-owned char* buffer for strings to keep the
     //  /MT module boundary safe. By-value RaycastHit is fine: it is POD, no heap.)

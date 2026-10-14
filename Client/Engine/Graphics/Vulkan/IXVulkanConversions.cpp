@@ -12,15 +12,19 @@ VkFormat ToVkFormat(ixrhi::IXRHIFormat format)
     using F = ixrhi::IXRHIFormat;
     switch (format)
     {
+    case F::R8Unorm: return VK_FORMAT_R8_UNORM;
     case F::R8G8B8A8Unorm: return VK_FORMAT_R8G8B8A8_UNORM;
     case F::R8G8B8A8Srgb: return VK_FORMAT_R8G8B8A8_SRGB;
     case F::B8G8R8A8Unorm: return VK_FORMAT_B8G8R8A8_UNORM;
     case F::B8G8R8A8Srgb: return VK_FORMAT_B8G8R8A8_SRGB;
+    case F::R32Float: return VK_FORMAT_R32_SFLOAT;
     case F::R32G32Float: return VK_FORMAT_R32G32_SFLOAT;
     case F::R32G32B32Float: return VK_FORMAT_R32G32B32_SFLOAT;
     case F::R32G32B32A32Float: return VK_FORMAT_R32G32B32A32_SFLOAT;
     case F::D32Float: return VK_FORMAT_D32_SFLOAT;
     case F::D24UnormS8Uint: return VK_FORMAT_D24_UNORM_S8_UINT;
+    case F::R16G16B16A16Float: return VK_FORMAT_R16G16B16A16_SFLOAT;
+    case F::D32FloatS8Uint: return VK_FORMAT_D32_SFLOAT_S8_UINT;
     case F::Undefined: break;
     }
     return VK_FORMAT_UNDEFINED;
@@ -31,15 +35,19 @@ ixrhi::IXRHIFormat FromVkFormat(VkFormat format)
     using F = ixrhi::IXRHIFormat;
     switch (format)
     {
+    case VK_FORMAT_R8_UNORM: return F::R8Unorm;
     case VK_FORMAT_R8G8B8A8_UNORM: return F::R8G8B8A8Unorm;
     case VK_FORMAT_R8G8B8A8_SRGB: return F::R8G8B8A8Srgb;
     case VK_FORMAT_B8G8R8A8_UNORM: return F::B8G8R8A8Unorm;
     case VK_FORMAT_B8G8R8A8_SRGB: return F::B8G8R8A8Srgb;
+    case VK_FORMAT_R32_SFLOAT: return F::R32Float;
     case VK_FORMAT_R32G32_SFLOAT: return F::R32G32Float;
     case VK_FORMAT_R32G32B32_SFLOAT: return F::R32G32B32Float;
     case VK_FORMAT_R32G32B32A32_SFLOAT: return F::R32G32B32A32Float;
     case VK_FORMAT_D32_SFLOAT: return F::D32Float;
     case VK_FORMAT_D24_UNORM_S8_UINT: return F::D24UnormS8Uint;
+    case VK_FORMAT_R16G16B16A16_SFLOAT: return F::R16G16B16A16Float;
+    case VK_FORMAT_D32_SFLOAT_S8_UINT: return F::D32FloatS8Uint;
     default: break;
     }
     return F::Undefined;
@@ -182,8 +190,14 @@ VkFilter ToVkFilter(ixrhi::IXRHISamplerFilter filter)
 
 VkSamplerAddressMode ToVkAddressMode(ixrhi::IXRHISamplerAddress mode)
 {
-    return mode == ixrhi::IXRHISamplerAddress::Repeat ? VK_SAMPLER_ADDRESS_MODE_REPEAT
-                                                      : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    using A = ixrhi::IXRHISamplerAddress;
+    switch (mode)
+    {
+    case A::Repeat: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    case A::ClampToBorder: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    case A::ClampToEdge: break;
+    }
+    return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
 }
 
 VkImageLayout ToVkImageLayout(ixrhi::IXRHIImageLayout layout)
@@ -220,7 +234,8 @@ VkImageAspectFlags ToVkAspectMask(ixrhi::IXRHIFormat format)
     switch (format)
     {
     case F::D32Float: return VK_IMAGE_ASPECT_DEPTH_BIT;
-    case F::D24UnormS8Uint: return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
+    case F::D24UnormS8Uint:
+    case F::D32FloatS8Uint: return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     default: break;
     }
     return VK_IMAGE_ASPECT_COLOR_BIT;

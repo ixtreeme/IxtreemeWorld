@@ -20,6 +20,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <cstdlib>
 
 namespace
 {
@@ -31,12 +33,42 @@ void ShowFatal(const char* message)
     std::fprintf(stderr, "%s\n", message);
 #endif
 }
+
+void ConfigurePresentSchedulerFromCommandLine(const char* commandLine)
+{
+    if (commandLine == nullptr)
+    {
+        return;
+    }
+
+    // Keep the feature removable: the command line only overrides the
+    // process-local environment used by the Vulkan device.
+    if (std::strstr(commandLine, "--async-present") != nullptr)
+    {
+#if defined(_WIN32)
+        _putenv_s("IX_ASYNC_PRESENT", "1");
+#else
+        setenv("IX_ASYNC_PRESENT", "1", 1);
+#endif
+        Tracen("[BOOT] async present requested (--async-present)");
+    }
+    else if (std::strstr(commandLine, "--sync-present") != nullptr)
+    {
+#if defined(_WIN32)
+        _putenv_s("IX_ASYNC_PRESENT", "0");
+#else
+        setenv("IX_ASYNC_PRESENT", "0", 1);
+#endif
+        Tracen("[BOOT] synchronous present requested (--sync-present)");
+    }
+}
 }
 
 #if defined(_WIN32)
-int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
+int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR commandLine, int showCommand)
 {
     (void)showCommand;
+    ConfigurePresentSchedulerFromCommandLine(commandLine);
 
     uint32_t windowWidth = 1280;
     uint32_t windowHeight = 720;
@@ -62,8 +94,12 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int showCommand)
     return result;
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    // Some toolchains select the console entry point even for a Windows target;
+    // preserve the same scheduler switches in that configuration too.
+    for (int i = 1; i < argc; ++i)
+        ConfigurePresentSchedulerFromCommandLine(argv[i]);
     return WinMain(GetModuleHandleA(nullptr), nullptr, nullptr, SW_SHOWNORMAL);
 }
 #endif

@@ -1,9 +1,47 @@
 #include "AssetWatcher.h"
 
 #include "AssetDatabase.h"
+#include "AssetLibrary.h"
+#include "Common.h"
 #include "Debug.h"
+#include "ProjectManager.h"
 
 #include <algorithm>
+
+namespace
+{
+// A path whose appearance, removal or move changes what the asset browser shows: a folder or an
+// asset file under the asset root, not the library's own files (thumbnails, manifest, .meta, temp
+// writes). A deleted path no longer exists, so one without an extension is taken for a folder.
+bool AffectsAssetBrowser(const std::filesystem::path& path, const std::string& assetRootKey)
+{
+    if (path.empty() || assetRootKey.empty())
+        return false;
+    try
+    {
+        // Compared as lower-case generic text: the watcher and the project may spell the same root
+        // differently (separators, drive-letter case).
+        const std::string key = ixtreeme::common::ToLowerAscii(path.lexically_normal().generic_string());
+        if (key.rfind(assetRootKey + "/", 0) != 0)
+            return false;
+        const std::string relative = key.substr(assetRootKey.size() + 1);
+        const std::string first = relative.substr(0, relative.find('/'));
+        if (first == "thumbnails" || first == "manifest.json")
+            return false;
+        const std::string ext = ixtreeme::common::ToLowerAscii(path.extension().generic_string());
+        if (ext == ".meta" || ext == ".tmp")
+            return false;
+        std::error_code ec;
+        if (std::filesystem::is_directory(path, ec) || !path.has_extension())
+            return true;
+        return ext == ".scene" || AssetLibrary::DiscoverableCategory(path).has_value();
+    }
+    catch (const std::exception&)
+    {
+        return false;  // a name the narrow path API cannot represent
+    }
+}
+} // namespace
 
 AssetWatcher& AssetWatcher::Instance()
 {
@@ -80,9 +118,27 @@ bool AssetWatcher::processPendingEvents()
         events.swap(queue_);
     }
 
+    std::string assetRootKey;
+    if (ProjectManager::Instance().HasProject())
+    {
+        std::error_code ec;
+        std::filesystem::path assetRoot = ProjectManager::Instance().AssetRootPath();
+        const std::filesystem::path canonical = std::filesystem::weakly_canonical(assetRoot, ec);
+        if (!ec)
+            assetRoot = canonical;
+        assetRootKey = ixtreeme::common::ToLowerAscii(assetRoot.lexically_normal().generic_string());
+        while (!assetRootKey.empty() && assetRootKey.back() == '/')
+            assetRootKey.pop_back();
+    }
+
     bool changed = false;
     for (const PendingEvent& event : events)
     {
+        if (!changed && event.action != efsw::Actions::Modified &&
+            (AffectsAssetBrowser(event.path, assetRootKey) || AffectsAssetBrowser(event.oldPath, assetRootKey)))
+        {
+            changed = true;
+        }
         switch (event.action)
         {
         case efsw::Actions::Add:

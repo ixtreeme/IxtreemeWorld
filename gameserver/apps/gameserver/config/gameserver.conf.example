@@ -1,0 +1,235 @@
+# GameServer config
+
+# TCP port to listen on (IPv4)
+listen_port=11020
+
+# Token game_server identifier. Must match loginserver.conf game_server.
+game_server=127.0.0.1:11020
+
+# World (MAP-1). Precedence: command line > this file > built-in default.
+# Relative paths in THIS file resolve against the directory holding this file
+# (never against the working directory); command-line paths resolve against
+# the working directory at launch. There is no default package: file mode
+# without world_package (or --world-package) refuses to start, and a missing
+# or invalid package ends the process before the database or the listener is
+# touched -- no fallback world.
+#   world_mode       file (default) | synthetic (explicit flat benchmark/dev world)
+#   world_package    world package directory       (CLI: --world-package <dir>)
+#   mob_types_config mob type registry              (CLI: --mob-types <file>)
+# Offline check of a package (every layer): gameserver --validate-world-package <dir>
+# Full startup then clean exit (deploy check): gameserver --startup-check
+world_mode=file
+# Set this (absolute, or relative to this file). Example for a copy of this
+# file placed in gameserver/apps/gameserver/config/:
+#world_package=../../../../Client/assets/Maps/test_zone
+mob_types_config=mob_types.conf
+# Synthetic mode only (extent 500 .. 131072 m, the world coordinate range):
+#synthetic_extent_m=4000
+#synthetic_zones_x=2
+#synthetic_zones_y=2
+
+# Initial server partition (MAP-2). Server configuration, NOT map data: the
+# package's worldlogic areas are design metadata and never become zones. The
+# loaded world bounds [min, max) are cut into a regions_x x regions_y grid
+# (+X east, +Y north; names World / West,East / South,North /
+# SouthWest,SouthEast,NorthWest,NorthEast / R<ix>_<iy>), and every region into
+# leaves_x x leaves_y initial leaf zones. Every initial leaf must be at least
+# 240 m (2 x AOI radius) on both axes and there may be at most 1024 initial
+# leaf zones in total (~1.3 MB + supervisor work each), else the server refuses to start
+# (exit 2, before the database/listener). Runtime splits/merges then reshape
+# the leaves (partition_min_zone_size_m / partition_max_depth below).
+# Synthetic mode: partition_regions defaults to 1x1 and must divide
+# synthetic_zones_x/y; partition_initial_leaves does not apply there.
+#partition_regions=2x2          (default; synthetic mode: 1x1)
+#partition_initial_leaves=1x1   (default)
+
+# Terrain residency (MAP-3). eager (default): the whole server terrain is read,
+# validated and kept resident at startup (<= 2^28 height samples). streaming:
+# startup checks every chunk file's presence + size and loads only the chunks
+# of the player spawn regions and warp targets (kept resident); every other
+# chunk is loaded on demand (moving entities, navigation, spawns) by dedicated
+# I/O threads, validated on load, evicted least-recently-used within the
+# budget. Missing data is never ground: movement waits, spawns retry/refuse.
+#terrain_residency=eager
+#terrain_cache_budget_mb=256     # own accounting: resident + in-flight + retired + metadata
+#terrain_io_threads=2
+#terrain_max_in_flight=32
+#terrain_retain_seconds=5        # soft retention; pressure may override, pins remain protected (>= 0.1)
+
+# Movement collision rules on top of the blocking grid (off by default: they
+# change gameplay-visible movement). max_slope = rise per horizontal meter of
+# one step (uphill only); max_water_depth_m = steps into deeper declared water
+# are refused (needs a water declaration in the package).
+#movement_max_slope=0
+#movement_max_water_depth_m=-1
+
+# Runtime
+io_threads=2
+# Zone worker threads (0 = hardware_concurrency - 1). Independent of the map's
+# seed zone count: dynamic splits add zones at runtime.
+zone_workers=0
+
+# Network resource policy (hardening H3). 0 disables a limit.
+# Send queue: frames are never dropped individually (replication v2 deltas
+# depend on the recipient's known state); a client that cannot keep up is
+# disconnected instead. soft = counted + logged once per episode.
+net_send_queue_soft_kb=512
+net_send_queue_hard_kb=8192
+net_send_queue_hard_frames=20000
+net_send_queue_hard_age_ms=10000
+# Close a connection that sends nothing for this long, and one that does not
+# complete the handshake within net_handshake_timeout_ms of connecting.
+net_idle_timeout_ms=60000
+net_handshake_timeout_ms=10000
+# Client input at the network edge. Movement is latest-state (the world
+# applies one input per tick per player), so only abuse far beyond any real
+# client disconnects; attacks are rate limited (excess dropped + counted).
+input_max_move_packets_per_second=1000
+input_attacks_per_second=20
+input_attack_burst=20
+
+# Logging
+log_level=info
+log_file=logs/gameserver.log
+
+# Dynamic zone partitioning (control plane ~1 Hz; simulation stays 20 Hz).
+# Scores are normalized load fractions (1.0 == at budget). Merge sits far
+# below split (hysteresis) plus cooldowns, so the topology cannot flap.
+# All keys are optional; invalid values warn + fall back per field, and the
+# effective set is logged at startup by WorldRuntime::ConfigurePartition.
+partition_split_load_threshold=0.9
+partition_merge_load_threshold=0.25
+partition_sustained_window_seconds=10
+partition_split_cooldown_seconds=30
+partition_merge_cooldown_seconds=60
+partition_tick_budget_ms=16.0
+partition_resident_budget=2000
+partition_max_depth=4
+partition_min_zone_size_m=500.0
+
+# Adaptive split scoring (Adaptive Simulation Fabric phase 2). Read-only
+# scorer over the Continuous Load Field: it evaluates a few deterministic
+# candidate cut points, scores each as expected improvement over doing
+# nothing, and only recommends a split when the best candidate clears the
+# minimum-improvement gate. The existing transactional split/merge executor
+# performs the mutation; all hard gates (sustained window, cooldown, depth,
+# min size) stay in place. Invalid values warn + fall back per field.
+#
+# Score = w_balance*balance_benefit
+#       - w_boundary*boundary_penalty - w_migration*migration_penalty
+#       - w_replication*replication_penalty - w_instability*instability_penalty
+#       - topology_penalty
+partition_scoring_adaptive_enabled=true
+partition_min_expected_improvement=0.10
+partition_scoring_timescale=fast
+partition_scoring_boundary_band_m=180.0
+partition_scoring_hotspot_threshold=0.5
+partition_scoring_hotspot_max_count=4
+partition_scoring_weight_balance=1.0
+partition_scoring_weight_boundary=0.35
+partition_scoring_weight_migration=0.15
+partition_scoring_weight_replication=0.20
+partition_scoring_weight_instability=0.10
+partition_scoring_topology_penalty=0.05
+partition_scoring_activity_band_budget=50
+partition_scoring_migration_band_budget=2.0
+partition_scoring_replication_band_budget=10.0
+partition_scoring_combat_band_budget=1.0
+partition_scoring_migration_work_budget=2000
+partition_scoring_instability_window_s=120.0
+partition_scoring_decision_log=true
+partition_scoring_why_not_log_seconds=10.0
+
+# Adaptive merge scoring + partition stability controller (phase 3). The tree
+# only simplifies when a whole quadtree sibling group has been SUSTAINED low
+# and the merge is measurably beneficial. Value hysteresis (merge threshold
+# far below split), time hysteresis (long group sustained-low window),
+# directional cooldowns and a post-merge safety margin prevent split/merge
+# oscillation. Invalid values warn + fall back per field.
+#
+# MergeScore = w_topology * topology_benefit
+#            + w_boundary * boundary_benefit + w_migration * migration_benefit
+#            + w_replication * replication_benefit
+#            - w_risk * parent_load_risk - w_execution * execution_penalty
+#            - w_instability * instability_penalty
+partition_merge_sustained_low_seconds=90.0
+partition_split_to_merge_cooldown_seconds=120.0
+partition_merge_to_split_cooldown_seconds=90.0
+partition_scoring_post_merge_safety_margin=0.15
+partition_scoring_min_merge_improvement=0.10
+partition_scoring_merge_topology_benefit=0.05
+partition_scoring_weight_merge_topology=1.0
+partition_scoring_weight_merge_boundary=0.35
+partition_scoring_weight_merge_migration=0.35
+partition_scoring_weight_merge_replication=0.20
+partition_scoring_weight_merge_risk=1.0
+partition_scoring_weight_merge_execution=0.15
+partition_scoring_weight_merge_instability=0.10
+partition_scoring_oscillation_window_seconds=300.0
+# Emergency split bypass: when the merge-to-split cooldown would block an
+# otherwise-passing split, a measured dual signal (p99 tick >= N x budget on
+# top of the passed load gate) may override it. Set to false to disable.
+partition_scoring_emergency_split_bypass=true
+partition_scoring_emergency_p99_multiplier=2.0
+
+# Simulation LOD (server-side compute tiers, not graphics). Mobs simulate at
+# Full (20 Hz) near players, Reduced/Low farther out, Dormant when nothing is
+# relevant. Promotion is immediate (attack/damage/proximity/spawn/migration);
+# demotion cascades down after per-level graces. All keys optional; invalid
+# values warn + fall back, effective set logged at startup.
+simulation_lod_enabled=true
+simulation_full_radius_m=150.0
+simulation_reduced_radius_m=500.0
+simulation_low_radius_m=1500.0
+simulation_reduced_hz=10.0
+simulation_low_hz=1.0
+simulation_demote_full_sec=5.0
+simulation_demote_reduced_sec=30.0
+simulation_demote_low_sec=60.0
+
+# Continuous Multi-Channel Load Field (Adaptive Simulation Fabric, phase 1).
+# World-space map of actual server work in five independent channels:
+# SimulationCost (executed AI/movement updates), ReplicationPressure
+# (measured outbound bytes), AOIWork (queries + pre-cap candidates),
+# CombatHeat (attack/damage events) and MigrationPressure (transfers +
+# boundary crossings). Derived telemetry only: no gameplay effect, no
+# partition decision reads it yet. All keys optional; invalid values warn +
+# fall back per field, effective set logged at startup. The world bounds are
+# runtime-owned (terrain extent), never config.
+load_field_enabled=true
+# L0 cell size in meters. 500m over the 100km world = 200x200 = 40k cells
+# (~3.2MB per generation); 250m = 160k cells. Benchmarked, not coupled to
+# the activity field or AOI radius. Safe range: >= 10 m, and at most 2^20
+# cells over the world bounds (100 km world: >= ~98 m); smaller values are
+# raised with a warning.
+load_field_cell_size_m=500.0
+load_field_aggregation_hz=1.0
+# Coarse L1 seam: one L1 cell = l1_ratio x l1_ratio L0 cells.
+load_field_l1_enabled=true
+load_field_l1_ratio=4
+# Normalization reference budgets: raw units per second per cell == 1.0.
+load_field_simulation_budget=5000
+load_field_replication_budget=1000000
+load_field_aoi_budget=20000
+load_field_combat_budget=100
+load_field_migration_budget=50
+# Composite load weights (raw channel breakdown always stays available).
+load_field_weight_simulation=1.0
+load_field_weight_replication=1.0
+load_field_weight_aoi=1.0
+load_field_weight_combat=1.0
+load_field_weight_migration=1.0
+# Asymmetric two-timescale EMA time constants (seconds): fast rise / slow
+# fall on each timescale. A 1-window spike cannot thrash; a dead hotspot
+# cools down instead of staying hot forever.
+load_field_fast_rise_tau_s=1.5
+load_field_fast_fall_tau_s=8.0
+load_field_slow_rise_tau_s=8.0
+load_field_slow_fall_tau_s=25.0
+
+# SL-2 R6 server loading policy: CLI --warp-policy overrides this value.
+# strict (default): any target inside any trigger is an error (413).
+# legacy: acyclic chains warn; self-loops/cycles always fail (412).
+# Applies to startup, --startup-check and --validate-world-package; no fallback.
+# The checked-in test_zone contains a chain: opt in explicitly for that fixture.
+#warp_policy=strict

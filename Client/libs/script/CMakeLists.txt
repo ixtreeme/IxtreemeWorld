@@ -2,6 +2,20 @@ file(GLOB IXSCRIPT_LUA_SOURCES CONFIGURE_DEPENDS third_party/lua/*.c)
 # User/sample native scripts (the C++ "MonoBehaviour"s). Drop new *.cpp here + IXSCRIPT_REGISTER.
 file(GLOB IXSCRIPT_NATIVE_SCRIPTS CONFIGURE_DEPENDS scripts_native/*.cpp)
 
+# AngelScript comes from vcpkg (`angelscript[addons]` — see vcpkg_require in Client/CMakeLists.txt).
+find_package(Angelscript CONFIG REQUIRED)
+# The `addons` feature installs the add-on sources/headers under <prefix>/include/angelscript/...
+# scriptstdstring registers std::string as the script `string` type (compiled into this target).
+find_path(ANGELSCRIPT_ADDON_INCLUDE_DIR scriptstdstring/scriptstdstring.h PATH_SUFFIXES angelscript)
+if(NOT ANGELSCRIPT_ADDON_INCLUDE_DIR)
+    message(FATAL_ERROR
+        "AngelScript add-on headers not found. Install the vcpkg package 'angelscript[addons]'.")
+endif()
+set(ANGELSCRIPT_STDSTRING_SOURCE "${ANGELSCRIPT_ADDON_INCLUDE_DIR}/scriptstdstring/scriptstdstring.cpp")
+set(ANGELSCRIPT_STDSTRING_UTILS_SOURCE "${ANGELSCRIPT_ADDON_INCLUDE_DIR}/scriptstdstring/scriptstdstring_utils.cpp")
+# scriptstdstring_utils needs the array<T> addon (split/join); the array type is useful to scripts anyway.
+set(ANGELSCRIPT_ARRAY_SOURCE "${ANGELSCRIPT_ADDON_INCLUDE_DIR}/scriptarray/scriptarray.cpp")
+
 add_library(IXEngineScript STATIC
     ScriptSystem.cpp
     ScriptSystem.h
@@ -10,12 +24,17 @@ add_library(IXEngineScript STATIC
     NativeScript.h
     LuaBackend.cpp
     LuaBackend.h
+    AngelScriptBackend.cpp
+    AngelScriptBackend.h
     ScriptApi.h
     IScriptBackend.h
     ScriptComponent.h
     IxModuleApi.h
     ${IXSCRIPT_NATIVE_SCRIPTS}
     ${IXSCRIPT_LUA_SOURCES}
+    ${ANGELSCRIPT_STDSTRING_SOURCE}
+    ${ANGELSCRIPT_STDSTRING_UTILS_SOURCE}
+    ${ANGELSCRIPT_ARRAY_SOURCE}
 )
 
 # Vendored Lua is C; compile it as C (separate TUs) so its linkage stays C. sol2 wraps lua.h in
@@ -29,11 +48,14 @@ target_include_directories(IXEngineScript
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/lua   # lua.h etc. — only this lib's .cpp needs it
         ${CMAKE_CURRENT_SOURCE_DIR}/third_party/sol2   # <sol/sol.hpp>
+        ${ANGELSCRIPT_ADDON_INCLUDE_DIR}               # <scriptstdstring/scriptstdstring.h>
 )
 
 target_link_libraries(IXEngineScript
     PUBLIC
         IXEngineDebug
+    PRIVATE
+        Angelscript::angelscript
 )
 
 target_compile_definitions(IXEngineScript

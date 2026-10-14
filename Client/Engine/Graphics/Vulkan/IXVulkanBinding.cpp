@@ -39,6 +39,12 @@ IXVulkanBindGroup::IXVulkanBindGroup(IXVulkanDevice& device,
     , m_textures(std::move(textureKeeps))
     , m_samplers(std::move(samplerKeeps))
 {
+    for (const auto& buffer : m_buffers)
+        m_kept.insert(buffer.get());
+    for (const auto& texture : m_textures)
+        m_kept.insert(texture.get());
+    for (const auto& sampler : m_samplers)
+        m_kept.insert(sampler.get());
 }
 
 IXVulkanBindGroup::~IXVulkanBindGroup()
@@ -61,7 +67,7 @@ void IXVulkanBindGroup::UpdateBuffer(std::uint32_t setIndex,
     assert(native != nullptr && "foreign IXRHIBuffer used with IXVulkan backend");
     if (native == nullptr)
         return;
-    m_buffers.push_back(buffer); // shared lifetime with the group
+    Keep(m_buffers, buffer); // shared lifetime with the group
 
     VkDescriptorBufferInfo info{};
     info.buffer = native->Native();
@@ -96,12 +102,13 @@ void IXVulkanBindGroup::UpdateTexture(std::uint32_t setIndex,
         "foreign IXRHITexture/Sampler used with IXVulkan backend");
     if (nativeTexture == nullptr || nativeSampler == nullptr)
         return;
-    m_textures.push_back(texture);
-    m_samplers.push_back(sampler);
+    Keep(m_textures, texture);
+    Keep(m_samplers, sampler);
 
+    // Sampled depth too (terrain shadow map, scene-depth refraction input): see TransitionTexture.
     VkDescriptorImageInfo info{};
     info.sampler = nativeSampler->Native();
-    info.imageView = nativeTexture->NativeView();
+    info.imageView = nativeTexture->NativeSampledView();
     info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkWriteDescriptorSet write{};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -123,10 +130,10 @@ void IXVulkanBindGroup::UpdateSampledImage(std::uint32_t setIndex,
     assert(nativeTexture != nullptr && "foreign IXRHITexture used with IXVulkan backend");
     if (nativeTexture == nullptr)
         return;
-    m_textures.push_back(texture);
+    Keep(m_textures, texture);
 
     VkDescriptorImageInfo info{};
-    info.imageView = nativeTexture->NativeView();
+    info.imageView = nativeTexture->NativeSampledView();
     info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     VkWriteDescriptorSet write{};
     write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -148,7 +155,7 @@ void IXVulkanBindGroup::UpdateSampler(std::uint32_t setIndex,
     assert(nativeSampler != nullptr && "foreign IXRHISampler used with IXVulkan backend");
     if (nativeSampler == nullptr)
         return;
-    m_samplers.push_back(sampler);
+    Keep(m_samplers, sampler);
 
     VkDescriptorImageInfo info{};
     info.sampler = nativeSampler->Native();

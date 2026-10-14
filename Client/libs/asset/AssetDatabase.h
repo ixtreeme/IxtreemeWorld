@@ -51,8 +51,10 @@ enum class AssetType
     Project,
     AnimationClip,
     AnimatorController,
+    ParticleEffect,
     AudioClip,
     Script,
+    UiDocument,  // game UI (RmlUi): .rml / .rcss
     Unknown
 };
 
@@ -78,6 +80,7 @@ public:
     std::optional<Guid> resolvePath(const std::filesystem::path& absPath) const;
     Guid getOrCreateGuid(const std::filesystem::path& absPath);
     std::vector<Guid> loadDefaultMaterials(const std::filesystem::path& modelPath) const;
+    std::vector<Guid> loadDependencies(const std::filesystem::path& assetPath) const;
     bool writeDefaultMaterials(const std::filesystem::path& modelPath, const std::vector<Guid>& materials) const;
     bool writeDependencies(const std::filesystem::path& assetPath, const std::vector<Guid>& dependencies) const;
     bool writeSkeletalAsset(const std::filesystem::path& modelPath,
@@ -98,6 +101,9 @@ private:
     };
 
     std::filesystem::path canonicalPath(const std::filesystem::path& path) const;
+    // True for a path inside a directory the scan skips (build/, .git/, ...): file-watcher events
+    // there (e.g. compiler outputs under <Project>/Scripts/build) must not register assets either.
+    bool isInIgnoredDirectory(const std::filesystem::path& path) const;
     std::filesystem::path metaPathFor(const std::filesystem::path& assetPath) const;
     std::filesystem::path assetPathForMeta(const std::filesystem::path& metaPath) const;
     std::string displayPath(const std::filesystem::path& path) const;

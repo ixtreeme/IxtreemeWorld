@@ -1,6 +1,7 @@
 // This file is included from EditorImGui.cpp inside the editor-enabled implementation block.
 // Keep shared anonymous-namespace helpers in EditorImGui.cpp until this panel group is fully decoupled.
 
+// One axis of a vector row: the colored axis letter, then the value filling `width`.
 bool EditorImGui::RenderAxisFloat(const char* axis,
                                   float& value,
                                   float r,
@@ -8,46 +9,84 @@ bool EditorImGui::RenderAxisFloat(const char* axis,
                                   float b,
                                   float speed,
                                   float minValue,
-                                  float maxValue)
+                                  float maxValue,
+                                  const char* format)
 {
     ImGui::PushID(axis);
+    const float width = ImGui::CalcItemWidth();
+    ImGui::BeginGroup();
     ImGui::TextColored(ImVec4(r, g, b, 1.0f), "%s", axis);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(-1.0f);
-    const bool changed = ImGui::DragFloat("##value", &value, speed, minValue, maxValue, "%.2f");
+    ImGui::SameLine(0.0f, 3.0f);
+    ImGui::SetNextItemWidth(std::max(20.0f, width - ImGui::CalcTextSize(axis).x - 3.0f));
+    const bool changed = ImGui::DragFloat("##value", &value, speed, minValue, maxValue, format);
+    ImGui::EndGroup();
     ImGui::PopID();
     return changed;
 }
 
-bool EditorImGui::RenderTransformComponent(float* position, float* rotation, float* scale)
+bool EditorImGui::RenderTransformComponent(float* position, float* rotation, float* scale, bool meshScale,
+                                         bool allowZeroScale)
 {
     bool changed = false;
-    if (ImGui::CollapsingHeader(ICON_FA_CUBE " Transform", ImGuiTreeNodeFlags_DefaultOpen))
+    // Position, rotation and scale as one row each: X / Y / Z side by side, like every 3D editor.
+    const auto vectorRow = [&](const char* label, const char* tooltip, float* values, float speed, float minValue, float maxValue,
+                               const char* format = "%.2f") {
+        UI::Property(label, [&](const char*) {
+            ImGui::PushID(label);
+            const float spacing = ImGui::GetStyle().ItemInnerSpacing.x;
+            const float fieldWidth = std::max(30.0f, (ImGui::GetContentRegionAvail().x - spacing * 2.0f) / 3.0f);
+            const char* axes[] = {"X", "Y", "Z"};
+            const ImVec4 colors[] = {UI::Theme::AxisX, UI::Theme::AxisY, UI::Theme::AxisZ};
+            for (int i = 0; i < 3; ++i)
+            {
+                if (i > 0)
+                    ImGui::SameLine(0.0f, spacing);
+                ImGui::PushItemWidth(fieldWidth);
+                changed |= RenderAxisFloat(axes[i], values[i], colors[i].x, colors[i].y, colors[i].z, speed, minValue, maxValue, format);
+                ImGui::PopItemWidth();
+            }
+            ImGui::PopID();
+            return false;
+        });
+        UI::ItemTooltip(tooltip);
+    };
+    if (ImGui::CollapsingHeader(ICON_FA_ARROWS_UP_DOWN_LEFT_RIGHT "  Transform", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
     {
-        ImGui::TextDisabled("Position");
-        changed |= RenderAxisFloat("X", position[0], 0.86f, 0.25f, 0.25f, 0.1f, -500.0f, 500.0f);
-        changed |= RenderAxisFloat("Y", position[1], 0.30f, 0.78f, 0.34f, 0.1f, -100.0f, 200.0f);
-        changed |= RenderAxisFloat("Z", position[2], 0.28f, 0.45f, 0.92f, 0.1f, -500.0f, 500.0f);
-
+        vectorRow("Position", "Position in metres", position, 0.1f, -500.0f, 500.0f);
         if (rotation)
-        {
-            ImGui::Spacing();
-            ImGui::TextDisabled("Rotation");
-            changed |= RenderAxisFloat("Pitch", rotation[0], 0.86f, 0.25f, 0.25f, 0.5f, 0.0f, 0.0f);
-            changed |= RenderAxisFloat("Yaw", rotation[1], 0.30f, 0.78f, 0.34f, 0.5f, 0.0f, 0.0f);
-            changed |= RenderAxisFloat("Roll", rotation[2], 0.28f, 0.45f, 0.92f, 0.5f, 0.0f, 0.0f);
-        }
-
-        if (scale)
-        {
-            ImGui::Spacing();
-            ImGui::TextDisabled("Scale");
-            changed |= RenderAxisFloat("W", scale[0], 0.86f, 0.25f, 0.25f, 0.1f, 0.1f, 200.0f);
-            changed |= RenderAxisFloat("H", scale[1], 0.30f, 0.78f, 0.34f, 0.1f, 0.1f, 200.0f);
-            changed |= RenderAxisFloat("D", scale[2], 0.28f, 0.45f, 0.92f, 0.1f, 0.1f, 200.0f);
-        }
+            vectorRow("Rotation", "Rotation in degrees around X (pitch), Y (yaw) and Z (roll)", rotation, 0.5f, 0.0f, 0.0f);
+        // A model scale gets three decimals and a 0.001 floor: models authored in centimetres
+        // (Mixamo FBX) need 0.01, which "%.2f" with a 0.1 drag floor could neither show nor reach.
+        if (scale && meshScale)
+            vectorRow("Scale", allowZeroScale
+                ? "Empty object scale. Zero is allowed; particle size and spawn volume use their own settings."
+                : "Scale along X, Y and Z (1 = as imported; 0.01 turns centimetres into metres)",
+                scale, 0.01f, allowZeroScale ? 0.0f : 0.001f, 1000.0f, "%.3f");
+        else if (scale)
+            vectorRow("Scale", "Size along X, Y and Z", scale, 0.1f, 0.1f, 200.0f);
     }
     return changed;
+}
+
+void EditorImGui::RenderInspectorTitle(const char* icon, const char* typeName, std::uint32_t objectId)
+{
+    const ImVec2 start = ImGui::GetCursorPos();
+    if (UI::GetEditorFonts().bold)
+        ImGui::PushFont(UI::GetEditorFonts().bold);
+    ImGui::Text("%s  %s", icon, typeName);
+    if (UI::GetEditorFonts().bold)
+        ImGui::PopFont();
+
+    // Engine ids and file paths help when debugging, not when building a scene: hidden by default.
+    const float buttonSize = ImGui::GetFrameHeight();
+    ImGui::SetCursorPos(ImVec2(ImGui::GetWindowContentRegionMax().x - buttonSize, start.y));
+    if (UI::ToggleIconButton(ICON_FA_BUG, m_inspectorShowDebugInfo,
+            m_inspectorShowDebugInfo ? "Hide engine ids and asset paths" : "Show engine ids and asset paths",
+            buttonSize))
+        m_inspectorShowDebugInfo = !m_inspectorShowDebugInfo;
+    if (m_inspectorShowDebugInfo)
+        ImGui::TextDisabled("entity %llu, object %u", static_cast<unsigned long long>(m_selectedHierarchyEntity), objectId);
+    ImGui::Separator();
 }
 
 void EditorImGui::RenderAddComponentMenu()
@@ -74,7 +113,7 @@ void EditorImGui::RenderAddComponentMenu()
         if (id == "builtin.transform")
             return hasSelection;
         if (id == "builtin.mesh_renderer")
-            return hasMesh;
+            return hasMesh && m_meshRendererState.HasMeshGeometry();
         if (id == "builtin.water_body")
             return hasWater;
         if (id == "builtin.point_light")
@@ -104,6 +143,10 @@ void EditorImGui::RenderAddComponentMenu()
             return hasMesh && m_meshRendererState.hasAudioListener;
         if (id == "scripting.script")
             return hasMesh && m_meshRendererState.hasScript;
+        if (id == "effects.particle_system")
+            return hasMesh && m_meshRendererState.hasParticleSystem;
+        if (id == "effects.fog_volume")
+            return hasMesh && m_meshRendererState.hasFogVolume;
         return hasMesh && hasAttachedComponent(definition.id);
     };
 
@@ -124,7 +167,7 @@ void EditorImGui::RenderAddComponentMenu()
     if (ImGui::BeginPopup("AddComponentPopup"))
     {
         ImGui::SetNextItemWidth(260.0f);
-        ImGui::InputTextWithHint("##componentSearch", "Search components...", m_componentSearchBuffer, sizeof(m_componentSearchBuffer));
+        UI::Prop::InputTextWithHint("##componentSearch", "Search components...", m_componentSearchBuffer, sizeof(m_componentSearchBuffer));
         ImGui::Separator();
 
         const std::string filter = ToLowerAscii(m_componentSearchBuffer);
@@ -167,6 +210,199 @@ void EditorImGui::RenderAddComponentMenu()
     }
 }
 
+bool EditorImGui::RenderLodGroupControls()
+{
+    LodComponent& lod = m_meshRendererState.lod;
+    bool changed = UI::Prop::Checkbox("Enabled", &lod.enabled);
+    const auto assetDefault = FindModelLodDefault(m_meshRendererState.meshAssetId);
+    ImGui::TextDisabled("%s", lod.overrideAssetDefault ? "Instance override" :
+        (assetDefault ? "Model asset default" : "Local settings"));
+    bool overrideEnabled = lod.overrideAssetDefault;
+    if (UI::Prop::Checkbox("Override on this instance", &overrideEnabled))
+    {
+        if (overrideEnabled && assetDefault) lod.config = *assetDefault;
+        lod.overrideAssetDefault = overrideEnabled;
+        changed = true;
+    }
+    LodConfig config = lod.overrideAssetDefault ? lod.config : assetDefault.value_or(lod.config);
+    config.levelCount = std::clamp(config.levelCount, 1u, LodConfig::MaxLevels);
+    const bool editable = lod.overrideAssetDefault || !assetDefault;
+    bool configChanged = false, commit = false;
+    ImGui::TextWrapped("Distance-based LOD. Drag the dividers to move transitions.");
+    if (m_meshRendererState.skinned)
+        ImGui::TextWrapped("Automatic geometry LOD is currently available for static meshes.");
+    const ImU32 colors[] = {IM_COL32(102,126,51,255), IM_COL32(48,112,145,255),
+        IM_COL32(93,85,145,255), IM_COL32(153,104,47,255)};
+    const float width = std::max(1.0f, ImGui::GetContentRegionAvail().x);
+    const ImGuiID rangeId = ImGui::GetID("##lod_timeline_range");
+    const float desiredRange = std::max(10.0f, config.distances[config.levelCount - 1] * 1.25f);
+    if (!ImGui::IsAnyItemActive()) ImGui::GetStateStorage()->SetFloat(rangeId, desiredRange);
+    const float range = ImGui::GetStateStorage()->GetFloat(rangeId, desiredRange);
+    const ImVec2 bar = ImGui::GetCursorScreenPos();
+    const float barHeight = ImGui::GetTextLineHeight() * 2.0f + 10.0f;
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    for (std::uint32_t level = 0; level < config.levelCount; ++level)
+    {
+        const float from = std::clamp(config.distances[level] / range, 0.0f, 1.0f);
+        const float to = level + 1 < config.levelCount ?
+            std::clamp(config.distances[level + 1] / range, from, 1.0f) : 1.0f;
+        const ImVec2 a(bar.x + from * width, bar.y), b(bar.x + to * width, bar.y + barHeight);
+        draw->AddRectFilled(a, b, colors[level]);
+        char label[64]{};
+        std::snprintf(label, sizeof(label), "LOD %u\n%.0f m%s", level, config.distances[level],
+            level + 1 == config.levelCount ? "+" : "");
+        draw->PushClipRect(a, b, true);
+        draw->AddText(ImVec2(a.x + 5.0f, a.y + 4.0f), IM_COL32_WHITE, label);
+        draw->PopClipRect();
+    }
+    ImGui::BeginDisabled(!editable);
+    for (std::uint32_t level = 1; level < config.levelCount; ++level)
+    {
+        ImGui::PushID(static_cast<int>(level));
+        const float divider = bar.x + std::clamp(config.distances[level] / range, 0.0f, 1.0f) * width;
+        ImGui::SetCursorScreenPos(ImVec2(divider - 4.0f, bar.y));
+        ImGui::InvisibleButton("##transition", ImVec2(8.0f, barHeight));
+        if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left) && ImGui::GetIO().MouseDelta.x != 0.0f)
+        {
+            const float low = config.distances[level - 1] + 0.1f;
+            const float high = level + 1 < config.levelCount ? config.distances[level + 1] - 0.1f : 100000.0f;
+            const float distance = std::clamp(config.distances[level] + ImGui::GetIO().MouseDelta.x * range / width,
+                low, std::max(low, high));
+            if (distance != config.distances[level])
+            {
+                config.distances[level] = distance;
+                configChanged = true;
+                ImGui::MarkItemEdited(ImGui::GetItemID());
+            }
+        }
+        commit |= ImGui::IsItemDeactivatedAfterEdit();
+        draw->AddLine(ImVec2(divider, bar.y), ImVec2(divider, bar.y + barHeight), IM_COL32(230,230,230,190));
+        UI::ItemTooltip(("LOD " + std::to_string(level) + " transition: " +
+            std::to_string(config.distances[level]) + " m").c_str());
+        ImGui::PopID();
+    }
+    ImGui::EndDisabled();
+    ImGui::SetCursorScreenPos(ImVec2(bar.x, bar.y + barHeight + ImGui::GetStyle().ItemSpacing.y));
+    if (m_meshRendererState.lodDiagnosticsAvailable)
+    {
+        const float marker = bar.x + std::clamp(m_meshRendererState.lodCameraDistance / range, 0.0f, 1.0f) * width;
+        draw->AddTriangleFilled(ImVec2(marker - 5.0f, bar.y + barHeight),
+            ImVec2(marker + 5.0f, bar.y + barHeight), ImVec2(marker, bar.y + barHeight - 7.0f),
+            IM_COL32(115,211,255,255));
+        ImGui::TextDisabled("Object size: %.2f m | Scene camera: %.1f m (centre)",
+            m_meshRendererState.lodObjectSize, m_meshRendererState.lodCameraDistance);
+        ImGui::TextDisabled("Scene View: LOD %u%s", m_meshRendererState.lodActiveLevel,
+            m_meshRendererState.lodActiveLevel > 0 && (m_meshRendererState.lodBuildPending ||
+                !m_meshRendererState.lodTrianglesKnown[m_meshRendererState.lodActiveLevel]) ?
+            " (building; displaying LOD 0)" : "");
+        if (m_meshRendererState.lodGameDiagnosticsAvailable)
+            ImGui::TextDisabled("Game camera: %.1f m (centre) | LOD %u",
+                m_meshRendererState.lodGameCameraDistance, m_meshRendererState.lodGameActiveLevel);
+    }
+
+    ImGui::BeginDisabled(!editable);
+    for (std::uint32_t level = 0; level < config.levelCount; ++level)
+    {
+        ImGui::PushID(static_cast<int>(level));
+        const bool known = m_meshRendererState.lodTrianglesKnown[level];
+        const auto triangles = m_meshRendererState.lodTriangles[level];
+        char label[160]{};
+        if (known)
+            std::snprintf(label, sizeof(label), "LOD %u   |   %llu tris (%.1f%%)   |   %u submeshes", level,
+                static_cast<unsigned long long>(triangles), m_meshRendererState.lodTriangles[0] ?
+                100.0 * triangles / m_meshRendererState.lodTriangles[0] : 0.0, m_meshRendererState.lodSubmeshCount);
+        else
+            std::snprintf(label, sizeof(label), "LOD %u   |   %s", level,
+                m_meshRendererState.lodCpuBuildPending ? "Building..." : "Not built");
+        ImGui::PushStyleColor(ImGuiCol_Header, ImGui::ColorConvertU32ToFloat4(colors[level]));
+        char compactLabel[96]{};
+        if (known && width < 450.0f)
+            std::snprintf(compactLabel, sizeof(compactLabel), "LOD %u | %llu tris (%.1f%%)", level,
+                static_cast<unsigned long long>(triangles), m_meshRendererState.lodTriangles[0] ?
+                100.0 * triangles / m_meshRendererState.lodTriangles[0] : 0.0);
+        const std::string stableLabel = std::string(compactLabel[0] ? compactLabel : label) + "###lod_level";
+        const bool open = ImGui::CollapsingHeader(stableLabel.c_str());
+        ImGui::PopStyleColor();
+        UI::ItemTooltip(label);
+        if (open)
+        {
+            ImGui::TextWrapped("Model: %s", m_meshRendererState.meshDisplayName.c_str());
+            if (known) ImGui::TextDisabled("%u submeshes", m_meshRendererState.lodSubmeshCount);
+            if (level == 0) ImGui::TextDisabled("Original mesh (100%%)");
+            else
+            {
+                float distance = config.distances[level];
+                if (UI::Prop::DragFloat("Transition (m)", &distance, 0.5f,
+                    config.distances[level - 1] + 0.1f,
+                    level + 1 < config.levelCount ? std::max(config.distances[level - 1] + 0.1f,
+                        config.distances[level + 1] - 0.1f) : 100000.0f, "%.1f m"))
+                {
+                    const float low = config.distances[level - 1] + 0.1f;
+                    const float high = level + 1 < config.levelCount ? config.distances[level + 1] - 0.1f : 100000.0f;
+                    config.distances[level] = std::clamp(distance, low, std::max(low, high));
+                    configChanged = true;
+                }
+                commit |= ImGui::IsItemDeactivatedAfterEdit();
+                float ratio = config.targetRatios[level] * 100.0f;
+                if (UI::Prop::SliderFloat("Target geometry", &ratio, 1.0f, 100.0f, "%.1f%%"))
+                {
+                    config.targetRatios[level] = std::clamp(ratio / 100.0f, 0.01f, 1.0f);
+                    configChanged = true;
+                }
+                commit |= ImGui::IsItemDeactivatedAfterEdit();
+                UI::ItemTooltip("Triangle budget. Low ratios permit stronger deformation and changes at texture seams. The header shows the actual triangle count; each submesh retains geometry.");
+            }
+        }
+        ImGui::PopID();
+    }
+    ImGui::BeginDisabled(config.levelCount >= LodConfig::MaxLevels);
+    if (ImGui::Button("+ Add LOD")) { ++config.levelCount; configChanged = commit = true; }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(config.levelCount <= 1);
+    if (ImGui::Button("- Last LOD")) { --config.levelCount; configChanged = commit = true; }
+    ImGui::EndDisabled();
+    if (ImGui::TreeNode("Advanced"))
+    {
+        if (UI::Prop::DragFloat("Hysteresis (m)", &config.hysteresisMeters, 0.25f, 0.0f, 100.0f, "%.2f m"))
+            configChanged = true;
+        commit |= ImGui::IsItemDeactivatedAfterEdit();
+        ImGui::TextWrapped("Hysteresis prevents rapid switching near a transition. The final LOD remains visible at greater distances.");
+        ImGui::TreePop();
+    }
+    ImGui::EndDisabled();
+    if (m_meshRendererState.lodCpuBuildPending) ImGui::TextDisabled("Generating LOD geometry in the background...");
+    if (m_meshRendererState.lodBuildPending) ImGui::TextDisabled("Generated LODs waiting for GPU upload.");
+    if (configChanged && editable)
+    {
+        config.targetRatios[0] = 1.0f;
+        config.distances[0] = 0.0f;
+        for (std::uint32_t level = 1; level < config.levelCount; ++level)
+            config.distances[level] = std::max(config.distances[level], config.distances[level - 1] + 0.1f);
+        lod.config = config;
+        changed = true;
+    }
+    ImGui::BeginDisabled(m_meshRendererState.skinned);
+    if (UI::IconButton(ICON_FA_ROTATE, "Generate / Rebuild LODs", ImVec2(-1, 0))) commit = true;
+    ImGui::EndDisabled();
+    if (commit && !m_meshRendererState.skinned)
+    {
+        m_commands.lodQualityCommitRequested = true;
+        m_commands.lodQualityCommitEntityId = m_meshRendererState.id;
+        m_commands.lodQualityCommitConfig = config;
+    }
+    if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Set as model asset default", ImVec2(-1, 0)) &&
+        SaveModelLodDefault(m_meshRendererState.meshAssetId, config))
+    {
+        lod.overrideAssetDefault = false;
+        lod.config = config;
+        changed = true;
+    }
+    return changed;
+}
+
 bool EditorImGui::RenderAttachedEditorComponents(std::vector<EditorAttachedComponent>& components)
 {
     bool changed = false;
@@ -177,9 +413,8 @@ bool EditorImGui::RenderAttachedEditorComponents(std::vector<EditorAttachedCompo
 
         ImGui::PushID(component.type.c_str());
         const bool isLod = component.type == kLodComponentId;
-        const bool open = ImGui::CollapsingHeader(isLod ? "LOD Group" : "Note", ImGuiTreeNodeFlags_DefaultOpen);
-        ImGui::SameLine();
-        if (ImGui::SmallButton("..."))
+        const bool open = ImGui::CollapsingHeader(isLod ? "LOD Group" : "Note", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
+        if (UI::HeaderMenuButton("Component options"))
             ImGui::OpenPopup("ComponentMenu");
         if (ImGui::BeginPopup("ComponentMenu"))
         {
@@ -194,104 +429,7 @@ bool EditorImGui::RenderAttachedEditorComponents(std::vector<EditorAttachedCompo
         {
             if (isLod)
             {
-                LodComponent& lod = m_meshRendererState.lod;
-                lod.enabled = true;
-                bool lodConfigChanged = false;
-                bool lodCommitRequested = false;
-                const std::optional<LodConfig> assetDefault = FindModelLodDefault(m_meshRendererState.meshAssetId);
-                const char* source = lod.overrideAssetDefault
-                    ? "Entity override"
-                    : (assetDefault ? "Asset default" : "Engine default");
-                ImGui::TextDisabled("Source: %s", source);
-                bool overrideEnabled = lod.overrideAssetDefault;
-                if (ImGui::Checkbox("Override on this entity", &overrideEnabled))
-                {
-                    lod.overrideAssetDefault = overrideEnabled;
-                    if (overrideEnabled && assetDefault)
-                        lod.config = *assetDefault;
-                    lodConfigChanged = true;
-                    changed = true;
-                }
-
-                LodConfig displayConfig = lod.overrideAssetDefault
-                    ? lod.config
-                    : (assetDefault ? *assetDefault : LodConfig{});
-                const bool editEnabled = lod.overrideAssetDefault || !assetDefault;
-                if (!editEnabled)
-                    ImGui::BeginDisabled();
-
-                int levelCount = static_cast<int>(std::clamp(displayConfig.levelCount, 1u, LodConfig::MaxLevels));
-                if (ImGui::SliderInt("Levels", &levelCount, 1, static_cast<int>(LodConfig::MaxLevels)))
-                {
-                    displayConfig.levelCount = static_cast<std::uint32_t>(levelCount);
-                    lodConfigChanged = true;
-                    changed = true;
-                }
-                lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                float hysteresis = displayConfig.hysteresisMeters;
-                if (ImGui::DragFloat("Hysteresis (m)", &hysteresis, 0.25f, 0.0f, 100.0f, "%.2f"))
-                {
-                    displayConfig.hysteresisMeters = std::max(0.0f, hysteresis);
-                    lodConfigChanged = true;
-                    changed = true;
-                }
-                lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                for (std::uint32_t level = 1; level < static_cast<std::uint32_t>(levelCount); ++level)
-                {
-                    ImGui::Separator();
-                    ImGui::Text("LOD%u", level);
-                    float ratioPercent = std::clamp(displayConfig.targetRatios[level], 0.001f, 1.0f) * 100.0f;
-                    std::string ratioLabel = "Target %##ratio" + std::to_string(level);
-                    if (ImGui::SliderFloat(ratioLabel.c_str(), &ratioPercent, 1.0f, 100.0f, "%.1f"))
-                    {
-                        displayConfig.targetRatios[level] = std::clamp(ratioPercent / 100.0f, 0.001f, 1.0f);
-                        lodConfigChanged = true;
-                        changed = true;
-                    }
-                    lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                    float distance = displayConfig.distances[level];
-                    std::string distanceLabel = "Distance (m)##distance" + std::to_string(level);
-                    if (ImGui::DragFloat(distanceLabel.c_str(), &distance, 1.0f, 0.0f, 100000.0f, "%.1f"))
-                    {
-                        displayConfig.distances[level] = std::max(0.0f, distance);
-                        lodConfigChanged = true;
-                        changed = true;
-                    }
-                    lodCommitRequested = lodCommitRequested || ImGui::IsItemDeactivatedAfterEdit();
-                }
-                if (!editEnabled)
-                    ImGui::EndDisabled();
-
-                if (lodConfigChanged && editEnabled)
-                {
-                    displayConfig.levelCount = std::clamp(displayConfig.levelCount, 1u, LodConfig::MaxLevels);
-                    displayConfig.targetRatios[0] = 1.0f;
-                    displayConfig.distances[0] = 0.0f;
-                    lod.config = displayConfig;
-                    if (LodLogsEnabled())
-                    {
-                        Tracenf("[LOD] ui edit entity=%u levels=%u override=%d",
-                            m_meshRendererState.id,
-                            lod.config.levelCount,
-                            lod.overrideAssetDefault ? 1 : 0);
-                    }
-                }
-                if (lodCommitRequested && editEnabled)
-                {
-                    m_commands.lodQualityCommitRequested = true;
-                    m_commands.lodQualityCommitEntityId = m_meshRendererState.id;
-                    m_commands.lodQualityCommitConfig = lod.config;
-                }
-                if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Set as asset default", ImVec2(-1.0f, 0.0f)))
-                {
-                    const LodConfig defaultConfig = lod.overrideAssetDefault ? lod.config : displayConfig;
-                    if (SaveModelLodDefault(m_meshRendererState.meshAssetId, defaultConfig))
-                    {
-                        lod.overrideAssetDefault = false;
-                        lod.config = defaultConfig;
-                        changed = true;
-                    }
-                }
+                changed |= RenderLodGroupControls();
             }
             else
             {
@@ -314,59 +452,94 @@ void EditorImGui::RenderPrefabOverrideControls(const std::string& assetId,
                                                const std::vector<std::string>& overrides)
 {
     const std::string effectiveAssetId = !instance.assetId.empty() ? instance.assetId : assetId;
-    std::string assetLabel = effectiveAssetId.empty() ? std::string("<missing>") : effectiveAssetId;
-    if (m_assetLibrary)
-    {
-        if (const auto entry = m_assetLibrary->FindById(effectiveAssetId))
-            assetLabel = entry->displayName.empty() ? entry->filename : entry->displayName;
-    }
+    std::string assetLabel = "Missing prefab source";
+    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(effectiveAssetId) : std::optional<AssetLibrary::Entry>{};
+    const bool sourceAvailable = entry && entry->category == AssetLibrary::Category::Prefab;
+    if (sourceAvailable) assetLabel = entry->displayName.empty() ? entry->filename : entry->displayName;
 
-    ImGui::TextUnformatted("Linked Prefab Instance");
-    ImGui::TextDisabled("Asset: %s", assetLabel.c_str());
-    ImGui::TextDisabled("Asset ID: %s", effectiveAssetId.c_str());
-    ImGui::TextDisabled("Local ID: %u", instance.localId == 0 ? 1u : instance.localId);
-    ImGui::TextDisabled("Overrides: %zu", overrides.size());
-    ImGui::Separator();
-
-    if (overrides.empty())
+    ImGui::TextWrapped(ICON_FA_LAYER_GROUP " %s", assetLabel.c_str());
+    ImGui::TextDisabled("%s | %zu overrides", instance.linked ? "Linked instance" : "Unlinked instance", overrides.size());
+    if (m_inspectorShowDebugInfo)
     {
-        ImGui::TextDisabled("No instance overrides.");
+        ImGui::TextDisabled("Asset ID: %s", effectiveAssetId.c_str());
+        ImGui::TextDisabled("Local ID: %u", instance.localId == 0 ? 1u : instance.localId);
     }
-    else
+    ImGui::BeginDisabled(!sourceAvailable);
+    if (ImGui::Button("Open"))
     {
-        for (const std::string& overrideName : overrides)
+        m_selectedAssetId = entry->id;
+        m_assetInspectorSelectionActive = true;
+        m_assetStatus = "Editing prefab source: " + assetLabel;
+    }
+    UI::ItemTooltip("Open the prefab source in the Inspector.");
+    ImGui::SameLine();
+    if (ImGui::Button("Select"))
+    {
+        SelectAssetBrowserFolder(entry->subpath);
+        m_assetSearchBuffer[0] = '\0';
+        m_selectedAssetId = entry->id;
+        m_assetBrowserPanelOpen = true;
+        m_assetStatus = "Selected prefab source: " + assetLabel;
+    }
+    UI::ItemTooltip("Reveal the prefab source in the Asset Browser.");
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button("Overrides")) ImGui::OpenPopup("PrefabOverrides");
+    if (ImGui::BeginPopup("PrefabOverrides"))
+    {
+        ImGui::TextWrapped("Changes on this instance compared with its prefab source.");
+        ImGui::Separator();
+
+        if (overrides.empty())
         {
-            ImGui::PushID(overrideName.c_str());
-            ImGui::BulletText("%s", overrideName.c_str());
-            if (overrideName != "Prefab asset missing")
-            {
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Revert"))
-                {
-                    m_commands.revertSelectedPrefabOverride = true;
-                    m_commands.selectedPrefabOverrideName = overrideName;
-                }
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Apply"))
-                {
-                    m_commands.applySelectedPrefabOverrideToAsset = true;
-                    m_commands.selectedPrefabOverrideName = overrideName;
-                }
-            }
-            ImGui::PopID();
+            ImGui::TextDisabled("No instance overrides.");
         }
+        else
+        {
+            for (const std::string& overrideName : overrides)
+            {
+                ImGui::PushID(overrideName.c_str());
+                ImGui::BulletText("%s", overrideName.c_str());
+                if (overrideName != "Prefab asset missing")
+                {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Revert"))
+                    {
+                        m_commands.revertSelectedPrefabOverride = true;
+                        m_commands.selectedPrefabOverrideName = overrideName;
+                    }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Apply"))
+                    {
+                        m_commands.applySelectedPrefabOverrideToAsset = true;
+                        m_commands.selectedPrefabOverrideName = overrideName;
+                    }
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::Separator();
+        ImGui::BeginDisabled(!sourceAvailable || overrides.empty());
+        if (ImGui::Button("Revert All"))
+            m_commands.revertSelectedPrefabInstance = true;
+        ImGui::SameLine();
+        if (ImGui::Button("Apply All"))
+            m_commands.applySelectedPrefabToAsset = true;
+        UI::ItemTooltip("Write all instance overrides back to the prefab source.");
+        ImGui::EndDisabled();
+        ImGui::EndPopup();
     }
-    ImGui::Separator();
-    if (UI::IconButton(ICON_FA_ROTATE, "Refresh Selected Instance", ImVec2(-1.0f, 0.0f)))
-        m_commands.refreshSelectedPrefabInstance = true;
-    if (UI::IconButton(ICON_FA_ROTATE, "Revert All Overrides", ImVec2(-1.0f, 0.0f)))
-        m_commands.revertSelectedPrefabInstance = true;
-    if (UI::IconButton(ICON_FA_FLOPPY_DISK, "Apply All Overrides to Prefab", ImVec2(-1.0f, 0.0f)))
-        m_commands.applySelectedPrefabToAsset = true;
-    if (UI::IconButton(ICON_FA_ROTATE, "Refresh All Prefab Instances", ImVec2(-1.0f, 0.0f)))
-        m_commands.refreshAllPrefabInstances = true;
-    if (UI::IconButton(ICON_FA_LAYER_GROUP, "Unpack Prefab Instance", ImVec2(-1.0f, 0.0f)))
-        m_commands.unpackSelectedPrefabInstance = true;
+    if (ImGui::SmallButton("More...")) ImGui::OpenPopup("PrefabActions");
+    if (ImGui::BeginPopup("PrefabActions"))
+    {
+        ImGui::BeginDisabled(!sourceAvailable);
+        if (ImGui::MenuItem("Refresh this instance")) m_commands.refreshSelectedPrefabInstance = true;
+        if (ImGui::MenuItem("Refresh all linked instances")) m_commands.refreshAllPrefabInstances = true;
+        ImGui::EndDisabled();
+        ImGui::Separator();
+        if (ImGui::MenuItem("Unpack instance")) m_commands.unpackSelectedPrefabInstance = true;
+        ImGui::EndPopup();
+    }
 }
 
 void EditorImGui::RenderSelectedWaterBodyInspector()
@@ -374,14 +547,11 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
     if (!m_waterBodyState.selected)
         return;
 
-    UI::SectionHeader(ICON_FA_CUBE " Entity");
-    ImGui::TextDisabled("flecs=%llu  object=%u",
-        static_cast<unsigned long long>(m_selectedHierarchyEntity),
-        m_waterBodyState.id);
+    RenderInspectorTitle(ICON_FA_DROPLET, "Water Body", m_waterBodyState.id);
 
     char nameBuffer[96]{};
     std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", m_waterBodyState.name.c_str());
-    if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+    if (UI::Prop::InputText("Name", nameBuffer, sizeof(nameBuffer)))
     {
         m_waterBodyState.name = nameBuffer[0] != '\0' ? nameBuffer : ("Water_" + std::to_string(m_waterBodyState.id));
         MarkSelectedWaterBodyChanged();
@@ -400,15 +570,13 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
         MarkSelectedWaterBodyChanged();
     }
 
-    if (!ImGui::CollapsingHeader(ICON_FA_WATER " Water Body", ImGuiTreeNodeFlags_DefaultOpen))
+    if (!ImGui::CollapsingHeader(ICON_FA_WATER " Water Body", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
         return;
     const std::string materialLabel = m_waterBodyState.materialName.empty()
         ? (m_waterBodyState.materialId.empty() ? std::string("Inline Water") : m_waterBodyState.materialId)
         : m_waterBodyState.materialName;
-    ImGui::TextUnformatted("Material");
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.42f, 0.46f, 1.0f));
-    ImGui::Button(materialLabel.c_str(), ImVec2(-1.0f, 42.0f));
-    ImGui::PopStyleColor();
+    UI::AssetField("Material", ICON_FA_WATER, materialLabel, "Double-click to edit this water material. Drop a water material from the Asset Browser here to change it.");
+    const bool openWaterMaterial = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left);
     if (ImGui::BeginDragDropTarget())
     {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
@@ -419,7 +587,7 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
         ImGui::EndDragDropTarget();
     }
 
-    if (UI::IconButton(ICON_FA_PALETTE, "Edit Material"))
+    if (UI::IconButton(ICON_FA_PALETTE, "Edit Material") || openWaterMaterial)
     {
         m_commands.selectedWaterBodyChanged = true;
         m_commands.selectedWaterBody = m_waterBodyState;
@@ -452,6 +620,15 @@ void EditorImGui::RenderSelectedWaterBodyInspector()
         ImGui::EndPopup();
     }
 
+    if (ImGui::CollapsingHeader(ICON_FA_PAINTBRUSH "  Shape", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
+    {
+        if (!CanUseEditorTools())
+            ImGui::BeginDisabled();
+        RenderWaterSculptTool();
+        if (!CanUseEditorTools())
+            ImGui::EndDisabled();
+    }
+
     ImGui::Separator();
     RenderAddComponentMenu();
     ImGui::Separator();
@@ -466,17 +643,14 @@ void EditorImGui::RenderSelectedLightInspector()
 
     const bool isPoint = m_dynamicLightState.type == DynamicLightType::Point;
     const bool isSpot = m_dynamicLightState.type == DynamicLightType::Spot;
-    UI::SectionHeader(ICON_FA_CUBE " Entity");
-    ImGui::TextDisabled("flecs=%llu  object=%u",
-        static_cast<unsigned long long>(m_selectedHierarchyEntity),
-        m_dynamicLightState.id);
+    RenderInspectorTitle(isSpot ? ICON_FA_BULLSEYE : ICON_FA_LIGHTBULB, isSpot ? "Spot Light" : "Point Light", m_dynamicLightState.id);
 
     if (isPoint)
     {
         PointLight& point = m_dynamicLightState.point;
         char nameBuffer[96]{};
         std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", PointLightDisplayName(point).c_str());
-        if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+        if (UI::Prop::InputText("Name", nameBuffer, sizeof(nameBuffer)))
         {
             point.name = nameBuffer;
             MarkSelectedLightChanged();
@@ -492,18 +666,18 @@ void EditorImGui::RenderSelectedLightInspector()
             MarkSelectedLightChanged();
         }
 
-        if (!ImGui::CollapsingHeader(ICON_FA_LIGHTBULB " Point Light", ImGuiTreeNodeFlags_DefaultOpen))
+        if (!ImGui::CollapsingHeader(ICON_FA_LIGHTBULB " Point Light", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
             return;
         bool changed = false;
-        changed |= ImGui::Checkbox("Enabled", &point.enabled);
-        changed |= ImGui::ColorEdit3("Color", &point.r);
-        changed |= ImGui::SliderFloat("Intensity", &point.intensity, 0.0f, 10.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Radius", &point.radius, 0.5f, 100.0f, "%.1f m");
+        changed |= UI::Prop::Checkbox("Enabled", &point.enabled);
+        changed |= UI::Prop::ColorEdit3("Color", &point.r);
+        changed |= UI::Prop::SliderFloat("Intensity", &point.intensity, 0.0f, 10.0f, "%.2f");
+        changed |= UI::Prop::SliderFloat("Radius", &point.radius, 0.5f, 100.0f, "%.1f m");
         if (changed)
             MarkSelectedLightChanged();
 
         if (!point.prefabAssetId.empty() &&
-            ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Prefab", ImGuiTreeNodeFlags_DefaultOpen))
+            ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Prefab", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
         {
             RenderPrefabOverrideControls(point.prefabAssetId, point.prefabInstance, m_dynamicLightState.prefabOverrides);
         }
@@ -513,7 +687,7 @@ void EditorImGui::RenderSelectedLightInspector()
         SpotLight& spot = m_dynamicLightState.spot;
         char nameBuffer[96]{};
         std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", SpotLightDisplayName(spot).c_str());
-        if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+        if (UI::Prop::InputText("Name", nameBuffer, sizeof(nameBuffer)))
         {
             spot.name = nameBuffer;
             MarkSelectedLightChanged();
@@ -533,33 +707,33 @@ void EditorImGui::RenderSelectedLightInspector()
             MarkSelectedLightChanged();
         }
 
-        if (!ImGui::CollapsingHeader(ICON_FA_BULLSEYE " Spot Light", ImGuiTreeNodeFlags_DefaultOpen))
+        if (!ImGui::CollapsingHeader(ICON_FA_BULLSEYE " Spot Light", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
             return;
         bool changed = false;
-        changed |= ImGui::Checkbox("Enabled", &spot.enabled);
-        changed |= ImGui::ColorEdit3("Color", &spot.r);
-        changed |= ImGui::SliderFloat("Intensity", &spot.intensity, 0.0f, 10.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Radius", &spot.radius, 0.5f, 100.0f, "%.1f m");
+        changed |= UI::Prop::Checkbox("Enabled", &spot.enabled);
+        changed |= UI::Prop::ColorEdit3("Color", &spot.r);
+        changed |= UI::Prop::SliderFloat("Intensity", &spot.intensity, 0.0f, 10.0f, "%.2f");
+        changed |= UI::Prop::SliderFloat("Radius", &spot.radius, 0.5f, 100.0f, "%.1f m");
         float pitch = spot.rotation[0] * 57.2957795f;
         float yaw = spot.rotation[1] * 57.2957795f;
-        if (ImGui::DragFloat("Pitch", &pitch, 0.5f, 0.0f, 0.0f, "%.1f deg"))
+        if (UI::Prop::DragFloat("Pitch", &pitch, 0.5f, 0.0f, 0.0f, "%.1f deg"))
         {
             spot.rotation[0] = pitch / 57.2957795f;
             changed = true;
         }
-        if (ImGui::DragFloat("Yaw", &yaw, 0.5f, 0.0f, 0.0f, "%.1f deg"))
+        if (UI::Prop::DragFloat("Yaw", &yaw, 0.5f, 0.0f, 0.0f, "%.1f deg"))
         {
             spot.rotation[1] = yaw / 57.2957795f;
             changed = true;
         }
-        changed |= ImGui::SliderFloat("Inner Cone", &spot.innerConeDegrees, 1.0f, 89.0f, "%.1f deg");
-        changed |= ImGui::SliderFloat("Outer Cone", &spot.outerConeDegrees, 1.0f, 90.0f, "%.1f deg");
+        changed |= UI::Prop::SliderFloat("Inner Cone", &spot.innerConeDegrees, 1.0f, 89.0f, "%.1f deg");
+        changed |= UI::Prop::SliderFloat("Outer Cone", &spot.outerConeDegrees, 1.0f, 90.0f, "%.1f deg");
         spot.outerConeDegrees = std::max(spot.outerConeDegrees, spot.innerConeDegrees);
         if (changed)
             MarkSelectedLightChanged();
 
         if (!spot.prefabAssetId.empty() &&
-            ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Prefab", ImGuiTreeNodeFlags_DefaultOpen))
+            ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Prefab", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
         {
             RenderPrefabOverrideControls(spot.prefabAssetId, spot.prefabInstance, m_dynamicLightState.prefabOverrides);
         }
@@ -572,12 +746,83 @@ void EditorImGui::RenderSelectedLightInspector()
         m_commands.deleteSelectedLight = true;
 }
 
+// A compact 4-key, piecewise-linear curve editor for the particle size-over-life curve.
+static bool ParticleCurveEditor4(const char* label, float values[4])
+{
+    bool changed = false;
+    const float width = 220.0f;
+    const float height = 56.0f;
+    ImGui::InvisibleButton(label, ImVec2(width, height));
+    const ImVec2 origin = ImGui::GetItemRectMin();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 end(origin.x + width, origin.y + height);
+    draw->AddRectFilled(origin, end, IM_COL32(22, 24, 28, 255), 3.0f);
+    draw->AddRect(origin, end, IM_COL32(72, 76, 84, 255), 3.0f);
+
+    const auto pointPosition = [&](int index, float value) {
+        return ImVec2(origin.x + width * (static_cast<float>(index) / 3.0f),
+            origin.y + height * (1.0f - std::clamp(value, 0.0f, 1.0f)));
+    };
+    for (int i = 0; i < 3; ++i)
+    {
+        draw->AddLine(pointPosition(i, values[i]), pointPosition(i + 1, values[i + 1]),
+            IM_COL32(255, 176, 64, 255), 2.0f);
+    }
+    for (int i = 0; i < 4; ++i)
+        draw->AddCircleFilled(pointPosition(i, values[i]), 4.0f, IM_COL32(255, 210, 120, 255));
+
+    if (ImGui::IsItemActive())
+    {
+        const ImVec2 mouse = ImGui::GetIO().MousePos;
+        int nearest = 0;
+        float nearestDistance = 1e9f;
+        for (int i = 0; i < 4; ++i)
+        {
+            const ImVec2 p = pointPosition(i, values[i]);
+            const float dx = p.x - mouse.x;
+            const float dy = p.y - mouse.y;
+            const float distance = dx * dx + dy * dy;
+            if (distance < nearestDistance)
+            {
+                nearestDistance = distance;
+                nearest = i;
+            }
+        }
+        const float value = std::clamp(1.0f - (mouse.y - origin.y) / height, 0.0f, 1.0f);
+        if (values[nearest] != value)
+        {
+            values[nearest] = value;
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+// A preview bar of the 4-key colour gradient (flattened: key i at keys[i * 4 .. i * 4 + 3]).
+static void ParticleGradientBar4(const float keys[16])
+{
+    ImGui::InvisibleButton("##gradient", ImVec2(220.0f, 16.0f));
+    const ImVec2 a = ImGui::GetItemRectMin();
+    const ImVec2 b = ImGui::GetItemRectMax();
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    for (int i = 0; i < 3; ++i)
+    {
+        const ImVec2 p0(a.x + (b.x - a.x) * (static_cast<float>(i) / 3.0f), a.y);
+        const ImVec2 p1(a.x + (b.x - a.x) * (static_cast<float>(i + 1) / 3.0f), b.y);
+        const ImU32 c0 = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(keys[i * 4 + 0], keys[i * 4 + 1], keys[i * 4 + 2], 1.0f));
+        const ImU32 c1 = ImGui::ColorConvertFloat4ToU32(
+            ImVec4(keys[(i + 1) * 4 + 0], keys[(i + 1) * 4 + 1], keys[(i + 1) * 4 + 2], 1.0f));
+        draw->AddRectFilledMultiColor(p0, p1, c0, c1, c1, c0);
+    }
+    draw->AddRect(a, b, IM_COL32(72, 76, 84, 255));
+}
+
 bool EditorImGui::RenderSelectedMeshPhysicsComponents()
 {
     bool changed = false;
     auto componentMenu = [&](const char* popupId, const char* componentId) {
-        ImGui::SameLine();
-        if (ImGui::SmallButton("..."))
+        if (UI::HeaderMenuButton("Component options"))
             ImGui::OpenPopup(popupId);
         if (ImGui::BeginPopup(popupId))
         {
@@ -593,7 +838,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
     if (m_meshRendererState.hasRigidbody)
     {
         ImGui::PushID("physics.rigidbody");
-        const bool open = ImGui::CollapsingHeader(ICON_FA_CUBE " Rigidbody", ImGuiTreeNodeFlags_DefaultOpen);
+        const bool open = ImGui::CollapsingHeader(ICON_FA_CUBE " Rigidbody", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
         componentMenu("RigidbodyComponentMenu", "physics.rigidbody");
         if (open)
         {
@@ -601,102 +846,112 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             const char* bodyTypes[] = {"Static", "Dynamic", "Kinematic"};
             int bodyTypeIndex = body.bodyType == ixtreeme::physics::BodyType::Static ? 0 :
                 (body.bodyType == ixtreeme::physics::BodyType::Kinematic ? 2 : 1);
-            if (ImGui::Combo("Body Type", &bodyTypeIndex, bodyTypes, IM_ARRAYSIZE(bodyTypes)))
+            if (UI::Prop::Combo("Body Type", &bodyTypeIndex, bodyTypes, IM_ARRAYSIZE(bodyTypes)))
             {
                 body.bodyType = bodyTypeIndex == 0 ? ixtreeme::physics::BodyType::Static :
                     (bodyTypeIndex == 2 ? ixtreeme::physics::BodyType::Kinematic : ixtreeme::physics::BodyType::Dynamic);
                 changed = true;
             }
-            changed |= ImGui::Checkbox("Enabled", &body.enabled);
-            changed |= ImGui::Checkbox("Use Gravity", &body.useGravity);
-            changed |= ImGui::Checkbox("Allow Sleeping", &body.allowSleeping);
+            changed |= UI::Prop::Checkbox("Enabled", &body.enabled);
+            changed |= UI::Prop::Checkbox("Use Gravity", &body.useGravity);
+            changed |= UI::Prop::Checkbox("Allow Sleeping", &body.allowSleeping);
             if (ImGui::IsItemHovered())
             {
                 ImGui::BeginTooltip();
                 ImGui::TextUnformatted("Sleeping lets inactive bodies stop simulating until they are touched or moved.");
                 ImGui::EndTooltip();
             }
-            changed |= ImGui::Checkbox("Continuous Collision", &body.continuousCollision);
+            changed |= UI::Prop::Checkbox("Continuous Collision", &body.continuousCollision);
             if (ImGui::IsItemHovered())
             {
                 ImGui::BeginTooltip();
                 ImGui::TextUnformatted("Uses linear-cast motion quality for fast dynamic bodies to reduce tunneling.");
                 ImGui::EndTooltip();
             }
-            changed |= ImGui::DragFloat("Mass", &body.mass, 0.05f, 0.001f, 100000.0f, "%.3f");
+            changed |= UI::Prop::DragFloat("Mass", &body.mass, 0.05f, 0.001f, 100000.0f, "%.3f");
             if (ImGui::IsItemHovered())
             {
                 ImGui::BeginTooltip();
                 ImGui::TextUnformatted("Dynamic body mass in kilograms. Static and kinematic bodies ignore mass.");
                 ImGui::EndTooltip();
             }
-            changed |= ImGui::DragFloat("Linear Damping", &body.linearDamping, 0.01f, 0.0f, 100.0f, "%.3f");
-            changed |= ImGui::DragFloat("Angular Damping", &body.angularDamping, 0.01f, 0.0f, 100.0f, "%.3f");
-            ImGui::TextDisabled("Freeze Position");
-            changed |= ImGui::Checkbox("X##freeze_pos", &body.freezePosition[0]); ImGui::SameLine();
-            changed |= ImGui::Checkbox("Y##freeze_pos", &body.freezePosition[1]); ImGui::SameLine();
-            changed |= ImGui::Checkbox("Z##freeze_pos", &body.freezePosition[2]);
-            ImGui::TextDisabled("Freeze Rotation");
-            changed |= ImGui::Checkbox("X##freeze_rot", &body.freezeRotation[0]); ImGui::SameLine();
-            changed |= ImGui::Checkbox("Y##freeze_rot", &body.freezeRotation[1]); ImGui::SameLine();
-            changed |= ImGui::Checkbox("Z##freeze_rot", &body.freezeRotation[2]);
+            changed |= UI::Prop::DragFloat("Linear Damping", &body.linearDamping, 0.01f, 0.0f, 100.0f, "%.3f");
+            changed |= UI::Prop::DragFloat("Angular Damping", &body.angularDamping, 0.01f, 0.0f, 100.0f, "%.3f");
+            const auto axisToggles = [&](const char* label, const char* id, bool* axes) {
+                UI::Property(label, [&](const char*) {
+                    ImGui::PushID(id);
+                    changed |= ImGui::Checkbox("X", &axes[0]);
+                    ImGui::SameLine();
+                    changed |= ImGui::Checkbox("Y", &axes[1]);
+                    ImGui::SameLine();
+                    changed |= ImGui::Checkbox("Z", &axes[2]);
+                    ImGui::PopID();
+                    return false;
+                });
+            };
+            axisToggles("Freeze Position", "freeze_pos", body.freezePosition);
+            axisToggles("Freeze Rotation", "freeze_rot", body.freezeRotation);
             ixtreeme::physics::Sanitize(body);
 
-            ImGui::SeparatorText("Runtime State");
-            if (m_meshRendererState.physicsRuntimeValid)
+            // Live values and test pushes only matter while Play runs: folded away by default.
+            if (ImGui::TreeNodeEx("Live physics (Play mode)", ImGuiTreeNodeFlags_SpanAvailWidth))
             {
-                const float* linear = m_meshRendererState.physicsRuntimeLinearVelocity;
-                const float* angular = m_meshRendererState.physicsRuntimeAngularVelocity;
-                const float speed = std::sqrt(
-                    linear[0] * linear[0] +
-                    linear[1] * linear[1] +
-                    linear[2] * linear[2]);
-                ImGui::TextDisabled("Body: %llu  %s",
-                    static_cast<unsigned long long>(m_meshRendererState.physicsRuntimeBodyId),
-                    m_meshRendererState.physicsRuntimeActive ? "active" : "sleeping");
-                ImGui::Text("Linear:  %.3f, %.3f, %.3f  | speed %.3f m/s",
-                    linear[0],
-                    linear[1],
-                    linear[2],
-                    speed);
-                ImGui::Text("Angular: %.3f, %.3f, %.3f rad/s",
-                    angular[0],
-                    angular[1],
-                    angular[2]);
-            }
-            else
-            {
-                ImGui::TextDisabled("Runtime body unavailable. Enter Play mode to inspect live physics.");
-            }
-
-            ImGui::SeparatorText("Runtime Test");
-            ImGui::DragFloat3("Linear Velocity", m_physicsTestLinearVelocity, 0.1f, -1000.0f, 1000.0f, "%.2f");
-            if (ImGui::Button("Set Velocity"))
-            {
-                m_commands.physicsSetLinearVelocityForSelected = true;
-                m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
-                std::copy(std::begin(m_physicsTestLinearVelocity), std::end(m_physicsTestLinearVelocity), std::begin(m_commands.physicsLinearVelocity));
-            }
-            ImGui::DragFloat3("Force", m_physicsTestForce, 0.5f, -100000.0f, 100000.0f, "%.2f");
-            if (ImGui::Button("Apply Force"))
-            {
-                m_commands.physicsApplyForceToSelected = true;
-                m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
-                std::copy(std::begin(m_physicsTestForce), std::end(m_physicsTestForce), std::begin(m_commands.physicsForce));
-            }
-            ImGui::DragFloat3("Impulse", m_physicsTestImpulse, 0.1f, -10000.0f, 10000.0f, "%.2f");
-            if (ImGui::Button("Apply Impulse"))
-            {
-                m_commands.physicsApplyImpulseToSelected = true;
-                m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
-                std::copy(std::begin(m_physicsTestImpulse), std::end(m_physicsTestImpulse), std::begin(m_commands.physicsImpulse));
-            }
-            ImGui::DragFloat3("Angular Impulse", m_physicsTestAngularImpulse, 0.1f, -10000.0f, 10000.0f, "%.2f");
-            if (ImGui::Button("Apply Angular Impulse"))
-            {
-                m_commands.physicsApplyAngularImpulseToSelected = true;
-                m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
-                std::copy(std::begin(m_physicsTestAngularImpulse), std::end(m_physicsTestAngularImpulse), std::begin(m_commands.physicsAngularImpulse));
+                if (m_meshRendererState.physicsRuntimeValid)
+                {
+                    const float* linear = m_meshRendererState.physicsRuntimeLinearVelocity;
+                    const float* angular = m_meshRendererState.physicsRuntimeAngularVelocity;
+                    const float speed = std::sqrt(
+                        linear[0] * linear[0] +
+                        linear[1] * linear[1] +
+                        linear[2] * linear[2]);
+                    ImGui::TextDisabled("Body: %llu  %s",
+                        static_cast<unsigned long long>(m_meshRendererState.physicsRuntimeBodyId),
+                        m_meshRendererState.physicsRuntimeActive ? "active" : "sleeping");
+                    ImGui::Text("Linear:  %.3f, %.3f, %.3f  | speed %.3f m/s",
+                        linear[0],
+                        linear[1],
+                        linear[2],
+                        speed);
+                    ImGui::Text("Angular: %.3f, %.3f, %.3f rad/s",
+                        angular[0],
+                        angular[1],
+                        angular[2]);
+                }
+                else
+                {
+                    ImGui::TextDisabled("Runtime body unavailable. Enter Play mode to inspect live physics.");
+                }
+    
+                ImGui::SeparatorText("Runtime Test");
+                UI::Prop::DragFloat3("Linear Velocity", m_physicsTestLinearVelocity, 0.1f, -1000.0f, 1000.0f, "%.2f");
+                if (ImGui::Button("Set Velocity"))
+                {
+                    m_commands.physicsSetLinearVelocityForSelected = true;
+                    m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
+                    std::copy(std::begin(m_physicsTestLinearVelocity), std::end(m_physicsTestLinearVelocity), std::begin(m_commands.physicsLinearVelocity));
+                }
+                UI::Prop::DragFloat3("Force", m_physicsTestForce, 0.5f, -100000.0f, 100000.0f, "%.2f");
+                if (ImGui::Button("Apply Force"))
+                {
+                    m_commands.physicsApplyForceToSelected = true;
+                    m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
+                    std::copy(std::begin(m_physicsTestForce), std::end(m_physicsTestForce), std::begin(m_commands.physicsForce));
+                }
+                UI::Prop::DragFloat3("Impulse", m_physicsTestImpulse, 0.1f, -10000.0f, 10000.0f, "%.2f");
+                if (ImGui::Button("Apply Impulse"))
+                {
+                    m_commands.physicsApplyImpulseToSelected = true;
+                    m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
+                    std::copy(std::begin(m_physicsTestImpulse), std::end(m_physicsTestImpulse), std::begin(m_commands.physicsImpulse));
+                }
+                UI::Prop::DragFloat3("Angular Impulse", m_physicsTestAngularImpulse, 0.1f, -10000.0f, 10000.0f, "%.2f");
+                if (ImGui::Button("Apply Angular Impulse"))
+                {
+                    m_commands.physicsApplyAngularImpulseToSelected = true;
+                    m_commands.physicsRuntimeEntityId = m_meshRendererState.id;
+                    std::copy(std::begin(m_physicsTestAngularImpulse), std::end(m_physicsTestAngularImpulse), std::begin(m_commands.physicsAngularImpulse));
+                }
+                ImGui::TreePop();
             }
         }
         ImGui::PopID();
@@ -705,15 +960,15 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
     if (m_meshRendererState.hasFixedJoint)
     {
         ImGui::PushID("physics.fixed_joint");
-        const bool open = ImGui::CollapsingHeader(ICON_FA_GEAR " Fixed Joint", ImGuiTreeNodeFlags_DefaultOpen);
+        const bool open = ImGui::CollapsingHeader(ICON_FA_GEAR " Fixed Joint", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
         componentMenu("FixedJointComponentMenu", "physics.fixed_joint");
         if (open)
         {
             auto& joint = m_meshRendererState.fixedJoint;
             ImGui::TextDisabled("Add this to one body only; Connected Entity is the other body.");
-            changed |= ImGui::Checkbox("Enabled", &joint.enabled);
+            changed |= UI::Prop::Checkbox("Enabled", &joint.enabled);
             int connectedEntity = static_cast<int>(joint.connectedEntityId);
-            if (ImGui::InputInt("Connected Entity ID", &connectedEntity))
+            if (UI::Prop::InputInt("Connected Entity ID", &connectedEntity))
             {
                 joint.connectedEntityId = static_cast<std::uint32_t>(std::max(0, connectedEntity));
                 changed = true;
@@ -729,28 +984,28 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
     if (m_meshRendererState.hasHingeJoint)
     {
         ImGui::PushID("physics.hinge_joint");
-        const bool open = ImGui::CollapsingHeader(ICON_FA_GEAR " Hinge Joint", ImGuiTreeNodeFlags_DefaultOpen);
+        const bool open = ImGui::CollapsingHeader(ICON_FA_GEAR " Hinge Joint", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
         componentMenu("HingeJointComponentMenu", "physics.hinge_joint");
         if (open)
         {
             auto& joint = m_meshRendererState.hingeJoint;
             ImGui::TextDisabled("Add this to one body only; Connected Entity is the other body.");
-            changed |= ImGui::Checkbox("Enabled", &joint.enabled);
+            changed |= UI::Prop::Checkbox("Enabled", &joint.enabled);
             int connectedEntity = static_cast<int>(joint.connectedEntityId);
-            if (ImGui::InputInt("Connected Entity ID", &connectedEntity))
+            if (UI::Prop::InputInt("Connected Entity ID", &connectedEntity))
             {
                 joint.connectedEntityId = static_cast<std::uint32_t>(std::max(0, connectedEntity));
                 changed = true;
             }
-            changed |= ImGui::DragFloat3("Anchor", joint.anchor, 0.05f, -10000.0f, 10000.0f, "%.2f");
-            changed |= ImGui::DragFloat3("Axis", joint.axis, 0.02f, -1.0f, 1.0f, "%.2f");
-            changed |= ImGui::Checkbox("Limits", &joint.limitsEnabled);
+            changed |= UI::Prop::DragFloat3("Anchor", joint.anchor, 0.05f, -10000.0f, 10000.0f, "%.2f");
+            changed |= UI::Prop::DragFloat3("Axis", joint.axis, 0.02f, -1.0f, 1.0f, "%.2f");
+            changed |= UI::Prop::Checkbox("Limits", &joint.limitsEnabled);
             if (joint.limitsEnabled)
             {
-                changed |= ImGui::DragFloat("Min Angle", &joint.minAngleDegrees, 0.5f, -180.0f, 0.0f, "%.1f deg");
-                changed |= ImGui::DragFloat("Max Angle", &joint.maxAngleDegrees, 0.5f, 0.0f, 180.0f, "%.1f deg");
+                changed |= UI::Prop::DragFloat("Min Angle", &joint.minAngleDegrees, 0.5f, -180.0f, 0.0f, "%.1f deg");
+                changed |= UI::Prop::DragFloat("Max Angle", &joint.maxAngleDegrees, 0.5f, 0.0f, 180.0f, "%.1f deg");
             }
-            changed |= ImGui::DragFloat("Friction Torque", &joint.frictionTorque, 0.1f, 0.0f, 100000.0f, "%.2f");
+            changed |= UI::Prop::DragFloat("Friction Torque", &joint.frictionTorque, 0.1f, 0.0f, 100000.0f, "%.2f");
             joint.frictionTorque = std::max(0.0f, joint.frictionTorque);
             if (joint.connectedEntityId == 0)
                 ImGui::TextDisabled("Pick another mesh entity with a Rigidbody before entering Play.");
@@ -763,7 +1018,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
     if (m_meshRendererState.skinned)
     {
         ImGui::PushID("animation.debug_clip");
-        if (ImGui::CollapsingHeader(ICON_FA_PERSON_RUNNING " Animation (debug)", ImGuiTreeNodeFlags_DefaultOpen))
+        if (ImGui::CollapsingHeader(ICON_FA_PERSON_RUNNING " Animation (debug)", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
         {
             std::vector<AssetLibrary::Entry> clips;
             if (m_assetLibrary)
@@ -779,7 +1034,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 if (clips[i].id == m_meshRendererState.debugAnimationClipId)
                     currentIndex = static_cast<int>(i) + 1;
             }
-            if (ImGui::Combo("Clip", &currentIndex, labels.data(), static_cast<int>(labels.size())))
+            if (UI::Prop::Combo("Clip", &currentIndex, labels.data(), static_cast<int>(labels.size())))
             {
                 m_meshRendererState.debugAnimationClipId =
                     (currentIndex <= 0) ? std::string() : clips[static_cast<std::size_t>(currentIndex - 1)].id;
@@ -803,7 +1058,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 if (controllers[i].id == m_meshRendererState.animatorControllerId)
                     ctrlIndex = static_cast<int>(i) + 1;
             }
-            if (ImGui::Combo("Controller", &ctrlIndex, ctrlLabels.data(), static_cast<int>(ctrlLabels.size())))
+            if (UI::Prop::Combo("Controller", &ctrlIndex, ctrlLabels.data(), static_cast<int>(ctrlLabels.size())))
             {
                 m_meshRendererState.animatorControllerId =
                     (ctrlIndex <= 0) ? std::string() : controllers[static_cast<std::size_t>(ctrlIndex - 1)].id;
@@ -813,6 +1068,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             {
                 AssetLibrary::ImportOptions opts;
                 opts.displayName = "Locomotion";
+                opts.subpath = m_assetSubpath;  // the folder the asset browser shows
                 AssetLibrary::Entry created;
                 std::string createErr;
                 if (m_assetLibrary->CreateAnimatorController(opts, created, createErr))
@@ -832,7 +1088,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 if (ImGui::Button(ICON_FA_PERSON_RUNNING " Open in Animator"))
                 {
                     m_animatorPanelOpen = true;
-                    m_pendingViewFocusWindow = ICON_FA_PERSON_RUNNING " Animator";
+                    m_pendingViewFocusWindow = EditorWindow::Animator;
                 }
             }
             ImGui::TextDisabled("Drives idle/walk/run by Speed (auto-bound from movement in Play).");
@@ -844,50 +1100,50 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
     if (m_meshRendererState.hasCharacterController)
     {
         ImGui::PushID("physics.character_controller");
-        const bool open = ImGui::CollapsingHeader(ICON_FA_PERSON_RUNNING " Character Controller", ImGuiTreeNodeFlags_DefaultOpen);
+        const bool open = ImGui::CollapsingHeader(ICON_FA_PERSON_RUNNING " Character Controller", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
         componentMenu("CharacterControllerComponentMenu", "physics.character_controller");
         if (open)
         {
             auto& cc = m_meshRendererState.characterController;
-            changed |= ImGui::Checkbox("Enabled", &cc.enabled);
+            changed |= UI::Prop::Checkbox("Enabled", &cc.enabled);
             ImGui::TextDisabled("Tags this entity as the player. WASD + Space drive it in Play.");
 
             const char* cameraModes[] = {"First Person", "Third Person", "Top Down"};
             int cameraModeIndex = std::clamp(static_cast<int>(cc.cameraMode), 0, 2);
-            if (ImGui::Combo("Camera Mode", &cameraModeIndex, cameraModes, IM_ARRAYSIZE(cameraModes)))
+            if (UI::Prop::Combo("Camera Mode", &cameraModeIndex, cameraModes, IM_ARRAYSIZE(cameraModes)))
             {
                 cc.cameraMode = static_cast<ixtreeme::physics::CameraMode>(cameraModeIndex);
                 changed = true;
             }
 
             ImGui::SeparatorText("Movement");
-            changed |= ImGui::DragFloat("Walk Speed", &cc.walkSpeed, 0.1f, 0.1f, 100.0f, "%.1f m/s");
-            changed |= ImGui::DragFloat("Run Speed", &cc.runSpeed, 0.1f, 0.1f, 100.0f, "%.1f m/s");
-            changed |= ImGui::DragFloat("Jump Height", &cc.jumpHeight, 0.05f, 0.0f, 50.0f, "%.2f m");
-            changed |= ImGui::DragFloat("Gravity Scale", &cc.gravityScale, 0.05f, 0.0f, 10.0f, "%.2f");
-            changed |= ImGui::DragFloat("Slope Limit", &cc.slopeLimitDegrees, 0.5f, 1.0f, 89.0f, "%.0f deg");
-            changed |= ImGui::DragFloat("Step Height", &cc.stepHeight, 0.01f, 0.0f, 5.0f, "%.2f m");
+            changed |= UI::Prop::DragFloat("Walk Speed", &cc.walkSpeed, 0.1f, 0.1f, 100.0f, "%.1f m/s");
+            changed |= UI::Prop::DragFloat("Run Speed", &cc.runSpeed, 0.1f, 0.1f, 100.0f, "%.1f m/s");
+            changed |= UI::Prop::DragFloat("Jump Height", &cc.jumpHeight, 0.05f, 0.0f, 50.0f, "%.2f m");
+            changed |= UI::Prop::DragFloat("Gravity Scale", &cc.gravityScale, 0.05f, 0.0f, 10.0f, "%.2f");
+            changed |= UI::Prop::DragFloat("Slope Limit", &cc.slopeLimitDegrees, 0.5f, 1.0f, 89.0f, "%.0f deg");
+            changed |= UI::Prop::DragFloat("Step Height", &cc.stepHeight, 0.01f, 0.0f, 5.0f, "%.2f m");
 
             ImGui::SeparatorText("Capsule");
-            changed |= ImGui::DragFloat("Capsule Radius", &cc.capsuleRadius, 0.01f, 0.05f, 5.0f, "%.2f m");
-            changed |= ImGui::DragFloat("Capsule Height", &cc.capsuleHeight, 0.05f, 0.2f, 10.0f, "%.2f m");
+            changed |= UI::Prop::DragFloat("Capsule Radius", &cc.capsuleRadius, 0.01f, 0.05f, 5.0f, "%.2f m");
+            changed |= UI::Prop::DragFloat("Capsule Height", &cc.capsuleHeight, 0.05f, 0.2f, 10.0f, "%.2f m");
 
             ImGui::SeparatorText("Camera");
-            changed |= ImGui::DragFloat("Mouse Sensitivity", &cc.mouseSensitivity, 0.01f, 0.01f, 2.0f, "%.2f");
+            changed |= UI::Prop::DragFloat("Mouse Sensitivity", &cc.mouseSensitivity, 0.01f, 0.01f, 2.0f, "%.2f");
             if (cc.cameraMode == ixtreeme::physics::CameraMode::FirstPerson)
             {
-                changed |= ImGui::DragFloat("Eye Height", &cc.eyeHeight, 0.02f, 0.1f, 10.0f, "%.2f m");
+                changed |= UI::Prop::DragFloat("Eye Height", &cc.eyeHeight, 0.02f, 0.1f, 10.0f, "%.2f m");
             }
             else if (cc.cameraMode == ixtreeme::physics::CameraMode::ThirdPerson)
             {
-                changed |= ImGui::DragFloat("Distance", &cc.thirdPersonDistance, 0.1f, 0.5f, 50.0f, "%.1f m");
-                changed |= ImGui::DragFloat("Height", &cc.thirdPersonHeight, 0.05f, 0.0f, 50.0f, "%.2f m");
-                changed |= ImGui::DragFloat("Pitch", &cc.thirdPersonPitchDegrees, 0.5f, -89.0f, 89.0f, "%.0f deg");
+                changed |= UI::Prop::DragFloat("Distance", &cc.thirdPersonDistance, 0.1f, 0.5f, 50.0f, "%.1f m");
+                changed |= UI::Prop::DragFloat("Height", &cc.thirdPersonHeight, 0.05f, 0.0f, 50.0f, "%.2f m");
+                changed |= UI::Prop::DragFloat("Pitch", &cc.thirdPersonPitchDegrees, 0.5f, -89.0f, 89.0f, "%.0f deg");
             }
             else
             {
-                changed |= ImGui::DragFloat("Camera Height", &cc.topDownHeight, 0.2f, 1.0f, 200.0f, "%.1f m");
-                changed |= ImGui::DragFloat("Camera Pitch", &cc.topDownPitchDegrees, 0.5f, 10.0f, 89.0f, "%.0f deg");
+                changed |= UI::Prop::DragFloat("Camera Height", &cc.topDownHeight, 0.2f, 1.0f, 200.0f, "%.1f m");
+                changed |= UI::Prop::DragFloat("Camera Pitch", &cc.topDownPitchDegrees, 0.5f, 10.0f, 89.0f, "%.0f deg");
             }
             ixtreeme::physics::Sanitize(cc);
             ImGui::TextDisabled("Right-drag in the Game view to look around.");
@@ -898,7 +1154,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
     if (m_meshRendererState.hasAudioSource)
     {
         ImGui::PushID("audio.audio_source");
-        const bool open = ImGui::CollapsingHeader("Audio Source", ImGuiTreeNodeFlags_DefaultOpen);
+        const bool open = ImGui::CollapsingHeader("Audio Source", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
         componentMenu("AudioSourceComponentMenu", "audio.audio_source");
         if (open)
         {
@@ -911,7 +1167,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 std::string preview = "(no clip)";
                 for (const AssetLibrary::Entry& e : clips)
                     if (e.id == a.clipAssetId) { preview = e.displayName; break; }
-                if (ImGui::BeginCombo("Clip", preview.c_str()))
+                if (UI::Prop::BeginCombo("Clip", preview.c_str()))
                 {
                     if (ImGui::Selectable("(no clip)", a.clipAssetId.empty())) { a.clipAssetId.clear(); changed = true; }
                     for (const AssetLibrary::Entry& e : clips)
@@ -924,19 +1180,19 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 }
             }
 
-            changed |= ImGui::Checkbox("Enabled", &a.enabled);
-            changed |= ImGui::Checkbox("Play On Start", &a.playOnStart);
+            changed |= UI::Prop::Checkbox("Enabled", &a.enabled);
+            changed |= UI::Prop::Checkbox("Play On Start", &a.playOnStart);
             ImGui::SameLine();
-            changed |= ImGui::Checkbox("Loop", &a.loop);
+            changed |= UI::Prop::Checkbox("Loop", &a.loop);
             ImGui::SameLine();
-            changed |= ImGui::Checkbox("3D", &a.is3d);
+            changed |= UI::Prop::Checkbox("3D", &a.is3d);
 
-            changed |= ImGui::SliderFloat("Volume", &a.volume, 0.0f, 1.0f, "%.2f");
-            changed |= ImGui::SliderFloat("Pitch", &a.pitch, 0.5f, 2.0f, "%.2f");
+            changed |= UI::Prop::SliderFloat("Volume", &a.volume, 0.0f, 1.0f, "%.2f");
+            changed |= UI::Prop::SliderFloat("Pitch", &a.pitch, 0.5f, 2.0f, "%.2f");
 
             const char* buses[] = {"Master", "Music", "SFX"};
             int busIdx = std::clamp(static_cast<int>(a.bus), 0, 2);
-            if (ImGui::Combo("Bus", &busIdx, buses, IM_ARRAYSIZE(buses)))
+            if (UI::Prop::Combo("Bus", &busIdx, buses, IM_ARRAYSIZE(buses)))
             {
                 a.bus = static_cast<ixaudio::AudioBus>(busIdx);
                 changed = true;
@@ -945,8 +1201,8 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             if (a.is3d)
             {
                 ImGui::SeparatorText("3D");
-                changed |= ImGui::DragFloat("Min Distance", &a.minDistance, 0.1f, 0.01f, 1000.0f, "%.2f m");
-                changed |= ImGui::DragFloat("Max Distance", &a.maxDistance, 0.5f, 0.1f, 5000.0f, "%.1f m");
+                changed |= UI::Prop::DragFloat("Min Distance", &a.minDistance, 0.1f, 0.01f, 1000.0f, "%.2f m");
+                changed |= UI::Prop::DragFloat("Max Distance", &a.maxDistance, 0.5f, 0.1f, 5000.0f, "%.1f m");
             }
             ixaudio::Sanitize(a);
             ImGui::TextDisabled("Plays in Play mode (Play On Start). Stops on Stop.");
@@ -957,11 +1213,11 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
     if (m_meshRendererState.hasAudioListener)
     {
         ImGui::PushID("audio.audio_listener");
-        const bool open = ImGui::CollapsingHeader("Audio Listener", ImGuiTreeNodeFlags_DefaultOpen);
+        const bool open = ImGui::CollapsingHeader("Audio Listener", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
         componentMenu("AudioListenerComponentMenu", "audio.audio_listener");
         if (open)
         {
-            changed |= ImGui::Checkbox("Enabled", &m_meshRendererState.audioListener.enabled);
+            changed |= UI::Prop::Checkbox("Enabled", &m_meshRendererState.audioListener.enabled);
             ImGui::TextDisabled("Puts the 3D \"ears\" at this entity. Without one, the camera listens.");
         }
         ImGui::PopID();
@@ -970,48 +1226,39 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
     if (m_meshRendererState.hasScript)
     {
         ImGui::PushID("scripting.script");
-        const bool open = ImGui::CollapsingHeader("Script", ImGuiTreeNodeFlags_DefaultOpen);
+        const bool open = ImGui::CollapsingHeader("Script", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
         componentMenu("ScriptComponentMenu", "scripting.script");
         if (open)
         {
             auto& sc = m_meshRendererState.script;
-            changed |= ImGui::Checkbox("Enabled", &sc.enabled);
+            changed |= UI::Prop::Checkbox("Enabled", &sc.enabled);
 
-            const char* backends[] = {"Native (C++)", "Lua"};
+            // Project scripting languages: AngelScript and Lua (both hot-reload in Play). Legacy Native
+            // (C++) components still run, but C++ is no longer offered to projects.
+            const char* backends[] = {"AngelScript", "Lua"};
             int backendIdx = (sc.backend == ixscript::ScriptBackendType::Lua) ? 1 : 0;
-            if (ImGui::Combo("Backend", &backendIdx, backends, IM_ARRAYSIZE(backends)))
+            if (UI::Prop::Combo("Backend", &backendIdx, backends, IM_ARRAYSIZE(backends)))
             {
                 sc.backend = (backendIdx == 1) ? ixscript::ScriptBackendType::Lua
-                                               : ixscript::ScriptBackendType::Native;
+                                               : ixscript::ScriptBackendType::AngelScript;
                 changed = true;
             }
 
             if (sc.backend == ixscript::ScriptBackendType::Native)
             {
-                const std::vector<std::string> classes = ixscript::NativeBackend::RegisteredNames();
-                const std::string preview = sc.nativeClassName.empty() ? "(class)" : sc.nativeClassName;
-                if (ImGui::BeginCombo("Class", preview.c_str()))
-                {
-                    for (const std::string& cls : classes)
-                        if (ImGui::Selectable(cls.c_str(), cls == sc.nativeClassName))
-                        {
-                            sc.nativeClassName = cls;
-                            changed = true;
-                        }
-                    ImGui::EndCombo();
-                }
-                if (classes.empty())
-                    ImGui::TextDisabled("No native scripts registered (IXSCRIPT_REGISTER).");
+                ImGui::TextDisabled("Legacy native C++ script (engine-internal). Pick AngelScript or Lua to migrate.");
             }
-            else if (m_assetLibrary)  // Lua: pick a .lua asset from the project library
+            else if (m_assetLibrary)  // AngelScript / Lua: pick a script asset from the project library
             {
-                const std::vector<AssetLibrary::Entry> scripts =
-                    m_assetLibrary->EntriesFor(AssetLibrary::Category::Script);
+                const bool isLua = sc.backend == ixscript::ScriptBackendType::Lua;
+                // Cached per asset-library revision (EntriesFor copies the whole Script category).
+                const std::vector<AssetLibrary::Entry>& scripts = CachedScriptAssets(isLua ? ".lua" : ".as");
                 std::string preview = sc.scriptAssetId.empty() ? "(no script)" : sc.scriptAssetId;
                 for (const AssetLibrary::Entry& e : scripts)
                     if (e.id == sc.scriptAssetId) { preview = e.displayName; break; }
                 // Label must differ from the "Script" CollapsingHeader above (same PushID scope → ID clash).
-                if (ImGui::BeginCombo("Lua Script", preview.c_str()))
+                const char* comboLabel = isLua ? "Lua Script" : "AngelScript";
+                if (UI::Prop::BeginCombo(comboLabel, preview.c_str()))
                 {
                     if (ImGui::Selectable("(no script)", sc.scriptAssetId.empty())) { sc.scriptAssetId.clear(); changed = true; }
                     for (const AssetLibrary::Entry& e : scripts)
@@ -1023,7 +1270,9 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     ImGui::EndCombo();
                 }
                 if (scripts.empty())
-                    ImGui::TextDisabled("No .lua scripts in the project. Drop a .lua into the asset browser.");
+                    ImGui::TextDisabled(isLua
+                        ? "No .lua scripts in the project. Drop a .lua into the asset browser."
+                        : "No .as scripts in the project. Drop an .as into the asset browser.");
             }
 
             // Reflected fields (Unity-[SerializeField] style): if the chosen native class declares fields
@@ -1063,7 +1312,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     case ixscript::ScriptFieldType::Float:
                     {
                         float v = std::strtof(current.c_str(), nullptr);
-                        if (ImGui::DragFloat(fd.name.c_str(), &v, 0.1f, 0.0f, 0.0f, "%.3f"))
+                        if (UI::Prop::DragFloat(fd.name.c_str(), &v, 0.1f, 0.0f, 0.0f, "%.3f"))
                         {
                             std::snprintf(buf, sizeof(buf), "%g", static_cast<double>(v));
                             sc.parameters[fd.name] = buf;
@@ -1074,7 +1323,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     case ixscript::ScriptFieldType::Int:
                     {
                         int v = std::atoi(current.c_str());
-                        if (ImGui::DragInt(fd.name.c_str(), &v, 0.1f))
+                        if (UI::Prop::DragInt(fd.name.c_str(), &v, 0.1f))
                         {
                             sc.parameters[fd.name] = std::to_string(v);
                             changed = true;
@@ -1084,7 +1333,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     case ixscript::ScriptFieldType::Bool:
                     {
                         bool v = (current == "1" || current == "true" || current == "True");
-                        if (ImGui::Checkbox(fd.name.c_str(), &v))
+                        if (UI::Prop::Checkbox(fd.name.c_str(), &v))
                         {
                             sc.parameters[fd.name] = v ? "1" : "0";
                             changed = true;
@@ -1095,7 +1344,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     {
                         float v[3] = {0.0f, 0.0f, 0.0f};
                         parseFloats(current, v, 3);
-                        if (ImGui::DragFloat3(fd.name.c_str(), v, 0.1f, 0.0f, 0.0f, "%.3f"))
+                        if (UI::Prop::DragFloat3(fd.name.c_str(), v, 0.1f, 0.0f, 0.0f, "%.3f"))
                         {
                             std::snprintf(buf, sizeof(buf), "%g,%g,%g",
                                 static_cast<double>(v[0]), static_cast<double>(v[1]), static_cast<double>(v[2]));
@@ -1108,7 +1357,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     {
                         float v[4] = {0.0f, 0.0f, 0.0f, 1.0f};
                         parseFloats(current, v, 4);
-                        if (ImGui::ColorEdit4(fd.name.c_str(), v))
+                        if (UI::Prop::ColorEdit4(fd.name.c_str(), v))
                         {
                             std::snprintf(buf, sizeof(buf), "%g,%g,%g,%g", static_cast<double>(v[0]),
                                 static_cast<double>(v[1]), static_cast<double>(v[2]), static_cast<double>(v[3]));
@@ -1136,7 +1385,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     char valueBuf[128];
                     std::snprintf(valueBuf, sizeof(valueBuf), "%s", kv.second.c_str());
                     ImGui::SetNextItemWidth(150.0f);
-                    if (ImGui::InputText("##val", valueBuf, sizeof(valueBuf)))
+                    if (UI::Prop::InputText("##val", valueBuf, sizeof(valueBuf)))
                     {
                         kv.second = valueBuf;
                         changed = true;
@@ -1153,7 +1402,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 }
                 static char s_newParamKey[64] = {};
                 ImGui::SetNextItemWidth(120.0f);
-                ImGui::InputText("##newparam", s_newParamKey, sizeof(s_newParamKey));
+                UI::Prop::InputText("##newparam", s_newParamKey, sizeof(s_newParamKey));
                 ImGui::SameLine();
                 if (ImGui::SmallButton("+ Add Param") && s_newParamKey[0] != '\0')
                 {
@@ -1166,10 +1415,274 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
         ImGui::PopID();
     }
 
+    if (m_meshRendererState.hasFogVolume)
+    {
+        ImGui::PushID("effects.fog_volume");
+        const bool open = ImGui::CollapsingHeader(ICON_FA_CLOUD_SUN " Fog Volume",
+            ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
+        componentMenu("FogVolumeComponentMenu", "effects.fog_volume");
+        if (open)
+        {
+            auto& fog = m_meshRendererState.fogVolume;
+            changed |= UI::Prop::Checkbox("Enabled", &fog.enabled);
+            const char* shapes[] = {"Box", "Sphere"};
+            int shape = fog.shape == FogVolumeComponent::Shape::Sphere ? 1 : 0;
+            if (UI::Prop::Combo("Shape", &shape, shapes, 2))
+            {
+                fog.shape = shape == 1 ? FogVolumeComponent::Shape::Sphere : FogVolumeComponent::Shape::Box;
+                changed = true;
+            }
+            changed |= UI::Prop::ColorEdit3("Color", fog.color);
+            changed |= UI::Prop::DragFloat("Density", &fog.density, 0.001f, 0.0f, 10.0f, "%.4f /m");
+            UI::ItemTooltip("Higher density hides more of the scene inside this volume.");
+            if (fog.shape == FogVolumeComponent::Shape::Box)
+                changed |= UI::Prop::DragFloat3("Half extents", fog.halfExtents, 0.1f, 0.01f, 100000.0f, "%.2f m");
+            else
+                changed |= UI::Prop::DragFloat("Radius", &fog.radius, 0.1f, 0.01f, 100000.0f, "%.2f m");
+            changed |= UI::Prop::DragFloat("Edge fade", &fog.edgeFade, 0.1f, 0.0f, 100000.0f, "%.2f m");
+            UI::ItemTooltip("Softens the boundary inward. Zero makes a sharp boundary.");
+            SanitizeFog(fog);
+            ImGui::TextWrapped("Move and rotate with Transform. Volume size is in metres and works with zero object scale. Local fog also works while global fog is off.");
+        }
+        ImGui::PopID();
+    }
+
+    if (m_meshRendererState.hasParticleSystem)
+    {
+        ImGui::PushID("effects.particle_system");
+        const bool open = ImGui::CollapsingHeader(ICON_FA_SHAPES " Particle System",
+            ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
+        componentMenu("ParticleSystemComponentMenu", "effects.particle_system");
+        if (open)
+        {
+            auto& ps = m_meshRendererState.particleSystem;
+            bool particleChanged = false;
+            particleChanged |= UI::Prop::Checkbox("Enabled", &ps.enabled);
+            particleChanged |= UI::Prop::Checkbox("Play On Start", &ps.playOnStart);
+            particleChanged |= UI::Prop::Checkbox("Loop", &ps.loop);
+            particleChanged |= UI::Prop::Checkbox("GPU Simulation", &ps.gpuSimulation);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Simulates this emitter on the GPU (for high particle counts).\n"
+                                  "The GPU path has no ground collision, no local space and\n"
+                                  "emits continuously (no duration/loop).");
+
+            const char* blendModes[] = {"Alpha", "Additive"};
+            int blendIndex = ps.blendMode == ixparticle::ParticleBlendMode::Additive ? 1 : 0;
+            if (UI::Prop::Combo("Blending", &blendIndex, blendModes, IM_ARRAYSIZE(blendModes)))
+            {
+                ps.blendMode = blendIndex == 1 ? ixparticle::ParticleBlendMode::Additive
+                                               : ixparticle::ParticleBlendMode::Alpha;
+                particleChanged = true;
+            }
+
+            if (m_assetLibrary)
+            {
+                // The category list is only materialized while the combo is OPEN: EntriesFor copies
+                // every entry of the category, which is far too heavy to do every frame (the Texture
+                // category can hold thousands). The preview uses one FindById lookup instead.
+                std::string preview = "(default soft sprite)";
+                if (!ps.textureAssetId.empty())
+                {
+                    preview = ps.textureAssetId;
+                    if (const auto entry = m_assetLibrary->FindById(ps.textureAssetId);
+                        entry && entry->category == AssetLibrary::Category::Texture)
+                        preview = entry->displayName;
+                }
+                if (UI::Prop::BeginCombo("Texture", preview.c_str()))
+                {
+                    if (ImGui::Selectable("(default soft sprite)", ps.textureAssetId.empty()))
+                    {
+                        ps.textureAssetId.clear();
+                        particleChanged = true;
+                    }
+                    const std::vector<AssetLibrary::Entry> textures =
+                        m_assetLibrary->EntriesFor(AssetLibrary::Category::Texture);
+                    for (const AssetLibrary::Entry& e : textures)
+                    {
+                        const bool selected = (e.id == ps.textureAssetId);
+                        if (ImGui::Selectable(e.displayName.c_str(), selected))
+                        {
+                            ps.textureAssetId = e.id;
+                            particleChanged = true;
+                        }
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+            }
+
+            if (m_assetLibrary)
+            {
+                // Same lazy pattern for the effect presets (usually few, but keep it uniform).
+                std::string effectPreview = "(inline parameters)";
+                if (!ps.effectAssetId.empty())
+                {
+                    effectPreview = ps.effectAssetId;
+                    if (const auto entry = m_assetLibrary->FindById(ps.effectAssetId);
+                        entry && entry->category == AssetLibrary::Category::ParticleEffect)
+                        effectPreview = entry->displayName;
+                }
+                if (UI::Prop::BeginCombo("Effect Preset", effectPreview.c_str()))
+                {
+                    if (ImGui::Selectable("(inline parameters)", ps.effectAssetId.empty()))
+                    {
+                        ps.effectAssetId.clear();
+                        particleChanged = true;
+                    }
+                    const std::vector<AssetLibrary::Entry> effects =
+                        m_assetLibrary->EntriesFor(AssetLibrary::Category::ParticleEffect);
+                    for (const AssetLibrary::Entry& e : effects)
+                    {
+                        const bool selected = (e.id == ps.effectAssetId);
+                        if (ImGui::Selectable(e.displayName.c_str(), selected))
+                        {
+                            if (ApplyParticleEffectPreset(e.id, ps))
+                                particleChanged = true;
+                        }
+                        if (selected)
+                            ImGui::SetItemDefaultFocus();
+                    }
+                    ImGui::EndCombo();
+                }
+                if (!ps.effectAssetId.empty())
+                {
+                    if (ImGui::SmallButton("Re-apply Preset") && ApplyParticleEffectPreset(ps.effectAssetId, ps))
+                        particleChanged = true;
+                    ImGui::SameLine();
+                }
+                if (ImGui::SmallButton("Save As New Effect"))
+                    CreateParticleEffectFromComponent(ps);
+                ImGui::TextDisabled("Presets copy their parameters into this component.");
+            }
+
+            ImGui::SeparatorText("Emission");
+            particleChanged |= UI::Prop::DragFloat("Duration (s)", &ps.duration, 0.05f, 0.05f, 3600.0f);
+            particleChanged |= UI::Prop::DragFloat("Rate (/s)", &ps.emissionRate, 0.5f, 0.0f, 5000.0f);
+            particleChanged |= UI::Prop::DragInt("Burst", &ps.burstCount, 1.0f, 0, 10000);
+            particleChanged |= UI::Prop::DragInt("Max Particles", &ps.maxParticles, 4.0f, 1, 65536);
+
+            ImGui::SeparatorText("Particle");
+            // Min/max pairs share one row each (fewer widgets = less per-frame ImGui work).
+            float lifetimeRange[2] = {ps.startLifetimeMin, ps.startLifetimeMax};
+            if (UI::Prop::DragFloat2("Lifetime Min/Max", lifetimeRange, 0.02f, 0.02f, 60.0f))
+            {
+                ps.startLifetimeMin = lifetimeRange[0];
+                ps.startLifetimeMax = lifetimeRange[1];
+                particleChanged = true;
+            }
+            float speedRange[2] = {ps.startSpeedMin, ps.startSpeedMax};
+            if (UI::Prop::DragFloat2("Speed Min/Max", speedRange, 0.05f, 0.0f, 100.0f))
+            {
+                ps.startSpeedMin = speedRange[0];
+                ps.startSpeedMax = speedRange[1];
+                particleChanged = true;
+            }
+            float sizeRange[2] = {ps.startSizeMin, ps.startSizeMax};
+            if (UI::Prop::DragFloat2("Size Min/Max", sizeRange, 0.01f, 0.0f, 100.0f))
+            {
+                ps.startSizeMin = sizeRange[0];
+                ps.startSizeMax = sizeRange[1];
+                particleChanged = true;
+            }
+            ImGui::TextUnformatted("Size Over Life");
+            particleChanged |= ParticleCurveEditor4("##size_curve", ps.sizeOverLife);
+            particleChanged |= UI::Prop::DragFloat("Gravity", &ps.gravity, 0.05f, -50.0f, 50.0f);
+            particleChanged |= UI::Prop::DragFloat("Drag", &ps.drag, 0.05f, 0.0f, 20.0f);
+            particleChanged |= UI::Prop::DragFloat("Spin (deg/s)", &ps.rotationSpeed, 1.0f, -720.0f, 720.0f);
+            particleChanged |= UI::Prop::Checkbox("Soft Particles", &ps.softParticles);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Fades the sprite where it comes close to scene geometry\n"
+                                  "(needs the scene depth snapshot; the Scene View and the game).");
+            if (ps.softParticles)
+                particleChanged |= UI::Prop::DragFloat("Soft Distance", &ps.softDistance, 0.01f, 0.01f, 10.0f);
+            particleChanged |= UI::Prop::DragInt("Atlas Columns", &ps.atlasColumns, 1.0f, 1, 64);
+            particleChanged |= UI::Prop::DragInt("Atlas Rows", &ps.atlasRows, 1.0f, 1, 64);
+            if (ps.atlasColumns > 1 || ps.atlasRows > 1)
+                ImGui::TextDisabled("Flipbook: the cells play over each particle's lifetime.");
+
+            // The advanced groups live behind collapsed sub-headers: their widgets only render while
+            // open, keeping the per-frame inspector cost low (at high frame rates ImGui is the cost).
+            if (ImGui::CollapsingHeader("Turbulence"))
+            {
+                particleChanged |= UI::Prop::Checkbox("Enable Turbulence", &ps.turbulenceEnabled);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Smooth swirling motion shared by nearby particles. Works on CPU and GPU.\n"
+                                      "For floating dust, use zero Gravity and a little Drag.");
+                if (ps.turbulenceEnabled)
+                {
+                    particleChanged |= UI::Prop::DragFloat("Strength (m/s2)", &ps.turbulenceStrength, 0.005f, 0.0f, 100.0f, "%.3f");
+                    particleChanged |= UI::Prop::DragFloat("Scale (m)", &ps.turbulenceScale, 0.05f, 0.01f, 1000.0f);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("Spatial size of the swirls. Larger values give broader, gentler motion.");
+                    particleChanged |= UI::Prop::DragFloat("Speed (rad/s)", &ps.turbulenceSpeed, 0.01f, 0.0f, 100.0f);
+                    if (ImGui::IsItemHovered())
+                        ImGui::SetTooltip("How quickly the flow changes over time. Zero keeps the flow field static.");
+                }
+            }
+
+            if (ImGui::CollapsingHeader("Shape"))
+            {
+                const char* shapes[] = {"Point", "Sphere", "Box", "Circle", "Edge"};
+                int shapeIndex = static_cast<int>(ps.shape);
+                if (UI::Prop::Combo("Emission Shape", &shapeIndex, shapes, IM_ARRAYSIZE(shapes)))
+                {
+                    ps.shape = static_cast<ixparticle::ParticleShape>(shapeIndex);
+                    particleChanged = true;
+                }
+                particleChanged |= UI::Prop::Checkbox("Local Space", &ps.localSpace);
+                if (ImGui::IsItemHovered())
+                    ImGui::SetTooltip("Particles follow the emitter as it moves and rotates.");
+                if (ps.shape == ixparticle::ParticleShape::Sphere || ps.shape == ixparticle::ParticleShape::Circle)
+                    particleChanged |= UI::Prop::DragFloat("Radius", &ps.shapeRadius, 0.01f, 0.0f, 50.0f);
+                if (ps.shape == ixparticle::ParticleShape::Box)
+                    particleChanged |= UI::Prop::DragFloat3("Extents", ps.shapeExtents, 0.01f, 0.0f, 50.0f);
+                if (ps.shape == ixparticle::ParticleShape::Edge)
+                    particleChanged |= UI::Prop::DragFloat("Half Length", &ps.shapeExtents[0], 0.01f, 0.0f, 50.0f);
+                if (ps.shape == ixparticle::ParticleShape::Circle)
+                    particleChanged |= UI::Prop::DragFloat("Arc (deg)", &ps.shapeArc, 1.0f, 1.0f, 360.0f);
+                particleChanged |= UI::Prop::DragFloat3("Direction", ps.direction, 0.05f, -1.0f, 1.0f);
+                particleChanged |= UI::Prop::DragFloat("Cone Angle", &ps.coneAngle, 0.5f, 0.0f, 180.0f);
+            }
+
+            if (ImGui::CollapsingHeader("Collision"))
+            {
+                particleChanged |= UI::Prop::Checkbox("Collide With Ground", &ps.collideWithGround);
+                if (ps.collideWithGround)
+                {
+                    particleChanged |= UI::Prop::DragFloat("Bounce", &ps.collisionBounce, 0.01f, 0.0f, 1.0f);
+                    particleChanged |= UI::Prop::DragFloat("Friction", &ps.collisionFriction, 0.01f, 0.0f, 1.0f);
+                    particleChanged |= UI::Prop::DragFloat("Fallback Ground Y", &ps.groundPlaneY, 0.1f, -1000.0f, 1000.0f);
+                    if (ps.localSpace)
+                        ImGui::TextDisabled("Local-space emitters do not collide with the ground.");
+                    else
+                        ImGui::TextDisabled("Collides with the terrain where the scene has one.");
+                }
+            }
+
+            if (ImGui::CollapsingHeader("Color"))
+            {
+                ParticleGradientBar4(ps.colorOverLife);
+                particleChanged |= UI::Prop::ColorEdit4("Color 0", &ps.colorOverLife[0], ImGuiColorEditFlags_AlphaBar);
+                particleChanged |= UI::Prop::ColorEdit4("Color 1", &ps.colorOverLife[4], ImGuiColorEditFlags_AlphaBar);
+                particleChanged |= UI::Prop::ColorEdit4("Color 2", &ps.colorOverLife[8], ImGuiColorEditFlags_AlphaBar);
+                particleChanged |= UI::Prop::ColorEdit4("Color 3", &ps.colorOverLife[12], ImGuiColorEditFlags_AlphaBar);
+            }
+
+            if (particleChanged)
+            {
+                ixparticle::Sanitize(ps);
+                changed = true;
+            }
+            ImGui::TextDisabled("Simulates in Play (world space). Alpha/Additive blends over the scene.");
+        }
+        ImGui::PopID();
+    }
+
     if (m_meshRendererState.hasCollider)
     {
         ImGui::PushID("physics.collider");
-        const bool open = ImGui::CollapsingHeader(ICON_FA_CUBE " Collider", ImGuiTreeNodeFlags_DefaultOpen);
+        const bool open = ImGui::CollapsingHeader(ICON_FA_CUBE " Collider", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap);
         componentMenu("ColliderComponentMenu", "physics.collider");
         if (open)
         {
@@ -1184,7 +1697,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 (collider.shape == ixtreeme::physics::ColliderShape::Capsule ? 2 :
                 (collider.shape == ixtreeme::physics::ColliderShape::Mesh ? 3 :
                 (collider.shape == ixtreeme::physics::ColliderShape::ConvexHull ? 4 : 0)));
-            if (ImGui::Combo("Shape", &shapeIndex, shapes, IM_ARRAYSIZE(shapes)))
+            if (UI::Prop::Combo("Shape", &shapeIndex, shapes, IM_ARRAYSIZE(shapes)))
             {
                 collider.shape = shapeIndex == 1 ? ixtreeme::physics::ColliderShape::Sphere :
                     (shapeIndex == 2 ? ixtreeme::physics::ColliderShape::Capsule :
@@ -1192,9 +1705,9 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     (shapeIndex == 4 ? ixtreeme::physics::ColliderShape::ConvexHull : ixtreeme::physics::ColliderShape::Box)));
                 changed = true;
             }
-            changed |= ImGui::Checkbox("Enabled", &collider.enabled);
-            changed |= ImGui::Checkbox("Is Trigger", &collider.trigger);
-            ImGui::Checkbox("Edit Collider In Scene", &m_editSelectedColliderInScene);
+            changed |= UI::Prop::Checkbox("Enabled", &collider.enabled);
+            changed |= UI::Prop::Checkbox("Is Trigger", &collider.trigger);
+            UI::Prop::Checkbox("Edit Collider In Scene", &m_editSelectedColliderInScene);
             if (ImGui::IsItemHovered())
             {
                 ImGui::BeginTooltip();
@@ -1213,7 +1726,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
             };
             int layerIndex = static_cast<int>(ixtreeme::physics::PhysicsLayerIndex(collider.layer));
             layerIndex = std::clamp(layerIndex, 0, static_cast<int>(ixtreeme::physics::PhysicsLayerCount()) - 1);
-            if (ImGui::Combo("Physics Layer", &layerIndex, layerNames, IM_ARRAYSIZE(layerNames)))
+            if (UI::Prop::Combo("Physics Layer", &layerIndex, layerNames, IM_ARRAYSIZE(layerNames)))
             {
                 collider.layer = static_cast<ixtreeme::physics::PhysicsLayer>(layerIndex);
                 changed = true;
@@ -1242,7 +1755,7 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                     }
                     return physicsMaterialNames[static_cast<std::size_t>(selectedPhysicsMaterial)].c_str();
                 };
-                if (ImGui::BeginCombo("Physics Material", comboPreview()))
+                if (UI::Prop::BeginCombo("Physics Material", comboPreview()))
                 {
                     if (ImGui::Selectable("None", selectedPhysicsMaterial == 0))
                     {
@@ -1317,19 +1830,19 @@ bool EditorImGui::RenderSelectedMeshPhysicsComponents()
                 collider.center[2] = 0.0f;
                 changed = true;
             }
-            changed |= ImGui::DragFloat3("Center", collider.center, 0.05f, -1000.0f, 1000.0f, "%.2f");
+            changed |= UI::Prop::DragFloat3("Center", collider.center, 0.05f, -1000.0f, 1000.0f, "%.2f");
             if (collider.shape == ixtreeme::physics::ColliderShape::Box)
-                changed |= ImGui::DragFloat3("Size", collider.size, 0.05f, 0.001f, 10000.0f, "%.2f");
+                changed |= UI::Prop::DragFloat3("Size", collider.size, 0.05f, 0.001f, 10000.0f, "%.2f");
             else if (collider.shape == ixtreeme::physics::ColliderShape::Mesh)
                 ImGui::TextDisabled("Mesh collider uses the render mesh triangles. Static/Kinematic recommended.");
             else if (collider.shape == ixtreeme::physics::ColliderShape::ConvexHull)
                 ImGui::TextDisabled("Convex Hull uses the render mesh shape and is suitable for dynamic bodies.");
             else
-                changed |= ImGui::DragFloat("Radius", &collider.radius, 0.025f, 0.001f, 10000.0f, "%.2f");
+                changed |= UI::Prop::DragFloat("Radius", &collider.radius, 0.025f, 0.001f, 10000.0f, "%.2f");
             if (collider.shape == ixtreeme::physics::ColliderShape::Capsule)
-                changed |= ImGui::DragFloat("Height", &collider.height, 0.05f, 0.001f, 10000.0f, "%.2f");
-            changed |= ImGui::SliderFloat("Friction", &collider.friction, 0.0f, 4.0f, "%.2f");
-            changed |= ImGui::SliderFloat("Bounciness", &collider.restitution, 0.0f, 1.0f, "%.2f");
+                changed |= UI::Prop::DragFloat("Height", &collider.height, 0.05f, 0.001f, 10000.0f, "%.2f");
+            changed |= UI::Prop::SliderFloat("Friction", &collider.friction, 0.0f, 4.0f, "%.2f");
+            changed |= UI::Prop::SliderFloat("Bounciness", &collider.restitution, 0.0f, 1.0f, "%.2f");
             ImGui::TextDisabled("Physics Presets");
             auto applyPhysicsPreset = [&](const char* name,
                 float friction,
@@ -1395,14 +1908,11 @@ void EditorImGui::RenderSelectedCameraInspector()
         return;
 
     CameraEntity& camera = m_cameraEditorState.camera;
-    UI::SectionHeader(ICON_FA_CUBE " Entity");
-    ImGui::TextDisabled("flecs=%llu  object=%u",
-        static_cast<unsigned long long>(m_selectedHierarchyEntity),
-        camera.id);
+    RenderInspectorTitle(ICON_FA_VIDEO, "Camera", camera.id);
 
     char nameBuffer[96]{};
     std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", camera.name.c_str());
-    if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+    if (UI::Prop::InputText("Name", nameBuffer, sizeof(nameBuffer)))
     {
         camera.name = nameBuffer;
         MarkSelectedCameraChanged();
@@ -1421,12 +1931,12 @@ void EditorImGui::RenderSelectedCameraInspector()
         MarkSelectedCameraChanged();
     }
 
-    if (ImGui::CollapsingHeader(ICON_FA_EYE " Camera", ImGuiTreeNodeFlags_DefaultOpen))
+    if (ImGui::CollapsingHeader(ICON_FA_EYE " Camera", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
     {
         bool changed = false;
-        changed |= ImGui::SliderFloat("Field of View", &camera.fovDegrees, 10.0f, 120.0f, "%.1f deg");
-        changed |= ImGui::DragFloat("Near Plane", &camera.nearPlane, 0.01f, 0.01f, 100.0f, "%.2f");
-        changed |= ImGui::DragFloat("Far Plane", &camera.farPlane, 1.0f, 1.0f, 100000.0f, "%.1f");
+        changed |= UI::Prop::SliderFloat("Field of View", &camera.fovDegrees, 10.0f, 120.0f, "%.1f deg");
+        changed |= UI::Prop::DragFloat("Near Plane", &camera.nearPlane, 0.01f, 0.01f, 100.0f, "%.2f");
+        changed |= UI::Prop::DragFloat("Far Plane", &camera.farPlane, 1.0f, 1.0f, 100000.0f, "%.1f");
         if (changed)
         {
             camera.fovDegrees = std::clamp(camera.fovDegrees, 1.0f, 179.0f);
@@ -1453,16 +1963,16 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
     if (!m_meshRendererState.selected)
         return;
 
-    UI::SectionHeader(ICON_FA_CUBE " Entity");
-    ImGui::TextDisabled("flecs=%llu  object=%u",
-        static_cast<unsigned long long>(m_selectedHierarchyEntity),
-        m_meshRendererState.id);
+    const bool emptyObject = !m_meshRendererState.HasMeshGeometry();
+    RenderInspectorTitle(emptyObject ? ICON_FA_ARROWS_UP_DOWN_LEFT_RIGHT : ICON_FA_CUBE,
+        emptyObject ? "Empty Object" : (m_meshRendererState.skinned ? "Animated Mesh" : "Mesh"), m_meshRendererState.id);
 
     char nameBuffer[96]{};
     std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", m_meshRendererState.name.c_str());
-    if (ImGui::InputText("Name", nameBuffer, sizeof(nameBuffer)))
+    if (UI::Prop::InputText("Name", nameBuffer, sizeof(nameBuffer)))
     {
-        m_meshRendererState.name = nameBuffer[0] != '\0' ? nameBuffer : ("Mesh Entity " + std::to_string(m_meshRendererState.id));
+        m_meshRendererState.name = nameBuffer[0] != '\0' ? nameBuffer :
+            ((emptyObject ? "Empty Object " : "Mesh Entity ") + std::to_string(m_meshRendererState.id));
         MarkSelectedMeshRendererChanged();
     }
 
@@ -1472,7 +1982,7 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         m_meshRendererState.rotation[1] * 57.2957795f,
         m_meshRendererState.rotation[2] * 57.2957795f};
     float scale[3] = {m_meshRendererState.scale[0], m_meshRendererState.scale[1], m_meshRendererState.scale[2]};
-    if (RenderTransformComponent(position, rotation, scale))
+    if (RenderTransformComponent(position, rotation, scale, /*meshScale=*/true, /*allowZeroScale=*/emptyObject))
     {
         m_meshRendererState.position[0] = position[0];
         m_meshRendererState.position[1] = position[1];
@@ -1480,21 +1990,27 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         m_meshRendererState.rotation[0] = rotation[0] / 57.2957795f;
         m_meshRendererState.rotation[1] = rotation[1] / 57.2957795f;
         m_meshRendererState.rotation[2] = rotation[2] / 57.2957795f;
-        m_meshRendererState.scale[0] = std::max(scale[0], 0.001f);
-        m_meshRendererState.scale[1] = std::max(scale[1], 0.001f);
-        m_meshRendererState.scale[2] = std::max(scale[2], 0.001f);
+        const float minimumScale = emptyObject ? 0.0f : 0.001f;
+        m_meshRendererState.scale[0] = std::max(scale[0], minimumScale);
+        m_meshRendererState.scale[1] = std::max(scale[1], minimumScale);
+        m_meshRendererState.scale[2] = std::max(scale[2], minimumScale);
         MarkSelectedMeshRendererChanged();
     }
 
-    if (ImGui::CollapsingHeader(ICON_FA_CUBE " MeshRenderer", ImGuiTreeNodeFlags_DefaultOpen))
+    if (!emptyObject && ImGui::CollapsingHeader(ICON_FA_CUBE "  Mesh Renderer", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
     {
-        const std::string meshLabel = m_meshRendererState.meshDisplayName.empty()
+        std::string meshLabel = m_meshRendererState.meshDisplayName.empty()
             ? (m_meshRendererState.meshAssetId.empty() ? std::string("No model assigned") : m_meshRendererState.meshAssetId)
             : m_meshRendererState.meshDisplayName;
-        ImGui::TextUnformatted("Mesh");
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.42f, 0.34f, 0.64f, 1.0f));
-        ImGui::Button(meshLabel.c_str(), ImVec2(-1.0f, 42.0f));
-        ImGui::PopStyleColor();
+        // Built-in primitives by name ("Cube (built-in)"), not by their internal id.
+        constexpr std::string_view kPrimitivePrefix = "builtin://primitive/";
+        if (meshLabel.starts_with(kPrimitivePrefix) && meshLabel.size() > kPrimitivePrefix.size())
+        {
+            std::string primitive = meshLabel.substr(kPrimitivePrefix.size());
+            primitive[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(primitive[0])));
+            meshLabel = primitive + " (built-in)";
+        }
+        UI::AssetField("Model", ICON_FA_CUBE, meshLabel, "The model this entity shows. Drop a model from the Asset Browser here to change it.");
         if (ImGui::BeginDragDropTarget())
         {
             if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
@@ -1504,13 +2020,16 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
             }
             ImGui::EndDragDropTarget();
         }
-        ImGui::TextDisabled("Asset ID: %s", m_meshRendererState.meshAssetId.empty() ? "<none>" : m_meshRendererState.meshAssetId.c_str());
-        ImGui::TextDisabled("Path: %s", m_meshRendererState.meshAssetPath.empty() ? "<none>" : m_meshRendererState.meshAssetPath.c_str());
-        ImGui::TextDisabled("Render path: %s", m_meshRendererState.skinned ? "SkinnedMeshRenderer" : "StaticMeshRenderer");
+        if (m_inspectorShowDebugInfo)
+        {
+            ImGui::TextDisabled("Asset ID: %s", m_meshRendererState.meshAssetId.empty() ? "<none>" : m_meshRendererState.meshAssetId.c_str());
+            ImGui::TextDisabled("Path: %s", m_meshRendererState.meshAssetPath.empty() ? "<none>" : m_meshRendererState.meshAssetPath.c_str());
+            ImGui::TextDisabled("Render path: %s", m_meshRendererState.skinned ? "SkinnedMeshRenderer" : "StaticMeshRenderer");
+        }
     }
 
     if (!m_meshRendererState.prefabAssetId.empty() &&
-        ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Prefab", ImGuiTreeNodeFlags_DefaultOpen))
+        ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Prefab", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
     {
         RenderPrefabOverrideControls(m_meshRendererState.prefabAssetId,
             m_meshRendererState.prefabInstance,
@@ -1520,7 +2039,51 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
     if (RenderSelectedMeshPhysicsComponents())
         MarkSelectedMeshRendererChanged();
 
-    if (ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Material Slots", ImGuiTreeNodeFlags_DefaultOpen))
+    // Collapsed by default: its 13 tag checkboxes would otherwise render every frame (the inspector's
+    // cost is proportional to the widgets drawn, which matters at high frame rates).
+    if ((!emptyObject || m_meshRendererState.hasCollider) &&
+        ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Layer generation", ImGuiTreeNodeFlags_AllowOverlap))
+    {
+        bool changed = UI::Prop::Checkbox("Include collision surfaces", &m_meshRendererState.layerAuthoring.enabled);
+        ImGui::TextDisabled("Bounds and floor heights are derived from collision geometry.");
+        ImGui::BeginDisabled(!m_meshRendererState.layerAuthoring.enabled);
+        struct TagOption { const char* name; mx::map::VolumeTag tag; };
+        constexpr TagOption tagOptions[] = {
+            {"Ground", mx::map::VolumeTagGround},
+            {"Building", mx::map::VolumeTagBuilding},
+            {"Bridge", mx::map::VolumeTagBridge},
+            {"Water", mx::map::VolumeTagWater},
+            {"Underwater", mx::map::VolumeTagUnderwater},
+            {"Dungeon", mx::map::VolumeTagDungeon},
+            {"Interior", mx::map::VolumeTagInterior},
+            {"Connector", mx::map::VolumeTagConnector},
+            {"Road", mx::map::VolumeTagRoad},
+            {"Stairs", mx::map::VolumeTagStairs},
+            {"Lift", mx::map::VolumeTagLift},
+            {"Dock", mx::map::VolumeTagDock},
+        };
+        for (const TagOption& option : tagOptions)
+        {
+            bool selected = mx::map::HasVolumeTag(m_meshRendererState.layerAuthoring.tags, option.tag);
+            if (UI::Prop::Checkbox(option.name, &selected))
+            {
+                if (selected)
+                    m_meshRendererState.layerAuthoring.tags |= option.tag;
+                else
+                    m_meshRendererState.layerAuthoring.tags &= ~static_cast<std::uint32_t>(option.tag);
+                changed = true;
+            }
+        }
+        ImGui::EndDisabled();
+        if (!m_meshRendererState.hasCollider || !m_meshRendererState.collider.enabled)
+            ImGui::TextDisabled("An enabled static collider is required for export.");
+        if ((m_meshRendererState.layerAuthoring.tags & ~mx::map::kKnownVolumeTags) != 0)
+            ImGui::TextUnformatted("Invalid layer tags: generation will reject this source.");
+        if (changed)
+            MarkSelectedMeshRendererChanged();
+    }
+
+    if (!emptyObject && ImGui::CollapsingHeader(ICON_FA_LAYER_GROUP " Material Slots", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
     {
         m_meshRendererState.materialSlotCount = std::max<std::uint32_t>(
             1u,
@@ -1529,75 +2092,126 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         if (m_meshRendererState.materialSlots.size() < m_meshRendererState.materialSlotCount)
             m_meshRendererState.materialSlots.resize(m_meshRendererState.materialSlotCount);
 
-        auto materialLabelForGuid = [](const std::string& guidText) {
-            if (guidText.empty())
-                return std::string("(Drop Material here)");
-            const std::optional<Guid> guid = Guid::fromString(guidText);
-            if (!guid)
-                return std::string("Invalid material GUID");
-            const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*guid);
-            if (!path)
-                return std::string("Missing Material");
-            return path->filename().generic_string();
-        };
-
-        for (std::uint32_t slot = 0; slot < m_meshRendererState.materialSlotCount; ++slot)
+        const float gridWidth = ImGui::GetContentRegionAvail().x;
+        const int columns = std::max(1, static_cast<int>(gridWidth / 120.0f));
+        if (ImGui::BeginTable("##material_slots_grid", columns,
+            ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_NoSavedSettings))
         {
-            ImGui::PushID(static_cast<int>(slot));
-            ImGui::Text("[%u] Submesh %u", slot, slot);
-            ImGui::SameLine();
-            if (UI::IconButton(ICON_FA_XMARK, "Clear Material Slot", ImVec2(28.0f, 0.0f)))
+            for (std::uint32_t slot = 0; slot < m_meshRendererState.materialSlotCount; ++slot)
             {
-                m_meshRendererState.materialSlots[slot].clear();
-                MarkSelectedMeshRendererChanged();
-                Tracenf("[MATERIAL-SLOTS] clear entity=%u slot=%u",
-                    m_meshRendererState.id,
-                    slot);
-            }
-            const std::string label = materialLabelForGuid(m_meshRendererState.materialSlots[slot]);
-            const bool emptySlot = m_meshRendererState.materialSlots[slot].empty();
-            ImGui::PushStyleColor(ImGuiCol_Button,
-                emptySlot ? ImVec4(0.22f, 0.22f, 0.25f, 1.0f) : ImVec4(0.34f, 0.42f, 0.34f, 1.0f));
-            ImGui::Button(label.c_str(), ImVec2(-1.0f, 42.0f));
-            ImGui::PopStyleColor();
-            if (ImGui::BeginDragDropTarget())
-            {
-                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+                ImGui::TableNextColumn();
+                ImGui::PushID(static_cast<int>(slot));
+                const float headerX = ImGui::GetCursorPosX();
+                const float headerWidth = ImGui::GetContentRegionAvail().x;
+                ImGui::TextDisabled("Slot %u", slot);
+                ImGui::SameLine();
+                ImGui::SetCursorPosX(headerX + std::max(0.0f, headerWidth - 22.0f));
+                if (UI::IconButton(ICON_FA_XMARK, "Clear Material Slot", ImVec2(22.0f, 0.0f)))
                 {
-                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
-                    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
-                    if (entry && entry->category == AssetLibrary::Category::Material)
-                    {
-                        std::filesystem::path materialPath =
-                            entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
-                        if (materialPath.is_relative())
-                            materialPath = m_assetLibrary->AbsolutePath(*entry);
-                        const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
-                        m_meshRendererState.materialSlots[slot] = guid.toString();
-                        m_assetStatus = "Material slot <- " + entry->displayName;
-                        MarkSelectedMeshRendererChanged();
-                        Tracenf("[MATERIAL-SLOTS] assign entity=%u slot=%u material=%s guid=%s",
-                            m_meshRendererState.id,
-                            slot,
-                            entry->displayName.c_str(),
-                            guid.toString().c_str());
-                    }
-                    else
-                    {
-                        m_assetStatus = "Material Slots accept Material assets";
-                    }
+                    m_meshRendererState.materialSlots[slot].clear();
+                    MarkSelectedMeshRendererChanged();
+                    Tracenf("[MATERIAL-SLOTS] clear entity=%u slot=%u",
+                        m_meshRendererState.id,
+                        slot);
                 }
-                ImGui::EndDragDropTarget();
+                const auto& presentation = QueryMaterialSlot(m_meshRendererState.materialSlots[slot]);
+                AssetPreviewTexture* preview = presentation.diffuse ? GetAssetPreviewTexture(*presentation.diffuse) : nullptr;
+                void* textureId = preview && m_textureProvider ? m_textureProvider->GetPreviewTexture(preview->handle) : nullptr;
+                const bool emptySlot = m_meshRendererState.materialSlots[slot].empty();
+                const float rowWidth = ImGui::GetContentRegionAvail().x;
+                const float previewSize = std::min(48.0f, std::max(1.0f, rowWidth - 12.0f));
+                const float textWidth = std::max(1.0f, rowWidth - 12.0f);
+                const float nameHeight = ImGui::GetTextLineHeight() * 2.0f;
+                std::string visibleName = emptySlot ? "Empty" : presentation.name;
+                if (ImGui::CalcTextSize(visibleName.c_str(), nullptr, false, textWidth).y > nameHeight)
+                {
+                    // Keep UTF-8 characters intact when fitting a long name into the two-line caption.
+                    do
+                    {
+                        std::size_t end = visibleName.size() - 1;
+                        while (end > 0 && (static_cast<unsigned char>(visibleName[end]) & 0xc0) == 0x80) --end;
+                        visibleName.resize(end);
+                    } while (!visibleName.empty() &&
+                        ImGui::CalcTextSize((visibleName + "...").c_str(), nullptr, false, textWidth).y > nameHeight);
+                    visibleName += "...";
+                }
+                const ImVec2 textSize = ImGui::CalcTextSize(visibleName.c_str(), nullptr, false, textWidth);
+                const float rowHeight = previewSize + nameHeight + 18.0f;
+                ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+                ImGui::Button("##material_slot", ImVec2(rowWidth, rowHeight));
+                ImGui::PopStyleColor();
+                const auto min = ImGui::GetItemRectMin();
+                const ImVec2 imageMin(min.x + (rowWidth - previewSize) * 0.5f, min.y + 6.0f);
+                const ImVec2 imageMax(imageMin.x + previewSize, imageMin.y + previewSize);
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                const auto* tint = presentation.material ? presentation.material->material.colorTint : nullptr;
+                const ImU32 color = tint ? ImGui::ColorConvertFloat4ToU32(ImVec4(
+                    std::clamp(tint[0], 0.0f, 1.0f), std::clamp(tint[1], 0.0f, 1.0f),
+                    std::clamp(tint[2], 0.0f, 1.0f), 1.0f)) : ImGui::GetColorU32(ImGuiCol_Button);
+                draw->AddRectFilled(imageMin, imageMax, textureId ? ImGui::GetColorU32(ImGuiCol_WindowBg) : color, 4.0f);
+                if (textureId)
+                {
+                    const float previewScale = std::min(previewSize / preview->width, previewSize / preview->height);
+                    const ImVec2 size(preview->width * previewScale, preview->height * previewScale);
+                    const ImVec2 at(imageMin.x + (previewSize - size.x) * 0.5f, imageMin.y + (previewSize - size.y) * 0.5f);
+                    draw->AddImageRounded(reinterpret_cast<ImTextureID>(textureId), at,
+                        ImVec2(at.x + size.x, at.y + size.y), ImVec2(0, 0), ImVec2(1, 1), color, 4.0f);
+                }
+                else if (!presentation.material)
+                {
+                    const char* icon = emptySlot ? "+" : ICON_FA_PALETTE;
+                    const auto size = ImGui::CalcTextSize(icon);
+                    draw->AddText(ImVec2(imageMin.x + (previewSize - size.x) * 0.5f,
+                        imageMin.y + (previewSize - size.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_TextDisabled), icon);
+                }
+                draw->AddText(ImGui::GetFont(), ImGui::GetFontSize(),
+                    ImVec2(min.x + std::max(6.0f, (rowWidth - textSize.x) * 0.5f), imageMax.y + 6.0f),
+                    ImGui::GetColorU32(ImGuiCol_Text), visibleName.c_str(), nullptr, textWidth);
+                if (!emptySlot && ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+                    OpenPbrMaterialEditor(m_meshRendererState.materialSlots[slot]);
+                if (!emptySlot)
+                    UI::ItemTooltip((presentation.name + "\nSubmesh " + std::to_string(slot) +
+                        "\nDouble-click to edit. Drop a material here to replace it.").c_str());
+                else
+                    UI::ItemTooltip("Drop a material here to assign it.");
+                if (ImGui::BeginDragDropTarget())
+                {
+                    if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
+                    {
+                        const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+                        const auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
+                        if (entry && entry->category == AssetLibrary::Category::Material)
+                        {
+                            std::filesystem::path materialPath =
+                                entry->originalPath.empty() ? m_assetLibrary->AbsolutePath(*entry) : std::filesystem::path(entry->originalPath);
+                            if (materialPath.is_relative())
+                                materialPath = m_assetLibrary->AbsolutePath(*entry);
+                            const Guid guid = AssetDatabase::Instance().getOrCreateGuid(materialPath);
+                            m_meshRendererState.materialSlots[slot] = guid.toString();
+                            m_assetStatus = "Material slot <- " + entry->displayName;
+                            MarkSelectedMeshRendererChanged();
+                            Tracenf("[MATERIAL-SLOTS] assign entity=%u slot=%u material=%s guid=%s",
+                                m_meshRendererState.id,
+                                slot,
+                                entry->displayName.c_str(),
+                                guid.toString().c_str());
+                        }
+                        else
+                        {
+                            m_assetStatus = "Material Slots accept Material assets";
+                        }
+                    }
+                    ImGui::EndDragDropTarget();
+                }
+                ImGui::Spacing();
+                ImGui::PopID();
             }
-            if (!m_meshRendererState.materialSlots[slot].empty())
-                ImGui::TextDisabled("guid: %s", m_meshRendererState.materialSlots[slot].c_str());
-            ImGui::Spacing();
-            ImGui::PopID();
+            ImGui::EndTable();
         }
     }
 
     if (!m_meshRendererState.skinned &&
-        ImGui::CollapsingHeader(ICON_FA_PALETTE " Material", ImGuiTreeNodeFlags_DefaultOpen))
+        ImGui::CollapsingHeader(ICON_FA_PALETTE " Material", ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_AllowOverlap))
     {
         m_meshRendererState.materialSlotCount = std::max<std::uint32_t>(1u, m_meshRendererState.materialSlotCount);
         m_meshRendererState.selectedMaterialSlot = std::min(m_meshRendererState.selectedMaterialSlot,
@@ -1639,16 +2253,22 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
 
         MeshSceneEntity::MaterialOverride& material = findOverride();
         bool changed = false;
-        changed |= ImGui::Checkbox("Override Active", &material.enabled);
-        changed |= ImGui::ColorEdit4("BaseColor Tint", material.baseColor, ImGuiColorEditFlags_Float);
-        changed |= ImGui::SliderFloat("Metallic", &material.metallic, 0.0f, 1.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Roughness", &material.roughness, 0.0f, 1.0f, "%.2f");
-        changed |= ImGui::SliderFloat("Normal Strength", &material.normalStrength, 0.0f, 4.0f, "%.2f");
-        changed |= ImGui::SliderFloat("AO Strength", &material.aoStrength, 0.0f, 2.0f, "%.2f");
-        changed |= ImGui::ColorEdit3("Emissive", material.emissive, ImGuiColorEditFlags_Float);
-        changed |= ImGui::SliderFloat("Emissive Intensity", &material.emissiveIntensity, 0.0f, 20.0f, "%.2f");
-        changed |= ImGui::DragFloat2("UV Tiling", material.uvTiling, 0.01f, 0.01f, 64.0f, "%.2f");
-        changed |= ImGui::DragFloat2("UV Offset", material.uvOffset, 0.01f, -1000.0f, 1000.0f, "%.2f");
+        changed |= UI::Prop::Checkbox("Override Active", &material.enabled);
+        // The override fields only render while the override is active: ten widgets that otherwise
+        // cost ImGui time every frame for nothing.
+        if (!material.enabled)
+            ImGui::TextDisabled("Enable Override Active to edit the material override.");
+        else
+        {
+        changed |= UI::Prop::ColorEdit4("BaseColor Tint", material.baseColor, ImGuiColorEditFlags_Float);
+        changed |= UI::Prop::SliderFloat("Metallic", &material.metallic, 0.0f, 1.0f, "%.2f");
+        changed |= UI::Prop::SliderFloat("Roughness", &material.roughness, 0.0f, 1.0f, "%.2f");
+        changed |= UI::Prop::SliderFloat("Normal Strength", &material.normalStrength, 0.0f, 4.0f, "%.2f");
+        changed |= UI::Prop::SliderFloat("AO Strength", &material.aoStrength, 0.0f, 2.0f, "%.2f");
+        changed |= UI::Prop::ColorEdit3("Emissive", material.emissive, ImGuiColorEditFlags_Float);
+        changed |= UI::Prop::SliderFloat("Emissive Intensity", &material.emissiveIntensity, 0.0f, 20.0f, "%.2f");
+        changed |= UI::Prop::DragFloat2("UV Tiling", material.uvTiling, 0.01f, 0.01f, 64.0f, "%.2f");
+        changed |= UI::Prop::DragFloat2("UV Offset", material.uvOffset, 0.01f, -1000.0f, 1000.0f, "%.2f");
 
         material.baseColor[0] = std::clamp(material.baseColor[0], 0.0f, 8.0f);
         material.baseColor[1] = std::clamp(material.baseColor[1], 0.0f, 8.0f);
@@ -1661,6 +2281,7 @@ void EditorImGui::RenderSelectedMeshRendererInspector()
         material.emissiveIntensity = std::clamp(material.emissiveIntensity, 0.0f, 20.0f);
         material.uvTiling[0] = std::clamp(material.uvTiling[0], 0.01f, 64.0f);
         material.uvTiling[1] = std::clamp(material.uvTiling[1], 0.01f, 64.0f);
+        }
 
         if (changed)
         {
@@ -1724,413 +2345,377 @@ void EditorImGui::ApplyTimeOfDayPreset(float hour)
 
 void EditorImGui::RenderLightingPanel()
 {
-    UI::SectionHeader(ICON_FA_LIGHTBULB " Directional Light");
-    ImGui::Checkbox("Sun Enabled", &m_lightingState.directional.enabled);
-    ImGui::Checkbox("Sun Shadows", &m_lightingState.sunShadowsEnabled);
-    ImGui::ColorEdit3("Sun Color", &m_lightingState.directional.r);
-    ImGui::SliderFloat("Sun Intensity", &m_lightingState.directional.intensity, 0.0f, 5.0f, "%.2f");
-    ImGui::SliderFloat("Sun Angle X", &m_lightingState.directional.elevationDegrees, -90.0f, 90.0f, "%.1f deg");
-    ImGui::SliderFloat("Sun Angle Y", &m_lightingState.directional.azimuthDegrees, 0.0f, 360.0f, "%.1f deg");
+    ImGui::SeparatorText("Sun");
+    UI::Prop::Checkbox("Enabled", &m_lightingState.directional.enabled);
+    UI::Prop::Checkbox("Casts shadows", &m_lightingState.sunShadowsEnabled);
+    UI::Prop::ColorEdit3("Color", &m_lightingState.directional.r);
+    UI::Prop::SliderFloat("Intensity", &m_lightingState.directional.intensity, 0.0f, 5.0f, "%.2f");
+    UI::Prop::SliderFloat("Height in sky", &m_lightingState.directional.elevationDegrees, -90.0f, 90.0f, "%.1f deg");
+    UI::ItemTooltip("Elevation above the horizon: 90 is straight overhead, below 0 is night");
+    UI::Prop::SliderFloat("Direction", &m_lightingState.directional.azimuthDegrees, 0.0f, 360.0f, "%.1f deg");
+    UI::ItemTooltip("Compass direction the sunlight comes from");
 
-    ImGui::Spacing();
-    UI::SectionHeader(ICON_FA_GEAR " Ambient Light");
-    ImGui::ColorEdit3("Ambient Color", &m_lightingState.ambient.r);
-    ImGui::SliderFloat("Ambient Intensity", &m_lightingState.ambient.intensity, 0.0f, 3.0f, "%.2f");
+    ImGui::SeparatorText("Ambient light");
+    ImGui::BeginDisabled(m_skySettings.ambientFromSky);
+    UI::Prop::ColorEdit3("Color##ambient", &m_lightingState.ambient.r);
+    ImGui::EndDisabled();
+    if (m_skySettings.ambientFromSky)
+        UI::ItemTooltip("Taken from the sky (Sky > Ambient from sky)");
+    UI::Prop::SliderFloat("Intensity##ambient", &m_lightingState.ambient.intensity, 0.0f, 3.0f, "%.2f");
 
-    ImGui::Spacing();
-    UI::SectionHeader(ICON_FA_GEAR " Time of Day");
-    ImGui::SliderFloat("Hour", &m_timeOfDayHours, 0.0f, 24.0f, "%.1f h");
-    if (UI::IconButton(ICON_FA_CHECK, "Apply Preset"))
-        ApplyTimeOfDayPreset(m_timeOfDayHours);
-}
-
-void EditorImGui::RenderDynamicLightsPanel()
-{
-    const uint32_t total = m_lightingState.numPointLights + m_lightingState.numSpotLights;
-    ImGui::Text("Total: %u / %u", total, kMaxDynamicPointLights + kMaxDynamicSpotLights);
-
-    if (UI::IconButton(ICON_FA_LIGHTBULB, "Point Light"))
-    {
-        m_commands.addPointLight = true;
-        Tracen("[EDITOR-IMGUI-2] Light spawn: type=point id=pending");
-    }
-    ImGui::SameLine();
-    if (UI::IconButton(ICON_FA_LIGHTBULB, "Spot Light"))
-    {
-        m_commands.addSpotLight = true;
-        Tracen("[EDITOR-IMGUI-2] Light spawn: type=spot id=pending");
-    }
-}
-
-void EditorImGui::RenderWorldPanel()
-{
-    if (ImGui::Begin(ICON_FA_GLOBE " World"))
-    {
-        if (ImGui::CollapsingHeader("Performance", ImGuiTreeNodeFlags_DefaultOpen))
-            RenderPerformancePanel();
-        if (ImGui::CollapsingHeader("Objects", ImGuiTreeNodeFlags_DefaultOpen))
-        {
-            auto queuePrimitive = [&](const char* type) {
-                m_commands.addPrimitiveEntity = true;
-                m_commands.primitiveType = type;
-                Tracenf("[PRIMITIVE] UI create queued type=%s", type);
-            };
-            if (UI::IconButton(ICON_FA_CUBE, "Cube"))
-                queuePrimitive("cube");
-            ImGui::SameLine();
-            if (UI::IconButton(ICON_FA_CUBE, "Sphere"))
-                queuePrimitive("sphere");
-            ImGui::SameLine();
-            if (UI::IconButton(ICON_FA_CUBE, "Capsule"))
-                queuePrimitive("capsule");
-        }
-        if (ImGui::CollapsingHeader("Terrain", ImGuiTreeNodeFlags_DefaultOpen))
-        {
-            if (UI::IconButton(ICON_FA_MOUNTAIN, "Create Terrain"))
-            {
-                if (m_terrainState.exists)
-                    m_replaceTerrainConfirmOpen = true;
-                else
-                    m_createTerrainModalOpen = true;
-            }
-            if (m_terrainState.exists)
-            {
-                ImGui::SameLine();
-                ImGui::TextDisabled("%.0fm x %.0fm, %.2fm/cell",
-                    m_terrainState.widthMeters,
-                    m_terrainState.depthMeters,
-                    m_terrainState.cellSizeMeters);
-            }
-        }
-        if (ImGui::CollapsingHeader("Environment", ImGuiTreeNodeFlags_DefaultOpen))
-            RenderLightingPanel();
-        if (ImGui::CollapsingHeader("Dynamic Lights", ImGuiTreeNodeFlags_DefaultOpen))
-            RenderDynamicLightsPanel();
-        if (ImGui::CollapsingHeader("Physics Events"))
-        {
-            ImGui::TextDisabled("Recent collision / trigger events: %zu", m_physicsEvents.size());
-            if (m_physicsEvents.empty())
-            {
-                ImGui::TextDisabled("No events yet. Enter Play mode and collide/trigger bodies.");
-            }
-            else if (ImGui::BeginTable("PhysicsEventsTable", 5, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY, ImVec2(0.0f, 180.0f)))
-            {
-                ImGui::TableSetupColumn("Event");
-                ImGui::TableSetupColumn("A");
-                ImGui::TableSetupColumn("B");
-                ImGui::TableSetupColumn("Point");
-                ImGui::TableSetupColumn("Depth");
-                ImGui::TableHeadersRow();
-                const std::size_t maxRows = std::min<std::size_t>(m_physicsEvents.size(), 48u);
-                for (std::size_t row = 0; row < maxRows; ++row)
-                {
-                    const PhysicsEventEditorState& event = m_physicsEvents[m_physicsEvents.size() - 1u - row];
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0);
-                    ImGui::Text("%s %s", event.kind.c_str(), event.phase.c_str());
-                    ImGui::TableSetColumnIndex(1);
-                    ImGui::Text("#%u %s", event.entityA, event.nameA.c_str());
-                    ImGui::TableSetColumnIndex(2);
-                    ImGui::Text("#%u %s", event.entityB, event.nameB.c_str());
-                    ImGui::TableSetColumnIndex(3);
-                    ImGui::Text("%.2f, %.2f, %.2f", event.point[0], event.point[1], event.point[2]);
-                    ImGui::TableSetColumnIndex(4);
-                    ImGui::Text("%.3f", event.penetrationDepth);
-                }
-                ImGui::EndTable();
-            }
-        }
-    }
-    ImGui::End();
-    RenderCreateTerrainModal();
-}
-
-void EditorImGui::RenderPerformancePanel()
-{
-    auto queueRenderResolution = [&](bool native, std::uint32_t width, std::uint32_t height) {
-        m_commands.renderResolutionChanged = true;
-        m_commands.renderResolutionUseNative = native;
-        m_commands.renderResolutionWidth = width;
-        m_commands.renderResolutionHeight = height;
-        Tracenf("[RENDER-RES] request mode=%s size=%ux%u",
-            native ? "native" : "fixed",
-            width,
-            height);
-    };
-
-    const double frameMs = m_engineStats.averageFrameMs > 0.0 ? m_engineStats.averageFrameMs : m_engineStats.frameMs;
-    ImGui::Text("FPS: %.1f", m_engineStats.fps);
-    ImGui::Text("Frame: %.2f ms  (min %.2f / max %.2f)",
-        frameMs,
-        m_engineStats.minFrameMs,
-        m_engineStats.maxFrameMs);
-    ImGui::Text("Swapchain: %u x %u",
-        m_engineStats.swapchainWidth,
-        m_engineStats.swapchainHeight);
-    ImGui::Text("Render Target: %u x %u",
-        m_engineStats.renderWidth,
-        m_engineStats.renderHeight);
-    if (m_engineStats.presentUncapped)
-        ImGui::TextDisabled("Present: UNCAPPED (no vsync)");
-    else
-        ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "Present: FIFO / VSYNC-CAPPED (FPS limited to monitor Hz)");
-    ImGui::Separator();
-    ImGui::TextDisabled("CPU frame breakdown (previous frame):");
-    ImGui::Text("  Total CPU:          %.2f ms", m_engineStats.cpuTotalMs);
-    ImGui::Text("  Scene render:       %.2f ms", m_engineStats.cpuSceneRenderMs);
-    ImGui::Text("  Editor UI (ImGui):  %.2f ms", m_engineStats.cpuEditorUiMs);
-    ImGui::Text("  Submit / Present:   %.2f ms", m_engineStats.cpuSubmitPresentMs);
-    ImGui::Text("  ECS update:         %.2f ms", m_engineStats.cpuEcsUpdateMs);
-    ImGui::Text("  Asset watcher poll: %.2f ms", m_engineStats.cpuAssetWatcherMs);
-    ImGui::Separator();
-    ImGui::Text("Math backend: %s", ixtreeme::math::simd::ActiveBackendName());
-    static ixtreeme::math::diagnostics::SelfCheckResult mathSelfCheck = ixtreeme::math::diagnostics::RunSelfCheck();
-    ImGui::Text("Math self-check: %s  max error %.6f  checks %u",
-        mathSelfCheck.passed ? "OK" : "FAILED",
-        mathSelfCheck.maxAbsError,
-        mathSelfCheck.checks);
-    static ixtreeme::math::diagnostics::BenchmarkResult mathBenchmark{};
-    static bool mathBenchmarkReady = false;
-    if (ImGui::Button("Run Math Benchmark"))
-    {
-        mathBenchmark = ixtreeme::math::diagnostics::RunBenchmark(75000);
-        mathBenchmarkReady = true;
-        Tracenf("[MATH-BENCH] backend=%s iters=%u mat4=%.3fms rowMat4=%.3fms vec4=%.3fms frustumAabb=%.3fms checksum=%.3f",
-            mathBenchmark.backend.c_str(),
-            mathBenchmark.iterations,
-            mathBenchmark.columnMajorMat4Ms,
-            mathBenchmark.rowMajorMat4Ms,
-            mathBenchmark.transformVec4Ms,
-            mathBenchmark.frustumAabbMs,
-            mathBenchmark.checksum);
-    }
-    if (mathBenchmarkReady)
-    {
-        ImGui::TextDisabled("Bench: mat4 %.2f ms | row %.2f ms | vec4 %.2f ms | frustum %.2f ms",
-            mathBenchmark.columnMajorMat4Ms,
-            mathBenchmark.rowMajorMat4Ms,
-            mathBenchmark.transformVec4Ms,
-            mathBenchmark.frustumAabbMs);
-    }
-    auto queuePhysicsDebugCommands = [&]() {
-        m_commands.debugPerfTogglesChanged = true;
-        m_commands.disableShadowPass = m_debugDisableShadowPass;
-        m_commands.disableWaterReflectionPass = m_debugDisableWaterReflectionPass;
-        m_commands.disableAssetLibraryDiscovery = m_debugDisableAssetLibraryDiscovery;
-        m_commands.disableAssetWatcherPoll = m_debugDisableAssetWatcherPoll;
-        m_commands.disableHierarchyIteration = m_debugDisableHierarchyIteration;
-        m_commands.showPhysicsColliders = m_debugShowPhysicsColliders;
-        m_commands.showPhysicsContacts = m_debugShowPhysicsContacts;
-        m_commands.showPhysicsBodyCenters = m_debugShowPhysicsBodyCenters;
-    };
-    if (ImGui::Checkbox("Show Physics Colliders", &m_debugShowPhysicsColliders))
-    {
-        queuePhysicsDebugCommands();
-    }
-    if (ImGui::Checkbox("Show Physics Contacts", &m_debugShowPhysicsContacts))
-    {
-        queuePhysicsDebugCommands();
-    }
-    if (ImGui::Checkbox("Show Physics Body Centers", &m_debugShowPhysicsBodyCenters))
-    {
-        queuePhysicsDebugCommands();
-    }
-    if (ImGui::CollapsingHeader("Physics Query"))
-    {
-        ImGui::DragFloat("Ray Distance", &m_physicsRaycastDistance, 5.0f, 0.1f, 5000.0f, "%.1f m");
-        m_physicsRaycastDistance = std::clamp(m_physicsRaycastDistance, 0.1f, 5000.0f);
-        ImGui::Checkbox("Hit Triggers", &m_physicsRaycastHitTriggers);
-        ImGui::TextDisabled("Layer Mask");
-        constexpr std::size_t kLayerCount = static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count);
-        for (std::size_t layerIndex = 0; layerIndex < kLayerCount; ++layerIndex)
-        {
-            const auto layer = static_cast<ixtreeme::physics::PhysicsLayer>(layerIndex);
-            bool enabled = (m_physicsRaycastLayerMask & ixtreeme::physics::PhysicsLayerMask(layer)) != 0u;
-            ImGui::PushID(static_cast<int>(layerIndex));
-            if (ImGui::Checkbox(ixtreeme::physics::DisplayName(layer), &enabled))
-            {
-                if (enabled)
-                    m_physicsRaycastLayerMask |= ixtreeme::physics::PhysicsLayerMask(layer);
-                else
-                    m_physicsRaycastLayerMask &= ~ixtreeme::physics::PhysicsLayerMask(layer);
-            }
-            ImGui::PopID();
-            if ((layerIndex % 2u) == 0u && layerIndex + 1u < kLayerCount)
-                ImGui::SameLine();
-        }
-        if (ImGui::Button("Raycast From Camera"))
-        {
-            m_commands.physicsRaycastFromCamera = true;
-            m_commands.physicsRaycastLayerMask = m_physicsRaycastLayerMask;
-            m_commands.physicsRaycastHitTriggers = m_physicsRaycastHitTriggers;
-            m_commands.physicsRaycastDistance = m_physicsRaycastDistance;
-        }
-
-        ImGui::SeparatorText("Sphere Overlap");
-        ImGui::DragFloat("Overlap Distance", &m_physicsOverlapDistance, 1.0f, 0.0f, 5000.0f, "%.1f m");
-        ImGui::DragFloat("Overlap Radius", &m_physicsOverlapRadius, 0.1f, 0.05f, 100.0f, "%.2f m");
-        ImGui::DragFloat3("Box Half Extents", m_physicsOverlapBoxHalfExtents, 0.1f, 0.05f, 100.0f, "%.2f m");
-        ImGui::DragFloat("Capsule Radius", &m_physicsOverlapCapsuleRadius, 0.05f, 0.05f, 100.0f, "%.2f m");
-        ImGui::DragFloat("Capsule Height", &m_physicsOverlapCapsuleHeight, 0.1f, 0.1f, 200.0f, "%.2f m");
-        m_physicsOverlapDistance = std::clamp(m_physicsOverlapDistance, 0.0f, 5000.0f);
-        m_physicsOverlapRadius = std::clamp(m_physicsOverlapRadius, 0.05f, 100.0f);
-        for (float& extent : m_physicsOverlapBoxHalfExtents)
-            extent = std::clamp(extent, 0.05f, 100.0f);
-        m_physicsOverlapCapsuleRadius = std::clamp(m_physicsOverlapCapsuleRadius, 0.05f, 100.0f);
-        m_physicsOverlapCapsuleHeight = std::clamp(m_physicsOverlapCapsuleHeight, m_physicsOverlapCapsuleRadius * 2.0f, 200.0f);
-        ImGui::Checkbox("Overlap Hit Triggers", &m_physicsOverlapHitTriggers);
-        ImGui::TextDisabled("Overlap Layer Mask");
-        for (std::size_t layerIndex = 0; layerIndex < kLayerCount; ++layerIndex)
-        {
-            const auto layer = static_cast<ixtreeme::physics::PhysicsLayer>(layerIndex);
-            bool enabled = (m_physicsOverlapLayerMask & ixtreeme::physics::PhysicsLayerMask(layer)) != 0u;
-            ImGui::PushID(static_cast<int>(1000u + layerIndex));
-            if (ImGui::Checkbox(ixtreeme::physics::DisplayName(layer), &enabled))
-            {
-                if (enabled)
-                    m_physicsOverlapLayerMask |= ixtreeme::physics::PhysicsLayerMask(layer);
-                else
-                    m_physicsOverlapLayerMask &= ~ixtreeme::physics::PhysicsLayerMask(layer);
-            }
-            ImGui::PopID();
-            if ((layerIndex % 2u) == 0u && layerIndex + 1u < kLayerCount)
-                ImGui::SameLine();
-        }
-        if (ImGui::Button("Overlap Sphere From Camera"))
-        {
-            m_commands.physicsOverlapSphereFromCamera = true;
-            m_commands.physicsOverlapLayerMask = m_physicsOverlapLayerMask;
-            m_commands.physicsOverlapHitTriggers = m_physicsOverlapHitTriggers;
-            m_commands.physicsOverlapDistance = m_physicsOverlapDistance;
-            m_commands.physicsOverlapRadius = m_physicsOverlapRadius;
-        }
+    ImGui::SeparatorText("Time of day preset");
+    UI::Property("Hour", [&](const char* id) {
+        const float buttonWidth = ImGui::CalcTextSize("Apply").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::SetNextItemWidth(std::max(40.0f, ImGui::GetContentRegionAvail().x - buttonWidth - ImGui::GetStyle().ItemSpacing.x));
+        UI::Prop::SliderFloat(id, &m_timeOfDayHours, 0.0f, 24.0f, "%.1f h");
         ImGui::SameLine();
-        if (ImGui::Button("Overlap Box From Camera"))
+        if (ImGui::Button("Apply"))
+            ApplyTimeOfDayPreset(m_timeOfDayHours);
+        return false;
+    });
+    UI::ItemTooltip("Sets the sun and ambient light for that hour");
+}
+
+namespace
+{
+// File-name words that mark each cube face, in SkySettings face order (+X, -X, +Y, -Y, +Z, -Z).
+// Dropping one face fills the others from same-named siblings: sky_right.png -> sky_left.png, ...
+const std::array<std::vector<std::string>, SkySettings::kCubeFaces> kSkyFaceWords = {{
+    {"right", "px", "posx", "rt"},
+    {"left", "nx", "negx", "lf"},
+    {"up", "top", "py", "posy"},
+    {"down", "bottom", "ny", "negy", "dn"},
+    {"front", "pz", "posz", "ft"},
+    {"back", "nz", "negz", "bk"},
+}};
+
+bool IsWordBoundary(const std::string& text, std::size_t index)
+{
+    return index == 0 || index >= text.size() ||
+        !std::isalnum(static_cast<unsigned char>(text[index - 1])) ||
+        !std::isalnum(static_cast<unsigned char>(text[index]));
+}
+
+// Finds the face word in a file stem: a whole word (between separators) or a trailing suffix.
+std::optional<std::pair<std::size_t, std::size_t>> FindSkyFaceWord(const std::string& stem, std::size_t face)
+{
+    std::string lower = stem;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    for (const std::string& word : kSkyFaceWords[face])
+    {
+        for (std::size_t at = lower.rfind(word); at != std::string::npos; at = at == 0 ? std::string::npos : lower.rfind(word, at - 1))
         {
-            m_commands.physicsOverlapBoxFromCamera = true;
-            m_commands.physicsOverlapLayerMask = m_physicsOverlapLayerMask;
-            m_commands.physicsOverlapHitTriggers = m_physicsOverlapHitTriggers;
-            m_commands.physicsOverlapDistance = m_physicsOverlapDistance;
-            std::copy(std::begin(m_physicsOverlapBoxHalfExtents), std::end(m_physicsOverlapBoxHalfExtents), std::begin(m_commands.physicsOverlapBoxHalfExtents));
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Overlap Capsule From Camera"))
-        {
-            m_commands.physicsOverlapCapsuleFromCamera = true;
-            m_commands.physicsOverlapLayerMask = m_physicsOverlapLayerMask;
-            m_commands.physicsOverlapHitTriggers = m_physicsOverlapHitTriggers;
-            m_commands.physicsOverlapDistance = m_physicsOverlapDistance;
-            m_commands.physicsOverlapCapsuleRadius = m_physicsOverlapCapsuleRadius;
-            m_commands.physicsOverlapCapsuleHeight = m_physicsOverlapCapsuleHeight;
+            const std::size_t end = at + word.size();
+            if (IsWordBoundary(lower, at) && (end == lower.size() || !std::isalpha(static_cast<unsigned char>(lower[end]))))
+                return std::make_pair(at, word.size());
         }
     }
-    if (ImGui::CollapsingHeader("Physics Collision Matrix"))
+    return std::nullopt;
+}
+
+// The other face's word in the same letter case as the one it replaces.
+std::string MatchCase(const std::string& word, const std::string& like)
+{
+    std::string out = word;
+    const bool upper = std::all_of(like.begin(), like.end(),
+        [](unsigned char c) { return !std::isalpha(c) || std::isupper(c); });
+    const bool capitalized = !upper && !like.empty() && std::isupper(static_cast<unsigned char>(like[0]));
+    for (std::size_t i = 0; i < out.size(); ++i)
     {
-        constexpr std::size_t kLayerCount = static_cast<std::size_t>(ixtreeme::physics::PhysicsLayer::Count);
-        bool matrixChanged = false;
-        if (ImGui::Button("Reset Physics Matrix"))
-        {
-            for (std::size_t a = 0; a < kLayerCount; ++a)
+        if (upper || (capitalized && i == 0))
+            out[i] = static_cast<char>(std::toupper(static_cast<unsigned char>(out[i])));
+    }
+    return out;
+}
+} // namespace
+
+void EditorImGui::RenderSkyPanel()
+{
+    SkySettings& sky = m_skySettings;
+    bool changed = false;
+
+    const char* modes[] = {"Color", "Procedural", "Cube map (6 images)", "Panorama (360 image)"};
+    int mode = static_cast<int>(sky.mode);
+    if (UI::Prop::Combo("Type", &mode, modes, IM_ARRAYSIZE(modes)))
+    {
+        sky.mode = static_cast<SkySettings::Mode>(std::clamp(mode, 0, 3));
+        changed = true;
+    }
+    UI::ItemTooltip("What the scene shows behind everything (the water reflects it too)");
+
+    // An image slot: shows the file, takes a texture dropped from the Asset Browser, X clears it.
+    // Returns the project-relative path of a newly dropped texture (empty when nothing was dropped).
+    const auto imageSlot = [&](const char* label, std::string& path, const char* tooltip) {
+        std::string dropped;
+        const std::string name = path.empty() ? std::string("None (drop an image here)")
+                                              : std::filesystem::path(path).filename().string();
+        ImGui::PushID(label);
+        UI::Property(label, [&](const char*) {
+            const float clearWidth = path.empty() ? 0.0f : ImGui::GetFrameHeight() + ImGui::GetStyle().ItemSpacing.x;
+            ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive));
+            ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
+            const std::string text = std::string(ICON_FA_IMAGE "  ") + name + "##image";
+            ImGui::Button(text.c_str(), ImVec2(std::max(40.0f, ImGui::GetContentRegionAvail().x - clearWidth), 0.0f));
+            ImGui::PopStyleVar();
+            ImGui::PopStyleColor(3);
+            UI::ItemTooltip(path.empty() ? tooltip : path.c_str());
+            if (ImGui::BeginDragDropTarget())
             {
-                for (std::size_t b = 0; b < kLayerCount; ++b)
+                if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
                 {
-                    m_physicsLayerMatrix[a][b] = ixtreeme::physics::DefaultLayerCollision(
-                        static_cast<ixtreeme::physics::PhysicsLayer>(a),
-                        static_cast<ixtreeme::physics::PhysicsLayer>(b));
-                }
-            }
-            matrixChanged = true;
-        }
-        const char* shortNames[] = {"Def", "World", "Dyn", "Player", "Trig", "Proj", "Foliage", "None"};
-        if (ImGui::BeginTable("PhysicsLayerMatrix", static_cast<int>(kLayerCount) + 1, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
-        {
-            ImGui::TableSetupColumn("");
-            for (std::size_t i = 0; i < kLayerCount; ++i)
-                ImGui::TableSetupColumn(shortNames[i]);
-            ImGui::TableHeadersRow();
-            for (std::size_t row = 0; row < kLayerCount; ++row)
-            {
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                ImGui::TextUnformatted(ixtreeme::physics::DisplayName(static_cast<ixtreeme::physics::PhysicsLayer>(row)));
-                for (std::size_t col = 0; col < kLayerCount; ++col)
-                {
-                    ImGui::TableSetColumnIndex(static_cast<int>(col) + 1);
-                    ImGui::PushID(static_cast<int>(row * kLayerCount + col));
-                    bool value = m_physicsLayerMatrix[row][col];
-                    if (ImGui::Checkbox("", &value))
+                    const std::string assetId(static_cast<const char*>(payload->Data), payload->DataSize);
+                    auto entry = m_assetLibrary ? m_assetLibrary->FindById(assetId) : std::optional<AssetLibrary::Entry>{};
+                    if (entry && entry->category == AssetLibrary::Category::Texture)
                     {
-                        m_physicsLayerMatrix[row][col] = value;
-                        m_physicsLayerMatrix[col][row] = value;
-                        matrixChanged = true;
+                        dropped = m_assetLibrary->AssetRelativePath(*entry);
+                        path = dropped;
+                        changed = true;
                     }
-                    ImGui::PopID();
+                    else
+                    {
+                        m_assetStatus = "The sky takes image assets only (PNG, JPG, TGA, HDR or EXR)";
+                    }
+                }
+                ImGui::EndDragDropTarget();
+            }
+            if (!path.empty())
+            {
+                ImGui::SameLine();
+                if (ImGui::Button(ICON_FA_XMARK "##clear", ImVec2(ImGui::GetFrameHeight(), 0.0f)))
+                {
+                    path.clear();
+                    changed = true;
+                }
+                UI::ItemTooltip("Remove the image");
+            }
+            return false;
+        });
+        ImGui::PopID();
+        return dropped;
+    };
+
+    switch (sky.mode)
+    {
+    case SkySettings::Mode::Color:
+        changed |= UI::Prop::ColorEdit3("Color##sky", sky.color);
+        break;
+    case SkySettings::Mode::Procedural:
+        changed |= UI::Prop::ColorEdit3("Zenith", sky.zenithColor);
+        UI::ItemTooltip("The sky straight overhead");
+        changed |= UI::Prop::ColorEdit3("Horizon", sky.horizonColor);
+        UI::ItemTooltip("The sky at the horizon; turns warm on the sun's side at sunrise and sunset");
+        changed |= UI::Prop::ColorEdit3("Ground", sky.groundColor);
+        UI::ItemTooltip("Below the horizon, where no terrain covers it");
+        changed |= UI::Prop::SliderFloat("Sun size", &sky.sunSizeDegrees, 0.0f, 10.0f, "%.1f deg");
+        UI::ItemTooltip("Angular size of the sun disc (the real sun is about 0.5); 0 hides it.\n"
+                        "The sun's place and colour come from the Sun above.");
+        changed |= UI::Prop::SliderFloat("Sun glow", &sky.sunGlow, 0.0f, 2.0f, "%.2f");
+        break;
+    case SkySettings::Mode::Cubemap:
+    {
+        static const char* faceLabels[SkySettings::kCubeFaces] = {
+            "Right (+X)", "Left (-X)", "Up (+Y)", "Down (-Y)", "Front (+Z)", "Back (-Z)"};
+        for (std::size_t face = 0; face < SkySettings::kCubeFaces; ++face)
+        {
+            const std::string dropped = imageSlot(faceLabels[face], sky.cubeFacePaths[face],
+                "Drop one face image: faces named like it (right / left / up / down / front / back,\n"
+                "px / nx / py / ny / pz / nz) in the same folder fill the empty slots");
+            if (dropped.empty())
+                continue;
+            // Fill the other empty faces from same-named siblings of the dropped image.
+            const std::filesystem::path droppedPath(dropped);
+            const std::string stem = droppedPath.stem().string();
+            const auto found = FindSkyFaceWord(stem, face);
+            if (!found)
+                continue;
+            const std::filesystem::path projectRoot = ProjectManager::Instance().HasProject()
+                ? ProjectManager::Instance().ProjectRoot() : std::filesystem::path{};
+            int filled = 0;
+            for (std::size_t other = 0; other < SkySettings::kCubeFaces; ++other)
+            {
+                if (other == face || !sky.cubeFacePaths[other].empty())
+                    continue;
+                const std::string original = stem.substr(found->first, found->second);
+                for (const std::string& word : kSkyFaceWords[other])
+                {
+                    const std::string candidateStem = stem.substr(0, found->first) + MatchCase(word, original) +
+                        stem.substr(found->first + found->second);
+                    const std::filesystem::path candidate =
+                        droppedPath.parent_path() / (candidateStem + droppedPath.extension().string());
+                    std::error_code ec;
+                    if (std::filesystem::exists(projectRoot / candidate, ec))
+                    {
+                        sky.cubeFacePaths[other] = candidate.generic_string();
+                        ++filled;
+                        break;
+                    }
                 }
             }
-            ImGui::EndTable();
+            if (filled > 0)
+                m_assetStatus = "Sky: filled " + std::to_string(filled) + " more face(s) from the same folder";
         }
-        if (matrixChanged)
-        {
-            m_commands.physicsLayerMatrixChanged = true;
-            m_commands.physicsLayerMatrix = m_physicsLayerMatrix;
-            StoreProjectPhysicsSettings();
-            Tracen("[PHYSICS-LAYER] matrix edited");
-        }
+        break;
+    }
+    case SkySettings::Mode::Panorama:
+        imageSlot("Panorama", sky.panoramaPath,
+            "An equirectangular 360 x 180 degree image (2:1), PNG, JPG, HDR or EXR.\n"
+            "Drop it here from the Asset Browser.");
+        break;
     }
 
-    const char* modes[] = {
-        "Native / Window",
-        "3840 x 2160",
-        "2560 x 1440",
-        "1920 x 1080",
-        "1600 x 900",
-        "1280 x 720",
-        "Custom"
-    };
-    if (ImGui::Combo("Render Resolution", &m_renderResolutionMode, modes, IM_ARRAYSIZE(modes)))
+    if (sky.mode != SkySettings::Mode::Color)
     {
-        switch (m_renderResolutionMode)
+        changed |= UI::Prop::SliderFloat("Exposure", &sky.exposure, 0.0f, 8.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+        UI::ItemTooltip("Brightness multiplier (HDR images often need less than 1)");
+        if (sky.mode != SkySettings::Mode::Procedural)
         {
-        case 0: queueRenderResolution(true, 0, 0); break;
-        case 1: queueRenderResolution(false, 3840, 2160); break;
-        case 2: queueRenderResolution(false, 2560, 1440); break;
-        case 3: queueRenderResolution(false, 1920, 1080); break;
-        case 4: queueRenderResolution(false, 1600, 900); break;
-        case 5: queueRenderResolution(false, 1280, 720); break;
-        default: break;
+            changed |= UI::Prop::SliderFloat("Rotation", &sky.rotationDegrees, 0.0f, 360.0f, "%.0f deg");
+            UI::ItemTooltip("Turns the image around the vertical axis");
         }
+        changed |= UI::Prop::ColorEdit3("Tint", sky.tint);
     }
-    if (m_renderResolutionMode == 6)
+    changed |= UI::Prop::Checkbox("Ambient from sky", &sky.ambientFromSky);
+    UI::ItemTooltip("The ambient light takes the sky's average colour (its intensity stays above)");
+
+    if (!m_skyStatus.empty())
     {
-        ImGui::InputInt("Width", &m_customRenderResolutionWidth, 16, 128);
-        ImGui::InputInt("Height", &m_customRenderResolutionHeight, 16, 128);
-        m_customRenderResolutionWidth = std::clamp(m_customRenderResolutionWidth, 320, 7680);
-        m_customRenderResolutionHeight = std::clamp(m_customRenderResolutionHeight, 180, 4320);
-        if (UI::IconButton(ICON_FA_CHECK, "Apply Resolution"))
-        {
-            queueRenderResolution(false,
-                static_cast<std::uint32_t>(m_customRenderResolutionWidth),
-                static_cast<std::uint32_t>(m_customRenderResolutionHeight));
-        }
+        ImGui::PushStyleColor(ImGuiCol_Text, UI::Theme::Warning);
+        ImGui::TextWrapped(ICON_FA_TRIANGLE_EXCLAMATION "  %s", m_skyStatus.c_str());
+        ImGui::PopStyleColor();
     }
 
-    const float budgetFraction = static_cast<float>(std::clamp(m_engineStats.frameBudgetPercent / 100.0, 0.0, 1.0));
-    const std::string budgetLabel =
-        std::to_string(static_cast<int>(ixtreeme::math::Round(static_cast<float>(m_engineStats.frameBudgetPercent)))) + "%";
-    ImGui::TextUnformatted("Frame Budget @60 FPS");
-    ImGui::ProgressBar(budgetFraction, ImVec2(-1.0f, 0.0f), budgetLabel.c_str());
+    if (changed)
+        SceneManager::Instance().MarkDirty();
+}
 
-    const float cpuFraction = static_cast<float>(std::clamp(m_engineStats.processCpuPercent / 100.0, 0.0, 1.0));
-    const std::string cpuLabel =
-        std::to_string(static_cast<int>(ixtreeme::math::Round(static_cast<float>(m_engineStats.processCpuPercent)))) + "%";
-    ImGui::TextUnformatted("Process CPU");
-    ImGui::ProgressBar(cpuFraction, ImVec2(-1.0f, 0.0f), cpuLabel.c_str());
+void EditorImGui::RenderFogPanel()
+{
+    auto& fog = m_skySettings.fog;
+    bool changed = UI::Prop::Checkbox("Global fog", &fog.enabled);
+    changed |= UI::Prop::ColorEdit3("Color", fog.color);
+    changed |= UI::Prop::DragFloat("Density", &fog.density, 0.0001f, 0.0f, 10.0f, "%.4f /m");
+    UI::ItemTooltip("Transmission is exp(-density * distance). Density 0.01 leaves about 37% visibility over 100 metres.");
+    changed |= UI::Prop::DragFloat("Start distance", &fog.startDistance, 1.0f, 0.0f, 100000.0f, "%.1f m");
+    changed |= UI::Prop::DragFloat("Max distance", &fog.maxDistance, 1.0f, 0.1f, 100000.0f, "%.1f m");
+    UI::ItemTooltip("Global fog stops accumulating after this distance; local volumes remain independent.");
+    changed |= UI::Prop::SliderFloat("Max opacity", &fog.maxOpacity, 0.0f, 1.0f, "%.2f");
+    changed |= UI::Prop::Checkbox("Height fog", &fog.heightEnabled);
+    if (fog.heightEnabled)
+    {
+        changed |= UI::Prop::DragFloat("Base height", &fog.baseHeight, 0.1f, -100000.0f, 100000.0f, "%.1f m");
+        changed |= UI::Prop::DragFloat("Height falloff", &fog.heightFalloff, 0.001f, 0.0f, 10.0f, "%.3f /m");
+        UI::ItemTooltip("Full density below the base; density decreases exponentially above it.");
+    }
+    changed |= UI::Prop::Checkbox("Affect sky", &fog.affectSky);
+    if (changed)
+    {
+        SanitizeFog(fog);
+        SceneManager::Instance().MarkDirty();
+    }
+    ImGui::TextWrapped("Local fog: Create > Fog Volume, or Add Component > Fog Volume on an object. Global and local fog combine.");
+    const auto& entities = SceneManager::Instance().GetCurrentScene().meshEntities;
+    const auto active = std::count_if(entities.begin(), entities.end(), [](const auto& entity) {
+        return entity.hasFogVolume && entity.enabled && entity.effectiveEnabled &&
+            entity.fogVolume.enabled && entity.fogVolume.density > 0;
+    });
+    ImGui::TextDisabled("Active local volumes: %d / 32", static_cast<int>(active));
+    if (active > 32)
+        ImGui::TextWrapped("Only the first 32 active local volumes are rendered. Disable unused volumes.");
+}
 
-    ImGui::TextDisabled("Frame #%llu | scene entities=%zu | static submitted=%zu drawcalls=%zu",
-        static_cast<unsigned long long>(m_engineStats.frameNumber),
-        m_engineStats.sceneEntityCount,
-        m_engineStats.staticMeshSubmitted,
-        m_engineStats.staticMeshDrawCalls);
+void EditorImGui::RenderGodRaysPanel()
+{
+    SkySettings& sky = m_skySettings;
+    bool changed = UI::Prop::Checkbox("Enabled##god_rays", &sky.godRays);
+    UI::ItemTooltip("Light shafts from the Sun (its colour and direction: Environment > Sun)");
+    ImGui::BeginDisabled(!sky.godRays);
+    const char* techniques[] = {"Screen space", "Volumetric", "Both"};
+    int technique = std::clamp(static_cast<int>(sky.godRayTechnique), 0, 2);
+    if (UI::Prop::Combo("Technique##god_rays", &technique, techniques, IM_ARRAYSIZE(techniques)))
+    {
+        sky.godRayTechnique = technique;
+        changed = true;
+    }
+    UI::ItemTooltip("Screen space: shafts around the sun while it is on the screen, from everything in\n"
+                    "front of it (terrain, trees, characters).\n"
+                    "Volumetric: light scattered in the air, with the terrain's sun shadow cutting it\n"
+                    "into shafts - also seen from the side and with the sun off the screen.\n"
+                    "Both: the two added together.");
+
+    if (sky.godRayTechnique != 1)
+    {
+        ImGui::SeparatorText("Screen space");
+        changed |= UI::Prop::SliderFloat("Intensity##god_rays", &sky.godRayIntensity, 0.0f, 2.0f, "%.2f");
+        changed |= UI::Prop::SliderFloat("Length##god_rays", &sky.godRayLength, 0.05f, 1.0f, "%.2f");
+        UI::ItemTooltip("How far across the screen the shafts reach");
+        changed |= UI::Prop::SliderFloat("Falloff##god_rays", &sky.godRayFalloff, 0.85f, 1.0f, "%.3f");
+        UI::ItemTooltip("How quickly the shafts fade along their length (closer to 1: they fade later)");
+        const char* qualities[] = {"Low (32 samples)", "Medium (64 samples)", "High (128 samples)"};
+        int quality = std::clamp(static_cast<int>(sky.godRayQuality), 0, 2);
+        if (UI::Prop::Combo("Quality##god_rays", &quality, qualities, IM_ARRAYSIZE(qualities)))
+        {
+            sky.godRayQuality = quality;
+            changed = true;
+        }
+        UI::ItemTooltip("Filtered leaf/sky coverage at every quality. High also uses half-resolution shafts.\n"
+                        "Quality changes detail and smoothness; falloff stays consistent.");
+    }
+    if (sky.godRayTechnique != 0)
+    {
+        ImGui::SeparatorText("Volumetric");
+        changed |= UI::Prop::SliderFloat("Intensity##volumetric", &sky.volumetricIntensity, 0.0f, 4.0f, "%.2f");
+        changed |= UI::Prop::SliderFloat("Haze##volumetric", &sky.volumetricDensity, 0.0f, 0.05f, "%.4f",
+            ImGuiSliderFlags_Logarithmic);
+        UI::ItemTooltip("How much the air scatters the sunlight: more haze, brighter and denser shafts");
+        changed |= UI::Prop::SliderFloat("Forward scattering##volumetric", &sky.volumetricAnisotropy, 0.0f, 0.95f, "%.2f");
+        UI::ItemTooltip("0: the haze glows the same in every direction; near 1: mostly when looking towards the sun");
+        changed |= UI::Prop::SliderFloat("Distance##volumetric", &sky.volumetricDistance, 5.0f, 200.0f, "%.0f m");
+        UI::ItemTooltip("How far from the camera the light in the air is gathered (the sun shadow reaches 200 m)");
+        const char* steps[] = {"Low (16 steps)", "Medium (32 steps)", "High (64 steps)"};
+        int quality = std::clamp(static_cast<int>(sky.volumetricQuality), 0, 2);
+        if (UI::Prop::Combo("Quality##volumetric", &quality, steps, IM_ARRAYSIZE(steps)))
+        {
+            sky.volumetricQuality = quality;
+            changed = true;
+        }
+        UI::ItemTooltip("Filtered sun shadows with smooth cascade transitions. High uses half-resolution light.");
+        ImGui::TextDisabled("Shafts come from the sun shadow (Environment > Sun > Casts shadows).");
+    }
+    ImGui::EndDisabled();
+    if (changed)
+        SceneManager::Instance().MarkDirty();
+}
+
+void EditorImGui::RenderToneMappingPanel()
+{
+    SkySettings& sky = m_skySettings;
+    bool changed = false;
+    const char* modes[] = {"None", "Neutral", "Filmic"};
+    int mode = std::clamp(static_cast<int>(sky.toneMapping), 0, 2);
+    if (UI::Prop::Combo("Curve##tone_mapping", &mode, modes, IM_ARRAYSIZE(modes)))
+    {
+        sky.toneMapping = mode;
+        changed = true;
+    }
+    UI::ItemTooltip("How light brighter than white reaches the screen.\n"
+                    "None: clipped at white.\n"
+                    "Neutral: colours up to 0.8 exactly as set, brighter ones roll off smoothly to white.\n"
+                    "Filmic: an ACES-like film curve - more contrast, brighter midtones.");
+    changed |= UI::Prop::SliderFloat("Exposure##tone_mapping", &sky.exposureEv, -4.0f, 4.0f, "%+.1f EV");
+    UI::ItemTooltip("Brightness of the whole image in stops: +1 doubles the light, -1 halves it");
+    if (changed)
+        SceneManager::Instance().MarkDirty();
+}
+
+void EditorImGui::OpenCreateTerrainDialog()
+{
+    if (m_terrainState.exists)
+        m_replaceTerrainConfirmOpen = true;
+    else
+        m_createTerrainModalOpen = true;
 }
 
 void EditorImGui::RenderCreateTerrainModal()
@@ -2163,13 +2748,13 @@ void EditorImGui::RenderCreateTerrainModal()
     if (ImGui::BeginPopupModal("Create Terrain", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
     {
         ImGui::SetNextItemWidth(180.0f);
-        ImGui::InputFloat("Width (m)", &m_createTerrainWidthMeters, 10.0f, 100.0f, "%.1f");
+        UI::Prop::InputFloat("Width (m)", &m_createTerrainWidthMeters, 10.0f, 100.0f, "%.1f");
         ImGui::SetNextItemWidth(180.0f);
-        ImGui::InputFloat("Depth (m)", &m_createTerrainDepthMeters, 10.0f, 100.0f, "%.1f");
+        UI::Prop::InputFloat("Depth (m)", &m_createTerrainDepthMeters, 10.0f, 100.0f, "%.1f");
         ImGui::SetNextItemWidth(180.0f);
-        ImGui::InputFloat("Cell size (m/cell)", &m_createTerrainCellSizeMeters, 0.25f, 1.0f, "%.2f");
+        UI::Prop::InputFloat("Cell size (m/cell)", &m_createTerrainCellSizeMeters, 0.25f, 1.0f, "%.2f");
         ImGui::SetNextItemWidth(180.0f);
-        ImGui::InputInt("Chunk size (cells/chunk)", &m_createTerrainChunkSizeCells, 16, 32);
+        UI::Prop::InputInt("Chunk size (cells/chunk)", &m_createTerrainChunkSizeCells, 16, 32);
 
         m_createTerrainWidthMeters = std::max(1.0f, m_createTerrainWidthMeters);
         m_createTerrainDepthMeters = std::max(1.0f, m_createTerrainDepthMeters);
@@ -2213,76 +2798,108 @@ void EditorImGui::RenderCreateTerrainModal()
     }
 }
 
-void EditorImGui::RenderWaterSculptToolPanel()
+namespace
 {
-    if (!m_editorModeActive || !m_waterSculptToolOpen)
-        return;
-
-    if (ImGui::Begin("Water Sculpt Tool", &m_waterSculptToolOpen))
+// A row of mutually exclusive choices drawn as joined buttons; returns the clicked index or -1.
+int SegmentedChoice(const char* id, const char* const* labels, int count, int selected, float width = -1.0f)
+{
+    ImGui::PushID(id);
+    const float available = width > 0.0f ? width : ImGui::GetContentRegionAvail().x;
+    const float spacing = 2.0f;
+    const float buttonWidth = std::max(40.0f, (available - spacing * static_cast<float>(count - 1)) / static_cast<float>(count));
+    int clicked = -1;
+    for (int i = 0; i < count; ++i)
     {
-        if (!m_waterBodyState.selected)
+        if (i > 0)
+            ImGui::SameLine(0.0f, spacing);
+        const bool active = i == selected;
+        if (active)
         {
-            ImGui::TextWrapped("Select a water body to sculpt its shape.");
+            ImGui::PushStyleColor(ImGuiCol_Button, UI::Theme::Accent);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, UI::Theme::AccentHovered);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, UI::Theme::AccentActive);
         }
-
-        bool active = m_editorSettings.toolMode == MapEditorToolMode::WaterSculpt;
-        if (ImGui::Checkbox("Sculpt Mode Active", &active))
-            SetToolMode(active ? MapEditorToolMode::WaterSculpt : MapEditorToolMode::None);
-
-        if (!m_waterBodyState.selected)
-            ImGui::BeginDisabled();
-        const char* modes[] = {"Add Water", "Remove Water"};
-        int mode = m_editorSettings.waterSculptAdd ? 0 : 1;
-        if (ImGui::Combo("Mode", &mode, modes, IM_ARRAYSIZE(modes)))
-        {
-            m_editorSettings.waterSculptAdd = mode == 0;
-            Tracenf("[EDITOR-IMGUI-5] Water sculpt brush mode: %s",
-                m_editorSettings.waterSculptAdd ? "add" : "remove");
-        }
-        ImGui::SliderFloat("Radius", &m_editorSettings.waterSculptRadiusMeters, 0.5f, 20.0f, "%.1f m");
-        if (!m_waterBodyState.selected)
-            ImGui::EndDisabled();
+        if (ImGui::Button(labels[i], ImVec2(buttonWidth, 0.0f)))
+            clicked = i;
+        if (active)
+            ImGui::PopStyleColor(3);
     }
-    ImGui::End();
+    ImGui::PopID();
+    return clicked;
 }
 
-void EditorImGui::RenderHeightmapToolPanel()
+// The one-line hint under a tool: what to do in the Scene View now.
+void ToolHint(bool active, const char* activeText, const char* idleText)
 {
-    if (!m_editorModeActive || !m_heightmapToolOpen)
-        return;
-
-    if (ImGui::Begin("Heightmap Tool", &m_heightmapToolOpen))
-    {
-        bool active = m_editorSettings.toolMode == MapEditorToolMode::Heightmap;
-        if (ImGui::Checkbox("Heightmap Editing Active", &active))
-            SetToolMode(active ? MapEditorToolMode::Heightmap : MapEditorToolMode::None);
-
-        auto modeRadio = [this](const char* label, MapEditorTool tool) {
-            if (ImGui::RadioButton(label, m_editorSettings.tool == tool))
-            {
-                m_editorSettings.tool = tool;
-                if (m_editorSettings.toolMode != MapEditorToolMode::Heightmap)
-                    SetToolMode(MapEditorToolMode::Heightmap);
-            }
-        };
-        modeRadio("Raise", MapEditorTool::Raise);
-        ImGui::SameLine();
-        modeRadio("Lower", MapEditorTool::Lower);
-        modeRadio("Smooth", MapEditorTool::Smooth);
-        ImGui::SameLine();
-        modeRadio("Flatten", MapEditorTool::Flatten);
-
-        ImGui::Separator();
-        ImGui::SliderFloat("Radius", &m_editorSettings.brushRadiusMeters, 1.0f, 100.0f, "%.1f m");
-        ImGui::SliderFloat("Strength", &m_editorSettings.brushStrength, 0.1f, 5.0f, "%.2f");
-        ImGui::SliderFloat("Falloff", &m_editorSettings.brushFalloff, 0.0f, 1.0f, "%.2f");
-        if (m_editorSettings.tool == MapEditorTool::Flatten)
-            ImGui::SliderFloat("Target Height", &m_editorSettings.flattenTargetY, -50.0f, 100.0f, "%.2f m");
-    }
-    ImGui::End();
+    if (active)
+        ImGui::TextColored(UI::Theme::AccentHovered, ICON_FA_CIRCLE_INFO "  %s", activeText);
+    else
+        ImGui::TextDisabled(ICON_FA_CIRCLE_INFO "  %s", idleText);
+}
 }
 
-void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
+void EditorImGui::RenderWaterSculptTool()
+{
+    const bool active = m_editorSettings.toolMode == MapEditorToolMode::WaterSculpt;
+    const char* modes[] = {ICON_FA_PLUS "  Add water", ICON_FA_ERASER "  Remove water"};
+    const int current = active ? (m_editorSettings.waterSculptAdd ? 0 : 1) : -1;
+    const int clicked = SegmentedChoice("water_sculpt_mode", modes, 2, current);
+    if (clicked >= 0)
+    {
+        if (clicked == current)
+        {
+            SetToolMode(MapEditorToolMode::None);
+        }
+        else
+        {
+            m_editorSettings.waterSculptAdd = clicked == 0;
+            SetToolMode(MapEditorToolMode::WaterSculpt);
+            Tracenf("[EDITOR-IMGUI-5] Water sculpt brush mode: %s", m_editorSettings.waterSculptAdd ? "add" : "remove");
+        }
+    }
+    UI::Prop::SliderFloat("Brush radius", &m_editorSettings.waterSculptRadiusMeters, 0.5f, 20.0f, "%.1f m");
+    ToolHint(active,
+        "Paint in the Scene View to change the water's shape. Click the tool again to stop.",
+        "Pick Add or Remove, then paint in the Scene View.");
+}
+
+void EditorImGui::RenderTerrainSculptTool()
+{
+    const bool active = m_editorSettings.toolMode == MapEditorToolMode::Heightmap;
+    const char* tools[] = {"Raise", "Lower", "Smooth", "Flatten"};
+    const MapEditorTool toolValues[] = {MapEditorTool::Raise, MapEditorTool::Lower, MapEditorTool::Smooth, MapEditorTool::Flatten};
+    int current = -1;
+    for (int i = 0; i < 4; ++i)
+    {
+        if (active && m_editorSettings.tool == toolValues[i])
+            current = i;
+    }
+    const int clicked = SegmentedChoice("terrain_sculpt_tool", tools, 4, current);
+    if (clicked >= 0)
+    {
+        if (clicked == current)
+        {
+            SetToolMode(MapEditorToolMode::None);
+        }
+        else
+        {
+            m_editorSettings.tool = toolValues[clicked];
+            SetToolMode(MapEditorToolMode::Heightmap);
+        }
+    }
+    ImGui::Spacing();
+    UI::Prop::SliderFloat("Brush radius", &m_editorSettings.brushRadiusMeters, 1.0f, 100.0f, "%.1f m");
+    UI::Prop::SliderFloat("Strength", &m_editorSettings.brushStrength, 0.1f, 5.0f, "%.2f");
+    UI::Prop::SliderFloat("Falloff", &m_editorSettings.brushFalloff, 0.0f, 1.0f, "%.2f");
+    UI::ItemTooltip("0: hard edge, 1: soft edge");
+    if (m_editorSettings.tool == MapEditorTool::Flatten)
+        UI::Prop::SliderFloat("Target height", &m_editorSettings.flattenTargetY, -50.0f, 100.0f, "%.2f m");
+    ToolHint(active,
+        "Hold the left mouse button in the Scene View to sculpt. Click the tool again to stop.",
+        "Pick a tool, then sculpt in the Scene View.");
+}
+
+void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex, float slotWidth)
 {
     if (slotIndex >= m_paletteSlots.size())
         return;
@@ -2290,23 +2907,69 @@ void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
     MapEditorPaletteSlot& slot = m_paletteSlots[slotIndex];
     ImGui::PushID(static_cast<int>(slotIndex));
     const bool selected = m_editorSettings.textureSlot == slotIndex;
-    const ImVec4 selectedColor = ImVec4(0.20f, 0.34f, 0.56f, 1.0f);
-    const ImVec4 selectedHover = ImVec4(0.24f, 0.42f, 0.68f, 1.0f);
-    const ImVec4 idleColor = ImGui::GetStyleColorVec4(ImGuiCol_Button);
-    ImGui::PushStyleColor(ImGuiCol_Button, selected ? selectedColor : idleColor);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, selected ? selectedHover : ImGui::GetStyleColorVec4(ImGuiCol_ButtonHovered));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, selected ? selectedHover : ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-    const std::string label = std::to_string(slotIndex) + "##splat_slot";
-    if (ImGui::Button(label.c_str(), ImVec2(48.0f, 38.0f)))
+    ImGui::BeginGroup();
+    const auto entry = m_assetLibrary ? m_assetLibrary->FindById(slot.assetId) : std::optional<AssetLibrary::Entry>{};
+    AssetPreviewTexture* preview = nullptr;
+    if (entry)
+    {
+        if (entry->category == AssetLibrary::Category::Material)
+        {
+            // Show the material's base color, never a normal/roughness map as its appearance.
+            const auto diffuse = m_assetLibrary->FindById(entry->material.diffuseTextureId);
+            if (diffuse)
+                preview = GetAssetPreviewTexture(*diffuse);
+        }
+        else if (entry->category == AssetLibrary::Category::Texture)
+            preview = GetAssetPreviewTexture(*entry);
+    }
+    const ImVec2 previewMin = ImGui::GetCursorScreenPos();
+    const ImVec2 previewMax(previewMin.x + slotWidth, previewMin.y + slotWidth);
+    if (ImGui::InvisibleButton("##splat_slot", ImVec2(slotWidth, slotWidth)))
     {
         m_editorSettings.textureSlot = slotIndex;
         m_editorSettings.tool = MapEditorTool::Paint;
-        if (m_editorSettings.toolMode != MapEditorToolMode::SplatPaint)
-            SetToolMode(MapEditorToolMode::SplatPaint);
+        SetToolMode(MapEditorToolMode::SplatPaint);
     }
-    ImGui::PopStyleColor(3);
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const bool occupied = entry.has_value() || !slot.texturePath.empty();
+    const ImU32 tint = ImGui::ColorConvertFloat4ToU32(ImVec4(
+        std::clamp(slot.colorTint[0], 0.0f, 1.0f),
+        std::clamp(slot.colorTint[1], 0.0f, 1.0f),
+        std::clamp(slot.colorTint[2], 0.0f, 1.0f), 1.0f));
+    void* textureId = preview && m_textureProvider ? m_textureProvider->GetPreviewTexture(preview->handle) : nullptr;
+    drawList->AddRectFilled(previewMin, previewMax,
+        occupied && !textureId ? tint : ImGui::GetColorU32(ImGuiCol_FrameBg), 4.0f);
+    if (textureId)
+        drawList->AddImageRounded(reinterpret_cast<ImTextureID>(textureId), previewMin, previewMax,
+            ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), tint, 4.0f);
+    else if (!occupied)
+    {
+        const ImVec2 iconSize = ImGui::CalcTextSize("+");
+        drawList->AddText(ImVec2(previewMin.x + (slotWidth - iconSize.x) * 0.5f,
+            previewMin.y + (slotWidth - iconSize.y) * 0.5f), ImGui::GetColorU32(ImGuiCol_TextDisabled), "+");
+    }
+    drawList->AddRect(previewMin, previewMax,
+        ImGui::ColorConvertFloat4ToU32(selected ? UI::Theme::Accent :
+            (hovered ? UI::Theme::AccentHovered : ImGui::GetStyleColorVec4(ImGuiCol_Border))),
+        4.0f, 0, selected ? 3.0f : (hovered ? 2.0f : 1.0f));
+    if (selected)
+    {
+        const float badgeSize = ImGui::GetFontSize() + 6.0f;
+        drawList->AddRectFilled(previewMin, ImVec2(previewMin.x + badgeSize, previewMin.y + badgeSize),
+            ImGui::ColorConvertFloat4ToU32(UI::Theme::Accent), 3.0f);
+        drawList->AddText(ImVec2(previewMin.x + 3.0f, previewMin.y + 3.0f), IM_COL32_WHITE, ICON_FA_CHECK);
+    }
+    if (hovered && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left) && entry)
+    {
+        if (entry->category == AssetLibrary::Category::Material)
+        {
+            OpenPbrMaterialEditor(entry->id);
+            SetToolMode(MapEditorToolMode::None);
+        }
+    }
 
-    if (m_assetFilter != AssetBrowserFilter::Scene && ImGui::BeginDragDropTarget())
+    if (ImGui::BeginDragDropTarget())
     {
         if (const ImGuiPayload* payload = ImGui::AcceptDragDropPayload(kAssetPayloadType))
         {
@@ -2324,7 +2987,7 @@ void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
                     m_commands.paletteAssetId = next.assetId;
                     m_commands.paletteTexturePath = next.texturePath;
                     m_commands.paletteSlotData = next;
-                    m_assetStatus = "Splat layer texture <- " + entry->displayName;
+                    m_assetStatus = "Terrain layer " + std::to_string(slotIndex + 1u) + " texture: " + entry->displayName;
                     Tracenf("[EDITOR-IMGUI-5] Splat layer texture changed: layer=%u asset_id=%s",
                         slotIndex,
                         entry->id.c_str());
@@ -2332,122 +2995,90 @@ void EditorImGui::RenderSplatLayerSlot(std::uint32_t slotIndex)
             }
             else
             {
-                m_assetStatus = "Splat slots accept texture or material assets";
+                m_assetStatus = "Terrain layers accept texture or material assets";
             }
         }
         ImGui::EndDragDropTarget();
     }
 
     const std::string name = slot.displayName.empty()
-        ? (slot.texturePath.empty() ? std::string("empty") : slot.texturePath)
+        ? (slot.texturePath.empty() ? std::string("(empty)") : std::filesystem::path(slot.texturePath).stem().string())
         : slot.displayName;
-    ImGui::TextWrapped("%s", name.c_str());
+    UI::ItemTooltip(("Layer " + std::to_string(slotIndex + 1u) + ": " + name +
+        "\nClick to paint; double-click a material layer to edit its material; drop a texture or material to change it").c_str());
+    ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + slotWidth);
+    ImGui::TextDisabled("%s", name.c_str());
+    ImGui::PopTextWrapPos();
+    ImGui::EndGroup();
     ImGui::PopID();
 }
 
-void EditorImGui::RenderSplatPaintToolPanel()
+void EditorImGui::RenderTerrainPaintTool()
 {
-    if (!m_editorModeActive || !m_splatPaintToolOpen)
-        return;
-
-    if (ImGui::Begin("Splat Paint Tool", &m_splatPaintToolOpen))
+    const bool active = m_editorSettings.toolMode == MapEditorToolMode::SplatPaint;
+    const float slotWidth = std::max(24.0f,
+        (ImGui::GetContentRegionAvail().x - 3.0f * ImGui::GetStyle().ItemSpacing.x) / 4.0f);
+    for (std::uint32_t i = 0; i < m_paletteSlots.size(); ++i)
     {
-        bool active = m_editorSettings.toolMode == MapEditorToolMode::SplatPaint;
-        if (ImGui::Checkbox("Splat Paint Active", &active))
-            SetToolMode(active ? MapEditorToolMode::SplatPaint : MapEditorToolMode::None);
-
-        ImGui::TextUnformatted("Active Layer");
-        for (std::uint32_t i = 0; i < m_paletteSlots.size(); ++i)
-        {
-            ImGui::BeginGroup();
-            RenderSplatLayerSlot(i);
-            ImGui::EndGroup();
-            if (i % 4 != 3)
-                ImGui::SameLine();
-        }
-
-        ImGui::Separator();
-        m_editorSettings.tool = MapEditorTool::Paint;
-        int paintMode = m_editorSettings.paintMode == MapEditorPaintMode::Mix ? 1 : 0;
-        const char* modes[] = {"Replace", "Mix"};
-        if (ImGui::Combo("Paint Mode", &paintMode, modes, IM_ARRAYSIZE(modes)))
-            m_editorSettings.paintMode = paintMode == 1 ? MapEditorPaintMode::Mix : MapEditorPaintMode::Replace;
-        ImGui::SliderFloat("Radius", &m_editorSettings.brushRadiusMeters, 1.0f, 100.0f, "%.1f m");
-        ImGui::SliderFloat("Strength", &m_editorSettings.brushStrength, 0.1f, 1.0f, "%.2f");
-        ImGui::SliderFloat("Falloff", &m_editorSettings.brushFalloff, 0.0f, 1.0f, "%.2f");
-
-        ImGui::Separator();
-        UI::SectionHeader(ICON_FA_PALETTE " Terrain Material");
-        if (m_terrainState.exists)
-        {
-            bool triplanarEnabled = m_terrainState.triplanarEnabled;
-            float triplanarSharpness = std::clamp(m_terrainState.triplanarSharpness, 1.0f, 16.0f);
-            float triplanarSlopeThreshold = std::clamp(m_terrainState.triplanarSlopeThreshold, 0.0f, 1.0f);
-            float triplanarSlopeTransition = std::clamp(m_terrainState.triplanarSlopeTransition, 0.001f, 1.0f);
-            bool triplanarChanged = false;
-            triplanarChanged |= ImGui::Checkbox("Triplanar Mapping", &triplanarEnabled);
-            triplanarChanged |= ImGui::SliderFloat("Triplanar Sharpness", &triplanarSharpness, 1.0f, 16.0f, "%.2f");
-            triplanarChanged |= ImGui::SliderFloat("Slope Threshold", &triplanarSlopeThreshold, 0.0f, 1.0f, "%.3f");
-            triplanarChanged |= ImGui::SliderFloat("Slope Transition", &triplanarSlopeTransition, 0.001f, 1.0f, "%.3f");
-            if (triplanarChanged)
-            {
-                m_terrainState.triplanarEnabled = triplanarEnabled;
-                m_terrainState.triplanarSharpness = triplanarSharpness;
-                m_terrainState.triplanarSlopeThreshold = triplanarSlopeThreshold;
-                m_terrainState.triplanarSlopeTransition = triplanarSlopeTransition;
-                m_commands.terrainTriplanarChanged = true;
-                m_commands.terrainTriplanarEnabled = triplanarEnabled;
-                m_commands.terrainTriplanarSharpness = triplanarSharpness;
-                m_commands.terrainTriplanarSlopeThreshold = triplanarSlopeThreshold;
-                m_commands.terrainTriplanarSlopeTransition = triplanarSlopeTransition;
-                SceneManager::Instance().MarkDirty();
-            }
-        }
-        else
-        {
-            ImGui::TextDisabled("Create a terrain to edit triplanar sampling.");
-        }
-        ImGui::Separator();
-        const std::uint32_t selectedSlot = std::min<std::uint32_t>(m_editorSettings.textureSlot, 7u);
-        MapEditorPaletteSlot& materialSlot = m_paletteSlots[selectedSlot];
-        ImGui::Text("Layer %u: %s",
-            selectedSlot,
-            materialSlot.displayName.empty() ? "empty" : materialSlot.displayName.c_str());
-
-        auto commitMaterialParams = [&]() {
-            materialSlot.slot = selectedSlot;
-            materialSlot.tilingScaleX = std::clamp(materialSlot.tilingScaleX, 0.01f, 64.0f);
-            materialSlot.tilingScaleY = std::clamp(materialSlot.tilingScaleY, 0.01f, 64.0f);
-            materialSlot.normalStrength = std::clamp(materialSlot.normalStrength, 0.0f, 4.0f);
-            materialSlot.roughnessStrength = std::clamp(materialSlot.roughnessStrength, 0.0f, 4.0f);
-            m_commands.paletteSlotParamsChanged = true;
-            m_commands.paletteSlot = selectedSlot;
-            m_commands.paletteSlotData = materialSlot;
-            SceneManager::Instance().MarkDirty();
-        };
-
-        float tiling = (materialSlot.tilingScaleX + materialSlot.tilingScaleY) * 0.5f;
-        if (ImGui::SliderFloat("Tiling", &tiling, 0.05f, 32.0f, "%.2f"))
-        {
-            materialSlot.tilingScaleX = tiling;
-            materialSlot.tilingScaleY = tiling;
-            commitMaterialParams();
-        }
-        if (ImGui::ColorEdit3("Tint", materialSlot.colorTint))
-            commitMaterialParams();
-        if (ImGui::SliderFloat("Normal Strength", &materialSlot.normalStrength, 0.0f, 3.0f, "%.2f"))
-            commitMaterialParams();
-        if (ImGui::SliderFloat("Roughness", &materialSlot.roughnessStrength, 0.0f, 2.0f, "%.2f"))
-            commitMaterialParams();
-        if (ImGui::SliderFloat("Metallic", &materialSlot.metallicStrength, 0.0f, 1.0f, "%.2f"))
-            commitMaterialParams();
-        if (ImGui::SliderFloat("AO Strength", &materialSlot.aoStrength, 0.0f, 1.0f, "%.2f"))
-            commitMaterialParams();
-        if (ImGui::SliderFloat2("UV Offset", materialSlot.uvOffset, -10.0f, 10.0f, "%.3f"))
-            commitMaterialParams();
-        if (ImGui::SliderFloat("UV Rotation", &materialSlot.uvRotationDegrees, -180.0f, 180.0f, "%.1f deg"))
-            commitMaterialParams();
+        RenderSplatLayerSlot(i, slotWidth);
+        if (i % 4 != 3)
+            ImGui::SameLine();
     }
-    ImGui::End();
-}
+    ToolHint(active,
+        "Hold the left mouse button in the Scene View to paint the highlighted layer.",
+        "Click a layer to paint with it. Drop textures from the Asset Browser onto the layers.");
+    if (active && ImGui::Button("Stop painting"))
+        SetToolMode(MapEditorToolMode::None);
 
+    ImGui::SeparatorText("Brush");
+    float diameter = 2.0f * m_editorSettings.brushRadiusMeters;
+    if (UI::Prop::SliderFloat("Diameter", &diameter, 1.0f, 100.0f, "%.1f m"))
+        m_editorSettings.brushRadiusMeters = 0.5f * std::clamp(diameter, 1.0f, 100.0f);
+    UI::ItemTooltip("The full width of the paint brush, in meters.");
+    float edgeSmoothing = 100.0f * m_editorSettings.paintEdgeSmoothing;
+    if (UI::Prop::SliderFloat("Edge smoothing", &edgeSmoothing, 0.0f, 100.0f, "%.0f%%"))
+        m_editorSettings.paintEdgeSmoothing = std::clamp(edgeSmoothing * 0.01f, 0.0f, 1.0f);
+    UI::ItemTooltip("0%: crisp contour with minimal antialiasing. 100%: a wide, smooth transition toward the edge. The center keeps the chosen coverage.");
+    float coverage = 100.0f * m_editorSettings.paintCoverage;
+    if (UI::Prop::SliderFloat("Overall coverage", &coverage, 0.0f, 100.0f, "%.0f%%"))
+        m_editorSettings.paintCoverage = std::clamp(coverage * 0.01f, 0.0f, 1.0f);
+    UI::ItemTooltip("100%: fully cover the previous texture in the brush interior. Lower values blend with it. Holding the brush does not accumulate coverage; existing stronger coverage is preserved.");
+
+    const std::uint32_t selectedSlot = std::min<std::uint32_t>(m_editorSettings.textureSlot, 7u);
+    MapEditorPaletteSlot& materialSlot = m_paletteSlots[selectedSlot];
+    const std::string layerTitle = "Layer " + std::to_string(selectedSlot + 1u) + ": " +
+        (materialSlot.displayName.empty() ? std::string("(empty)") : materialSlot.displayName);
+    ImGui::SeparatorText(layerTitle.c_str());
+    auto commitMaterialParams = [&]() {
+        materialSlot.slot = selectedSlot;
+        materialSlot.tilingScaleX = std::clamp(materialSlot.tilingScaleX, 0.01f, 64.0f);
+        materialSlot.tilingScaleY = std::clamp(materialSlot.tilingScaleY, 0.01f, 64.0f);
+        materialSlot.normalStrength = std::clamp(materialSlot.normalStrength, 0.0f, 4.0f);
+        materialSlot.roughnessStrength = std::clamp(materialSlot.roughnessStrength, 0.0f, 4.0f);
+        m_commands.paletteSlotParamsChanged = true;
+        m_commands.paletteSlot = selectedSlot;
+        m_commands.paletteSlotData = materialSlot;
+        SceneManager::Instance().MarkDirty();
+    };
+    float tiling = (materialSlot.tilingScaleX + materialSlot.tilingScaleY) * 0.5f;
+    if (UI::Prop::SliderFloat("Tiling", &tiling, 0.05f, 32.0f, "%.2f"))
+    {
+        materialSlot.tilingScaleX = tiling;
+        materialSlot.tilingScaleY = tiling;
+        commitMaterialParams();
+    }
+    if (UI::Prop::ColorEdit3("Tint", materialSlot.colorTint))
+        commitMaterialParams();
+    if (UI::Prop::SliderFloat("Normal strength", &materialSlot.normalStrength, 0.0f, 3.0f, "%.2f"))
+        commitMaterialParams();
+    if (UI::Prop::SliderFloat("Roughness", &materialSlot.roughnessStrength, 0.0f, 2.0f, "%.2f"))
+        commitMaterialParams();
+    if (UI::Prop::SliderFloat("Metallic", &materialSlot.metallicStrength, 0.0f, 1.0f, "%.2f"))
+        commitMaterialParams();
+    if (UI::Prop::SliderFloat("AO strength", &materialSlot.aoStrength, 0.0f, 1.0f, "%.2f"))
+        commitMaterialParams();
+    if (UI::Prop::SliderFloat2("UV offset", materialSlot.uvOffset, -10.0f, 10.0f, "%.3f"))
+        commitMaterialParams();
+    if (UI::Prop::SliderFloat("UV rotation", &materialSlot.uvRotationDegrees, -180.0f, 180.0f, "%.1f deg"))
+        commitMaterialParams();
+}

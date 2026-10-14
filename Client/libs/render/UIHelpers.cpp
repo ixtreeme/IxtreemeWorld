@@ -2,6 +2,10 @@
 
 #include "IconsFontAwesome6.h"
 
+#include <imgui_internal.h>
+
+#include <algorithm>
+#include <cfloat>
 #include <cstdarg>
 #include <cstdio>
 
@@ -76,6 +80,108 @@ bool IconOnlyButton(const char* icon, float size)
     return ImGui::Button(icon ? icon : "", ImVec2(buttonSize, buttonSize));
 }
 
+bool ToggleIconButton(const char* icon, bool active, const char* tooltip, float size)
+{
+    if (active)
+    {
+        ImGui::PushStyleColor(ImGuiCol_Button, Theme::Accent);
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Theme::AccentHovered);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, Theme::AccentActive);
+    }
+    const bool pressed = IconOnlyButton(icon, size);
+    if (active)
+        ImGui::PopStyleColor(3);
+    if (tooltip)
+        ItemTooltip(tooltip);
+    return pressed;
+}
+
+void ItemTooltip(const char* text)
+{
+    if (text && ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort | ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("%s", text);
+}
+
+const char* PropertyLabel(const char* label, char* idBuffer, std::size_t idBufferSize)
+{
+    ImGuiContext& g = *ImGui::GetCurrentContext();
+    ImGuiWindow* window = ImGui::GetCurrentWindow();
+    const char* labelEnd = ImGui::FindRenderedTextEnd(label);
+    if (labelEnd == label || window->DC.IsSameLine || ImGui::GetCurrentTable() != nullptr ||
+        window->DC.CurrentColumns != nullptr)
+        return nullptr;
+
+    // Keep a width the caller asked for: drawing the label would consume it.
+    const bool hasWidth = (g.NextItemData.HasFlags & ImGuiNextItemDataFlags_HasWidth) != 0;
+    const float requestedWidth = g.NextItemData.Width;
+
+    const float rowStartX = ImGui::GetCursorPosX();
+    const float avail = ImGui::GetContentRegionAvail().x;
+    const float labelWidth = std::clamp(avail * 0.38f, 70.0f, 220.0f);
+    const float textRoom = labelWidth - g.Style.ItemInnerSpacing.x;
+
+    ImGui::AlignTextToFramePadding();
+    const ImVec2 textSize = ImGui::CalcTextSize(label, labelEnd);
+    if (textSize.x <= textRoom)
+    {
+        ImGui::TextUnformatted(label, labelEnd);
+    }
+    else
+    {
+        // Too long for the column: cut with an ellipsis, full text on hover.
+        const ImVec2 pos = ImGui::GetCursorScreenPos();
+        const ImVec2 size(textRoom, textSize.y);
+        ImGui::Dummy(size);
+        ImGui::RenderTextEllipsis(ImGui::GetWindowDrawList(),
+            pos,
+            ImVec2(pos.x + size.x, pos.y + size.y),
+            pos.x + size.x,
+            label,
+            labelEnd,
+            &textSize);
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort))
+            ImGui::SetTooltip("%.*s", static_cast<int>(labelEnd - label), label);
+    }
+    ImGui::SameLine(rowStartX + labelWidth);
+    ImGui::SetNextItemWidth(hasWidth ? requestedWidth : -FLT_MIN);
+
+    std::snprintf(idBuffer, idBufferSize, "##%s", label);
+    return idBuffer;
+}
+
+bool AssetField(const char* label, const char* icon, const std::string& value, const char* tooltip)
+{
+    return Property(label, [&](const char*) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_FrameBg));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgHovered));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImGui::GetStyleColorVec4(ImGuiCol_FrameBgActive));
+        ImGui::PushStyleVar(ImGuiStyleVar_ButtonTextAlign, ImVec2(0.0f, 0.5f));
+        const std::string text = std::string(icon ? icon : "") + "  " + value + "##asset_field";
+        const bool clicked = ImGui::Button(text.c_str(), ImVec2(-FLT_MIN, 0.0f));
+        ImGui::PopStyleVar();
+        ImGui::PopStyleColor(3);
+        ItemTooltip(tooltip);
+        return clicked;
+    });
+}
+
+namespace Prop
+{
+void Text(const char* label, const char* fmt, ...)
+{
+    char id[256];
+    if (PropertyLabel(label, id, sizeof(id)) == nullptr)
+    {
+        ImGui::TextUnformatted(label, ImGui::FindRenderedTextEnd(label));
+        ImGui::SameLine();
+    }
+    va_list args;
+    va_start(args, fmt);
+    ImGui::TextV(fmt, args);
+    va_end(args);
+}
+}
+
 void SectionHeader(const char* text)
 {
     ImGui::Dummy(ImVec2(0.0f, 2.0f));
@@ -86,6 +192,23 @@ void SectionHeader(const char* text)
         ImGui::PopFont();
     ImGui::Separator();
     ImGui::Dummy(ImVec2(0.0f, 1.0f));
+}
+
+bool HeaderMenuButton(const char* tooltip)
+{
+    const ImVec2 headerMin = ImGui::GetItemRectMin();
+    const ImVec2 headerMax = ImGui::GetItemRectMax();
+    const float size = headerMax.y - headerMin.y;
+    const ImVec2 restore = ImGui::GetCursorScreenPos();
+    ImGui::SetCursorScreenPos(ImVec2(headerMax.x - size - 2.0f, headerMin.y));
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
+    const bool pressed = ImGui::Button(ICON_FA_ELLIPSIS_VERTICAL "##header_menu", ImVec2(size, size));
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+    ItemTooltip(tooltip);
+    ImGui::SetCursorScreenPos(restore);
+    return pressed;
 }
 
 void ColoredText(const ImVec4& color, const char* fmt, ...)

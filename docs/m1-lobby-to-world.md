@@ -67,6 +67,10 @@ A token-store M1-ben **közös MariaDB tábla** (nincs új infra; Redis csak M8)
 
 - **asio IO:** `io_context` szál-pool (kiindulás 2–4). Beérkező packet parse → hot-path mozgás-input: push a **bejövő input queue**-ba (MPSC), `session_id`-vel. Strukturált (EnterWorld stb.): control-path.
 - **Sim-szál:** egyetlen szál, fix lépésközű tick-loop (7.), birtokolja a flecs worldöt.
+  *(Történeti M1-terv. A mai modell: zónánként külön flecs world egy bounded
+  worker poolon, supervisor-szál vezérléssel; az input tick-igazítottan, a
+  zóna saját 20 Hz-es tickjének elején kerül be — lásd `architecture.md` és
+  `adaptive-simulation-fabric.md` §15.)*
 - **Kimenő:** a sim-szál send-jobokat tölt; `asio::post`-tal adja át az IO-rétegnek.
 - DB (token-validálás, karakter-betöltés): a meglévő `DbPool` mintán, completion visszaposztolva — a sim-szál SOHA ne blokkoljon DB-n. A belépő spawn a DB-completion után, a sim-szálra posztolva történik.
 

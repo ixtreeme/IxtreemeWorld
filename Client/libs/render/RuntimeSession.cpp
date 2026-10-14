@@ -5,14 +5,14 @@ namespace
 class EmptyRuntimeSession final : public RuntimeSession
 {
 public:
-    bool Create(VulkanDevice&, client::asset::IAssetReader&, uint32_t, uint32_t) override { return true; }
+    bool Create(client::asset::IAssetReader&, uint32_t, uint32_t) override { return true; }
     void Destroy() override {}
     void SetQuitCallback(std::function<void()> callback) override { m_quitCallback = std::move(callback); }
     void Update(double) override {}
     void UpdateNetwork() override {}
     void SendMoveInput(float, RuntimeMoveState) override {}
     void SendAttackTarget(std::uint32_t) override {}
-    void OnRenderPassChanged(VulkanDevice&) override {}
+    void OnRenderPassChanged() override {}
     void Resize(uint32_t, uint32_t) override {}
 
     void Start(const SceneData&) override { m_playing = true; }

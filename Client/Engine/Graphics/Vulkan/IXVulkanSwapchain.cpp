@@ -143,6 +143,7 @@ void IXVulkanSwapchain::Rebuild()
             mainPass,
             /*ownPass=*/false,
             framebuffer,
+            /*ownedDepthLayerView=*/VK_NULL_HANDLE,
             IXVulkanRenderPass::Borrow(*m_device, mainPass),
             clearColor,
             /*clearDepth=*/1.0f,
@@ -152,10 +153,6 @@ void IXVulkanSwapchain::Rebuild()
         m_backbuffers.push_back(std::move(backbuffer));
         m_mainTargets.push_back(std::move(target));
     }
-
-    // Mirror the main pass into the legacy object for still-native pipelines
-    // (RmlUi, terrain/skinned direct paths). Owned here; legacy must not free.
-    loop.SetMigrationMainPass(mainPass);
 }
 
 void IXVulkanSwapchain::Teardown()
@@ -169,8 +166,6 @@ void IXVulkanSwapchain::Teardown()
         vkDestroyRenderPass(m_device->NativeDevice(), m_mainPass, nullptr);
         m_mainPass = VK_NULL_HANDLE;
     }
-    if (m_device != nullptr)
-        m_device->Loop().SetMigrationMainPass(VK_NULL_HANDLE);
 }
 
 const ixrhi::IXRHIRenderPass* IXVulkanSwapchain::MainPass() const

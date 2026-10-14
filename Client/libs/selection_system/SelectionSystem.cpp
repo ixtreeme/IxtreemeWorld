@@ -1,4 +1,5 @@
 #include "SelectionSystem.h"
+#include "FogMath.h"
 
 namespace xm = ixtreeme::math;
 
@@ -165,7 +166,7 @@ std::vector<SelectionOutlineRenderer::Line> BuildSelectionOutlineLines(
     const std::vector<SpotLight>& spotLights,
     const std::vector<WaterBody>& waterBodies,
     const WorldCamera& camera,
-    const StaticMeshResolver& resolveStaticMesh)
+    const StaticMeshResolver&)
 {
     std::vector<SelectionOutlineRenderer::Line> lines;
     constexpr std::array<float, 4> kOutlineColor{1.0f, 0.61f, 0.07f, 1.0f};
@@ -195,29 +196,30 @@ std::vector<SelectionOutlineRenderer::Line> BuildSelectionOutlineLines(
 
     if (selected.type == SelectedEditorObjectType::MeshEntity)
     {
-        auto it = std::find_if(meshes.begin(), meshes.end(),
-            [&](const MeshSceneEntity& mesh) { return mesh.id == selected.id; });
-        if (it != meshes.end())
+        const auto it = std::find_if(meshes.begin(), meshes.end(), [&](const auto& mesh) { return mesh.id == selected.id; });
+        if (it != meshes.end() && it->hasFogVolume && !it->editorHidden)
         {
-            if (it->skinned)
+            const auto fog = BuildFogVolume(*it);
+            const WorldVec3 center{fog.centerShape[0], fog.centerShape[1], fog.centerShape[2]};
+            const WorldVec3 axes[] = {{fog.axisXExtent[0], fog.axisXExtent[1], fog.axisXExtent[2]},
+                {fog.axisYExtent[0], fog.axisYExtent[1], fog.axisYExtent[2]},
+                {fog.axisZExtent[0], fog.axisZExtent[1], fog.axisZExtent[2]}};
+            if (fog.centerShape[3] == 1)
             {
-                const float radius = std::max({1.25f, it->scale[0], it->scale[1], it->scale[2]});
-                addCircle({it->position[0], it->position[1] + radius, it->position[2]}, radius);
+                AddCircle(lines, center, axes[0], axes[1], fog.axisXExtent[3], kOutlineColor, 48);
+                AddCircle(lines, center, axes[0], axes[2], fog.axisXExtent[3], kOutlineColor, 48);
+                AddCircle(lines, center, axes[1], axes[2], fog.axisXExtent[3], kOutlineColor, 48);
             }
-            else if (StaticMeshRenderer* renderer = resolveStaticMesh(*it))
+            else
             {
-                if (renderer->IsLoaded())
-                {
-                    const auto corners = BuildStaticMeshWorldAabbCorners(*it, *renderer);
-                    constexpr std::array<std::array<int, 2>, 12> kBoxEdges{{
-                        {{0, 1}}, {{0, 2}}, {{1, 3}}, {{2, 3}},
-                        {{4, 5}}, {{4, 6}}, {{5, 7}}, {{6, 7}},
-                        {{0, 4}}, {{1, 5}}, {{2, 6}}, {{3, 7}},
-                    }};
-                    lines.reserve(kBoxEdges.size());
-                    for (const auto& edge : kBoxEdges)
-                        addLine(corners[edge[0]], corners[edge[1]]);
-                }
+                const WorldVec3 x = axes[0] * fog.axisXExtent[3], y = axes[1] * fog.axisYExtent[3], z = axes[2] * fog.axisZExtent[3];
+                std::array<WorldVec3, 8> corners;
+                for (int i = 0; i < 8; ++i)
+                    corners[i] = center + x * ((i & 1) ? 1.0f : -1.0f) +
+                        y * ((i & 2) ? 1.0f : -1.0f) + z * ((i & 4) ? 1.0f : -1.0f);
+                for (int i = 0; i < 8; ++i)
+                    for (int axis = 0; axis < 3; ++axis)
+                        if (!(i & (1 << axis))) addLine(corners[i], corners[i | (1 << axis)]);
             }
         }
     }
@@ -441,7 +443,7 @@ bool ApplySceneGizmoToMesh(MeshSceneEntity& mesh,
     std::copy(rotation, rotation + 3, std::begin(updated.rotation));
     std::copy(scale, scale + 3, std::begin(updated.scale));
     for (float& value : updated.scale)
-        value = std::max(0.001f, value);
+        value = std::max(updated.MinimumScale(), value);
     if (renderer && renderer->IsLoaded())
     {
         MeshSceneEntity centerOffsetMesh = updated;

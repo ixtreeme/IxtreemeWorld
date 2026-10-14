@@ -9,8 +9,11 @@
 #include <string>
 #include <vector>
 
+// Key for generated geometry; excludes transition distances and hysteresis.
 std::uint64_t HashLodConfig(const LodConfig& config);
 float DistanceToAabb(const WorldVec3& point, const SpatialIndex::Aabb& bounds);
+// LOD transitions use the object's centre, not the nearest edge of its box.
+float MeshLodDistance(const WorldVec3& point, const SpatialIndex::Aabb& bounds);
 std::uint32_t SelectLodLevel(const LodConfig& config, float distanceMeters, std::uint32_t previousLevel);
 
 struct StaticMeshLodBatchKey
@@ -55,7 +58,7 @@ struct StaticMeshLodBatch
     };
 
     LodConfig config;
-    std::vector<StaticMeshRenderer::Instance> instances;
+    StaticMeshRenderer::InstanceList instances;  // the instances are the caller's (render records)
     std::vector<LodDispositionRecord> lodDispositionRecords;
 };
 

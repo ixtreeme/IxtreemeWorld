@@ -144,9 +144,11 @@ public:
     ConstraintId CreateHingeJoint(const HingeJointDesc& desc);
     void DestroyConstraint(ConstraintId id);
     void DestroyBody(BodyId id);
+    void SetBodyEnabled(BodyId id, bool enabled);
     void SetBodyTransform(BodyId id, const PhysicsTransform& transform);
     bool GetBodyTransform(BodyId id, PhysicsTransform& outTransform) const;
     bool SetLinearVelocity(BodyId id, const float velocity[3]);
+    bool SetAngularVelocity(BodyId id, const float velocity[3]);
     bool GetLinearVelocity(BodyId id, float outVelocity[3]) const;
     bool GetAngularVelocity(BodyId id, float outVelocity[3]) const;
     bool IsBodyActive(BodyId id) const;
