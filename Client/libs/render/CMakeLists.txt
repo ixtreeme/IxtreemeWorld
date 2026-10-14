@@ -294,12 +294,14 @@ if(BUILD_TESTING AND NOT ANDROID)
         target_link_libraries(GraphMaterialRenderTest PRIVATE IXEngineRender IXEngineVulkan)
         target_compile_definitions(GraphMaterialRenderTest PRIVATE IX_GRAPH_RENDER_TEST_ASSETS_ROOT="${CLIENT_ROOT}"
             IX_GRAPH_RENDER_TEST_SHADER_ROOT="${CMAKE_CURRENT_BINARY_DIR}" IX_GRAPH_DXC="${DXC_EXECUTABLE}")
-        set(_graph_render_sample "${CMAKE_CURRENT_BINARY_DIR}/graph_render_test_SampleCS.spv")
-        add_custom_command(OUTPUT "${_graph_render_sample}"
-            COMMAND "${DXC_EXECUTABLE}" -spirv -T cs_6_0 -E SampleCS -Fo "${_graph_render_sample}"
-                "${CMAKE_CURRENT_SOURCE_DIR}/tests/GraphMaterialRenderTest.hlsl"
-            DEPENDS tests/GraphMaterialRenderTest.hlsl VERBATIM)
-        target_sources(GraphMaterialRenderTest PRIVATE "${_graph_render_sample}")
+        foreach(_graph_render_entry IN ITEMS SampleCS CopyCS)
+            set(_graph_render_output "${CMAKE_CURRENT_BINARY_DIR}/graph_render_test_${_graph_render_entry}.spv")
+            add_custom_command(OUTPUT "${_graph_render_output}"
+                COMMAND "${DXC_EXECUTABLE}" -spirv -T cs_6_0 -E ${_graph_render_entry} -Fo "${_graph_render_output}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/GraphMaterialRenderTest.hlsl"
+                DEPENDS tests/GraphMaterialRenderTest.hlsl VERBATIM)
+            target_sources(GraphMaterialRenderTest PRIVATE "${_graph_render_output}")
+        endforeach()
         add_dependencies(GraphMaterialRenderTest IXEngineShaders)
         if(MSVC)
             set_target_properties(GraphMaterialRenderTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

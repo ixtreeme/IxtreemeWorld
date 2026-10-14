@@ -73,7 +73,21 @@ that the model is removed and the preview returns to its source. The pinned MIT 
 
 `GraphMaterialRenderTest` reads one graph material's shading back from the GPU and
 matches it to the expected lit value; it is not a CPU/GPU parity sweep over every
-node kind or preset. The baking and editor tests also check that published
+node kind or preset.
+
+End-to-end check, 2026-10-14. `MaterialGraphBakingTest --publish-into <project>`
+published Weathered Metal through the real publication path into a fresh project
+(`Client/build/graph-runtime-audit-20261014/project`, not in git). The editor-less
+runtime player (`build-runtime`) started that project, loaded the package
+(`[GRAPH-MATERIAL] loaded`) and ran clean under the Vulkan validation layer.
+`GraphMaterialRenderTest --compare <project> <graph material> <baked copy> <png>`
+then drew the material and a copy without its graph shader through the real
+renderer: mean absolute difference 0.0003, largest 0.0015 (linear HDR, 256 x 256,
+sun and ambient light), so the per-pixel graph matches its CPU-baked textures.
+The first run of this check showed the baked copy fully white, which exposed the
+emissive factor of 1 that publishing gave every material (fixed in 3c7db10).
+
+![Weathered Metal: live graph shader (left) and its baked textures (right)](images/graph-shader-vs-baked-20261014.png) The baking and editor tests also check that published
 materials carry their compiled package and geometry map, and that a Bake & Apply
 material accepts a live parameter edit (exactly one uniform changes, live and in
 the saved package) but not a structural one.

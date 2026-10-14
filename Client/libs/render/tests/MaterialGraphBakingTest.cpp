@@ -201,6 +201,20 @@ void SmartAssetBrowser(AssetLibrary& library, const std::filesystem::path& root)
 }
 }
 int main(int argc, char** argv) {
+    if(argc==3 && std::string_view(argv[1])=="--publish-into") {
+        // Publishes Weathered Metal with its graph shader into an existing project (for a check in the
+        // real runtime); the material GUID is printed. Only adds files under Materials/GraphBakes.
+        const std::filesystem::path root=argv[2];
+        AssetDatabase::Instance().scan(root);AssetLibrary library(root,root/"Assets");
+        Check(library.Initialize(),"project opens");
+        AssetLibrary::Entry material;std::string error,notice;
+        const bool published=PublishBakedMaterial(library,MaterialGraphDocument::WeatheredMetal(),{},256,"Live Weathered Metal",material,error,{},nullptr,{},nullptr,&notice);
+        if(!error.empty())std::cout<<error<<'\n';
+        if(!notice.empty())std::cout<<notice<<'\n';
+        Check(published && notice.empty(),"Weathered Metal publishes with its graph shader");
+        std::cout<<"MATERIAL "<<material.guid<<'\n';
+        return failures?1:0;
+    }
     if(argc==3 && std::string_view(argv[1])=="--model-under-test") {
         // Exercise user-reported files on a copy; no original assets or metadata are changed.
         const std::filesystem::path source=argv[2];

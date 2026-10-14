@@ -8,3 +8,13 @@ void SampleCS()
 {
     results[0] = sceneColor.Load(int3(48, 32, 0));
 }
+
+// The whole scene image, row by row (the --compare mode).
+[numthreads(8, 8, 1)]
+void CopyCS(uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    sceneColor.GetDimensions(width, height);
+    if (id.x < width && id.y < height)
+        results[id.y * width + id.x] = sceneColor.Load(int3(id.xy, 0));
+}
