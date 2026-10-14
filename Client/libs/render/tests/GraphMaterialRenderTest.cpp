@@ -40,12 +40,13 @@ bool WriteFile(const std::filesystem::path& path, const std::string& bytes)
     file.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     return static_cast<bool>(file);
 }
-std::string MaterialJson(const std::string& name, const std::string& graphShader)
+std::string MaterialJson(const std::string& name, const std::string& graphShader, const std::string& emissiveTexture = {})
 {
     return "{\n  \"version\": 2,\n  \"shader\": \"PBR-Standard\",\n  \"shadingMode\": \"Lit\",\n  \"name\": \"" + name +
         "\",\n  \"baseColor\": [1, 1, 1, 1],\n  \"alphaMode\": \"Opaque\",\n" +
         (graphShader.empty() ? std::string{} : "  \"graphShader\": \"" + graphShader + "\",\n") +
-        "  \"textures\": {}\n}\n";
+        (emissiveTexture.empty() ? std::string("  \"textures\": {}\n}\n") :
+            "  \"emissive\": [1, 1, 1, 1],\n  \"textures\": {\"emissive\": \"" + emissiveTexture + "\"}\n}\n");
 }
 }
 
@@ -234,7 +235,9 @@ struct GraphMaterialRenderTestAccess
         Check(EncodeGraphShaderPackage(package, bytes, error) && WriteFile(root / "Graph" / "graph.ixgraphshader", bytes),
               "package writes beside its material");
         Check(WriteFile(root / "Graph" / "Graph.material", MaterialJson("Graph", "graph.ixgraphshader")) &&
-              WriteFile(root / "Plain" / "Plain.material", MaterialJson("Plain", "")), "material fixtures write");
+              WriteFile(root / "Plain" / "Plain.material", MaterialJson("Plain", "")) &&
+              WriteFile(root / "Glowing" / "Glowing.material", MaterialJson("Glowing", "", glowGuid)), "material fixtures write");
+        const auto glowingMaterial = AssetDatabase::Instance().getOrCreateGuid(root / "Glowing" / "Glowing.material").toString();
         const auto graphMaterial = AssetDatabase::Instance().getOrCreateGuid(root / "Graph" / "Graph.material").toString();
         const auto plainMaterial = AssetDatabase::Instance().getOrCreateGuid(root / "Plain" / "Plain.material").toString();
 
@@ -371,6 +374,16 @@ struct GraphMaterialRenderTestAccess
             Check(render(plainMaterial, pixel) && Near(pixel, {0.5f, 0.5f, 0.5f}) &&
                   renderer.m_lastMaterialBindings[0].pipelineName == "StaticMesh:Opaque",
                   "a material without a compiled graph is drawn from its textures");
+
+            // An emissive map is sampled (sRGB) and multiplied by the emissive colour, not added as plain white.
+            const auto linear = [](float v) { return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f); };
+            const std::array<float, 3> glowing = {0.5f + linear(128 / 255.0f), 0.5f + linear(32 / 255.0f), 0.5f + linear(200 / 255.0f)};
+            bool emissiveDrawn = false;
+            const auto emissiveDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            while (!emissiveDrawn && std::chrono::steady_clock::now() < emissiveDeadline)
+                emissiveDrawn = render(glowingMaterial, pixel) && Near(pixel, glowing);
+            std::cout << "emissive pixel " << pixel[0] << ' ' << pixel[1] << ' ' << pixel[2] << '\n';
+            Check(emissiveDrawn, "a material's emissive map is sampled, not drawn as uniform emissive colour");
 
             // A broken republished package keeps the last working shader.
             Check(WriteFile(root / "Graph" / "graph.ixgraphshader", "not a package"), "package is overwritten with garbage");

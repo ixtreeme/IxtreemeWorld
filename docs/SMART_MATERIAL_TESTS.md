@@ -84,8 +84,13 @@ runtime player (`build-runtime`) started that project, loaded the package
 then drew the material and a copy without its graph shader through the real
 renderer: mean absolute difference 0.0003, largest 0.0015 (linear HDR, 256 x 256,
 sun and ambient light), so the per-pixel graph matches its CPU-baked textures.
-The first run of this check showed the baked copy fully white, which exposed the
-emissive factor of 1 that publishing gave every material (fixed in 3c7db10).
+The first run of this check showed the baked copy fully white: publishing gives
+the emissive map a factor of 1, but the static mesh shader never sampled emissive
+maps, so every published material (and every imported model with an emissive map)
+added uniform white light. The static mesh shader now samples the material's
+emissive map at set 0 binding 6 (sRGB, white when absent); the comparison was
+repeated with the factor of 1 and gave the same difference, and
+`GraphMaterialRenderTest` checks that a material's emissive map is sampled.
 
 ![Weathered Metal: live graph shader (left) and its baked textures (right)](images/graph-shader-vs-baked-20261014.png) The baking and editor tests also check that published
 materials carry their compiled package and geometry map, and that a Bake & Apply

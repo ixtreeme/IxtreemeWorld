@@ -74,9 +74,11 @@ float4 PSMain(VSOutput input) : SV_Target0
 
     float3 texColor = texSample.rgb;
     float3 albedo = texColor * input.materialBaseColor.rgb * input.tint.rgb;
+    const float3 emissive = input.materialEmissive.rgb * input.materialEmissive.a *
+        u_emissiveMap.Sample(u_emissiveSampler, input.uv).rgb;
 
 #if defined(SHADING_MODE_UNLIT)
-    float3 unlitColor = albedo + input.materialEmissive.rgb * input.materialEmissive.a;
+    float3 unlitColor = albedo + emissive;
     return float4(unlitColor, alpha);
 #else
     float3 normal = ApplyNormalMap(normalize(input.normal), input.worldPos, input.uv, input.materialParams.z);
@@ -84,8 +86,7 @@ float4 PSMain(VSOutput input) : SV_Target0
     const float metallic = saturate(input.materialParams.x * orm.b);
     const float roughness = saturate(input.materialParams.y * max(orm.g, 0.04));
     const float ao = saturate(input.materialParams.w * orm.r);
-    float3 color = StaticMeshLighting(albedo, normal, normalize(input.normal), input.worldPos, roughness, metallic, ao) +
-        input.materialEmissive.rgb * input.materialEmissive.a;
+    float3 color = StaticMeshLighting(albedo, normal, normalize(input.normal), input.worldPos, roughness, metallic, ao) + emissive;
     return float4(color, alpha);
 #endif
 #endif

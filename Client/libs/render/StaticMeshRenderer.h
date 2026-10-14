@@ -424,6 +424,7 @@ private:
         MaterialTexture baseColor;
         MaterialTexture normal;
         MaterialTexture orm;
+        MaterialTexture emissive;
         std::string resolvedMaterial = "gltf_baked";
         std::optional<Guid> baseColorTextureGuid;  // the material's base colour texture (diagnostics)
         std::string alphaMode = "OPAQUE";
@@ -501,7 +502,7 @@ private:
         std::shared_ptr<ixrhi::IXRHIBuffer> indexStaging;
         std::shared_ptr<ixrhi::IXRHIBuffer> lodIndexStaging;
         std::shared_ptr<ixrhi::IXRHIBuffer> cardLodVertexStaging;
-        std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, 3> textureStaging{};  // diffuse, normal, orm
+        std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, 4> textureStaging{};  // diffuse, normal, orm, emissive
         std::uint64_t recordedFrame = std::numeric_limits<std::uint64_t>::max();
     };
     // Whether the model's data is on the GPU for this frame's draws (copied, or the copies recorded).
@@ -536,7 +537,7 @@ private:
     {
         std::unique_ptr<ixrhi::IXRHIBindGroup> group;  // set = frame index * kUniformSlots + slot
         std::shared_ptr<ixrhi::IXRHIBuffer> uniforms;  // every set's UniformBlock (kUniformStride apart)
-        std::array<std::array<BoundSlotTexture, 3>, kFramesInFlight * kUniformSlots> textures{};
+        std::array<std::array<BoundSlotTexture, 4>, kFramesInFlight * kUniformSlots> textures{};
         // The instance buffer binding 4 points at: re-pointed when the set is next taken, after a
         // frame grew the buffer (never while a frame that bound the set may still run).
         std::array<const ixrhi::IXRHIBuffer*, kFramesInFlight * kUniformSlots> instances{};
@@ -607,6 +608,7 @@ private:
     Texture m_texture;
     Texture m_normalTexture;
     Texture m_ormTexture;
+    Texture m_emissiveTexture;  // white: a material without an emissive map keeps its emissive colour
     // Material textures by (role, texture GUID). Looked up for every draw of every pass, so the key
     // builds no strings.
     struct MaterialTextureKey
@@ -689,7 +691,7 @@ private:
     std::uint32_t m_lodCoalescedDropped = 0;
     std::unordered_map<std::uint64_t, LodCpuSet> m_lodPendingResults;
     std::vector<MaterialDefaults> m_materialDefaults;
-    std::array<RgbaImage, 3> m_decodedTextures;  // diffuse, normal, orm: LoadCpu -> FinishGpu
+    std::array<RgbaImage, 4> m_decodedTextures;  // diffuse, normal, orm, emissive: LoadCpu -> FinishGpu
     // A glTF's parsed asset, LoadCpu -> FinishGpu: registering its materials (the material manager
     // and the asset database are not thread-safe) is the render thread's work.
     struct PendingMaterialImport;

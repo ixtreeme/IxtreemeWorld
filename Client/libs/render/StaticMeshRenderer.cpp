@@ -1032,6 +1032,10 @@ std::uint8_t MaterialTextureRoleIndex(const char* role)
         return 2;
     if (std::strcmp(role, "metallicRoughness") == 0)
         return 3;
+    if (std::strcmp(role, "emissive") == 0)
+        return 5;
+    if (std::strcmp(role, "graph") == 0)
+        return 6;
     return 4;
 }
 
@@ -3079,7 +3083,7 @@ void StaticMeshRenderer::RecordPendingUploads(ixrhi::IXRHICommandList& cmd, cons
         cmd.TransitionBuffer(*m_cardLodVertexBuffer, ixrhi::IXRHIBufferState::TransferDst,
             ixrhi::IXRHIBufferState::VertexRead);
     }
-    const std::array<Texture*, 3> textures = {&m_texture, &m_normalTexture, &m_ormTexture};
+    const std::array<Texture*, 4> textures = {&m_texture, &m_normalTexture, &m_ormTexture, &m_emissiveTexture};
     for (std::size_t i = 0; i < textures.size(); ++i)
     {
         const std::shared_ptr<ixrhi::IXRHIBuffer>& staging = uploads.textureStaging[i];
@@ -3165,6 +3169,7 @@ void StaticMeshRenderer::DecodeTextures(const std::string& modelPath)
     diffuse = {};
     normal = {};
     orm = {};
+    m_decodedTextures[3] = CreateFallbackWhiteImage(modelPath + "#emissive");
     if (!m_assets || !LoadGltfMaterialTextures(*m_assets, modelPath, diffuse, normal, orm))
     {
         LogFormat("[STATIC-MESH] using fallback PBR textures for %s", modelPath.c_str());
@@ -3183,7 +3188,8 @@ bool StaticMeshRenderer::UploadDecodedTextures(ixrhi::IXRHIDevice& rhi)
     const bool uploaded =
         UploadTexture(rhi, m_decodedTextures[0], m_texture, defer ? &m_pendingUploads->textureStaging[0] : nullptr) &&
         UploadTexture(rhi, m_decodedTextures[1], m_normalTexture, defer ? &m_pendingUploads->textureStaging[1] : nullptr) &&
-        UploadTexture(rhi, m_decodedTextures[2], m_ormTexture, defer ? &m_pendingUploads->textureStaging[2] : nullptr);
+        UploadTexture(rhi, m_decodedTextures[2], m_ormTexture, defer ? &m_pendingUploads->textureStaging[2] : nullptr) &&
+        UploadTexture(rhi, m_decodedTextures[3], m_emissiveTexture, defer ? &m_pendingUploads->textureStaging[3] : nullptr);
     for (RgbaImage& image : m_decodedTextures)
         image = {};
     return uploaded;
@@ -3250,6 +3256,7 @@ StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialText
     views.baseColor = materialOf(m_texture);
     views.normal = materialOf(m_normalTexture);
     views.orm = materialOf(m_ormTexture);
+    views.emissive = materialOf(m_emissiveTexture);
     if (m_isTreeImpostor && !m_materialDefaults.empty())
     {
         const auto& defaults = m_materialDefaults.front();
@@ -3288,6 +3295,9 @@ StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialText
     if (const Texture* texture =
             EnsureMaterialTexture(rhi, material->baseColorTexture, ixrhi::IXRHIFormat::R8G8B8A8Srgb, "baseColor"))
         views.baseColor = materialOf(*texture);
+    if (const Texture* texture =
+            EnsureMaterialTexture(rhi, material->emissiveTexture, ixrhi::IXRHIFormat::R8G8B8A8Srgb, "emissive"))
+        views.emissive = materialOf(*texture);
     if (!views.unlit)
     {
         if (const Texture* texture =
@@ -3502,7 +3512,7 @@ void StaticMeshRenderer::UpdateMaterialTextureDescriptors(const BindSlot& slot, 
     if (!slot.page)
         return;
 
-    std::array<BoundSlotTexture, 3>& bound = slot.page->textures[slot.set];
+    std::array<BoundSlotTexture, 4>& bound = slot.page->textures[slot.set];
     auto update = [&](std::uint32_t binding, const MaterialTexture& material, BoundSlotTexture& current) {
         if (!material.texture || !material.sampler)
             return;
@@ -3514,6 +3524,7 @@ void StaticMeshRenderer::UpdateMaterialTextureDescriptors(const BindSlot& slot, 
     update(1, textures.baseColor, bound[0]);
     update(2, textures.normal, bound[1]);
     update(3, textures.orm, bound[2]);
+    update(6, textures.emissive, bound[3]);
 }
 
 bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
@@ -3527,6 +3538,7 @@ bool StaticMeshRenderer::CreateBindGroup(ixrhi::IXRHIDevice& rhi)
         {3, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},
         {4, ixrhi::IXRHIBindingType::StorageBuffer, allStages},
         {5, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},  // sun shadow cascades
+        {6, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment},  // emissive map
     };
     m_bindLayout = rhi.CreateBindGroupLayout(bindings);
     if (!m_bindLayout)
@@ -3564,9 +3576,12 @@ StaticMeshRenderer::BindPage* StaticMeshRenderer::AddBindPage(ixrhi::IXRHIDevice
             page->group->UpdateTexture(set, 2, m_normalTexture.image, m_normalTexture.sampler);
         if (m_ormTexture.image && m_ormTexture.sampler)
             page->group->UpdateTexture(set, 3, m_ormTexture.image, m_ormTexture.sampler);
+        if (m_emissiveTexture.image && m_emissiveTexture.sampler)
+            page->group->UpdateTexture(set, 6, m_emissiveTexture.image, m_emissiveTexture.sampler);
         page->textures[set] = {{{m_texture.image.get(), m_texture.sampler.get()},
             {m_normalTexture.image.get(), m_normalTexture.sampler.get()},
-            {m_ormTexture.image.get(), m_ormTexture.sampler.get()}}};
+            {m_ormTexture.image.get(), m_ormTexture.sampler.get()},
+            {m_emissiveTexture.image.get(), m_emissiveTexture.sampler.get()}}};
         page->group->UpdateBuffer(set, 4, m_instanceBuffers[frame], 0,
             sizeof(InstanceBlock) * m_instanceBufferCapacity[frame]);
         page->instances[set] = m_instanceBuffers[frame].get();
@@ -5294,6 +5309,7 @@ void StaticMeshRenderer::Destroy()
     m_texture = {};
     m_normalTexture = {};
     m_ormTexture = {};
+    m_emissiveTexture = {};
     m_materialTextureLoads.clear();  // (waits for their decodes)
     m_materialTextureStaging.clear();
     m_materialTextureCache.clear();

@@ -259,14 +259,9 @@ bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& doc
         for (const auto& guid : expansion.dependencyGuids) if (const auto parsed=Guid::fromString(guid)) dependencies.push_back(*parsed);
         if (!AssetDatabase::Instance().writeDependencies(authored,dependencies)) { error="Cannot write baked definition dependencies"; return false; }
     }
-    GltfMaterialSource material;material.name=name;material.baseColorTexturePath=folder/filenames[0];material.normalTexturePath=folder/filenames[1];material.aoTexturePath=folder/filenames[2];material.roughnessTexturePath=folder/filenames[3];material.metallicTexturePath=folder/filenames[4];material.heightTexturePath=folder/filenames[5];material.emissiveTexturePath=folder/filenames[6];material.emissive={0,0,0,1};
-    // The static mesh shader takes emissive light as one colour and does not sample an emissive texture:
-    // a factor of 1 for the emissive map lit every published material fully white. Use the map's average.
-    {double sum[3]{};std::size_t covered=0;
-     for(std::size_t at=0;at+3<images.emissive.size();at+=4)if(!geometry || geometry->coverage[at/4]) {
-         ++covered;for(int k=0;k<3;++k)sum[k]+=SrgbToLinear(images.emissive[at+k]/255.0f);
-     }
-     if(covered)for(int k=0;k<3;++k)material.emissive[k]=static_cast<float>(sum[k]/static_cast<double>(covered));}material.roughness=1;material.metallic=1;
+    GltfMaterialSource material;material.name=name;material.baseColorTexturePath=folder/filenames[0];material.normalTexturePath=folder/filenames[1];material.aoTexturePath=folder/filenames[2];material.roughnessTexturePath=folder/filenames[3];material.metallicTexturePath=folder/filenames[4];material.heightTexturePath=folder/filenames[5];material.emissiveTexturePath=folder/filenames[6];
+    // glTF convention: the baked emissive map (black where the graph emits nothing) times this colour.
+    material.emissive={1,1,1,1};material.roughness=1;material.metallic=1;
     for(size_t at=3;at<images.color.size();at+=4)if((!geometry || geometry->coverage[at/4]) && images.color[at]<255){material.alphaMode="blend";break;}
     std::string notice;const bool graphShader=WriteGraphShader(library,source,geometry,graphFolder,folder,notice);
     if(runtimeNotice)*runtimeNotice=notice;

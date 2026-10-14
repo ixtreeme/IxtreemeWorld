@@ -70,6 +70,9 @@ struct StaticMeshInstanceData
 
 [[vk::combinedImageSampler]] [[vk::binding(5, 0)]] Texture2DArray<float> u_sunShadowMap : register(t4);
 [[vk::combinedImageSampler]] [[vk::binding(5, 0)]] SamplerComparisonState u_sunShadowSampler : register(s4);
+// The material's emissive map (sRGB view; white when it has none), multiplied by its emissive colour.
+[[vk::combinedImageSampler]] [[vk::binding(6, 0)]] Texture2D u_emissiveMap : register(t5);
+[[vk::combinedImageSampler]] [[vk::binding(6, 0)]] SamplerState u_emissiveSampler : register(s5);
 
 #include "SunShadow.hlsli"
 

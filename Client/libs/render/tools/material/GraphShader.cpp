@@ -184,7 +184,7 @@ bool ValidateGraphShaderBindings(const std::vector<std::uint32_t>& words, std::s
     if (!ReflectSpirvBindings(words, bindings, error)) return false;
     for (const auto& b : bindings)
     {
-        const bool staticMesh = b.set == 0 && b.binding <= 5;
+        const bool staticMesh = b.set == 0 && b.binding <= 6;
         const bool graph = b.set == kGraphDescriptorSet && (b.binding == kGraphUniformBinding ||
             (geometryMap && b.binding == kGraphGeometryBinding) ||
             (b.binding >= kGraphFirstTextureBinding && b.binding < kGraphFirstTextureBinding + textureCount));

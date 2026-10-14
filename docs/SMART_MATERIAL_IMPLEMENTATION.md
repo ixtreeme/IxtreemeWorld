@@ -264,6 +264,11 @@ are saved into its package once the value settles. A structural edit cannot reus
 the compiled shader; the panel says so and a new Bake & Apply is needed. Live
 values do not update the baked fallback textures.
 
+The static mesh shader also samples a material's emissive map now (set 0 binding
+6, sRGB, white when absent). Before that, published materials and imported models
+with emissive maps added their emissive colour as uniform light and looked white;
+already published materials are drawn correctly without republishing.
+
 Not covered: skinned meshes and terrain still use baked textures; the graph is
 evaluated per pixel, and its GPU cost against baked textures was not measured;
 there is no global pipeline cache shared between models (each model builds its

@@ -40,7 +40,7 @@ struct SpirvBinding
 // Descriptor bindings actually present in a SPIR-V module (not the source's declarations).
 bool ReflectSpirvBindings(const std::vector<std::uint32_t>& words, std::vector<SpirvBinding>& bindings, std::string& error);
 // Accepts a graph shader only if every binding it uses is one the static mesh renderer provides:
-// set 0 bindings 0..5 and, in kGraphDescriptorSet, the uniform block, the geometry map when the
+// set 0 bindings 0..6 and, in kGraphDescriptorSet, the uniform block, the geometry map when the
 // graph reads geometry data, and textureCount textures.
 bool ValidateGraphShaderBindings(const std::vector<std::uint32_t>& words, std::size_t textureCount, bool geometryMap, std::string& error);
 

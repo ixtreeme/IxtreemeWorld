@@ -277,8 +277,8 @@ int main(int argc, char** argv) {
     if(baked) {
         const auto guid=Guid::fromString(material.guid);const auto* loaded=guid?MaterialAssetManager::Instance().getOrLoad(*guid):nullptr;
         Check(loaded && loaded->baseColorTexture && loaded->normalTexture && loaded->metallicRoughnessTexture && loaded->heightTexture && loaded->emissiveTexture,"published material uses baked color, normal, ORM, height and emissive maps");
-        Check(loaded && loaded->emissive[0]==0 && loaded->emissive[1]==0 && loaded->emissive[2]==0,
-              "a graph without emissive light publishes no emissive factor (the static shader does not sample the emissive map)");
+        Check(loaded && loaded->emissiveTexture && loaded->emissive[0]==1 && loaded->emissive[1]==1 && loaded->emissive[2]==1,
+              "published emissive light is the baked emissive map with a factor of one");
         if(loaded && loaded->metallicRoughnessTexture) {
             const auto orm=AssetDatabase::Instance().resolveGuid(*loaded->metallicRoughnessTexture);int w=0,h=0,c=0;auto* pixels=orm?stbi_load(orm->string().c_str(),&w,&h,&c,4):nullptr;
             Check(pixels && w==16 && pixels[0]==255 && pixels[1]==153 && pixels[2]==0,"runtime ORM uses AO/Roughness/Metallic in RGB order");stbi_image_free(pixels);
