@@ -47,10 +47,13 @@ class IAssetReader;
 }
 namespace tree_tool { struct TreeImpostorSettings; }
 
+struct MaterialAsset;
+
 class StaticMeshRenderer
 {
     friend struct StaticMeshLeafLodTestAccess;
     friend struct StaticMeshLodGenerationTestAccess;
+    friend struct GraphMaterialRenderTestAccess;
 public:
     enum class LoadStatus
     {
@@ -393,8 +396,30 @@ private:
         std::shared_ptr<ixrhi::IXRHISampler> sampler;
     };
 
+    // A material drawn with its compiled graph (MaterialAsset::graphShader): its own pixel shaders and
+    // descriptor set 1. A graph that failed to load, or whose textures are still loading, is drawn
+    // from the baked textures instead; a reload that fails keeps the last working one.
+    struct GraphMaterial
+    {
+        std::filesystem::path package;
+        std::filesystem::file_time_type stamp{};
+        std::uintmax_t bytes = 0;
+        std::uint64_t materialRevision = 0;
+        bool failed = false;
+        std::unique_ptr<ixrhi::IXRHIBindGroupLayout> layout;
+        std::unique_ptr<ixrhi::IXRHIBindGroup> group;  // one set per frame in flight
+        std::array<std::shared_ptr<ixrhi::IXRHIBuffer>, kFramesInFlight> uniforms{};
+        std::array<std::vector<const ixrhi::IXRHITexture*>, kFramesInFlight> bound{};
+        std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> opaque, mask, maskOnDepth;
+        std::array<std::unique_ptr<ixrhi::IXRHIGraphicsPipeline>, 2> blend;  // back faces, front faces
+        std::vector<std::pair<std::uint32_t, Guid>> textures;  // binding, texture asset
+        std::vector<std::array<float, 4>> values;
+        std::vector<const Texture*> resident;  // the textures for this frame, in the order of textures
+    };
+
     struct MaterialTextureViews
     {
+        GraphMaterial* graph = nullptr;  // drawn with this instead of the textures when set
         MaterialTexture baseColor;
         MaterialTexture normal;
         MaterialTexture orm;
@@ -487,9 +512,14 @@ private:
         const std::optional<Guid>& guid,
         ixrhi::IXRHIFormat format,
         const char* role);
+    // withGraph: the lit colour passes, which can draw a compiled material graph.
     MaterialTextureViews ResolveMaterialTextureViews(ixrhi::IXRHIDevice& rhi,
         const Instance& instance,
-        std::uint32_t materialSlot);
+        std::uint32_t materialSlot,
+        bool withGraph = false);
+    GraphMaterial* EnsureGraphMaterial(ixrhi::IXRHIDevice& rhi, const MaterialAsset& material);
+    bool BuildGraphMaterial(ixrhi::IXRHIDevice& rhi, const std::string& bytes, GraphMaterial& graph, std::string& error);
+    void BindGraphMaterial(ixrhi::IXRHICommandList& cmd, GraphMaterial& graph, std::uint32_t frameIndex);
     // Textures/samplers each bind set's descriptors point at (baseColor, normal, orm), so a draw
     // re-binding the same material skips the descriptor writes. A bind group keeps every resource
     // ever bound to it alive, so a stored pointer cannot be reused by another texture meanwhile.
@@ -624,6 +654,10 @@ private:
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_maskOnDepthPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_unlitMaskOnDepthPipeline;
     std::unique_ptr<ixrhi::IXRHIGraphicsPipeline> m_outlinePipeline;
+    // Compiled material graphs by material GUID, and the pipeline states they are built from.
+    std::unordered_map<std::string, std::unique_ptr<GraphMaterial>> m_graphMaterials;
+    std::vector<std::pair<std::unique_ptr<GraphMaterial>, std::uint64_t>> m_retiredGraphMaterials;  // with their last frame
+    std::optional<ixrhi::IXRHIGraphicsPipelineDesc> m_graphPipelineBase, m_graphBlendBase;
     // Alpha-blended (Blend materials): [lit, unlit] x [back faces, front faces].
     std::array<std::array<std::unique_ptr<ixrhi::IXRHIGraphicsPipeline>, 2>, 2> m_blendPipelines;
     // Sun shadow pass (depth only), baked against the cascades' pass: opaque, and alpha-masked.

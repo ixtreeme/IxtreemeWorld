@@ -289,6 +289,25 @@ if(BUILD_TESTING AND NOT ANDROID)
     endif()
     add_test(NAME WaterViewTest COMMAND WaterViewTest)
 
+    if(WIN32 AND DXC_EXECUTABLE)
+        add_executable(GraphMaterialRenderTest tests/GraphMaterialRenderTest.cpp)
+        target_link_libraries(GraphMaterialRenderTest PRIVATE IXEngineRender IXEngineVulkan)
+        target_compile_definitions(GraphMaterialRenderTest PRIVATE IX_GRAPH_RENDER_TEST_ASSETS_ROOT="${CLIENT_ROOT}"
+            IX_GRAPH_RENDER_TEST_SHADER_ROOT="${CMAKE_CURRENT_BINARY_DIR}" IX_GRAPH_DXC="${DXC_EXECUTABLE}")
+        set(_graph_render_sample "${CMAKE_CURRENT_BINARY_DIR}/graph_render_test_SampleCS.spv")
+        add_custom_command(OUTPUT "${_graph_render_sample}"
+            COMMAND "${DXC_EXECUTABLE}" -spirv -T cs_6_0 -E SampleCS -Fo "${_graph_render_sample}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/GraphMaterialRenderTest.hlsl"
+            DEPENDS tests/GraphMaterialRenderTest.hlsl VERBATIM)
+        target_sources(GraphMaterialRenderTest PRIVATE "${_graph_render_sample}")
+        add_dependencies(GraphMaterialRenderTest IXEngineShaders)
+        if(MSVC)
+            set_target_properties(GraphMaterialRenderTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+        endif()
+        add_test(NAME GraphMaterialRenderTest COMMAND GraphMaterialRenderTest)
+        set_tests_properties(GraphMaterialRenderTest PROPERTIES TIMEOUT 120)
+    endif()
+
     add_executable(FogSystemTest tests/FogSystemTest.cpp)
     target_link_libraries(FogSystemTest PRIVATE IXEngineRender)
     if(WIN32)

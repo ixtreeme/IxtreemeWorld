@@ -11,6 +11,7 @@
 #include "IXRHIShader.h"
 #include "JobSystem.h"
 #include "MaterialAssetManager.h"
+#include "tools/material/GraphShader.h"
 #include "ProjectManager.h"
 #include "asset/IAssetReader.h"
 
@@ -3235,7 +3236,8 @@ const StaticMeshRenderer::Texture* StaticMeshRenderer::EnsureMaterialTexture(ixr
 
 StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialTextureViews(ixrhi::IXRHIDevice& rhi,
     const Instance& instance,
-    std::uint32_t materialSlot)
+    std::uint32_t materialSlot,
+    bool withGraph)
 {
     auto materialOf = [](const Texture& texture) {
         MaterialTexture material{};
@@ -3298,8 +3300,192 @@ StaticMeshRenderer::MaterialTextureViews StaticMeshRenderer::ResolveMaterialText
                     "metallicRoughness"))
             views.orm = materialOf(*texture);
     }
+    if (withGraph && !views.unlit && !material->graphShader.empty())
+        views.graph = EnsureGraphMaterial(rhi, *material);
 
     return views;
+}
+
+StaticMeshRenderer::GraphMaterial* StaticMeshRenderer::EnsureGraphMaterial(ixrhi::IXRHIDevice& rhi, const MaterialAsset& material)
+{
+    auto& entry = m_graphMaterials[material.guid.toString()];
+    if (!entry)
+        entry = std::make_unique<GraphMaterial>();
+    // Re-read only after a material changed somewhere (a save, a republished graph), not every frame.
+    const std::uint64_t revision = MaterialAssetManager::Instance().Revision();
+    if (entry->materialRevision != revision)
+    {
+        entry->materialRevision = revision;
+        const std::filesystem::path path = material.path.parent_path() /
+            std::filesystem::path(std::u8string(material.graphShader.begin(), material.graphShader.end()));
+        std::error_code timeError, sizeError;
+        const auto stamp = std::filesystem::last_write_time(path, timeError);
+        const auto bytes = std::filesystem::file_size(path, sizeError);
+        if (path != entry->package || timeError || sizeError || stamp != entry->stamp || bytes != entry->bytes)
+        {
+            auto loaded = std::make_unique<GraphMaterial>();
+            loaded->package = path;
+            loaded->stamp = stamp;
+            loaded->bytes = timeError || sizeError ? 0 : bytes;
+            loaded->materialRevision = revision;
+            std::string error;
+            std::string data;
+            if (timeError || sizeError || bytes > (64u << 20))
+                error = "missing or too large";
+            else
+            {
+                std::ifstream file(path, std::ios::binary);
+                data.assign(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+            }
+            if (error.empty() && BuildGraphMaterial(rhi, data, *loaded, error))
+            {
+                LogFormat("[GRAPH-MATERIAL] loaded material=%s package=%s textures=%zu",
+                    material.guid.toString().c_str(), path.generic_string().c_str(), loaded->textures.size());
+                if (entry->opaque)
+                    m_retiredGraphMaterials.emplace_back(std::move(entry), m_worldRenderFrameNumber);
+                entry = std::move(loaded);
+            }
+            else
+            {
+                LogFormat("[GRAPH-MATERIAL] material=%s package=%s not used (%s)%s",
+                    material.guid.toString().c_str(), path.generic_string().c_str(), error.c_str(),
+                    entry->opaque ? "; keeping the previous shader" : "; drawn from its textures");
+                if (!entry->opaque)
+                {
+                    entry->failed = true;
+                    entry->package = path;
+                }
+                entry->stamp = stamp;
+                entry->bytes = loaded->bytes;
+            }
+        }
+    }
+    GraphMaterial& graph = *entry;
+    if (!graph.opaque || !graph.mask || !graph.maskOnDepth || !graph.blend[0] || !graph.blend[1])
+        return nullptr;
+    graph.resident.clear();
+    for (const auto& [binding, guid] : graph.textures)
+    {
+        const Texture* texture = EnsureMaterialTexture(rhi, guid, ixrhi::IXRHIFormat::R8G8B8A8Unorm, "graph");
+        if (!texture || !texture->image || !texture->sampler)
+            return nullptr;  // still loading: drawn from the baked textures meanwhile
+        graph.resident.push_back(texture);
+    }
+    return &graph;
+}
+
+bool StaticMeshRenderer::BuildGraphMaterial(ixrhi::IXRHIDevice& rhi, const std::string& bytes, GraphMaterial& graph,
+    std::string& error)
+{
+    using namespace material_tool;
+    GraphShaderPackage package;
+    if (!DecodeGraphShaderPackage(bytes, package, error))
+        return false;
+    if (!m_graphPipelineBase || !m_graphBlendBase || !m_bindLayout)
+    {
+        error = "static mesh pipelines are not ready";
+        return false;
+    }
+    const std::size_t textureCount = package.textures.size();
+    const bool geometryMap = std::any_of(package.textures.begin(), package.textures.end(),
+        [](const auto& texture) { return texture.binding == kGraphGeometryBinding; });
+    for (const auto* spirv : {&package.opaqueSpirv, &package.maskedSpirv})
+        if (!ValidateGraphShaderBindings(*spirv, textureCount - (geometryMap ? 1u : 0u), geometryMap, error))
+            return false;
+    std::vector<ixrhi::IXRHIBinding> bindings = {
+        {kGraphUniformBinding, ixrhi::IXRHIBindingType::UniformBuffer, ixrhi::IXRHIShaderStage::Fragment}};
+    for (const auto& texture : package.textures)
+    {
+        const std::optional<Guid> guid = Guid::fromString(texture.guid);
+        if (!guid)
+        {
+            error = "invalid texture GUID";
+            return false;
+        }
+        bindings.push_back({texture.binding, ixrhi::IXRHIBindingType::SampledTexture, ixrhi::IXRHIShaderStage::Fragment});
+        graph.textures.emplace_back(texture.binding, *guid);
+    }
+    graph.layout = rhi.CreateBindGroupLayout(bindings);
+    graph.group = graph.layout ? rhi.CreateBindGroup(*graph.layout, kFramesInFlight) : nullptr;
+    if (!graph.group)
+    {
+        error = "cannot create descriptor set 1";
+        return false;
+    }
+    graph.values.assign(package.uniforms.begin(), package.uniforms.end());
+    if (graph.values.empty())
+        graph.values.push_back({});  // the layout always has a uniform block
+    const std::uint64_t uniformBytes = graph.values.size() * sizeof(graph.values[0]);
+    for (std::uint32_t frame = 0; frame < kFramesInFlight; ++frame)
+    {
+        graph.uniforms[frame] = CreateRhiBuffer(rhi, uniformBytes, ixrhi::IXRHIBufferUsage::Uniform,
+            ixrhi::IXRHICpuAccess::Write, graph.values.data(), "StaticMesh:GraphUniforms");
+        if (!graph.uniforms[frame])
+        {
+            error = "cannot create the uniform block";
+            return false;
+        }
+        graph.group->UpdateBuffer(frame, kGraphUniformBinding, graph.uniforms[frame], 0, uniformBytes);
+        graph.bound[frame].assign(textureCount, nullptr);
+    }
+    const auto shader = [&](const std::vector<std::uint32_t>& spirv, const char* name) {
+        ixrhi::IXRHIShaderDesc desc;
+        desc.stage = ixrhi::IXRHIShaderStage::Fragment;
+        desc.entryPoint = "PSMain";
+        desc.spirv = spirv;
+        desc.debugName = name;
+        return rhi.CreateShader(desc);
+    };
+    const auto opaque = shader(package.opaqueSpirv, "StaticMesh:GraphOpaquePS");
+    const auto masked = shader(package.maskedSpirv, "StaticMesh:GraphMaskedPS");
+    if (!opaque || !masked)
+    {
+        error = "cannot create the shader modules";
+        return false;
+    }
+    const std::vector<const ixrhi::IXRHIBindGroupLayout*> layouts = {m_bindLayout.get(), graph.layout.get()};
+    ixrhi::IXRHIGraphicsPipelineDesc desc = *m_graphPipelineBase;
+    desc.bindGroupLayouts = layouts;
+    desc.fragmentShader = opaque;
+    desc.debugName = "StaticMesh:GraphOpaque";
+    graph.opaque = rhi.CreateGraphicsPipeline(desc);
+    desc.fragmentShader = masked;
+    desc.debugName = "StaticMesh:GraphMask";
+    graph.mask = rhi.CreateGraphicsPipeline(desc);
+    desc.depthWriteEnable = false;
+    desc.depthCompareOp = ixrhi::IXRHICompareOp::LessOrEqual;
+    desc.debugName = "StaticMesh:GraphMaskOnDepth";
+    graph.maskOnDepth = rhi.CreateGraphicsPipeline(desc);
+    ixrhi::IXRHIGraphicsPipelineDesc blend = *m_graphBlendBase;
+    blend.bindGroupLayouts = layouts;
+    blend.fragmentShader = masked;
+    for (std::size_t side = 0; side < 2; ++side)
+    {
+        blend.cullMode = side == 0 ? ixrhi::IXRHICullMode::Front : ixrhi::IXRHICullMode::Back;
+        blend.debugName = side == 0 ? "StaticMesh:GraphBlendBack" : "StaticMesh:GraphBlendFront";
+        graph.blend[side] = rhi.CreateGraphicsPipeline(blend);
+    }
+    if (!graph.opaque || !graph.mask || !graph.maskOnDepth || !graph.blend[0] || !graph.blend[1])
+    {
+        error = "cannot create the pipelines";
+        return false;
+    }
+    return true;
+}
+
+void StaticMeshRenderer::BindGraphMaterial(ixrhi::IXRHICommandList& cmd, GraphMaterial& graph, std::uint32_t frameIndex)
+{
+    // Same values every draw of a frame (both views, reflections); a change lands with the next frame.
+    graph.uniforms[frameIndex]->Write(0, graph.values.data(), graph.values.size() * sizeof(graph.values[0]));
+    for (std::size_t i = 0; i < graph.textures.size() && i < graph.resident.size(); ++i)
+    {
+        const Texture& texture = *graph.resident[i];
+        if (graph.bound[frameIndex][i] == texture.image.get())
+            continue;
+        graph.group->UpdateTexture(frameIndex, graph.textures[i].first, texture.image, texture.sampler);
+        graph.bound[frameIndex][i] = texture.image.get();
+    }
+    cmd.BindGroup(1, *graph.group, frameIndex);
 }
 
 void StaticMeshRenderer::UpdateMaterialTextureDescriptors(const BindSlot& slot, const MaterialTextureViews& textures)
@@ -3388,6 +3574,9 @@ void StaticMeshRenderer::BeginFrameSlots(const ixrhi::IXRHIFrameInfo& frame)
         return;
     m_worldRenderFrameNumber = frame.frameNumber;
     m_worldRenderFrameIndex = frame.frameIndex % kFramesInFlight;
+    std::erase_if(m_retiredGraphMaterials, [&](const auto& retired) {
+        return frame.frameNumber > retired.second + kFramesInFlight;
+    });
     m_worldUniformCursor = 0;
     m_worldInstanceCursor = 0;
 }
@@ -3528,6 +3717,8 @@ bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
         ixrhi::IXRHIBlendOp::Add}};
     desc.sampleCount = 1;
     desc.targetRenderPass = m_targetPass;
+    m_graphPipelineBase = desc;
+    m_graphMaterials.clear();
 
     // All 5 variants share vertex input/assembly/viewport/raster(base)/
     // multisample/depth(base)/blend/dynamic state; only the fragment shader
@@ -3582,6 +3773,7 @@ bool StaticMeshRenderer::CreatePipeline(ixrhi::IXRHIDevice& rhi)
         ixrhi::IXRHIBlendFactor::One,
         ixrhi::IXRHIBlendFactor::OneMinusSrcAlpha,
         ixrhi::IXRHIBlendOp::Add}};
+    m_graphBlendBase = blend;
     const std::array<std::shared_ptr<ixrhi::IXRHIShader>, 2> blendFragments = {ps, unlitPs};
     const std::array<std::array<const char*, 2>, 2> blendNames = {{
         {"StaticMesh:BlendBack", "StaticMesh:BlendFront"},
@@ -4431,7 +4623,7 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
         run.draw.firstInstance = command.firstInstance + runStart;
         run.draw.instanceCount = runEnd - runStart;
         run.instance = instances[runStart];
-        run.textures = ResolveMaterialTextureViews(*m_rhi, *run.instance, run.draw.materialSlot);
+        run.textures = ResolveMaterialTextureViews(*m_rhi, *run.instance, run.draw.materialSlot, true);
         run.isMask = std::strcmp(run.textures.fragmentShaderAlphaPath, "discard") == 0 || fades(*run.instance);
         run.isBlend = std::strcmp(run.textures.fragmentShaderAlphaPath, "blend") == 0;
         run.level = level;
@@ -4466,6 +4658,11 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
                 pipelineForDraw = m_maskDepthPipeline.get();
             else if (step == MaskStep::Colour)
                 pipelineForDraw = materialTextures.unlit ? m_unlitMaskOnDepthPipeline.get() : m_maskOnDepthPipeline.get();
+            // A compiled material graph shades the colour; the depth step keeps the baked alpha test.
+            GraphMaterial* graph = step == MaskStep::Depth ? nullptr : materialTextures.graph;
+            if (graph)
+                pipelineForDraw = step == MaskStep::Colour ? graph->maskOnDepth.get()
+                    : (run.isMask ? graph->mask.get() : graph->opaque.get());
 
             if (boundPipeline != pipelineForDraw)
             {
@@ -4503,6 +4700,8 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
                 if (!kept)
                     continue;
                 cmd.BindGroup(0, *kept->page->group, kept->set);
+                if (graph)
+                    BindGraphMaterial(cmd, *graph, frameIndex);
                 if (!culler || capturing || !culler->Draw(cmd, indexCount, draw.instanceCount, firstIndex, 0, draw.firstInstance))
                 cmd.DrawIndexed(indexCount, draw.instanceCount, firstIndex, 0, draw.firstInstance);
                 ++m_lastSubmittedDrawCalls;
@@ -4543,6 +4742,8 @@ void StaticMeshRenderer::RenderLodBatchInWorld(ixrhi::IXRHICommandList& cmd, con
             binding.boundBeforeDraw = true;
             ++m_lastMaterialUniformUpdates;
             cmd.BindGroup(0, *slot->page->group, slot->set);
+            if (graph)
+                BindGraphMaterial(cmd, *graph, frameIndex);
             const auto inRun = [&](std::size_t index) {
                 const std::size_t first = draw.firstInstance - command.firstInstance;
                 return index >= first && index < first + draw.instanceCount;
@@ -4796,7 +4997,7 @@ void StaticMeshRenderer::RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
     for (std::size_t i = 0; i < blendDraws.size(); ++i)
     {
         const MeshDraw& draw = m_draws[blendDraws[i]];
-        const MaterialTextureViews textures = ResolveMaterialTextureViews(*m_rhi, instance, draw.materialSlot);
+        const MaterialTextureViews textures = ResolveMaterialTextureViews(*m_rhi, instance, draw.materialSlot, true);
         const std::optional<BindSlot> slot = NextBindSlot(frameIndex);
         if (!slot)
             return;
@@ -4804,9 +5005,11 @@ void StaticMeshRenderer::RenderTransparentInWorld(ixrhi::IXRHICommandList& cmd,
         UpdateMaterialTextureDescriptors(*slot, textures);
         // The set binds against the bound pipeline's layout: this renderer's first (the previous draw
         // may be another renderer's); the second side shares the layout, so the set stays bound.
-        const auto& sides = m_blendPipelines[textures.unlit ? 1 : 0];
+        const auto& sides = textures.graph ? textures.graph->blend : m_blendPipelines[textures.unlit ? 1 : 0];
         cmd.SetGraphicsPipeline(*sides[0]);  // back faces
         cmd.BindGroup(0, *slot->page->group, slot->set);
+        if (textures.graph)
+            BindGraphMaterial(cmd, *textures.graph, frameIndex);
         cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, *base + static_cast<std::uint32_t>(i));
         cmd.SetGraphicsPipeline(*sides[1]);  // front faces
         cmd.DrawIndexed(draw.indexCount, 1, draw.firstIndex, 0, *base + static_cast<std::uint32_t>(i));
@@ -5039,6 +5242,10 @@ void StaticMeshRenderer::DestroyPipeline()
     m_maskOnDepthPipeline.reset();
     m_unlitMaskOnDepthPipeline.reset();
     m_outlinePipeline.reset();
+    m_graphMaterials.clear();
+    m_retiredGraphMaterials.clear();
+    m_graphPipelineBase.reset();
+    m_graphBlendBase.reset();
     for (auto& sides : m_blendPipelines)
     {
         for (auto& pipeline : sides)
