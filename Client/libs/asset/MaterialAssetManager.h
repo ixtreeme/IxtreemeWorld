@@ -51,6 +51,10 @@ struct MaterialAsset
     std::optional<Guid> roughnessTexture;
     std::optional<Guid> metallicTexture;
     std::optional<Guid> heightTexture;
+    // A compiled material graph (a GraphShaderPackage file, relative to this material's folder). The
+    // static mesh renderer draws the lit colour with it where it can, the textures above everywhere
+    // else and whenever the package is missing or cannot be used.
+    std::string graphShader;
     std::uint64_t loadedFromTimestamp = 0;
 };
 

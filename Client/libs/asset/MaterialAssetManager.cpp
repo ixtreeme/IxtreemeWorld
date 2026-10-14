@@ -129,8 +129,10 @@ std::string MaterialJson(const MaterialAsset& material)
          << "  \"uvTiling\": " << FloatArray(material.uvTiling) << ",\n"
          << "  \"uvOffset\": " << FloatArray(material.uvOffset) << ",\n"
          << "  \"alphaMode\": \"" << AlphaModeName(material.alphaMode) << "\",\n"
-         << "  \"alphaCutoff\": " << FloatValue(material.alphaCutoff) << ",\n"
-         << "  \"textures\": {\n"
+         << "  \"alphaCutoff\": " << FloatValue(material.alphaCutoff) << ",\n";
+    if (!material.graphShader.empty())
+        json << "  \"graphShader\": \"" << EscapeJson(material.graphShader) << "\",\n";
+    json << "  \"textures\": {\n"
          << "    \"baseColor\": " << GuidOrNull(material.baseColorTexture) << ",\n"
          << "    \"normal\": " << GuidOrNull(material.normalTexture) << ",\n"
          << "    \"metallicRoughness\": " << GuidOrNull(material.metallicRoughnessTexture) << ",\n"
@@ -295,6 +297,7 @@ MaterialAsset* MaterialAssetManager::getOrLoad(const Guid& guid)
     ReadFloatArray(text, "uvOffset", material->uvOffset);
     material->alphaMode = ParseAlphaMode(JsonStringValue(text, "alphaMode"));
     material->alphaCutoff = JsonFloatValue(text, "alphaCutoff", material->alphaCutoff);
+    material->graphShader = JsonStringValue(text, "graphShader");
     if (HasJsonKey(text, "shadingMode"))
     {
         material->shadingMode = ParseShadingMode(JsonStringValue(text, "shadingMode"));

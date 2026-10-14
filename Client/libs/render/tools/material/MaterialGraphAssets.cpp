@@ -2,12 +2,14 @@
 #include "GeometryAssets.h"
 #include "MaterialInstance.h"
 #include "MaterialGraphIO.h"
+#include "GraphShader.h"
 #include "asset/AssetDatabase.h"
 #include "asset/ExrImage.h"
 #include "asset/MaterialAssetManager.h"
 #include <stb_image.h>
 #include <stb_image_write.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cctype>
 #include <cstdio>
@@ -137,7 +139,63 @@ SampledTexture GraphTextureCache::Sample(const GraphNode& n,const std::string& o
     }
     return {result,binding.exr};
 }
-bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& document,const ParameterOverrides& parameters,unsigned resolution,const std::string& name,AssetLibrary::Entry& result,std::string& error,const std::filesystem::path& graphFolder,const GeometryBake* geometry,const std::string& geometryGuid,const GraphGeometryCache* unsavedGeometry) {
+namespace {
+// The runtime form of a published material: its effective graph compiled for the static mesh
+// renderer, beside the baked textures. Any reason it cannot be made is reported, not fatal.
+bool WriteGraphShader(AssetLibrary& library,const MaterialGraphDocument& source,const GeometryBake* geometry,
+    const std::filesystem::path& graphFolder,const std::filesystem::path& folder,std::string& notice) {
+    MaterialGraphProgram program;
+    if(!program.Compile(source,notice)){notice="Runtime shader not built: "+notice;return false;}
+    const auto& layout=program.Layout();
+    GraphShaderPackage package;std::vector<bool> linear;
+    GraphTextureCache resolver;resolver.Configure(&library,graphFolder);
+    const auto root=std::filesystem::weakly_canonical(library.LibraryRoot());
+    for(const auto& texture:layout.textures) {
+        const auto* node=source.FindNode(texture.nodeId);
+        if(node && node->resource.empty() && node->assetGuid.empty() && node->assetId.empty()) {
+            // An unbound texture samples its node value, as on the CPU: a small texture of that value.
+            std::array<std::uint8_t,16*4> pixels{};
+            for(std::size_t i=0;i<pixels.size();++i)pixels[i]=static_cast<std::uint8_t>(std::lround(std::clamp(node->value[i%4],0.0f,1.0f)*255.0f));
+            const auto file=folder/("texture_"+std::to_string(texture.nodeId)+".png");
+            if(!stbi_write_png(file.string().c_str(),4,4,4,pixels.data(),16)){notice="Runtime shader not built: cannot write a texture default";return false;}
+            package.textures.push_back({kGraphFirstTextureBinding+texture.binding,AssetDatabase::Instance().getOrCreateGuid(file).toString()});
+            linear.push_back(false);continue;
+        }
+        const auto path=node?resolver.Resolve(*node,{}):std::filesystem::path{};
+        std::error_code ec;
+        if(path.empty() || !std::filesystem::is_regular_file(path,ec)){notice="Runtime shader not built: a texture of node "+std::to_string(texture.nodeId)+" is missing";return false;}
+        std::string guid;
+        for(const auto& entry:library.Entries())if(entry.category==AssetLibrary::Category::Texture && std::filesystem::equivalent(library.AbsolutePath(entry),path,ec)){guid=entry.guid;break;}
+        if(guid.empty()) {
+            const auto canonical=std::filesystem::weakly_canonical(path,ec);
+            const auto relative=canonical.lexically_relative(root);
+            if(ec || relative.empty() || *relative.begin()==".."){notice="Runtime shader not built: texture "+path.filename().string()+" is outside the project";return false;}
+            guid=AssetDatabase::Instance().getOrCreateGuid(canonical).toString();
+        }
+        package.textures.push_back({kGraphFirstTextureBinding+texture.binding,guid});
+        linear.push_back(client::asset::IsExrPath(path));
+    }
+    if(!program.BuildRuntimeUniforms({},linear,package.uniforms,notice)){notice="Runtime shader not built: "+notice;return false;}
+    if(layout.needsGeometryData) {
+        // AO, curvature and cavity of the baked mesh, in the same texel order as the baked images.
+        if(!geometry){notice="Runtime shader not built: the graph reads geometry data, bake it on a mesh";return false;}
+        const auto size=geometry->settings.resolution;std::vector<std::uint8_t> pixels(static_cast<std::size_t>(size)*size*4,255);
+        const auto unit=[](float v){return static_cast<std::uint8_t>(std::lround(std::clamp(v,0.0f,1.0f)*255.0f));};
+        for(std::size_t i=0;i<geometry->texels.size();++i) {
+            const auto& t=geometry->texels[i];const bool covered=geometry->coverage[i]!=0;
+            pixels[i*4]=covered?unit(t.ao):255;pixels[i*4+1]=covered?unit(t.curvature):128;pixels[i*4+2]=covered?unit(t.cavity):0;
+        }
+        const auto file=folder/"geometry.png";
+        if(!stbi_write_png(file.string().c_str(),static_cast<int>(size),static_cast<int>(size),4,pixels.data(),static_cast<int>(size)*4)){notice="Runtime shader not built: cannot write the geometry map";return false;}
+        package.textures.push_back({kGraphGeometryBinding,AssetDatabase::Instance().getOrCreateGuid(file).toString()});
+    }
+    if(!CompileGraphShader(program,package,notice)){notice="Runtime shader not built: "+notice;return false;}
+    std::string bytes;
+    if(!EncodeGraphShaderPackage(package,bytes,notice) || !SaveMaterialTextAtomic(folder/"graph.ixgraphshader",bytes,notice)){notice="Runtime shader not built: "+notice;return false;}
+    notice.clear();return true;
+}
+}
+bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& document,const ParameterOverrides& parameters,unsigned resolution,const std::string& name,AssetLibrary::Entry& result,std::string& error,const std::filesystem::path& graphFolder,const GeometryBake* geometry,const std::string& geometryGuid,const GraphGeometryCache* unsavedGeometry,std::string* runtimeNotice) {
     GraphGeometryCache verifiedGeometry;std::string geometryBytes;
     if(geometry) {
         if(resolution!=geometry->settings.resolution){error="Material resolution must match the Geometry Bake atlas";return false;}
@@ -203,8 +261,12 @@ bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& doc
     }
     GltfMaterialSource material;material.name=name;material.baseColorTexturePath=folder/filenames[0];material.normalTexturePath=folder/filenames[1];material.aoTexturePath=folder/filenames[2];material.roughnessTexturePath=folder/filenames[3];material.metallicTexturePath=folder/filenames[4];material.heightTexturePath=folder/filenames[5];material.emissiveTexturePath=folder/filenames[6];material.emissive={1,1,1,1};material.roughness=1;material.metallic=1;
     for(size_t at=3;at<images.color.size();at+=4)if((!geometry || geometry->coverage[at/4]) && images.color[at]<255){material.alphaMode="blend";break;}
+    std::string notice;const bool graphShader=WriteGraphShader(library,source,geometry,graphFolder,folder,notice);
+    if(runtimeNotice)*runtimeNotice=notice;
     auto& manager=MaterialAssetManager::Instance();const auto guid=manager.createFromGltfMaterial(material,folder,stem);
-    if(!manager.getOrLoad(guid)){error="Cannot create material asset";return false;}
+    auto* published=manager.getOrLoad(guid);
+    if(!published){error="Cannot create material asset";return false;}
+    if(graphShader){published->graphShader="graph.ixgraphshader";if(!manager.save(*published)){error="Cannot record the runtime shader in the material";return false;}}
     if(!library.Refresh(error))return false;
     for(const auto& entry:library.Entries())if(entry.category==AssetLibrary::Category::Material && entry.guid==guid.toString()){result=entry;return true;}
     error="Baked material was saved but the Asset Browser could not register it";return false;

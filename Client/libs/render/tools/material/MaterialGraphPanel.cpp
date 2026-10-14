@@ -911,7 +911,9 @@ void MaterialGraphPanel::BakeMaterial()
     geometry_.Refresh();
     if(geometryPreview_ && (!geometry_.Bake() || geometry_.BakeGuid().empty())){status_="Save a valid Geometry Bake cache before publishing a mesh material";return;}
     const auto* geometry=geometryPreview_?geometry_.Bake():nullptr;
-    if(PublishBakedMaterial(*library_,document_,parameters_,geometry?geometry->settings.resolution:256U<<bakeResolution_,bakeName_,result,error,path_.parent_path(),geometry,geometryPreview_?geometry_.BakeGuid():""))status_="Baked material: "+result.displayName+" in Materials/GraphBakes";
+    std::string runtimeNotice;
+    if(PublishBakedMaterial(*library_,document_,parameters_,geometry?geometry->settings.resolution:256U<<bakeResolution_,bakeName_,result,error,path_.parent_path(),geometry,geometryPreview_?geometry_.BakeGuid():"",nullptr,&runtimeNotice))
+        status_="Baked material: "+result.displayName+" in Materials/GraphBakes"+(runtimeNotice.empty()?std::string(" (live graph shader)"):". "+runtimeNotice);
     else status_=error;
 }
 bool MaterialGraphPanel::SelectGeometryMesh(const std::filesystem::path& path,unsigned index) {
@@ -960,13 +962,15 @@ void MaterialGraphPanel::PollGeometryBake() {
     if(!geometry_.Accept(std::move(completed),status_)){DiscardApplyRequest();return;}
     if (applyRequest_) {
         AssetLibrary::Entry material;
+        std::string runtimeNotice;
         if (!library_ || !PublishBakedMaterial(*library_,applyRequest_->document,applyRequest_->parameters,geometry_.Bake()->settings.resolution,
-            applyRequest_->name,material,status_,applyRequest_->graphFolder,geometry_.Bake(),{},&geometry_)) { DiscardApplyRequest(); return; }
+            applyRequest_->name,material,status_,applyRequest_->graphFolder,geometry_.Bake(),{},&geometry_,&runtimeNotice)) { DiscardApplyRequest(); return; }
         auto request=std::move(*applyRequest_);applyRequest_.reset();
         geometry_.Refresh(true);
         if (!geometry_.Bake()) { status_="Model changed during material baking; output remains in Asset Browser. Bake & Apply again."; return; }
         request.target.materialGuid=material.guid;materialAssignment_=std::move(request.target);
-        geometryPreview_=true;previewDirty_=true;status_="Baked material ready; assigning it to the model.";return;
+        geometryPreview_=true;previewDirty_=true;
+        status_=runtimeNotice.empty()?"Baked material with live graph shader ready; assigning it to the model.":"Baked material ready; assigning it to the model. "+runtimeNotice;return;
     }
     geometryPreview_=true;previewDirty_=true;status_="Geometry Bake complete; save the cache for instances and material export";
 }

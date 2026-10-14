@@ -10,6 +10,7 @@
 #include "asset/MaterialAssetManager.h"
 #include "import_export/AssimpImporter.h"
 #include "tools/material/RendererGeometry.h"
+#include "tools/material/GraphShader.h"
 #include <stb_image.h>
 #include <stb_image_write.h>
 #include <chrono>
@@ -19,6 +20,18 @@ using namespace material_tool;
 namespace {
 int failures=0;
 void Check(bool ok,const char* message){std::cout<<(ok?"PASS ":"FAIL ")<<message<<'\n';failures+=!ok;}
+bool ShaderCompilerAvailable(){std::error_code ec;return std::filesystem::is_regular_file(FindShaderCompiler(),ec);}
+// The compiled graph a published material references, decoded; empty when it has none.
+std::optional<GraphShaderPackage> PublishedGraphShader(const AssetLibrary::Entry& material)
+{
+    const auto guid=Guid::fromString(material.guid);const auto* asset=guid?MaterialAssetManager::Instance().getOrLoad(*guid):nullptr;
+    if(!asset || asset->graphShader.empty())return std::nullopt;
+    std::ifstream file(asset->path.parent_path()/asset->graphShader,std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());
+    GraphShaderPackage package;std::string error;
+    if(!DecodeGraphShaderPackage(bytes,package,error))return std::nullopt;
+    return package;
+}
 GeometryMesh Surface(const AssimpImporter::StaticMeshData& mesh)
 {
     GeometryMesh result;result.indices=mesh.indices;
@@ -240,6 +253,13 @@ int main(int argc, char** argv) {
     AssetLibrary::Entry material;std::string error;
     const bool baked=PublishBakedMaterial(library,graph,{},16,"Test material",material,error);if(!baked)std::cout<<error<<'\n';
     Check(baked && material.category==AssetLibrary::Category::Material && !material.guid.empty(),"UV graph publishes a real GUID material to the Asset Browser");
+    if(!ShaderCompilerAvailable())std::cout<<"SKIP no shader compiler: published materials carry no runtime graph shader\n";
+    else if(baked) {
+        const auto package=PublishedGraphShader(material);
+        Check(package && !package->opaqueSpirv.empty() && !package->maskedSpirv.empty() &&
+              std::none_of(package->textures.begin(),package->textures.end(),[](const auto& t){return t.binding==kGraphGeometryBinding;}),
+              "UV graph material carries its compiled runtime shader without a geometry map");
+    }
     if(baked) {
         const auto guid=Guid::fromString(material.guid);const auto* loaded=guid?MaterialAssetManager::Instance().getOrLoad(*guid):nullptr;
         Check(loaded && loaded->baseColorTexture && loaded->normalTexture && loaded->metallicRoughnessTexture && loaded->heightTexture && loaded->emissiveTexture,"published material uses baked color, normal, ORM, height and emissive maps");
@@ -333,7 +353,8 @@ int main(int argc, char** argv) {
             Check(bound.Bind(geometryGuid,error) && bound.Bake() && bound.Bake()->meshHash==bake.meshHash,"cache reload verifies actual source content against its GUID dependency");
             Check(AssetDatabase::Instance().loadDependencies(geometryFile)==std::vector<Guid>{*Guid::fromString(modelGuid)},"geometry cache records native source mesh dependency");
             auto stone=MaterialGraphDocument::WeatheredStone();
-            const bool stoneBaked=PublishBakedMaterial(library,stone,{},32,"Mesh Weathered Stone",material,error,{},geometry.Bake(),geometryGuid);
+            std::string stoneNotice;const bool stoneBaked=PublishBakedMaterial(library,stone,{},32,"Mesh Weathered Stone",material,error,{},geometry.Bake(),geometryGuid,nullptr,&stoneNotice);
+            if(!stoneNotice.empty())std::cout<<stoneNotice<<std::endl;
             if(!stoneBaked)std::cout<<error<<'\n';Check(stoneBaked,"Weathered Stone publishes real mesh-dependent color/normal/ORM/height material");
             if(stoneBaked) {
                 const auto folder=library.AbsolutePath(material).parent_path();GraphGeometryCache snapshot;
@@ -343,6 +364,17 @@ int main(int argc, char** argv) {
                 Check(snapshotGuid && std::find(sourceDependencies.begin(),sourceDependencies.end(),*snapshotGuid)!=sourceDependencies.end(),"effective source tracks its geometry snapshot GUID");
                 const auto* native=MaterialAssetManager::Instance().getOrLoad(*Guid::fromString(material.guid));
                 Check(native && native->baseColorTexture && native->normalTexture && native->metallicRoughnessTexture,"mesh bake uses the existing native material renderer path");
+                if(ShaderCompilerAvailable()) {
+                    const auto package=PublishedGraphShader(material);
+                    const auto geometryMap=package?std::find_if(package->textures.begin(),package->textures.end(),[](const auto& t){return t.binding==kGraphGeometryBinding;}):package->textures.end();
+                    const auto mapPath=package && geometryMap!=package->textures.end()?AssetDatabase::Instance().resolveGuid(*Guid::fromString(geometryMap->guid)):std::nullopt;
+                    int w=0,h=0,c=0;auto* pixels=mapPath?stbi_load(mapPath->string().c_str(),&w,&h,&c,4):nullptr;
+                    bool matches=pixels && w==static_cast<int>(bake.settings.resolution) && h==w;
+                    for(std::size_t i=0;matches && i<bake.texels.size();++i)if(bake.coverage[i]==1)
+                        matches=std::abs(pixels[i*4]-bake.texels[i].ao*255)<=1 && std::abs(pixels[i*4+1]-bake.texels[i].curvature*255)<=1 && std::abs(pixels[i*4+2]-bake.texels[i].cavity*255)<=1;
+                    if(pixels)stbi_image_free(pixels);
+                    Check(matches,"mesh material's runtime shader reads AO, curvature and cavity from the baked geometry map");
+                }
             }
             SmartGenerator generator;const auto generatorFile=root/"wear.ixsmartgenerator";
             const bool generatorCreated=SmartGenerator::Create(SmartGeneratorKind::EdgeWear,generator,error) && SaveMaterialTextAtomic(generatorFile,generator.ToJson(),error);
