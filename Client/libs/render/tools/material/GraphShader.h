@@ -1,8 +1,10 @@
 #pragma once
 #include "MaterialGraphCompiler.h"
 #include <cstdint>
+#include <atomic>
 #include <filesystem>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -70,4 +72,20 @@ std::filesystem::path FindShaderCompiler();
 // reflected bindings. Only the SPIR-V fields of package are written.
 bool CompileGraphShader(const MaterialGraphProgram& program, GraphShaderPackage& package, std::string& error,
                         const std::filesystem::path& compiler = {});
+// CompileGraphShader on a worker thread, for recompiling a live material while its graph is edited.
+class GraphShaderJob
+{
+public:
+    ~GraphShaderJob();
+    bool Start(MaterialGraphProgram program, GraphShaderPackage package);
+    bool Running() const { return running_.load(); }
+    // False until the compilation finished; then the package (on success) and the error, once.
+    bool TakeResult(GraphShaderPackage& package, std::string& error);
+private:
+    std::jthread worker_;
+    std::atomic<bool> running_{false}, ready_{false};
+    GraphShaderPackage result_;
+    std::string error_;
+    bool success_ = false;
+};
 }

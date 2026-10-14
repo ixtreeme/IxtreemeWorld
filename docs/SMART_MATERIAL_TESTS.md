@@ -95,7 +95,11 @@ repeated with the factor of 1 and gave the same difference, and
 ![Weathered Metal: live graph shader (left) and its baked textures (right)](images/graph-shader-vs-baked-20261014.png) The baking and editor tests also check that published
 materials carry their compiled package and geometry map, and that a Bake & Apply
 material accepts a live parameter edit (exactly one uniform changes, live and in
-the saved package) but not a structural one.
+the saved package) without recompiling. A structural edit is not pushed into the
+old shader; it waits for the edits to pause, then compiles in the background into
+the same package (new SPIR-V carrying the current values, live values dropped, the
+material revision moved), after which parameter edits are live again. Opening
+another graph ends the link without compiling it into the published material.
 Earlier core geometry-context test values are explicitly supplied. The separate
 geometry fixtures and native OBJ/cache tests execute actual baking. GPU resource
 lifetime and runtime shader cache tests are future work. Mesh preview is a CPU UV

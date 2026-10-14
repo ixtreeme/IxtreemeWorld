@@ -55,7 +55,7 @@ MaterialGraphPanel::MaterialGraphPanel() = default;
 MaterialGraphPanel::~MaterialGraphPanel() { ResetContext(); if(provider_ && previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_); }
 void MaterialGraphPanel::SetServices(AssetLibrary* library,ixeditor::graphics::IEditorTextureProvider* provider) {
     if(provider_!=provider) {if(provider_ && previewTexture_.IsValid())provider_->ReleasePreviewTexture(previewTexture_);previewTexture_={};provider_=provider;previewDirty_=true;}
-    if(library_!=library){if(applyRequest_){geometryJob_.Cancel();uvAtlasJob_.Cancel();}DiscardApplyRequest();materialAssignment_.reset();library_=library;textures_.Clear();subgraphs_.Clear();forceCompile_=true;parameters_={};previewDirty_=true;}
+    if(library_!=library){if(applyRequest_){geometryJob_.Cancel();uvAtlasJob_.Cancel();}DiscardApplyRequest();materialAssignment_.reset();UnlinkLiveMaterial();library_=library;textures_.Clear();subgraphs_.Clear();forceCompile_=true;parameters_={};previewDirty_=true;}
     textures_.Configure(library_,path_.parent_path());
 }
 void MaterialGraphPanel::ResetContext()
@@ -163,6 +163,7 @@ void MaterialGraphPanel::RequestReplace(bool openFile)
         generatorMode_=generator;generator_=std::move(preset);subgraphMode_=generator || pendingPreset_==4; subgraphVersion_=1;
         document_ = generator?generator_.definition.graph:(subgraphMode_?MaterialSubgraph::Example().graph:(pendingPreset_==1?MaterialGraphDocument::WeatheredMetal():(pendingPreset_==2?MaterialGraphDocument::MossyRock():(pendingPreset_==3?MaterialGraphDocument::WeatheredStone():MaterialGraphDocument::Example())))); pendingPreset_=0; saved_ = MaterialGraphDocument::Example(); path_.clear();
         undo_.clear(); redo_.clear(); selected_ = 0; parameters_={}; previewDirty_=true; ResetContext(); fitPending_ = true; status_.clear();
+        UnlinkLiveMaterial();
         subgraphs_.Clear(); forceCompile_=true;
         previewPin_=0;
         if (subgraphMode_) {for(const auto& node:document_.nodes)if(node.kind==NodeKind::SubgraphOutput){selected_=node.id;previewPin_=PinId(node.id,1);previewSettings_.channel=PreviewChannel::SelectedOutput;break;}}
@@ -450,6 +451,7 @@ bool MaterialGraphPanel::Load(const std::filesystem::path& path)
         draft=std::move(asset.graph); interfaceVersion=asset.interfaceVersion;
     } else if (!draft.FromJson(text, status_)) return false;
     document_ = std::move(draft); saved_ = document_; path_ = path; undo_.clear(); redo_.clear();
+    UnlinkLiveMaterial();
     dragBefore_.reset(); propertyBefore_.reset(); selected_ = 0; ResetContext(); fitPending_ = true;
     subgraphMode_=subgraph; subgraphVersion_=interfaceVersion; subgraphs_.Clear(); forceCompile_=true;
     generatorMode_=generator;generator_=std::move(generatorAsset);
@@ -839,21 +841,30 @@ void MaterialGraphPanel::DiscardApplyRequest()
     if (!path || !geometry_.SelectMaterialSlot(*path,slot,ignored)) geometry_.Clear();
     previewDirty_=true;
 }
-void MaterialGraphPanel::LinkLiveMaterial(const AssetLibrary::Entry& material, const MaterialGraphDocument& document)
+void MaterialGraphPanel::UnlinkLiveMaterial()
 {
-    live_.reset();
+    std::string bytes,error;
+    if(live_ && live_->unsaved && !(EncodeGraphShaderPackage(live_->data,bytes,error) && SaveMaterialTextAtomic(live_->package,bytes,error)))
+        status_="Cannot save live material values: "+error;
+    live_.reset();liveJobGuid_.clear(); // a compilation still running belongs to no material now
+}
+void MaterialGraphPanel::LinkLiveMaterial(const AssetLibrary::Entry& material, const MaterialGraphDocument& document,
+                                          const ParameterOverrides& parameters, const std::filesystem::path& graphFolder)
+{
+    UnlinkLiveMaterial();
     const auto guid=Guid::fromString(material.guid);
     const auto* asset=guid?MaterialAssetManager::Instance().getOrLoad(*guid):nullptr;
     if(!asset || asset->graphShader.empty())return;
     LiveMaterial link;
-    link.guid=material.guid;link.name=material.displayName;link.document=document;
+    link.guid=material.guid;link.name=material.displayName;link.document=document;link.textures=parameters.textures;link.graphFolder=graphFolder;
     link.package=asset->path.parent_path()/std::filesystem::path(std::u8string(asset->graphShader.begin(),asset->graphShader.end()));
     std::string bytes,error;MaterialGraphProgram program;
     subgraphs_.BeginCompilation();const bool compiled=program.Compile(document,error,0,subgraphs_.Resolver());subgraphs_.FinishCompilation();
     if(!compiled || !LoadMaterialText(link.package,bytes,error) || !DecodeGraphShaderPackage(bytes,link.data,error))return;
     link.parameters=program.Layout().parameterBufferBytes/sizeof(Float4);
     if(link.parameters>link.data.uniforms.size())return;
-    link.checkedDocument=document_;link.checkedParameters=parameters_;
+    for(const auto& texture:link.data.textures)if(texture.binding==kGraphGeometryBinding)link.geometryMap=texture.guid;
+    link.checkedDocument=document_;link.checkedParameters=parameters_;link.recheck=true;
     GraphLiveValues::Instance().Clear(link.guid);
     live_=std::move(link);
 }
@@ -870,9 +881,30 @@ void MaterialGraphPanel::UpdateLiveMaterial(bool persistNow)
 {
     if(!live_)return;
     auto& link=*live_;
-    if(link.checkedDocument!=document_ || link.checkedParameters!=parameters_) {
+    const auto now=std::chrono::steady_clock::now();
+    GraphShaderPackage recompiled;std::string compileError;
+    if(liveJob_.TakeResult(recompiled,compileError) && liveJobGuid_==link.guid) {
+        std::string bytes;
+        if(!compileError.empty() || recompiled.opaqueSpirv.empty()) link.notice=compileError.empty()?"the shader compiler gave no output":compileError;
+        else if(!EncodeGraphShaderPackage(recompiled,bytes,compileError) || !SaveMaterialTextAtomic(link.package,bytes,compileError)) link.notice="cannot save the shader: "+compileError;
+        else {
+            // The renderer reads the package again when the material revision moves; its uniforms hold
+            // the values the graph was compiled with, so earlier live values are dropped.
+            link.document=std::move(link.compiling);link.textures=link.compilingParameters.textures;
+            link.data=std::move(recompiled);link.parameters=link.compilingSlots;link.unsaved=false;link.recheck=true;link.notice.clear();
+            link.failed={};link.failedParameters={};
+            GraphLiveValues::Instance().Clear(link.guid);
+            MaterialAssetManager::Instance().markChanged();
+            status_="Live shader updated: "+link.name;
+        }
+        if(!link.notice.empty()){link.failed=link.compiling;link.failedParameters=link.compilingParameters;status_=link.name+": "+link.notice+". The scene keeps the previous shader.";}
+        link.compiling={};link.compilingParameters={};
+    }
+    if(link.recheck || link.checkedDocument!=document_ || link.checkedParameters!=parameters_) {
+        link.recheck=false;
         link.checkedDocument=document_;link.checkedParameters=parameters_;
-        link.structureChanged=!SameShaderStructure(document_,link.document);
+        link.structureChanged=!SameShaderStructure(document_,link.document) || parameters_.textures!=link.textures;
+        if(link.structureChanged)link.edited=now; // each edit restarts the pause before compiling
         MaterialGraphProgram program;std::string error;std::vector<Float4> parameters;
         bool compiled=false;
         if(!link.structureChanged){subgraphs_.BeginCompilation();compiled=program.Compile(document_,error,0,subgraphs_.Resolver());subgraphs_.FinishCompilation();}
@@ -884,18 +916,36 @@ void MaterialGraphPanel::UpdateLiveMaterial(bool persistNow)
         }
     }
     // Saved once the values settle, so a dragged slider writes the file once, not every frame.
-    if(link.unsaved && (persistNow || std::chrono::steady_clock::now()-link.changed>std::chrono::milliseconds(400))) {
+    if(link.unsaved && (persistNow || now-link.changed>std::chrono::milliseconds(400))) {
         std::string bytes,error;
         if(EncodeGraphShaderPackage(link.data,bytes,error) && SaveMaterialTextAtomic(link.package,bytes,error))link.unsaved=false;
         else status_="Cannot save live material values: "+error;
     }
+    // A changed graph is compiled once the edits pause; a graph that failed waits for the next edit.
+    const bool failedAgain=document_==link.failed && parameters_==link.failedParameters;
+    if(!link.structureChanged || failedAgain || liveJob_.Running() || !library_ ||
+       (!persistNow && now-link.edited<std::chrono::milliseconds(500)))return;
+    MaterialGraphDocument source;MaterialGraphProgram program;GraphShaderPackage package;std::string notice;
+    if(!EffectiveGraph(*library_,document_,parameters_,source,notice) ||
+       !PrepareGraphShader(*library_,source,nullptr,link.geometryMap,link.graphFolder,link.package.parent_path(),program,package,notice)) {
+        static constexpr std::string_view prefix="Runtime shader not built: ";
+        if(notice.starts_with(prefix))notice.erase(0,prefix.size());
+        link.notice=notice;link.failed=document_;link.failedParameters=parameters_;
+        status_=link.name+": "+notice+". The scene keeps the previous shader.";return;
+    }
+    link.compilingSlots=program.Layout().parameterBufferBytes/sizeof(Float4);
+    if(!liveJob_.Start(std::move(program),std::move(package)))return;
+    liveJobGuid_=link.guid;link.compiling=document_;link.compilingParameters=parameters_;link.notice.clear();
 }
 void MaterialGraphPanel::RenderApplyMaterial()
 {
     ImGui::SeparatorText("Apply to model");
     if(live_) {
-        if(live_->structureChanged)ImGui::TextColored(ImVec4(1,.75f,.3f,1),"%s: the graph changed. Bake & Apply again to update the scene.",live_->name.c_str());
-        else ImGui::TextWrapped("Live in the scene: %s. Parameter changes show at once.",live_->name.c_str());
+        if(liveJob_.Running() && liveJobGuid_==live_->guid)ImGui::TextWrapped("Live in the scene: %s. Compiling the changed graph...",live_->name.c_str());
+        else if(live_->structureChanged && !live_->notice.empty())
+            ImGui::TextColored(ImVec4(1,.75f,.3f,1),"%s: the changed graph cannot run live (%s). The scene keeps the previous shader.",live_->name.c_str(),live_->notice.c_str());
+        else if(live_->structureChanged)ImGui::TextWrapped("Live in the scene: %s. The changed graph compiles when the edits pause.",live_->name.c_str());
+        else ImGui::TextWrapped("Live in the scene: %s. Parameter and graph changes show in the scene.",live_->name.c_str());
     }
     if (applyTarget_.selected) ImGui::Text("%s / Material Slot %u",applyTarget_.name.c_str(),applyTarget_.selectedMaterialSlot+1);
     else ImGui::TextDisabled("Select a model in Hierarchy.");
@@ -972,7 +1022,7 @@ void MaterialGraphPanel::BakeMaterial()
     std::string runtimeNotice;
     if(PublishBakedMaterial(*library_,document_,parameters_,geometry?geometry->settings.resolution:256U<<bakeResolution_,bakeName_,result,error,path_.parent_path(),geometry,geometryPreview_?geometry_.BakeGuid():"",nullptr,&runtimeNotice)) {
         status_="Baked material: "+result.displayName+" in Materials/GraphBakes"+(runtimeNotice.empty()?std::string(" (live graph shader)"):". "+runtimeNotice);
-        if(runtimeNotice.empty())LinkLiveMaterial(result,document_);
+        if(runtimeNotice.empty())LinkLiveMaterial(result,document_,parameters_,path_.parent_path());
     }
     else status_=error;
 }
@@ -1029,7 +1079,7 @@ void MaterialGraphPanel::PollGeometryBake() {
         geometry_.Refresh(true);
         if (!geometry_.Bake()) { status_="Model changed during material baking; output remains in Asset Browser. Bake & Apply again."; return; }
         request.target.materialGuid=material.guid;materialAssignment_=std::move(request.target);
-        if(runtimeNotice.empty())LinkLiveMaterial(material,request.document);
+        if(runtimeNotice.empty())LinkLiveMaterial(material,request.document,request.parameters,request.graphFolder);
         geometryPreview_=true;previewDirty_=true;
         status_=runtimeNotice.empty()?"Baked material with live graph shader ready; assigning it to the model.":"Baked material ready; assigning it to the model. "+runtimeNotice;return;
     }

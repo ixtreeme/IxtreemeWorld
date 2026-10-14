@@ -14,6 +14,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <thread>
 
 using namespace material_tool;
 namespace ed = ax::NodeEditor;
@@ -90,6 +91,14 @@ struct MaterialGraphPanelTestAccess
     static bool LiveStructureChanged(const MaterialGraphPanel& panel) { return panel.live_ && panel.live_->structureChanged; }
     static std::filesystem::path LivePackage(const MaterialGraphPanel& panel) { return panel.live_ ? panel.live_->package : std::filesystem::path{}; }
     static void UpdateLive(MaterialGraphPanel& panel, bool persist) { panel.UpdateLiveMaterial(persist); }
+    static bool LiveCompiling(const MaterialGraphPanel& panel) { return panel.liveJob_.Running(); }
+    static std::string LiveNotice(const MaterialGraphPanel& panel) { return panel.live_ ? panel.live_->notice : std::string{}; }
+    // Lets a started background recompile finish and takes its result.
+    static void FinishLive(MaterialGraphPanel& panel)
+    {
+        for (int i = 0; i < 3000 && panel.liveJob_.Running(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        panel.UpdateLiveMaterial(true);
+    }
     static std::string DerivedModel(const MaterialGraphPanel& panel) { return panel.applyRequest_ ? panel.applyRequest_->target.replacementModelGuid : std::string{}; }
     static const std::string& GeometryModel(const MaterialGraphPanel& panel) { return panel.geometry_.MeshGuid(); }
     static const MaterialCompileResult& Layout(const MaterialGraphPanel& panel) {return panel.program_.Layout();}
@@ -430,10 +439,28 @@ void Editor(bool capture)
                       "the live value is saved into the package with its shader unchanged");
                 MaterialGraphPanelTestAccess::DisableLayer(applyPanel);
                 MaterialGraphPanelTestAccess::NumericOverride(applyPanel,parameter,.1f);
-                MaterialGraphPanelTestAccess::UpdateLive(applyPanel,true);
+                MaterialGraphPanelTestAccess::UpdateLive(applyPanel,false);
                 std::vector<Float4> ignored;
-                Check(MaterialGraphPanelTestAccess::LiveStructureChanged(applyPanel) && GraphLiveValues::Instance().Get(liveGuid,revision,ignored)==revision,
-                      "a changed graph is not pushed into the old shader and asks for a new Bake & Apply");
+                Check(MaterialGraphPanelTestAccess::LiveStructureChanged(applyPanel) && !MaterialGraphPanelTestAccess::LiveCompiling(applyPanel) &&
+                      GraphLiveValues::Instance().Get(liveGuid,revision,ignored)==revision,
+                      "a changed graph is not pushed into the old shader and waits for the edits to pause");
+                // The changed graph is compiled in the background into the same package.
+                const auto materialRevision=MaterialAssetManager::Instance().Revision();
+                MaterialGraphPanelTestAccess::UpdateLive(applyPanel,true);
+                Check(MaterialGraphPanelTestAccess::LiveCompiling(applyPanel),"a changed graph starts compiling in the background");
+                MaterialGraphPanelTestAccess::FinishLive(applyPanel);
+                GraphShaderPackage recompiled;
+                const bool readRecompiled=LoadMaterialText(MaterialGraphPanelTestAccess::LivePackage(applyPanel),packageBytes,error) && DecodeGraphShaderPackage(packageBytes,recompiled,error);
+                Check(readRecompiled && !MaterialGraphPanelTestAccess::LiveStructureChanged(applyPanel) && MaterialGraphPanelTestAccess::LiveNotice(applyPanel).empty() &&
+                      recompiled.opaqueSpirv!=published.opaqueSpirv && !recompiled.maskedSpirv.empty(),
+                      "the changed graph is recompiled into the live package without a new Bake & Apply");
+                Check(readRecompiled && std::any_of(recompiled.uniforms.begin(),recompiled.uniforms.end(),[](const Float4& v){return std::abs(v[0]-.1f)<1e-6f;}) &&
+                      GraphLiveValues::Instance().Get(liveGuid,0,ignored)==0 && MaterialAssetManager::Instance().Revision()!=materialRevision,
+                      "the recompiled package carries the current values and the renderer is told to load it");
+                MaterialGraphPanelTestAccess::NumericOverride(applyPanel,parameter,.7f);
+                MaterialGraphPanelTestAccess::UpdateLive(applyPanel,true);
+                Check(!MaterialGraphPanelTestAccess::LiveCompiling(applyPanel) && GraphLiveValues::Instance().Get(liveGuid,0,ignored)!=0,
+                      "parameter edits of the recompiled graph are live again without compiling");
             }
             const auto bakedGuid=materialPath?AssetDatabase::Instance().resolvePath(materialPath->parent_path()/"geometry.ixgeometrybake"):std::nullopt;
             GraphGeometryCache appliedGeometry;
@@ -503,6 +530,14 @@ void Editor(bool capture)
         MaterialGraphPanelTestAccess::Poll(applyPanel);
         Check(!applyPanel.TakeMaterialAssignment() && derivedFiles()==filesBefore && MaterialGraphPanelTestAccess::GeometryModel(applyPanel)==reusedTarget.meshAssetId,
               "cancelling removes the unused automatic UV model and returns the preview to its source");
+        std::error_code liveCompiler;
+        if(std::filesystem::is_regular_file(FindShaderCompiler(),liveCompiler)) {
+            const auto linked=MaterialGraphPanelTestAccess::LiveGuid(applyPanel);
+            const bool opened=applyPanel.Load(generatedFile);
+            MaterialGraphPanelTestAccess::UpdateLive(applyPanel,true);
+            Check(!linked.empty() && opened && MaterialGraphPanelTestAccess::LiveGuid(applyPanel).empty() && !MaterialGraphPanelTestAccess::LiveCompiling(applyPanel),
+                  "opening another graph ends the live link instead of compiling it into the published material");
+        }
         const auto validGeometryPixels=MaterialGraphPanelTestAccess::Pixels(panel);
         SaveMaterialTextAtomic(cacheFile,"broken geometry",error);frame();frame();
         Check(!MaterialGraphPanelTestAccess::Error(panel).empty() && MaterialGraphPanelTestAccess::Pixels(panel)==validGeometryPixels,"invalid geometry keeps the last valid real-mesh preview");

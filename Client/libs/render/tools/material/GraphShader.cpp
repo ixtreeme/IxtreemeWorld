@@ -243,6 +243,27 @@ float4 PSMain(VSOutput input) : SV_Target0
     return h.str();
 }
 
+GraphShaderJob::~GraphShaderJob() { if (worker_.joinable()) worker_.join(); }
+bool GraphShaderJob::Start(MaterialGraphProgram program, GraphShaderPackage package)
+{
+    if (running_) return false;
+    if (worker_.joinable()) worker_.join();
+    ready_ = false; success_ = false; error_.clear(); result_ = {}; running_ = true;
+    worker_ = std::jthread([this, program = std::move(program), package = std::move(package)]() mutable {
+        try { success_ = CompileGraphShader(program, package, error_); if (success_) result_ = std::move(package); }
+        catch (const std::exception& e) { success_ = false; error_ = std::string("Graph shader compilation failed: ") + e.what(); }
+        ready_ = true; running_ = false;
+    });
+    return true;
+}
+bool GraphShaderJob::TakeResult(GraphShaderPackage& package, std::string& error)
+{
+    if (!ready_.load() || running_.load()) return false;
+    if (worker_.joinable()) worker_.join();
+    ready_ = false; error = error_;
+    if (success_) package = std::move(result_);
+    return true;
+}
 GraphLiveValues& GraphLiveValues::Instance()
 {
     static GraphLiveValues instance;

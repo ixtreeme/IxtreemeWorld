@@ -140,24 +140,55 @@ SampledTexture GraphTextureCache::Sample(const GraphNode& n,const std::string& o
     return {result,binding.exr};
 }
 namespace {
+// Instance overrides written into the effective graph's parameter and texture nodes.
+void ApplyOverrides(AssetLibrary& library,const ParameterOverrides& parameters,MaterialGraphDocument& source) {
+    for(auto& n:source.nodes) {
+        if(parameters.values.contains(n.parameter))n.value=parameters.values.at(n.parameter);
+        if(parameters.textures.contains(n.parameter)){const auto& overrideValue=parameters.textures.at(n.parameter);n.resource=overrideValue;n.assetGuid.clear();n.assetId.clear();
+            if(overrideValue.starts_with("asset:"))if(const auto entry=library.FindById(overrideValue.substr(6))){n.assetId=entry->id;n.assetGuid=entry->guid;n.resource=library.AssetRelativePath(*entry);}
+            if(overrideValue.starts_with("guid:"))for(const auto& entry:library.Entries())if(entry.guid==overrideValue.substr(5)){n.assetGuid=entry.guid;n.assetId=entry.id;n.resource=library.AssetRelativePath(entry);break;}}
+    }
+}
 // The runtime form of a published material: its effective graph compiled for the static mesh
 // renderer, beside the baked textures. Any reason it cannot be made is reported, not fatal.
 bool WriteGraphShader(AssetLibrary& library,const MaterialGraphDocument& source,const GeometryBake* geometry,
     const std::filesystem::path& graphFolder,const std::filesystem::path& folder,std::string& notice) {
-    MaterialGraphProgram program;
+    MaterialGraphProgram program;GraphShaderPackage package;
+    if(!PrepareGraphShader(library,source,geometry,{},graphFolder,folder,program,package,notice))return false;
+    if(!CompileGraphShader(program,package,notice)){notice="Runtime shader not built: "+notice;return false;}
+    std::string bytes;
+    if(!EncodeGraphShaderPackage(package,bytes,notice) || !SaveMaterialTextAtomic(folder/"graph.ixgraphshader",bytes,notice)){notice="Runtime shader not built: "+notice;return false;}
+    notice.clear();return true;
+}
+}
+bool EffectiveGraph(AssetLibrary& library,const MaterialGraphDocument& document,const ParameterOverrides& parameters,
+    MaterialGraphDocument& source,std::string& error) {
+    auto draft=document;GraphSubgraphCache subgraphs;MaterialSubgraphExpansion expansion;
+    const bool hasSubgraphs=std::any_of(document.nodes.begin(),document.nodes.end(),[](const auto& n){return n.kind==NodeKind::Subgraph;});
+    if(hasSubgraphs && !ExpandMaterialSubgraphs(document,subgraphs.Resolver(),draft,expansion,error))return false;
+    ApplyOverrides(library,parameters,draft);
+    source=std::move(draft);return true;
+}
+bool PrepareGraphShader(AssetLibrary& library,const MaterialGraphDocument& source,const GeometryBake* geometry,
+    const std::string& existingGeometryMap,const std::filesystem::path& graphFolder,const std::filesystem::path& folder,
+    MaterialGraphProgram& program,GraphShaderPackage& package,std::string& notice) {
+    package={};
     if(!program.Compile(source,notice)){notice="Runtime shader not built: "+notice;return false;}
     const auto& layout=program.Layout();
-    GraphShaderPackage package;std::vector<bool> linear;
+    std::vector<bool> linear;
     GraphTextureCache resolver;resolver.Configure(&library,graphFolder);
     const auto root=std::filesystem::weakly_canonical(library.LibraryRoot());
     for(const auto& texture:layout.textures) {
         const auto* node=source.FindNode(texture.nodeId);
         if(node && node->resource.empty() && node->assetGuid.empty() && node->assetId.empty()) {
-            // An unbound texture samples its node value, as on the CPU: a small texture of that value.
+            // An unbound texture samples its node value, as on the CPU: a small texture of that value,
+            // named by the value so a changed default is a new asset rather than a cached old one.
             std::array<std::uint8_t,16*4> pixels{};
             for(std::size_t i=0;i<pixels.size();++i)pixels[i]=static_cast<std::uint8_t>(std::lround(std::clamp(node->value[i%4],0.0f,1.0f)*255.0f));
-            const auto file=folder/("texture_"+std::to_string(texture.nodeId)+".png");
-            if(!stbi_write_png(file.string().c_str(),4,4,4,pixels.data(),16)){notice="Runtime shader not built: cannot write a texture default";return false;}
+            char value[9];std::snprintf(value,sizeof(value),"%02x%02x%02x%02x",pixels[0],pixels[1],pixels[2],pixels[3]);
+            const auto file=folder/("texture_"+std::to_string(texture.nodeId)+"_"+value+".png");
+            std::error_code exists;
+            if(!std::filesystem::is_regular_file(file,exists) && !stbi_write_png(file.string().c_str(),4,4,4,pixels.data(),16)){notice="Runtime shader not built: cannot write a texture default";return false;}
             package.textures.push_back({kGraphFirstTextureBinding+texture.binding,AssetDatabase::Instance().getOrCreateGuid(file).toString()});
             linear.push_back(false);continue;
         }
@@ -177,23 +208,21 @@ bool WriteGraphShader(AssetLibrary& library,const MaterialGraphDocument& source,
     }
     if(!program.BuildRuntimeUniforms({},linear,package.uniforms,notice)){notice="Runtime shader not built: "+notice;return false;}
     if(layout.needsGeometryData) {
-        // AO, curvature and cavity of the baked mesh, in the same texel order as the baked images.
-        if(!geometry){notice="Runtime shader not built: the graph reads geometry data, bake it on a mesh";return false;}
-        const auto size=geometry->settings.resolution;std::vector<std::uint8_t> pixels(static_cast<std::size_t>(size)*size*4,255);
-        const auto unit=[](float v){return static_cast<std::uint8_t>(std::lround(std::clamp(v,0.0f,1.0f)*255.0f));};
-        for(std::size_t i=0;i<geometry->texels.size();++i) {
-            const auto& t=geometry->texels[i];const bool covered=geometry->coverage[i]!=0;
-            pixels[i*4]=covered?unit(t.ao):255;pixels[i*4+1]=covered?unit(t.curvature):128;pixels[i*4+2]=covered?unit(t.cavity):0;
-        }
-        const auto file=folder/"geometry.png";
-        if(!stbi_write_png(file.string().c_str(),static_cast<int>(size),static_cast<int>(size),4,pixels.data(),static_cast<int>(size)*4)){notice="Runtime shader not built: cannot write the geometry map";return false;}
-        package.textures.push_back({kGraphGeometryBinding,AssetDatabase::Instance().getOrCreateGuid(file).toString()});
+        if(geometry) {
+            // AO, curvature and cavity of the baked mesh, in the same texel order as the baked images.
+            const auto size=geometry->settings.resolution;std::vector<std::uint8_t> pixels(static_cast<std::size_t>(size)*size*4,255);
+            const auto unit=[](float v){return static_cast<std::uint8_t>(std::lround(std::clamp(v,0.0f,1.0f)*255.0f));};
+            for(std::size_t i=0;i<geometry->texels.size();++i) {
+                const auto& t=geometry->texels[i];const bool covered=geometry->coverage[i]!=0;
+                pixels[i*4]=covered?unit(t.ao):255;pixels[i*4+1]=covered?unit(t.curvature):128;pixels[i*4+2]=covered?unit(t.cavity):0;
+            }
+            const auto file=folder/"geometry.png";
+            if(!stbi_write_png(file.string().c_str(),static_cast<int>(size),static_cast<int>(size),4,pixels.data(),static_cast<int>(size)*4)){notice="Runtime shader not built: cannot write the geometry map";return false;}
+            package.textures.push_back({kGraphGeometryBinding,AssetDatabase::Instance().getOrCreateGuid(file).toString()});
+        } else if(!existingGeometryMap.empty()) package.textures.push_back({kGraphGeometryBinding,existingGeometryMap});
+        else {notice="Runtime shader not built: the graph reads geometry data, bake it on a mesh";return false;}
     }
-    if(!CompileGraphShader(program,package,notice)){notice="Runtime shader not built: "+notice;return false;}
-    std::string bytes;
-    if(!EncodeGraphShaderPackage(package,bytes,notice) || !SaveMaterialTextAtomic(folder/"graph.ixgraphshader",bytes,notice)){notice="Runtime shader not built: "+notice;return false;}
     notice.clear();return true;
-}
 }
 bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& document,const ParameterOverrides& parameters,unsigned resolution,const std::string& name,AssetLibrary::Entry& result,std::string& error,const std::filesystem::path& graphFolder,const GeometryBake* geometry,const std::string& geometryGuid,const GraphGeometryCache* unsavedGeometry,std::string* runtimeNotice) {
     GraphGeometryCache verifiedGeometry;std::string geometryBytes;
@@ -230,12 +259,7 @@ bool PublishBakedMaterial(AssetLibrary& library,const MaterialGraphDocument& doc
     }
     // Generated images must be in the database before the material resolves their texture GUIDs.
     for(const auto* filename:filenames)AssetDatabase::Instance().getOrCreateGuid(folder/filename);
-    for(auto& n:source.nodes) {
-        if(parameters.values.contains(n.parameter))n.value=parameters.values.at(n.parameter);
-        if(parameters.textures.contains(n.parameter)){const auto& overrideValue=parameters.textures.at(n.parameter);n.resource=overrideValue;n.assetGuid.clear();n.assetId.clear();
-            if(overrideValue.starts_with("asset:"))if(const auto entry=library.FindById(overrideValue.substr(6))){n.assetId=entry->id;n.assetGuid=entry->guid;n.resource=library.AssetRelativePath(*entry);}
-            if(overrideValue.starts_with("guid:"))for(const auto& entry:library.Entries())if(entry.guid==overrideValue.substr(5)){n.assetGuid=entry.guid;n.assetId=entry.id;n.resource=library.AssetRelativePath(entry);break;}}
-    }
+    ApplyOverrides(library,parameters,source);
     std::vector<Guid> sourceDependencies;
     for(const auto& node:source.nodes)if(const auto guid=Guid::fromString(node.assetGuid))if(std::find(sourceDependencies.begin(),sourceDependencies.end(),*guid)==sourceDependencies.end())sourceDependencies.push_back(*guid);
     if(geometry) {

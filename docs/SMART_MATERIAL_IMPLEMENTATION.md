@@ -260,9 +260,19 @@ after the frames that may use it.
 
 The Material Graph panel keeps the last material it published linked: parameter
 edits reach every renderer drawing it for the next frame (`GraphLiveValues`) and
-are saved into its package once the value settles. A structural edit cannot reuse
-the compiled shader; the panel says so and a new Bake & Apply is needed. Live
-values do not update the baked fallback textures.
+are saved into its package once the value settles. A structural edit (nodes,
+links, layers, texture bindings) is compiled into the same package in the
+background (`GraphShaderJob`) once the edits pause for half a second: the panel
+builds the effective graph (`EffectiveGraph`: subgraphs expanded, instance
+overrides applied), resolves its textures and uniform block on the editor thread
+(`PrepareGraphShader`, which publication uses too), runs dxc on a worker thread,
+then saves the package and moves the material manager's revision so every renderer
+loads it. The scene keeps the previous shader until then, and keeps it when the
+new graph cannot compile (the panel shows why and waits for the next edit). A
+graph that reads geometry data reuses the published geometry map. Opening or
+starting another graph ends the link, so it is never compiled into the published
+material. Live values and recompiled graphs do not update the baked fallback
+textures; Bake & Apply refreshes them.
 
 The static mesh shader also samples a material's emissive map now (set 0 binding
 6, sRGB, white when absent). Before that, published materials and imported models
@@ -274,4 +284,5 @@ evaluated per pixel (Weathered Metal over the whole screen: +0.19 ms scene GPU o
 RTX 2060 at 2560 x 1369, see the performance document);
 there is no global pipeline cache shared between models (each model builds its
 pipelines once per graph material); compilation runs on the editor thread when
-publishing (about 0.33 s per material on the test machine).
+publishing (about 0.33 s per material on the test machine); live recompiles run in
+the background.

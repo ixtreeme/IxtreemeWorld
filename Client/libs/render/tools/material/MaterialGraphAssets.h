@@ -2,6 +2,7 @@
 #include "MaterialGraphImages.h"
 #include "SmartGenerator.h"
 #include "AssetLibrary.h"
+#include "GraphShader.h"
 #include <filesystem>
 
 namespace material_tool {
@@ -48,6 +49,17 @@ private:
     std::string error_;
     std::size_t bytes_ = 0;
 };
+// The graph a material is published from: subgraphs expanded and the instance overrides written into
+// its parameter and texture nodes.
+bool EffectiveGraph(AssetLibrary& library, const MaterialGraphDocument& document, const ParameterOverrides& parameters,
+    MaterialGraphDocument& source, std::string& error);
+// Everything a graph shader needs except its SPIR-V: the program, its uniform block and texture GUIDs.
+// Default-value textures go into folder; the geometry map comes from a mesh bake (written as
+// folder/geometry.png) or, for a material already published, from existingGeometryMap.
+// notice says why no shader can be made.
+bool PrepareGraphShader(AssetLibrary& library, const MaterialGraphDocument& source, const GeometryBake* geometry,
+    const std::string& existingGeometryMap, const std::filesystem::path& graphFolder, const std::filesystem::path& folder,
+    MaterialGraphProgram& program, GraphShaderPackage& package, std::string& notice);
 // runtimeNotice receives why the material has no compiled graph shader (it is still published
 // with its baked textures), or stays empty when the shader was written.
 bool PublishBakedMaterial(AssetLibrary& library, const MaterialGraphDocument& document, const ParameterOverrides& parameters,

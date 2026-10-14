@@ -28,11 +28,14 @@ van, a közben módosult modell/transzformáció/anyaghely védelmével.
 SPIR-V shaderré fordul (a fordítás a szerkesztőben, közzétételkor történik, a játék
 csak a kész shadert tölti be), a renderer pixelenként ezzel rajzolja, a sült textúrák
 maradnak tartaléknak, a paraméterek pedig a Material Graph panelből élőben
-állíthatók. Részletek: `SMART_MATERIAL_IMPLEMENTATION.md`, 5. mérföldkő.
+állíthatók. A gráf szerkezeti módosítása (node, kapcsolat, réteg, textúra) a
+háttérben újrafordul ugyanabba a csomagba, új Bake & Apply nélkül. Részletek:
+`SMART_MATERIAL_IMPLEMENTATION.md`, 5. mérföldkő; GPU-költség:
+`SMART_MATERIAL_PERFORMANCE.md`.
 
 Az Asset Browser katalógus/preview thumbnail, a jelenetkijelöléshez kötött 3D mesh
-preview, terrain/skinned bake, a skinned modellek és a terrain élő gráf-shadere,
-valamint a gráf-shaderek GPU-költségének mérése továbbra is hátravan. Az alábbi eredeti állapotfelmérés a
+preview, terrain/skinned bake, valamint a skinned modellek és a terrain élő
+gráf-shadere továbbra is hátravan. Az alábbi eredeti állapotfelmérés a
 2026. október 11-i helyzetet rögzíti; a friss státuszhoz a fenti dokumentumokat használd.
 
 ## Korábbi állapotfelmérés

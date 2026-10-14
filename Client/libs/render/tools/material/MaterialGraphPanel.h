@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace ax::NodeEditor { struct EditorContext; }
@@ -99,21 +100,34 @@ private:
     void DiscardApplyRequest();
     // The material last published from this panel with a compiled graph shader. Parameter edits reach
     // it in the scene at once (GraphLiveValues) and are written into its package shortly after; a
-    // change to the graph itself needs a new Bake & Apply.
+    // change to the graph itself is compiled into a new package in the background once the edits
+    // pause, and the scene keeps the previous shader until then (or when the new graph cannot compile).
     struct LiveMaterial
     {
         std::string guid, name;
-        std::filesystem::path package;
+        std::filesystem::path package, graphFolder;
+        std::string geometryMap;        // GUID of the baked geometry map the package samples, if any
         MaterialGraphDocument document; // the authored graph it was compiled from
+        std::unordered_map<std::string, std::string> textures; // and its texture overrides
         GraphShaderPackage data;
         std::size_t parameters = 0;     // leading float4s of the uniform block
         MaterialGraphDocument checkedDocument;
         ParameterOverrides checkedParameters;
-        bool structureChanged = false, unsaved = false;
-        std::chrono::steady_clock::time_point changed{};
+        bool structureChanged = false, unsaved = false, recheck = false;
+        std::chrono::steady_clock::time_point changed{}, edited{};
+        // The graph being compiled, and the last one that could not be (not retried until edited).
+        MaterialGraphDocument compiling, failed;
+        ParameterOverrides compilingParameters, failedParameters;
+        std::size_t compilingSlots = 0;
+        std::string notice;
     };
     std::optional<LiveMaterial> live_;
-    void LinkLiveMaterial(const AssetLibrary::Entry& material, const MaterialGraphDocument& document);
+    GraphShaderJob liveJob_;
+    std::string liveJobGuid_;
+    // Ends the link (another graph opened): values waiting to be saved are written first.
+    void UnlinkLiveMaterial();
+    void LinkLiveMaterial(const AssetLibrary::Entry& material, const MaterialGraphDocument& document,
+                          const ParameterOverrides& parameters, const std::filesystem::path& graphFolder);
     void UpdateLiveMaterial(bool persistNow = false);
     GeometryBakeSettings geometrySettings_;
     struct ApplyRequest {
