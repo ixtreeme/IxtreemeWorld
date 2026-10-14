@@ -105,9 +105,24 @@ before larger interactive bakes. The independent geometry baker now has a
 cancellable worker; material previews and exports remain synchronous. GPU baking
 is still unimplemented.
 
-GPU material cost, total allocated instance memory, cache hit/miss rate and real
-texture fetch count are not measured. Graph shaders are evaluated per pixel; their
-cost against the baked textures is not measured either.
+Total allocated instance memory, cache hit/miss rate and real texture fetch count
+are not measured.
+
+Graph shader GPU cost (2026-10-14, editor-less runtime, NVIDIA GeForce RTX 2060,
+2560 x 1369, `IX_PERF_LOG=2 IX_GPU_PROFILE=1`): a wall of 180 cubes filling the view
+with Weathered Metal (four noise octaves per pixel), against the same wall with the
+material's baked copy. Two alternating 18 s runs each, the last three GPU samples of
+each run; medians:
+
+| | Graph shader | Baked textures |
+| --- | ---: | ---: |
+| Scene pass GPU | 0.823 ms | 0.631 ms |
+| Frame GPU | 2.428 ms | 2.278 ms |
+
+The live shader adds about 0.19 ms to a frame where the material covers the whole
+screen; the cost grows with the graph (noise octaves, texture samples, layers) and
+the covered pixels. Scenes and project: `Client/build/graph-runtime-audit-20261014`
+(not in git), scenes `GraphWall` and `BakedWall`.
 
 Graph shader compilation (2026-10-14, `GraphShaderTest`, three runs): the four
 presets, each compiled to both variants with dxc and reflected, took 1329, 1342 and

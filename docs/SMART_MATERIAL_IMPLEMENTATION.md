@@ -270,7 +270,8 @@ with emissive maps added their emissive colour as uniform light and looked white
 already published materials are drawn correctly without republishing.
 
 Not covered: skinned meshes and terrain still use baked textures; the graph is
-evaluated per pixel, and its GPU cost against baked textures was not measured;
+evaluated per pixel (Weathered Metal over the whole screen: +0.19 ms scene GPU on an
+RTX 2060 at 2560 x 1369, see the performance document);
 there is no global pipeline cache shared between models (each model builds its
 pipelines once per graph material); compilation runs on the editor thread when
 publishing (about 0.33 s per material on the test machine).
