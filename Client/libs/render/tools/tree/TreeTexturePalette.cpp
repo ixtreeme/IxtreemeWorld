@@ -20,6 +20,8 @@ namespace
 {
 namespace xm = ixtreeme::math;
 
+enum class BarkStyle { Stripes, Rings };
+
 struct PaletteSpec
 {
     const char* label;
@@ -27,23 +29,32 @@ struct PaletteSpec
     std::array<float, 4> previewColor;
     std::array<std::uint8_t, 4> baseColor;
     std::array<std::uint8_t, 4> accentColor;
+    int gridX = 2;       // leaf atlas cells across and down (the image stays 512 x 512)
+    int gridY = 2;
+    BarkStyle barkStyle = BarkStyle::Stripes;
 };
 
-constexpr std::array<PaletteSpec, 5> kBarkSpecs{{
+constexpr PaletteSpec kBarkSpecs[]{
     {"Oak", "textures/bark/oak_bark.png", {0.49f, 0.31f, 0.16f, 0.78f}, {110, 72, 35, 255}, {70, 45, 24, 255}},
     {"Birch", "textures/bark/birch_bark.png", {0.77f, 0.73f, 0.62f, 0.78f}, {194, 184, 156, 255}, {73, 65, 55, 255}},
     {"Pine", "textures/bark/pine_bark.png", {0.37f, 0.23f, 0.12f, 0.78f}, {85, 52, 27, 255}, {43, 29, 17, 255}},
     {"Willow", "textures/bark/willow_bark.png", {0.48f, 0.42f, 0.28f, 0.78f}, {120, 107, 75, 255}, {67, 72, 51, 255}},
     {"Ash", "textures/bark/ash_bark.png", {0.56f, 0.52f, 0.44f, 0.78f}, {142, 132, 111, 255}, {74, 70, 62, 255}},
-}};
+    {"Palm", "textures/bark/palm_bark.png", {0.52f, 0.42f, 0.30f, 0.78f}, {138, 112, 80, 255}, {74, 58, 40, 255}, 2, 2, BarkStyle::Rings},
+};
 
-constexpr std::array<PaletteSpec, 5> kLeafSpecs{{
+constexpr PaletteSpec kLeafSpecs[]{
     {"Oak", "textures/leaves/oak_leaf.png", {0.25f, 0.52f, 0.22f, 0.82f}, {72, 142, 58, 230}, {37, 92, 34, 235}},
     {"Ash", "textures/leaves/ash_leaf.png", {0.34f, 0.61f, 0.30f, 0.82f}, {86, 157, 76, 230}, {42, 99, 45, 235}},
     {"Pine", "textures/leaves/pine_leaf.png", {0.14f, 0.41f, 0.24f, 0.82f}, {39, 105, 62, 235}, {18, 66, 42, 240}},
     {"Willow", "textures/leaves/willow_leaf.png", {0.43f, 0.61f, 0.31f, 0.82f}, {110, 156, 78, 225}, {67, 112, 51, 235}},
     {"Birch", "textures/leaves/birch_leaf.png", {0.51f, 0.69f, 0.30f, 0.82f}, {130, 176, 75, 225}, {81, 122, 37, 235}},
-}};
+    {"Palm", "textures/leaves/palm_frond.png", {0.27f, 0.52f, 0.22f, 0.82f}, {72, 138, 54, 235}, {36, 88, 32, 240}, 2, 1},
+    {"Blossom", "textures/leaves/blossom_leaf.png", {0.93f, 0.66f, 0.77f, 0.82f}, {246, 178, 206, 235}, {206, 96, 146, 240}},
+    {"SnowyPine", "textures/leaves/snowy_pine_leaf.png", {0.55f, 0.66f, 0.62f, 0.82f}, {39, 105, 62, 235}, {18, 66, 42, 240}},
+};
+static_assert(std::size(kBarkSpecs) == ixtreemetree::kBarkTypeCount);
+static_assert(std::size(kLeafSpecs) == ixtreemetree::kLeafTypeCount);
 
 std::uint32_t Crc32(const std::uint8_t* data, std::size_t size)
 {
@@ -99,6 +110,51 @@ float SmoothStep(float edge0, float edge1, float x)
     return t * t * (3.0f - 2.0f * t);
 }
 
+// A palm frond on a tall cell (x across, -1..1; y down, -1 its tip, 1 its base): a midrib, a bare
+// stalk at the base, and narrow leaflets slanting toward the tip, longest at the middle.
+float FrondSilhouette(int variant, float x, float y)
+{
+    const float s = (1.0f - y) * 0.5f;  // 0 at the base, 1 at the tip
+    const float ax = xm::Abs(x);
+    const float midrib = (ax < 0.05f * (1.0f - 0.6f * s) && s < 0.985f) ? 1.0f : 0.0f;
+    if (s < 0.1f)
+        return midrib;
+    const float slant = 0.18f + 0.03f * static_cast<float>(variant % 2);
+    const float s0 = s - slant * ax;  // where this point's leaflet leaves the midrib
+    if (s0 < 0.1f || s0 > 0.97f)
+        return midrib;
+    const float reach = 0.97f * xm::Pow(xm::Sin(xm::Pi * (s0 - 0.1f) / 0.87f), 0.55f);
+    if (ax > reach)
+        return midrib;
+    const float period = 0.021f;
+    const float phase = s0 / period - std::floor(s0 / period);
+    const float thickness = 0.42f * xm::Pow(1.0f - ax / std::max(reach, 0.001f), 0.35f);
+    const float leaflet = 1.0f - SmoothStep(thickness * 0.5f - 0.06f, thickness * 0.5f + 0.02f, xm::Abs(phase - 0.5f));
+    return std::max(midrib, leaflet);
+}
+
+// Five-petalled flowers scattered over the cell, the variant choosing where.
+float BlossomSilhouette(int variant, float x, float y, float& centre)
+{
+    float mask = 0.0f;
+    centre = 0.0f;
+    std::uint32_t seed = 2654435761u * static_cast<std::uint32_t>(variant + 1);
+    for (int flower = 0; flower < 7; ++flower)
+    {
+        seed = seed * 1664525u + 1013904223u;
+        const float fx = (static_cast<float>(seed >> 8 & 0xffffu) / 65535.0f) * 1.3f - 0.65f;
+        seed = seed * 1664525u + 1013904223u;
+        const float fy = (static_cast<float>(seed >> 8 & 0xffffu) / 65535.0f) * 1.3f - 0.65f;
+        const float dx = x - fx;
+        const float dy = y - fy;
+        const float r = std::sqrt(dx * dx + dy * dy);
+        const float petals = 0.2f * (0.55f + 0.45f * xm::Abs(xm::Cos(2.5f * std::atan2(dy, dx) + static_cast<float>(flower))));
+        mask = std::max(mask, 1.0f - SmoothStep(petals - 0.02f, petals + 0.015f, r));
+        centre = std::max(centre, 1.0f - SmoothStep(0.035f, 0.06f, r));
+    }
+    return mask;
+}
+
 float LeafSilhouette(const char* label, int variant, float x, float y)
 {
     const float bend = 0.08f * xm::Sin((static_cast<float>(variant) + 1.0f) * 1.7f);
@@ -107,7 +163,7 @@ float LeafSilhouette(const char* label, int variant, float x, float y)
     const float vein = xm::Abs(x);
 
     float width = 0.0f;
-    if (std::strcmp(label, "Pine") == 0)
+    if (std::strcmp(label, "Pine") == 0 || std::strcmp(label, "SnowyPine") == 0)
     {
         const float centerNeedle = std::max(0.0f, 1.0f - xm::Abs(x) / 0.07f) * std::max(0.0f, 1.0f - absY / 0.88f);
         const float sideNeedleA = std::max(0.0f, 1.0f - xm::Abs(x - 0.16f * y) / 0.055f) * std::max(0.0f, 1.0f - absY / 0.78f);
@@ -142,12 +198,48 @@ float LeafSilhouette(const char* label, int variant, float x, float y)
 
 void LeafPixel(const PaletteSpec& spec, std::uint32_t x, std::uint32_t y, std::uint8_t& r, std::uint8_t& g, std::uint8_t& b, std::uint8_t& a)
 {
-    constexpr std::uint32_t cellSize = 256u;
-    const int cellX = static_cast<int>(x / cellSize);
-    const int cellY = static_cast<int>(y / cellSize);
-    const int variant = cellY * 2 + cellX;
-    const float localX = ((static_cast<float>(x % cellSize) + 0.5f) / static_cast<float>(cellSize)) * 2.0f - 1.0f;
-    const float localY = ((static_cast<float>(y % cellSize) + 0.5f) / static_cast<float>(cellSize)) * 2.0f - 1.0f;
+    const std::uint32_t cellWidth = 512u / static_cast<std::uint32_t>(std::max(1, spec.gridX));
+    const std::uint32_t cellHeight = 512u / static_cast<std::uint32_t>(std::max(1, spec.gridY));
+    const int cellX = static_cast<int>(x / cellWidth);
+    const int cellY = static_cast<int>(y / cellHeight);
+    const int variant = cellY * spec.gridX + cellX;
+    const float localX = ((static_cast<float>(x % cellWidth) + 0.5f) / static_cast<float>(cellWidth)) * 2.0f - 1.0f;
+    const float localY = ((static_cast<float>(y % cellHeight) + 0.5f) / static_cast<float>(cellHeight)) * 2.0f - 1.0f;
+    const bool frond = std::strcmp(spec.label, "Palm") == 0;
+    const bool blossom = std::strcmp(spec.label, "Blossom") == 0;
+    if (frond || blossom)
+    {
+        // A frond stays upright on its cell (the generator puts its midrib down the middle).
+        float centre = 0.0f;
+        const float mask = frond ? FrondSilhouette(variant, localX, localY) : BlossomSilhouette(variant, localX, localY, centre);
+        if (mask <= 0.01f)
+        {
+            r = g = b = a = 0u;
+            return;
+        }
+        const std::uint32_t n = (x * 37u + y * 53u + static_cast<std::uint32_t>(variant * 79)) & 0xffu;
+        const float noise = static_cast<float>(n) / 255.0f;
+        const float rib = frond ? std::max(0.0f, 1.0f - xm::Abs(localX) / 0.06f) : 0.0f;
+        const float accent = std::clamp((1.0f - mask) * 0.8f + rib * 0.6f + noise * 0.15f, 0.0f, 1.0f);
+        r = MixByte(spec.baseColor[0], spec.accentColor[0], accent);
+        g = MixByte(spec.baseColor[1], spec.accentColor[1], accent);
+        b = MixByte(spec.baseColor[2], spec.accentColor[2], accent);
+        if (blossom)
+        {
+            const float pale = 0.45f * (1.0f - centre) * (0.5f + 0.5f * xm::Sin(localY * 9.0f + variant));
+            r = MixByte(r, 255, pale);
+            g = MixByte(g, 246, pale);
+            b = MixByte(b, 250, pale);
+        }
+        if (blossom && centre > 0.0f)  // a yellow eye in each flower
+        {
+            r = MixByte(r, 250, centre);
+            g = MixByte(g, 214, centre);
+            b = MixByte(b, 90, centre);
+        }
+        a = static_cast<std::uint8_t>(std::clamp(mask, 0.0f, 1.0f) * 235.0f + 0.5f);
+        return;
+    }
 
     const float rotation = (static_cast<float>(variant) - 1.5f) * 0.18f;
     const float cr = xm::Cos(rotation);
@@ -171,6 +263,14 @@ void LeafPixel(const PaletteSpec& spec, std::uint32_t x, std::uint32_t y, std::u
     r = MixByte(spec.baseColor[0], spec.accentColor[0], accent);
     g = MixByte(spec.baseColor[1], spec.accentColor[1], accent);
     b = MixByte(spec.baseColor[2], spec.accentColor[2], accent);
+    if (std::strcmp(spec.label, "SnowyPine") == 0)
+    {
+        // Snow lies on the upper side of the needles.
+        const float snow = (1.0f - SmoothStep(-0.55f, 0.25f, ry)) * (0.65f + 0.35f * noise);
+        r = MixByte(r, 236, snow);
+        g = MixByte(g, 242, snow);
+        b = MixByte(b, 248, snow);
+    }
     a = static_cast<std::uint8_t>(std::clamp(mask, 0.0f, 1.0f) * 235.0f + 0.5f);
 }
 
@@ -215,7 +315,8 @@ bool WriteFallbackPng(const std::filesystem::path& path, const PaletteSpec& spec
             }
 
             const std::uint32_t n = (x * 37u + y * 53u + ((x ^ y) * 11u)) & 0xffu;
-            const bool stripe = (((x / 7u + y * 3u) % 23u) < 4u);
+            const bool stripe = spec.barkStyle == BarkStyle::Rings
+                ? ((y + (x / 16u) % 3u) % 24u) < 6u : (((x / 7u + y * 3u) % 23u) < 4u);
             const auto& a = stripe ? spec.accentColor : spec.baseColor;
             const auto& b = stripe ? spec.baseColor : spec.accentColor;
             const std::uint32_t mix = n % 58u;
@@ -294,12 +395,12 @@ void EnsureTextureFile(const std::filesystem::path& path, const PaletteSpec& spe
 
 int BarkIndex(ixtreemetree::BarkType type)
 {
-    return std::clamp(static_cast<int>(type), 0, static_cast<int>(kBarkSpecs.size() - 1u));
+    return std::clamp(static_cast<int>(type), 0, static_cast<int>(std::size(kBarkSpecs) - 1u));
 }
 
 int LeafIndex(ixtreemetree::LeafType type)
 {
-    return std::clamp(static_cast<int>(type), 0, static_cast<int>(kLeafSpecs.size() - 1u));
+    return std::clamp(static_cast<int>(type), 0, static_cast<int>(std::size(kLeafSpecs) - 1u));
 }
 }
 
@@ -330,35 +431,26 @@ void TreeTexturePalette::Load(const std::filesystem::path& internalRoot)
         ? (std::filesystem::current_path() / "assets" / "internal")
         : internalRoot;
 
-    for (std::size_t i = 0; i < kBarkSpecs.size(); ++i)
+    for (std::size_t i = 0; i < std::size(kBarkSpecs); ++i)
     {
         const PaletteSpec& spec = kBarkSpecs[i];
         const std::filesystem::path path = root / std::filesystem::path(spec.relativePath);
         EnsureTextureFile(path, spec, false);
         bark_[i] = {AssetDatabase::Instance().getOrCreateGuid(path), path, spec.previewColor};
+        Tracenf("[TREE-3] palette_loaded bark=%s guid=%s", spec.label, bark_[i].guid.toString().c_str());
     }
-    for (std::size_t i = 0; i < kLeafSpecs.size(); ++i)
+    for (std::size_t i = 0; i < std::size(kLeafSpecs); ++i)
     {
         const PaletteSpec& spec = kLeafSpecs[i];
         const std::filesystem::path path = root / std::filesystem::path(spec.relativePath);
         EnsureTextureFile(path, spec, true);
-        leaves_[i] = {AssetDatabase::Instance().getOrCreateGuid(path), path, spec.previewColor};
+        leaves_[i] = {AssetDatabase::Instance().getOrCreateGuid(path), path, spec.previewColor, spec.gridX, spec.gridY};
+        Tracenf("[TREE-3] palette_loaded leaves=%s guid=%s atlas=%dx%d", spec.label,
+            leaves_[i].guid.toString().c_str(), spec.gridX, spec.gridY);
     }
 
     loaded_ = true;
     loadedRoot_ = root;
-    Tracenf("[TREE-3] palette_loaded bark={Oak=%s, Birch=%s, Pine=%s, Willow=%s, Ash=%s}",
-        bark_[0].guid.toString().c_str(),
-        bark_[1].guid.toString().c_str(),
-        bark_[2].guid.toString().c_str(),
-        bark_[3].guid.toString().c_str(),
-        bark_[4].guid.toString().c_str());
-    Tracenf("[TREE-3] palette_loaded leaves={Oak=%s, Ash=%s, Pine=%s, Willow=%s, Birch=%s}",
-        leaves_[0].guid.toString().c_str(),
-        leaves_[1].guid.toString().c_str(),
-        leaves_[2].guid.toString().c_str(),
-        leaves_[3].guid.toString().c_str(),
-        leaves_[4].guid.toString().c_str());
     Tracenf("[TREE-LEAF-FORM-1] atlas_grid=2x2 cardsPerCluster_default=3");
 }
 }

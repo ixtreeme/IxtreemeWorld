@@ -22,8 +22,12 @@ struct Vec3
 };
 
 enum class TreeType : std::uint8_t { Deciduous, Evergreen };
-enum class BarkType : std::uint8_t { Oak, Birch, Pine, Willow, Ash };
-enum class LeafType : std::uint8_t { Oak, Ash, Pine, Willow, Birch };
+enum class BarkType : std::uint8_t { Oak, Birch, Pine, Willow, Ash, Palm };
+// Palm: frond images (2 x 1 atlas, see LeafStyle::Fronds); Blossom: flower clusters; SnowyPine: needles
+// with snow on top.
+enum class LeafType : std::uint8_t { Oak, Ash, Pine, Willow, Birch, Palm, Blossom, SnowyPine };
+constexpr int kBarkTypeCount = static_cast<int>(BarkType::Palm) + 1;
+constexpr int kLeafTypeCount = static_cast<int>(LeafType::SnowyPine) + 1;
 // A crown's outline: how long a branch grows for where it starts on its parent (the shape ratios of
 // Weber and Penn, "Creation and Rendering of Realistic Trees", 1995). Uniform: every one the same.
 enum class CrownShape : std::uint8_t { Uniform, Conical, Spherical, Hemispherical, TaperedCylinder, Flame, InverseConical, TendFlame };

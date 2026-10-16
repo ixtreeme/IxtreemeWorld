@@ -15,6 +15,8 @@ struct TreePaletteTexture
     Guid guid{};
     std::filesystem::path path;
     std::array<float, 4> previewColor{1.0f, 1.0f, 1.0f, 1.0f};
+    int gridX = 2;
+    int gridY = 2;
 };
 
 class TreeTexturePalette
@@ -31,7 +33,7 @@ private:
 
     bool loaded_ = false;
     std::filesystem::path loadedRoot_;
-    std::array<TreePaletteTexture, 5> bark_{};
-    std::array<TreePaletteTexture, 5> leaves_{};
+    std::array<TreePaletteTexture, ixtreemetree::kBarkTypeCount> bark_{};
+    std::array<TreePaletteTexture, ixtreemetree::kLeafTypeCount> leaves_{};
 };
 }
