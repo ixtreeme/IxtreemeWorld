@@ -24,6 +24,12 @@ struct Vec3
 enum class TreeType : std::uint8_t { Deciduous, Evergreen };
 enum class BarkType : std::uint8_t { Oak, Birch, Pine, Willow, Ash };
 enum class LeafType : std::uint8_t { Oak, Ash, Pine, Willow, Birch };
+// A crown's outline: how long a branch grows for where it starts on its parent (the shape ratios of
+// Weber and Penn, "Creation and Rendering of Realistic Trees", 1995). Uniform: every one the same.
+enum class CrownShape : std::uint8_t { Uniform, Conical, Spherical, Hemispherical, TaperedCylinder, Flame, InverseConical, TendFlame };
+// Where a level's branches sit around their parent: anywhere, in rings (a fir's whorls) or one after
+// another at the golden angle (a palm's crown).
+enum class BranchArrangement : std::uint8_t { Random, Whorled, Spiral };
 
 struct TreeOptions
 {
@@ -52,6 +58,13 @@ struct TreeOptions
         std::array<float, kMaxBranchLevels> start{};
         std::array<float, kMaxBranchLevels> taper{};
         std::array<float, kMaxBranchLevels> twist{};
+        // Per level (the trunk's entry unused for shape and arrangement).
+        std::array<CrownShape, kMaxBranchLevels> shape{};
+        std::array<BranchArrangement, kMaxBranchLevels> arrangement{};
+        std::array<int, kMaxBranchLevels> whorlSize{};  // branches a ring (Whorled); 0: 4
+        std::array<float, kMaxBranchLevels> droop{};    // bend toward the ground a metre grown; negative bends up
+        int trunks = 1;            // stems from the ground (a shrub has several)
+        float trunkSpread = 0.0f;  // how far the stems lean from upright, degrees
 
         Vec3 forceDirection{0.0f, 1.0f, 0.0f};
         float forceStrength = 0.05f;

@@ -140,24 +140,48 @@ Vec3 RotateAroundAxis(Vec3 v, Vec3 axis, float radians)
     return Add(Add(Mul(v, c), Mul(Cross(axis, v), s)), Mul(axis, Dot(axis, v) * (1.0f - c)));
 }
 
+// How long a branch grows, as a share of its level's length, for where it starts in its parent's
+// crown: ratio 1 at the crown's base, 0 at its top (Weber and Penn's shape ratios).
+float ShapeRatio(CrownShape shape, float ratio)
+{
+    ratio = std::clamp(ratio, 0.0f, 1.0f);
+    switch (shape)
+    {
+    case CrownShape::Conical: return 0.2f + 0.8f * ratio;
+    case CrownShape::Spherical: return 0.2f + 0.8f * xm::Sin(xm::Pi * ratio);
+    case CrownShape::Hemispherical: return 0.2f + 0.8f * xm::Sin(0.5f * xm::Pi * ratio);
+    case CrownShape::TaperedCylinder: return 0.5f + 0.5f * ratio;
+    case CrownShape::Flame: return ratio <= 0.7f ? ratio / 0.7f : (1.0f - ratio) / 0.3f;
+    case CrownShape::InverseConical: return 1.0f - 0.8f * ratio;
+    case CrownShape::TendFlame: return ratio <= 0.7f ? 0.5f + 0.5f * ratio / 0.7f : 0.5f + 0.5f * (1.0f - ratio) / 0.3f;
+    case CrownShape::Uniform: break;
+    }
+    return 1.0f;
+}
+
+// lengthScale shrinks the branch (its length and radius) and everything growing from it: the crown
+// shape of its own and its ancestors' levels.
 BranchEnd GenerateBranch(const TreeOptions& options,
                          Rng& rng,
                          TreeMesh& mesh,
                          int level,
                          Vec3 origin,
                          Vec3 direction,
-                         std::vector<TerminalBranch>& terminalBranches)
+                         std::vector<TerminalBranch>& terminalBranches,
+                         float lengthScale = 1.0f)
 {
     const int index = std::clamp(level, 0, kMaxBranchLevels - 1);
     const int sections = std::max(1, options.branch.sections[index]);
     const int radialSegments = std::max(3, options.branch.segments[index]);
-    const float length = std::max(0.1f, options.branch.length[index]);
-    const float baseRadius = std::max(0.01f, options.branch.radius[index]);
+    const float length = std::max(0.1f, options.branch.length[index] * lengthScale);
+    const float baseRadius = std::max(0.01f, options.branch.radius[index] * lengthScale);
     const float taper = std::clamp(options.branch.taper[index], 0.05f, 1.0f);
     const float gnarliness = std::max(0.0f, options.branch.gnarliness[index]);
     const float twist = xm::DegreesToRadians(options.branch.twist[index]);
     const Vec3 forceDirection = Normalize(options.branch.forceDirection);
     const float forceStrength = options.branch.forceStrength;
+    // Droop is a bend a metre grown, so a branch arches the same however finely it is cut.
+    const float droopStep = options.branch.droop[index] * length / static_cast<float>(sections);
 
     direction = Normalize(direction);
     std::vector<Vec3> centers;
@@ -177,7 +201,10 @@ BranchEnd GenerateBranch(const TreeOptions& options,
             rng.uniform(-gnarliness, gnarliness),
             rng.uniform(-gnarliness, gnarliness),
         };
-        currentDirection = Normalize(Add(Add(currentDirection, Mul(randomBend, 0.12f)), Mul(forceDirection, forceStrength * t)));
+        Vec3 bent = Add(Add(currentDirection, Mul(randomBend, 0.12f)), Mul(forceDirection, forceStrength * t));
+        if (droopStep != 0.0f)
+            bent = Add(bent, Vec3{0.0f, -droopStep, 0.0f});
+        currentDirection = Normalize(bent);
         cursor = Add(cursor, Mul(currentDirection, length / static_cast<float>(sections)));
         centers.push_back(cursor);
         axes.push_back(currentDirection);
@@ -230,19 +257,53 @@ BranchEnd GenerateBranch(const TreeOptions& options,
     const int childCount = std::max(0, options.branch.children[childLevel]);
     const float start = std::clamp(options.branch.start[childLevel], 0.0f, 0.95f);
     const float angleRadians = xm::DegreesToRadians(options.branch.angle[childLevel]);
+    const BranchArrangement arrangement = options.branch.arrangement[childLevel];
+    const CrownShape shape = options.branch.shape[childLevel];
+    const int whorlSize = options.branch.whorlSize[childLevel] > 0 ? options.branch.whorlSize[childLevel] : 4;
+    const int whorls = std::max(1, (childCount + whorlSize - 1) / whorlSize);
+    constexpr float kGoldenAngle = 2.39996323f;  // 137.5 degrees: a palm's fronds, a sunflower's seeds
+    const float spiralStart = arrangement == BranchArrangement::Spiral ? rng.uniform(0.0f, xm::TwoPi) : 0.0f;
+    float whorlBase = 0.0f;
     for (int child = 0; child < childCount; ++child)
     {
-        const float spanT = (static_cast<float>(child) + rng.uniform(0.15f, 0.85f)) / std::max(1.0f, static_cast<float>(childCount));
-        const float t = std::clamp(start + (1.0f - start) * spanT, 0.0f, 1.0f);
+        float t = 0.0f;
+        if (arrangement == BranchArrangement::Whorled)
+        {
+            // Rings of whorlSize, evenly up the parent, each turned at random, its branches evenly round.
+            if (child % whorlSize == 0)
+                whorlBase = rng.uniform(0.0f, xm::TwoPi);
+            t = start + (1.0f - start) * (static_cast<float>(child / whorlSize) + 0.5f) / static_cast<float>(whorls);
+        }
+        else if (arrangement == BranchArrangement::Spiral)
+        {
+            t = start + (1.0f - start) * (static_cast<float>(child) + 0.5f) / static_cast<float>(childCount);
+        }
+        else
+        {
+            const float spanT = (static_cast<float>(child) + rng.uniform(0.15f, 0.85f)) / std::max(1.0f, static_cast<float>(childCount));
+            t = start + (1.0f - start) * spanT;
+        }
+        t = std::clamp(t, 0.0f, 1.0f);
         const int centerIndex = std::clamp(static_cast<int>(t * static_cast<float>(sections)), 0, sections);
         Vec3 right{};
         Vec3 up{};
         BuildFrame(axes[static_cast<std::size_t>(centerIndex)], right, up);
-        const float around = rng.uniform(0.0f, xm::TwoPi);
+        float around = 0.0f;
+        if (arrangement == BranchArrangement::Whorled)
+            around = whorlBase + xm::TwoPi * static_cast<float>(child % whorlSize) / static_cast<float>(whorlSize) +
+                rng.uniform(-0.15f, 0.15f);
+        else if (arrangement == BranchArrangement::Spiral)
+            around = spiralStart + kGoldenAngle * static_cast<float>(child);
+        else
+            around = rng.uniform(0.0f, xm::TwoPi);
         const Vec3 radial = Normalize(Add(Mul(right, xm::Cos(around)), Mul(up, xm::Sin(around))));
         const Vec3 childDir = Normalize(Add(Mul(axes[static_cast<std::size_t>(centerIndex)], xm::Cos(angleRadians)),
             Mul(radial, xm::Sin(angleRadians))));
-        GenerateBranch(options, rng, mesh, childLevel, centers[static_cast<std::size_t>(centerIndex)], childDir, terminalBranches);
+        float childScale = lengthScale;
+        if (shape != CrownShape::Uniform)
+            childScale *= std::max(0.05f, ShapeRatio(shape, start < 1.0f ? 1.0f - (t - start) / (1.0f - start) : 0.0f));
+        GenerateBranch(options, rng, mesh, childLevel, centers[static_cast<std::size_t>(centerIndex)], childDir,
+            terminalBranches, childScale);
     }
 
     return end;
@@ -373,7 +434,29 @@ TreeMesh Tree::generate() const
 
     Rng rng(options.seed);
     std::vector<TerminalBranch> terminalBranches;
-    GenerateBranch(options, rng, mesh, 0, Vec3{0.0f, 0.0f, 0.0f}, Vec3{0.0f, 1.0f, 0.0f}, terminalBranches);
+    const int trunks = std::clamp(options.branch.trunks, 1, 16);
+    const float spread = xm::DegreesToRadians(std::clamp(options.branch.trunkSpread, 0.0f, 89.0f));
+    if (trunks == 1 && spread == 0.0f)
+    {
+        GenerateBranch(options, rng, mesh, 0, Vec3{0.0f, 0.0f, 0.0f}, Vec3{0.0f, 1.0f, 0.0f}, terminalBranches);
+    }
+    else
+    {
+        // Stems evenly round, each leaning out by about the spread; several are a little shorter and
+        // stand a little apart, so they do not grow through each other at the base.
+        const float firstAzimuth = rng.uniform(0.0f, xm::TwoPi);
+        for (int trunk = 0; trunk < trunks; ++trunk)
+        {
+            const float azimuth = firstAzimuth + xm::TwoPi * static_cast<float>(trunk) / static_cast<float>(trunks) +
+                (trunks > 1 ? rng.uniform(-0.3f, 0.3f) : 0.0f);
+            const float lean = spread * (trunks > 1 ? rng.uniform(0.6f, 1.0f) : 1.0f);
+            const Vec3 outward{xm::Cos(azimuth), 0.0f, xm::Sin(azimuth)};
+            const Vec3 direction{outward.x * xm::Sin(lean), xm::Cos(lean), outward.z * xm::Sin(lean)};
+            const Vec3 origin = trunks > 1 ? Mul(outward, std::max(0.01f, options.branch.radius[0]) * 0.8f) : Vec3{};
+            const float scale = trunks > 1 ? rng.uniform(0.75f, 1.0f) : 1.0f;
+            GenerateBranch(options, rng, mesh, 0, origin, direction, terminalBranches, scale);
+        }
+    }
     GenerateLeaves(options, rng, mesh, terminalBranches);
 
     if (mesh.bark.vertices.empty() && mesh.leaves.vertices.empty())

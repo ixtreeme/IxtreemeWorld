@@ -222,6 +222,136 @@ std::uint64_t HashOf(const ixtreemetree::TreeOptions& options)
     return MeshHash(tree.generate());
 }
 
+// A straight 10 m trunk with one level of straight, level branches and one leaf card at each tip: a
+// card's centre is where its branch ends.
+ixtreemetree::TreeOptions LevelBranches(int children)
+{
+    ixtreemetree::TreeOptions options = ixtreemetree::defaultTreeOptions();
+    options.branch.levels = 1;
+    options.branch.gnarliness = {0.0f, 0.0f, 0.0f, 0.0f};
+    options.branch.forceStrength = 0.0f;
+    options.branch.length[0] = 10.0f;
+    options.branch.sections[0] = 40;
+    options.branch.children[1] = children;
+    options.branch.angle[1] = 90.0f;
+    options.branch.start[1] = 0.2f;
+    options.branch.length[1] = 3.0f;
+    options.branch.sections[1] = 12;
+    options.leaves.count = 1;
+    options.leaves.cardsPerCluster = 1;
+    options.leaves.start = 0.95f;
+    options.leaves.sizeVariance = 0.0f;
+    return options;
+}
+
+std::vector<ixtreemetree::Vec3> TipCards(const ixtreemetree::TreeOptions& options)
+{
+    ixtreemetree::Tree tree;
+    tree.options = options;
+    const ixtreemetree::TreeMesh mesh = tree.generate();
+    std::vector<ixtreemetree::Vec3> centers;
+    for (std::size_t card = 0; card < mesh.leaves.vertices.size() / 4u; ++card)
+        centers.push_back(CardCenter(mesh.leaves, card));
+    return centers;
+}
+
+// The farthest a tip reaches from the trunk among the branches starting between y0 and y1.
+float Reach(const std::vector<ixtreemetree::Vec3>& tips, float y0, float y1)
+{
+    float reach = 0.0f;
+    for (const ixtreemetree::Vec3& p : tips)
+        if (p.y >= y0 && p.y <= y1)
+            reach = std::max(reach, std::sqrt(p.x * p.x + p.z * p.z));
+    return reach;
+}
+
+void TestCrownShape()
+{
+    // Level branches from 2 m to 10 m: a cone's top ones are short, a uniform crown's all alike.
+    ixtreemetree::TreeOptions options = LevelBranches(40);
+    const std::vector<ixtreemetree::Vec3> uniform = TipCards(options);
+    options.branch.shape[1] = ixtreemetree::CrownShape::Conical;
+    const std::vector<ixtreemetree::Vec3> cone = TipCards(options);
+    Check(Reach(uniform, 8.4f, 10.0f) > 0.8f * Reach(uniform, 2.0f, 3.6f), "a uniform crown is as wide at the top");
+    Check(Reach(cone, 8.4f, 10.0f) < 0.5f * Reach(cone, 2.0f, 3.6f) && Reach(cone, 2.0f, 3.6f) > 2.0f,
+        "a conical crown narrows to the top");
+    options.branch.shape[1] = ixtreemetree::CrownShape::Spherical;
+    const std::vector<ixtreemetree::Vec3> sphere = TipCards(options);
+    Check(Reach(sphere, 5.0f, 7.0f) > 1.5f * Reach(sphere, 9.0f, 10.0f) && Reach(sphere, 5.0f, 7.0f) > 1.5f * Reach(sphere, 2.0f, 2.8f),
+        "a spherical crown is widest in the middle");
+}
+
+std::size_t DistinctHeights(const std::vector<ixtreemetree::Vec3>& tips, float step)
+{
+    std::vector<long> heights;
+    for (const ixtreemetree::Vec3& p : tips)
+        heights.push_back(std::lround(p.y / step));
+    std::sort(heights.begin(), heights.end());
+    return static_cast<std::size_t>(std::unique(heights.begin(), heights.end()) - heights.begin());
+}
+
+void TestArrangements()
+{
+    ixtreemetree::TreeOptions options = LevelBranches(12);
+    Check(DistinctHeights(TipCards(options), 0.25f) >= 8u, "random branches start at many heights");
+    options.branch.arrangement[1] = ixtreemetree::BranchArrangement::Whorled;
+    options.branch.whorlSize[1] = 4;
+    const std::vector<ixtreemetree::Vec3> whorls = TipCards(options);
+    Check(whorls.size() == 12u && DistinctHeights(whorls, 0.25f) == 3u, "twelve branches in rings of four: three heights");
+
+    // A spiral turns by the golden angle from one branch to the next (around the vertical trunk, a
+    // branch's azimuth is atan2(x, z)).
+    options = LevelBranches(8);
+    options.branch.arrangement[1] = ixtreemetree::BranchArrangement::Spiral;
+    const std::vector<ixtreemetree::Vec3> spiral = TipCards(options);
+    bool golden = spiral.size() == 8u;
+    for (std::size_t i = 1; golden && i < spiral.size(); ++i)
+    {
+        const double a = std::atan2(spiral[i - 1].x, spiral[i - 1].z);
+        const double b = std::atan2(spiral[i].x, spiral[i].z);
+        double turn = (b - a) * 180.0 / 3.14159265358979 - 137.5;
+        turn -= 360.0 * std::round(turn / 360.0);
+        golden = std::abs(turn) < 3.0;
+    }
+    Check(golden, "spiral branches turn by 137.5 degrees each");
+    Check(DistinctHeights(spiral, 0.25f) == 8u, "spiral branches climb the trunk one by one");
+}
+
+void TestDroop()
+{
+    ixtreemetree::TreeOptions options = LevelBranches(12);
+    const auto meanY = [](const std::vector<ixtreemetree::Vec3>& tips) {
+        double sum = 0.0;
+        for (const ixtreemetree::Vec3& p : tips)
+            sum += p.y;
+        return tips.empty() ? 0.0 : sum / static_cast<double>(tips.size());
+    };
+    const double level = meanY(TipCards(options));
+    options.branch.droop[1] = 0.2f;
+    const std::vector<ixtreemetree::Vec3> drooping = TipCards(options);
+    Check(meanY(drooping) < level - 0.5, "drooping branches bend toward the ground");
+    options.branch.droop[1] = -0.2f;
+    Check(meanY(TipCards(options)) > level + 0.5, "negative droop bends them up");
+}
+
+void TestTrunks()
+{
+    ixtreemetree::TreeOptions options = LevelBranches(0);
+    options.branch.levels = 0;
+    options.branch.trunks = 5;
+    options.branch.trunkSpread = 30.0f;
+    const std::vector<ixtreemetree::Vec3> tips = TipCards(options);
+    float widest = 0.0f;
+    for (const ixtreemetree::Vec3& a : tips)
+        for (const ixtreemetree::Vec3& b : tips)
+            widest = std::max(widest, std::sqrt((a.x - b.x) * (a.x - b.x) + (a.z - b.z) * (a.z - b.z)));
+    Check(tips.size() == 5u && widest > 4.0f, "five stems lean out from one base");
+    bool lowered = !tips.empty();
+    for (const ixtreemetree::Vec3& p : tips)
+        lowered = lowered && p.y < 9.6f && p.y > 5.0f;
+    Check(lowered, "a leaning stem's tip is lower than an upright one's");
+}
+
 // The trees made before the generator learned crown shapes, arrangements, droop, several trunks and
 // fronds: their new settings default to the old behaviour, so every one must come out bit for bit
 // the same.
@@ -273,6 +403,10 @@ int main(int argc, char** argv)
     TestCutout();
     TestLeavesAlongTwig();
     TestDoubleCardsCross();
+    TestCrownShape();
+    TestArrangements();
+    TestDroop();
+    TestTrunks();
     TestExistingTreesUnchanged(argc > 1 && std::string(argv[1]) == "--print-golden");
     if (g_errors == 0)
         std::cout << "TreeGeneratorTest: all checks passed\n";
