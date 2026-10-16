@@ -1,11 +1,16 @@
 // The tree generator's leaf placement and the export's leaf card trim.
 #include "ixtreemetree/leaf_trim.h"
+#include "ixtreemetree/preset.h"
 #include "ixtreemetree/tree.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <iostream>
+#include <iterator>
 #include <limits>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace
@@ -189,14 +194,86 @@ void TestDoubleCardsCross()
         Check(cards > 0u && worst < 0.95f, "the cards of a cluster cross each other");
     }
 }
+
+// FNV-1a over every byte of the mesh: its vertices (position, normal, uv) and indices.
+std::uint64_t MeshHash(const ixtreemetree::TreeMesh& mesh)
+{
+    std::uint64_t hash = 1469598103934665603ull;
+    const auto add = [&hash](const void* data, std::size_t size) {
+        const auto* bytes = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < size; ++i)
+            hash = (hash ^ bytes[i]) * 1099511628211ull;
+    };
+    for (const auto* part : {&mesh.bark.vertices, &mesh.leaves.vertices})
+        for (const ixtreemetree::Vertex& v : *part)
+        {
+            const float values[8] = {v.position.x, v.position.y, v.position.z, v.normal.x, v.normal.y, v.normal.z, v.uv.x, v.uv.y};
+            add(values, sizeof(values));
+        }
+    add(mesh.bark.indices.data(), mesh.bark.indices.size() * sizeof(std::uint32_t));
+    add(mesh.leaves.indices.data(), mesh.leaves.indices.size() * sizeof(std::uint32_t));
+    return hash;
+}
+
+std::uint64_t HashOf(const ixtreemetree::TreeOptions& options)
+{
+    ixtreemetree::Tree tree;
+    tree.options = options;
+    return MeshHash(tree.generate());
+}
+
+// The trees made before the generator learned crown shapes, arrangements, droop, several trunks and
+// fronds: their new settings default to the old behaviour, so every one must come out bit for bit
+// the same.
+void TestExistingTreesUnchanged(bool print)
+{
+    struct Golden
+    {
+        const char* name;
+        std::uint64_t hash;
+    };
+    static const Golden kGolden[] = {
+        {"default", 0x2351d9504fe5e02bull},
+        {"Ash Large", 0x397b3dd627be20dull},
+        {"Ash Medium", 0x6a5b32221451eebull},
+        {"Ash Small", 0xfac3f447583161c0ull},
+        {"Aspen Large", 0x859b461e919522f7ull},
+        {"Aspen Medium", 0xa189f3ec1450ca33ull},
+        {"Aspen Small", 0x9830c30db9baccc9ull},
+        {"Bush 1", 0xc8d451d7d2370172ull},
+        {"Bush 2", 0x4c4af74bd925e36bull},
+        {"Bush 3", 0x322e0a9f31227a8bull},
+        {"Oak Large", 0x2ced4a2153ad78d9ull},
+        {"Oak Medium", 0xe302c548475c4a3full},
+        {"Oak Small", 0x5a24bdeffa31bfc4ull},
+        {"Pine Large", 0x318d2c4c77a2e221ull},
+        {"Pine Medium", 0x8bf49ff498544c8full},
+        {"Pine Small", 0x4ccd31966451d811ull},
+        {"Trellis", 0xd3dd19e13437a81eull},
+    };
+    std::vector<std::pair<std::string, std::uint64_t>> actual{{"default", HashOf(ixtreemetree::defaultTreeOptions())}};
+    for (const ixtreemetree::Preset& preset : ixtreemetree::loadAllPresets(IXTREEMETREE_PRESET_DIR))
+        actual.push_back({preset.name, HashOf(preset.options)});
+    for (const auto& [name, hash] : actual)
+    {
+        if (print)
+            std::cout << "        {\"" << name << "\", 0x" << std::hex << hash << std::dec << "ull},\n";
+        const auto golden = std::find_if(std::begin(kGolden), std::end(kGolden),
+            [&name = name](const Golden& g) { return name == g.name; });
+        if (golden != std::end(kGolden))
+            Check(golden->hash == hash, ("an existing tree is unchanged: " + name).c_str());
+    }
+    Check(actual.size() >= std::size(kGolden), "every golden tree still loads");
+}
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     TestTrim();
     TestCutout();
     TestLeavesAlongTwig();
     TestDoubleCardsCross();
+    TestExistingTreesUnchanged(argc > 1 && std::string(argv[1]) == "--print-golden");
     if (g_errors == 0)
         std::cout << "TreeGeneratorTest: all checks passed\n";
     return g_errors == 0 ? 0 : 1;

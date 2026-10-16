@@ -24,6 +24,8 @@ add_library(IXEngineTree::IXEngineTree ALIAS IXEngineTree)
 if(BUILD_TESTING AND NOT ANDROID)
     add_executable(TreeGeneratorTest tests/TreeGeneratorTest.cpp)
     target_link_libraries(TreeGeneratorTest PRIVATE IXEngineTree)
+    target_compile_definitions(TreeGeneratorTest PRIVATE
+        IXTREEMETREE_PRESET_DIR="${CLIENT_ROOT}/assets/internal/tree_presets")
     if(MSVC)
         set_target_properties(TreeGeneratorTest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
