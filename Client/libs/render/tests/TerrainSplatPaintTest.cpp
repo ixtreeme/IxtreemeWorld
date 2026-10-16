@@ -1,9 +1,11 @@
 #include "TerrainSplatPaint.h"
+#include "WorldMath.h"
 
 #include <cmath>
 #include <iostream>
 #include <numeric>
 #include <random>
+#include <utility>
 
 namespace
 {
@@ -169,6 +171,29 @@ int main()
     Check("Coverage outside slider range is clamped",
         StrokeCoverage(dot.start, dot, 0.5f, -1.0f) == 0.0f &&
         StrokeCoverage(dot.start, dot, 0.5f, 2.0f) == 1.0f);
+
+    // The brush casts its ray from the cursor pixel; anything projected back onto the Scene View
+    // (the area overlay) must land on that same pixel, not on its mirror image.
+    WorldCamera camera{};
+    camera.eye = {12.0f, 60.0f, -45.0f};
+    camera.target = {0.0f, 0.0f, 0.0f};
+    camera.nearPlane = 0.1f;
+    camera.farPlane = 1000.0f;
+    constexpr std::uint32_t viewWidth = 800;
+    constexpr std::uint32_t viewHeight = 500;
+    camera.viewProjection = WorldMultiply(WorldLookAt(camera.eye, camera.target, {0.0f, 1.0f, 0.0f}),
+        WorldPerspective(ixtreeme::math::DegreesToRadians(45.0f), 800.0f / 500.0f, camera.nearPlane, camera.farPlane));
+    for (const auto& [mouseX, mouseY] : {std::pair{400, 250}, std::pair{120, 60}, std::pair{700, 440}, std::pair{380, 470}})
+    {
+        const WorldVec3 ray = WorldScreenRayDirection(camera, viewWidth, viewHeight, mouseX, mouseY);
+        const float t = -camera.eye.y / ray.y;
+        const WorldVec3 ground = camera.eye + ray * t;
+        float screenX = -1.0f, screenY = -1.0f;
+        Check("Ground hit under the cursor projects back onto the screen",
+            ray.y < 0.0f && WorldProjectToScreen(camera, ground, viewWidth, viewHeight, screenX, screenY));
+        Check("Projected ground hit lands on the cursor pixel",
+            std::abs(screenX - static_cast<float>(mouseX)) < 0.5f && std::abs(screenY - static_cast<float>(mouseY)) < 0.5f);
+    }
     std::cout << "Terrain splat paint: " << checks << " checks, " << failures << " failures\n";
     return failures == 0 ? 0 : 1;
 }

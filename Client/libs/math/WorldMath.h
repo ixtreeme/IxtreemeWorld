@@ -161,8 +161,9 @@ inline bool WorldProjectToScreen(const WorldCamera& camera,
     if (ndcX < -1.2f || ndcX > 1.2f || ndcY < -1.2f || ndcY > 1.2f)
         return false;
 
+    // Vulkan clip space (WorldPerspective): +y already points down the screen.
     outX = (ndcX * 0.5f + 0.5f) * static_cast<float>(width);
-    outY = (1.0f - (ndcY * 0.5f + 0.5f)) * static_cast<float>(height);
+    outY = (ndcY * 0.5f + 0.5f) * static_cast<float>(height);
     return true;
 }
 
