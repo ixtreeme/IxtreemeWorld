@@ -30,6 +30,9 @@ EntityTransfer BuildTransfer(flecs::entity entity, bool is_player, std::uint16_t
     if (is_player) {
         transfer.session = entity.get<SessionRef>().session;
         if (entity.has<WarpState>()) transfer.warp_state = entity.get<WarpState>();
+        if (const auto* area = entity.try_get<AreaPresence>()) {
+            transfer.area = *area;
+        }
     } else {
         transfer.wander = entity.get<WanderState>();
         transfer.mob_type_id = entity.get<MobTypeRef>().id;
@@ -75,6 +78,9 @@ flecs::entity ApplyTransfer(flecs::world& world, const EntityTransfer& transfer)
     if (transfer.is_player) {
         entity.set<SessionRef>({transfer.session}).add<PlayerTag>();
         entity.set<WarpState>(transfer.warp_state);
+        if (transfer.area.known) {
+            entity.set<AreaPresence>(transfer.area);
+        }
     } else {
         entity.set<WanderState>(transfer.wander)
             .set<MobTypeRef>({transfer.mob_type_id})

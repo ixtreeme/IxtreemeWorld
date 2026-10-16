@@ -74,6 +74,8 @@ public:
 
     mx::map::HeightSample Height(float world_x, float world_y) const noexcept;
     mx::map::CellSample Cell(float world_x, float world_y) const noexcept;
+    // Most specific area of the cell (areaIds layer); a flat world has none.
+    mx::map::AreaSample Area(float world_x, float world_y) const noexcept;
     // Walkable ground with data (Cell(...).Walkable()).
     bool IsWalkable(float world_x, float world_y) const noexcept
     {

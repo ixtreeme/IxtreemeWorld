@@ -20,6 +20,7 @@ set(GAMESERVER_WORLD_SOURCES
     src/world/zone/ZoneScheduler.cpp
     src/world/zone/ZoneWorkerPool.cpp
     src/world/systems/AiSystem.cpp
+    src/world/systems/AreaSystem.cpp
     src/world/systems/CombatSystem.cpp
     src/world/systems/CooldownSystem.cpp
     src/world/systems/LodSystem.cpp

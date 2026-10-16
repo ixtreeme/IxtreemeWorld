@@ -372,7 +372,7 @@ bool ParseArgs(int argc, char** argv, BenchConfig& config)
         config.mode != "worldpackage" && config.mode != "layerlookup" && config.mode != "layersupport" && config.mode != "layerclearance" && config.mode != "layeredpresence" && config.mode != "scriptwire" && config.mode != "terrain" && config.mode != "bootstrap" &&
         config.mode != "streaming" && config.mode != "worldquery" && config.mode != "streamsoak" &&
         config.mode != "streamlife" && config.mode != "streamadmission" && config.mode != "map4" &&
-        config.mode != "mapsplit") {
+        config.mode != "mapsplit" && config.mode != "areas") {
         std::cerr << "bad mode: " << config.mode << "\n";
         return false;
     }
@@ -5029,6 +5029,11 @@ int BenchMain(int argc, char** argv)
         // MAP-2 review: aggregate bootstrap resources (--grid N, default 32).
         const int scenario_failures = gs::bench::RunBootstrapScenario(config.bootstrap_grid);
         std::printf("BENCH-DONE bootstrap failures=%d\n", scenario_failures);
+        return scenario_failures == 0 ? 0 : 2;
+    }
+    if (config.mode == "areas") {
+        const int scenario_failures = gs::bench::RunAreaRuntimeScenario();
+        std::printf("BENCH-DONE areas failures=%d\n", scenario_failures);
         return scenario_failures == 0 ? 0 : 2;
     }
     if (config.mode == "mapsplit") {

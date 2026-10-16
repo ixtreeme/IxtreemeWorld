@@ -129,6 +129,7 @@ WorldRuntime::WorldRuntime(boost::asio::io_context& io,
             throw std::invalid_argument("WorldRuntime: invalid layered metadata: " + error);
         }
     }
+    areas_ = std::move(world.areas);
     if (world.layered_world && !world.layered_world->volumes.empty()) {
         layered_metadata_ = std::make_unique<const mx::map::LayeredWorld>(std::move(*world.layered_world));
         // 3D-5A: explicit layered admission uses the same immutable world.
@@ -705,6 +706,8 @@ ZoneTickContext WorldRuntime::BuildZoneTickContext()
     ctx.prepare_terrain=[this](float x,float y){return PrepareTerrain(x,y,0.0f);};
     ctx.layered = layered_metadata_.get();
     ctx.layer_actor = LayerActor();
+    ctx.areas = areas_ ? &*areas_ : nullptr;
+    ctx.area_transitions = &area_transitions_;
     return ctx;
 }
 
@@ -856,7 +859,8 @@ void WorldRuntime::Run()
                     ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
                                              activity_for_validation.get(), error,
                                              &spawn_.Presence(), scheduler_.WakeDecision().get()) &&
-                    ValidateLayeredPresence(zones_, layered_metadata_.get(), LayerActor(), error);
+                    ValidateLayeredPresence(zones_, layered_metadata_.get(), LayerActor(), error) &&
+                    ValidateAreaPresence(zones_, terrain_, world_logic_, Areas(), error);
                 std::lock_guard lock(validation_mutex_);
                 validation_result_ = ok ? std::string("OK") : "FAIL: " + error;
                 validation_ready_ = true;
@@ -1376,7 +1380,8 @@ bool WorldRuntime::ValidateConsistency(std::string& out_error)
     const auto activity = activity_field_.Snapshot();
     return ValidateWorldConsistency(zones_, owners_by_session_, migration_queue_, directory_,
                                     activity.get(), out_error, &spawn_.Presence(), scheduler_.WakeDecision().get()) &&
-           ValidateLayeredPresence(zones_, layered_metadata_.get(), LayerActor(), out_error);
+           ValidateLayeredPresence(zones_, layered_metadata_.get(), LayerActor(), out_error) &&
+           ValidateAreaPresence(zones_, terrain_, world_logic_, Areas(), out_error);
 }
 
 void WorldRuntime::RequestActivityValidation(std::size_t max_samples)

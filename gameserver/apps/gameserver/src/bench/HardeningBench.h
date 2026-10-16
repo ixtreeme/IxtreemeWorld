@@ -118,6 +118,8 @@ int RunTerrainScenario();
 // min-size refusal diagnostic, and the checked-in test map under the approved
 // R2 partitioning.
 int RunMapSplitScenario();
+// Areas at runtime: resolution, nested transitions, zone border, audit.
+int RunAreaRuntimeScenario();
 
 // MAP-2 review: aggregate bootstrap resources -- startup cost of the initial
 // partition (1 .. max_grid^2 initial zones on an empty 100 km world:

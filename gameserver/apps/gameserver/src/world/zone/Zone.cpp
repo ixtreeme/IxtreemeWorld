@@ -10,6 +10,7 @@
 #include "ZoneOwnership.h"
 #include "../activity/SpatialActivityField.h"
 #include "../systems/AiSystem.h"
+#include "../systems/AreaSystem.h"
 #include "../systems/CooldownSystem.h"
 #include "../systems/LodSystem.h"
 #include "../systems/MovementSystem.h"
@@ -269,6 +270,7 @@ void Zone::Tick(float dt, ZoneTickContext& ctx)
                 std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - movement_start)
                     .count()),
             std::memory_order_relaxed);
+        AreaSystem::Step(*this, ctx);
         AssertZoneOwner(*this, "flecs world progress");
         world_.progress(dt);
         diagnostics_.gameplay_micros_since_diag.fetch_add(

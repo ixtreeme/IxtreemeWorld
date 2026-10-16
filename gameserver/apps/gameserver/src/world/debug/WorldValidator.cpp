@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "../components/AreaComponents.h"
 #include "../components/LayerComponents.h"
 #include "../components/SimulationLod.h"
 #include "../components/Tags.h"
@@ -15,6 +16,7 @@
 #include "../partition/ZonePartition.h"
 #include "../spawn/PresenceRegistry.h"
 #include "../spatial/SpatialValidator.h"
+#include "../systems/AreaSystem.h"
 #include "../zone/Zone.h"
 #include "../zone/ZoneManager.h"
 
@@ -855,6 +857,42 @@ bool ValidateActivityFieldDetailed(const ZoneManager& zones,
     return true;
 }
 
+
+bool ValidateAreaPresence(const ZoneManager& zones,
+                          const TerrainService& terrain,
+                          const mx::map::WorldLogic& logic,
+                          const mx::map::AreaTable* areas,
+                          std::string& out_error)
+{
+    for (std::size_t zi = 0; zi < zones.ZoneCount(); ++zi) {
+        const auto& zone = zones.GetZone(zi);
+        for (const auto& [net_id, binding] : zone.Players()) {
+            (void)binding;
+            const auto entity = zone.FindEntity(net_id);
+            if (!entity.is_valid() || !entity.has<Position>()) {
+                continue;
+            }
+            const auto* held = entity.try_get<AreaPresence>();
+            if (held == nullptr || !held->known) {
+                continue;
+            }
+            const auto position = entity.get<Position>();
+            const auto* layer = entity.try_get<LayerPresence>();
+            const std::uint32_t volume = layer != nullptr ? layer->volume_id : 0;
+            if (held->x != position.x || held->y != position.y || held->volume_id != volume) {
+                continue;
+            }
+            const auto area = ResolveArea(terrain, logic, areas, position.x, position.y, volume);
+            if (area && *area != held->area) {
+                std::ostringstream message;
+                message << "area: player net " << net_id << " in zone " << zone.Id() << " holds area "
+                        << held->area << " but stands in area " << *area;
+                return Fail(out_error, message.str());
+            }
+        }
+    }
+    return true;
+}
 
 bool ValidateLayeredPresence(const ZoneManager& zones,
                              const mx::map::LayeredWorld* layered,

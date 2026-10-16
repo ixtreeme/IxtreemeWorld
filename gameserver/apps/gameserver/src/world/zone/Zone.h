@@ -20,6 +20,7 @@
 #include "db/CharacterRepository.h"
 #include "map/LayerActorMovement.h"
 #include "map/MapData.h"
+#include "map/WorldAreas.h"
 #include "network/Session.h"
 
 #include "../activity/ActivityTypes.h"
@@ -85,6 +86,10 @@ struct ZoneTickContext {
     // move only through these; without them they cannot move at all.
     const mx::map::LayeredWorld* layered = nullptr;
     mx::map::LayerActorProfile layer_actor{};
+    // Nested content areas of the package (null = none: the MXL1 rectangles
+    // of world_logic are the areas) and the world-wide transition counter.
+    const mx::map::AreaTable* areas = nullptr;
+    std::atomic<std::uint64_t>* area_transitions = nullptr;
 };
 
 // A zone owns exactly one flecs::world, which is the SOLE authoritative

@@ -75,6 +75,15 @@ mx::map::CellSample TerrainService::Cell(float world_x, float world_y) const noe
     return terrain_.Cell(world_x, world_y);
 }
 
+mx::map::AreaSample TerrainService::Area(float world_x, float world_y) const noexcept
+{
+    if (flat_ || !Contains(world_x, world_y)) {
+        return Contains(world_x, world_y) ? mx::map::AreaSample{mx::map::TerrainStatus::Ok, 0}
+                                          : mx::map::AreaSample{mx::map::TerrainStatus::OutsideWorld, 0};
+    }
+    return terrain_.Area(world_x, world_y);
+}
+
 std::size_t TerrainService::ResidentBytes() const noexcept
 {
     return flat_ ? 0 : terrain_.ResidentBytes();

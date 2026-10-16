@@ -12,6 +12,8 @@
 #include "../components/SimulationLod.h"
 #include "../OwnerMap.h"
 #include "map/LayerActorMovement.h"
+#include "map/MapData.h"
+#include "map/WorldAreas.h"
 
 // Debug/test world consistency audit across all zones. Checks:
 //  - every indexed NetId resolves to a live entity in exactly that zone
@@ -33,6 +35,7 @@ class ZoneManager;
 class MigrationQueue;
 class WorldDirectory;
 class PresenceRegistry;
+class TerrainService;
 
 bool ValidateWorldConsistency(ZoneManager& zones,
                               const OwnerMap& owners,
@@ -57,6 +60,15 @@ bool ValidateLayeredPresence(const ZoneManager& zones,
                              const mx::map::LayeredWorld* layered,
                              const mx::map::LayerActorProfile& actor,
                              std::string& out_error);
+// Area audit (all zones): a player whose area was resolved at the point it
+// stands on holds exactly the area ResolveArea answers there. A player that
+// moved since (its zone has not ticked yet) or stands on a point without
+// terrain data is not checked; mobs carry no area.
+bool ValidateAreaPresence(const ZoneManager& zones,
+                          const TerrainService& terrain,
+                          const mx::map::WorldLogic& logic,
+                          const mx::map::AreaTable* areas,
+                          std::string& out_error);
 bool ValidateActivityGeneration(const ZoneManager&,const ActivityGrid&,std::string&);
 bool ValidateActivityWake(const ZoneManager&,const ActivityWakeFrame*,std::string&);
 

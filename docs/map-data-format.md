@@ -1100,3 +1100,24 @@ Egy cella a raszter szerinti area-ba **és annak minden ősébe** tartozik.
   chunkot betölt.
 - Streaming esetén az induló halmaz a terepen lévő újraéledési pontok
   chunkjait is tartalmazza.
+
+### Futásidő (gameserver)
+- Minden zóna-tickben, a mozgás után az `AreaSystem` újra meghatározza
+  minden olyan játékos area-ját, aki az előző meghatározás óta elmozdult,
+  vagy még nincs area-ja. Sorrend: a köteten álló játékosnál a kötet
+  area-ja, ha van ilyen; különben a raszter; area-réteg nélküli csomagban
+  az az MXL1-téglalap, amelyik a pontot tartalmazza (lapos area-k, a világ
+  alapszabályaival). A világon kívül 0.
+- Ha a pont chunkja még nincs betöltve (streaming), a játékos megtartja
+  az előző area-t, és a következő tickben újra próbálkozik.
+- Az eredmény az `AreaPresence` komponensben él, a meghatározás helyével
+  együtt. Átmenet az első meghatározás, és minden olyan meghatározás, ahol
+  az area megváltozik. Az átmeneteket a futtatókörnyezet számolja.
+- A zónaváltás (`EntityTransfer`) az `AreaPresence`-t is viszi, így egy
+  area-n belüli zónahatár nem ad átmenetet.
+- A validátor ellenőrzi, hogy minden olyan játékos, akinek a pozíciója
+  azonos a meghatározás helyével, pontosan a pozíciójából számolt area-t
+  tartja.
+- A PvP-szabály egyelőre csak adat: a szerver ma minden PvP-támadást
+  elutasít, a kikényszerítés a PvP-harccal együtt jön.
+- Teszt: `worldbench --mode areas`.

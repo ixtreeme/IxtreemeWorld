@@ -7,6 +7,7 @@
 #include <flecs.h>
 
 #include "../components/AiComponents.h"
+#include "../components/AreaComponents.h"
 #include "../components/CombatComponents.h"
 #include "../components/LayerComponents.h"
 #include "../components/MigrationComponents.h"
@@ -52,6 +53,7 @@ static_assert(std::is_standard_layout_v<AttackCooldown>);
 static_assert(std::is_standard_layout_v<WanderState>);
 static_assert(std::is_standard_layout_v<SimulationLod>);
 static_assert(std::is_standard_layout_v<LayerPresence>);
+static_assert(std::is_standard_layout_v<AreaPresence>);
 
 struct EntityTransfer {
     GlobalEntityId entity_id;
@@ -85,6 +87,9 @@ struct EntityTransfer {
     // is the support-plane height and must never be re-derived from the
     // terrain on the destination (see IsLayered()).
     LayerPresence layer;
+    // The player's resolved content area rides along, so crossing a zone
+    // border inside one area raises no transition on the destination.
+    AreaPresence area;
 
     bool IsLayered() const noexcept
     {

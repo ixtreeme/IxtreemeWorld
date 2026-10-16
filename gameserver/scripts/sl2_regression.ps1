@@ -80,7 +80,7 @@ try {
         foreach($mode in @('lod','activity','loadfield','partitionscore','stability','splitmerge','ghost','aoi','replication','scheduler','tickrate','inputpath','netstress','presence','asfdeterminism','workerpool','replv2','protocol','hygiene')){Run-Case $mode @('--mode',$mode,'--seconds','3')}
         foreach($cycles in @('100','1000')){Run-Case "reclamation$cycles" @('--mode','reclamation','--cycles',$cycles)}
     } else {
-        $modes=if($Suite -eq 'debug'){@('streamadmission','streaming','worldquery','streamlife','map4','snapshot','worldpackage')}else{@('streamadmission','streaming','worldquery','streamlife','map4','snapshot','terrain','worldpackage','mapsplit','mapaudit','bootstrap')}
+        $modes=if($Suite -eq 'debug'){@('streamadmission','streaming','worldquery','streamlife','map4','snapshot','worldpackage','areas')}else{@('streamadmission','streaming','worldquery','streamlife','map4','snapshot','terrain','worldpackage','mapsplit','mapaudit','bootstrap','areas')}
         foreach($mode in $modes){Run-Case $mode @('--mode',$mode)}
     }
 } finally {$env:TEMP=$oldTemp;$env:TMP=$oldTmp}

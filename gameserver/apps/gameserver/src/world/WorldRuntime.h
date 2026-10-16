@@ -22,6 +22,7 @@
 #include "map/LayerActorMovement.h"
 #include "map/LayerGroundSupport.h"
 #include "map/MapData.h"
+#include "map/WorldAreas.h"
 #include "network/Session.h"
 
 #include "activity/ContinuousLoadField.h"
@@ -218,6 +219,17 @@ public:
     const mx::map::LayeredWorld* LayeredMetadata() const noexcept
     {
         return layered_metadata_.get();
+    }
+    // Nested content areas of the package (null = none; the MXL1 rectangles
+    // are then the flat areas). Immutable for this runtime's lifetime.
+    const mx::map::AreaTable* Areas() const noexcept
+    {
+        return areas_ ? &*areas_ : nullptr;
+    }
+    // Area transitions of players so far, the first resolution included.
+    std::uint64_t AreaTransitionsTotal() const noexcept
+    {
+        return area_transitions_.load(std::memory_order_relaxed);
     }
     // Half-open point lookup against the validated metadata. The returned
     // volume remains valid until this WorldRuntime is destroyed. Uncovered
@@ -771,6 +783,9 @@ private:
 
     TerrainService terrain_;
     std::unique_ptr<const mx::map::LayeredWorld> layered_metadata_;
+    // Nested content areas (areaIds + areaDefs); empty = the MXL1 areas.
+    std::optional<mx::map::AreaTable> areas_;
+    std::atomic<std::uint64_t> area_transitions_{0};
     // MAP-3: chunk streaming (null for eager / flat terrain). Declared after
     // terrain_: it mutates terrain_'s published slots and is destroyed first.
     std::unique_ptr<TerrainStreamer> streamer_;

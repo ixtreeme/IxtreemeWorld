@@ -35,6 +35,7 @@
 
 #include "../world/WorldConstants.h"
 #include "../world/WorldRuntime.h"
+#include "../world/components/AreaComponents.h"
 #include "../world/components/Tags.h"
 #include "../world/components/WarpState.h"
 #include "../world/components/MobComponents.h"
@@ -1575,6 +1576,167 @@ int RunMapSplitScenario()
     std::error_code ec;
     fs::remove_all(fs::temp_directory_path() / "ixw_mapruntime", ec);
     std::printf("MAPSPLIT-DONE passes=%d failures=%d\n", c.passes, c.failures);
+    return c.failures;
+}
+
+// ============================================================================
+// Areas at runtime (format section 15): every player's area after movement,
+// nested transitions, a zone border inside one area, the validator's audit,
+// and the MXL1 rectangles of a package without area layers.
+// ============================================================================
+int RunAreaRuntimeScenario()
+{
+    Checks c{"AREAS"};
+    struct PlayerArea {
+        bool found = false;
+        float x = 0.0f;
+        gs::game::ZoneId zone = 0;
+        std::uint32_t area = 0;
+        bool known = false;
+    };
+    auto read = [](gs::game::WorldRuntime& sim, gs::common::SessionId session) {
+        return ReadWorld(sim, [session](const WorldSnapshot& snap) {
+            PlayerArea out;
+            const auto it = snap.owners.find(session);
+            if (it == snap.owners.end() || it->second.zone_index >= snap.zones.ZoneCount()) {
+                return out;
+            }
+            const auto& zone = snap.zones.GetZone(it->second.zone_index);
+            const auto entity = zone.FindEntity(it->second.net_id);
+            if (!entity.is_valid() || !entity.has<gs::game::Position>()) {
+                return out;
+            }
+            out.found = true;
+            out.x = entity.get<gs::game::Position>().x;
+            out.zone = zone.Id();
+            if (const auto* area = entity.try_get<gs::game::AreaPresence>()) {
+                out.area = area->area;
+                out.known = area->known;
+            }
+            return out;
+        });
+    };
+    {
+        // 512 x 256 m, flat, 4 m cells, 32-cell chunks. Two regions of
+        // 256 x 256 m, so the zone border runs at x = 256. Areas: region 1
+        // is x < 320 (it spans the zone border), its town 2 is
+        // [64,192) x [64,192), the town's arena 4 is [96,128) x [96,128);
+        // area 3 (top level) is x >= 320.
+        mx::map::PackageWriteSpec spec;
+        spec.world_id = "areas-runtime";
+        spec.world_name = "areas runtime";
+        spec.size_cells_x = 128;
+        spec.size_cells_y = 64;
+        spec.cell_size_m = 4.0f;
+        spec.chunk_size_cells = 32;
+        spec.height_raw = [](std::uint32_t, std::uint32_t) -> std::int32_t { return 0; };
+        spec.attributes = [](std::uint32_t, std::uint32_t) -> std::uint16_t { return 0; };
+        spec.logic.spawns = {{1, 2, {150.0f, 100.0f, 160.0f, 110.0f}}};
+        spec.areas = {{1, 0, "region", "area.region", {}, {}},
+                      {2, 1, "town", "area.town", {}, {}},
+                      {3, 0, "east", "area.east", {}, {}},
+                      {4, 2, "arena", "area.arena", {}, {}}};
+        spec.area_id = [](std::uint32_t cx, std::uint32_t cy) -> std::uint16_t {
+            const float x = static_cast<float>(cx) * 4.0f;
+            const float y = static_cast<float>(cy) * 4.0f;
+            if (x >= 320.0f) {
+                return 3;
+            }
+            if (x >= 96.0f && x < 128.0f && y >= 96.0f && y < 128.0f) {
+                return 4;
+            }
+            return x >= 64.0f && x < 192.0f && y >= 64.0f && y < 192.0f ? 2 : 1;
+        };
+        spec.overwrite = true;
+        std::string error;
+        auto world = WriteAndLoad(FixtureDir("areas_runtime"), spec, error);
+        c.Report("nested-package-loads", world.has_value() && world->areas.has_value(), error);
+        if (!world) {
+            std::printf("AREAS-DONE passes=%d failures=%d\n", c.passes, c.failures);
+            return c.failures;
+        }
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {}, std::move(*world), gs::game::PartitionLayout{2, 1, 1, 1, {}});
+        gs::game::PartitionConfig partition;
+        partition.scoring.adaptive_enabled = false;
+        sim.ConfigurePartition(partition);
+        sim.Start();
+        constexpr gs::common::SessionId kSession = 1;
+        sim.PostSpawn(DetachedSession(runner.io, kSession), MakeCharacter(1),
+                      gs::game::DebugSpawnOverride{110.0f, 110.0f});
+        const bool resolved = WaitFor(5000ms, [&] { return read(sim, kSession).known; });
+        const auto start = read(sim, kSession);
+        const auto first = sim.AreaTransitionsTotal();
+        c.Report("first-resolution-is-the-deepest-area", resolved && start.area == 4 && first == 1,
+                 Fmt("known=%d area=%u transitions=%llu", start.known ? 1 : 0, start.area,
+                     static_cast<unsigned long long>(first)));
+        // Run east: arena 4 -> town 2 -> region 1 -> (zone border inside
+        // region 1) -> area 3.
+        std::vector<std::uint32_t> areas{start.area};
+        std::vector<gs::game::ZoneId> zones{start.zone};
+        std::uint32_t seq = 0;
+        std::string mid_audit = "not reached";
+        const auto deadline = Clock::now() + 60s;
+        PlayerArea now = start;
+        while (Clock::now() < deadline && now.x < 340.0f) {
+            sim.PostMoveInput(kSession, ++seq, 1.5707963f, gs::game::MoveState::Running);
+            std::this_thread::sleep_for(50ms);
+            now = read(sim, kSession);
+            if (now.found && now.area != areas.back()) {
+                areas.push_back(now.area);
+            }
+            if (now.found && now.zone != zones.back()) {
+                zones.push_back(now.zone);
+            }
+            if (mid_audit == "not reached" && now.x > 270.0f) {
+                mid_audit = AuditNow(sim);
+            }
+        }
+        sim.PostMoveInput(kSession, ++seq, 1.5707963f, gs::game::MoveState::Idle);
+        std::this_thread::sleep_for(200ms);
+        const auto transitions = sim.AreaTransitionsTotal();
+        std::string sequence;
+        for (const auto area : areas) {
+            sequence += (sequence.empty() ? "" : ">") + std::to_string(area);
+        }
+        c.Report("nested-walk-sequence", areas == std::vector<std::uint32_t>{4, 2, 1, 3},
+                 Fmt("areas %s, reached x=%.1f", sequence.c_str(), now.x));
+        c.Report("zone-border-inside-area-no-transition", zones.size() == 2 && transitions == 4,
+                 Fmt("zones crossed=%zu transitions=%llu (1 first + 3 area borders)", zones.size(),
+                     static_cast<unsigned long long>(transitions)));
+        const std::string end_audit = AuditNow(sim);
+        c.Report("validator-area-audit", mid_audit == "OK" && end_audit == "OK",
+                 "mid=" + mid_audit + " end=" + end_audit);
+        const auto* table = sim.Areas();
+        c.Report("runtime-table", table != nullptr && table->Depth(4) == 3 && table->IsWithin(4, 1),
+                 Fmt("depth(4)=%zu", table != nullptr ? table->Depth(4) : 0));
+        sim.Stop();
+    }
+    {
+        // Without area layers the MXL1 rectangles are the (flat) areas.
+        auto world = LoadBenchTestWorld();
+        const auto logic = world.logic;
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {}, std::move(world), LegacyTestMapLayout());
+        sim.Start();
+        const auto& region = logic.spawns.front();
+        sim.PostSpawn(DetachedSession(runner.io, 2), MakeCharacter(2),
+                      gs::game::DebugSpawnOverride{region.bounds.CenterX(), region.bounds.CenterY()});
+        WaitFor(5000ms, [&] { return read(sim, 2).known; });
+        const auto player = read(sim, 2);
+        std::uint32_t expected = 0;
+        for (const auto& area : logic.zones) {
+            if (area.bounds.ContainsHalfOpen(region.bounds.CenterX(), region.bounds.CenterY())) {
+                expected = area.id;
+            }
+        }
+        c.Report("mxl1-rect-area", player.known && expected != 0 && player.area == expected && sim.Areas() == nullptr,
+                 Fmt("known=%d area=%u expected=%u", player.known ? 1 : 0, player.area, expected));
+        sim.Stop();
+    }
+    std::error_code ec;
+    fs::remove_all(fs::temp_directory_path() / "ixw_mapruntime", ec);
+    std::printf("AREAS-DONE passes=%d failures=%d\n", c.passes, c.failures);
     return c.failures;
 }
 

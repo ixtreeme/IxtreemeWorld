@@ -3,6 +3,7 @@
 #include <flecs.h>
 
 #include "AiComponents.h"
+#include "AreaComponents.h"
 #include "CombatComponents.h"
 #include "GridSlot.h"
 #include "LayerComponents.h"
@@ -45,6 +46,7 @@ inline void RegisterWorldComponents(flecs::world& world)
     world.component<GridSlot>();
     world.component<WarpState>();
     world.component<LayerPresence>();
+    world.component<AreaPresence>();
 }
 
 } // namespace gs::game
