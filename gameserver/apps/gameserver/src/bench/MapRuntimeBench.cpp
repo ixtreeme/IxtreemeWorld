@@ -2,6 +2,7 @@
 #include "ReadinessBench.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -13,6 +14,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <random>
 #include <string>
@@ -24,9 +26,13 @@
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/read.hpp>
 
 #include "db/CharacterRepository.h"
 #include "network/Session.h"
+#include "protocol/Protocol.h"
+#include "protocol/Serialization.h"
+#include "schema/packet.capnp.h"
 
 #include "map/MapData.h"
 #include "map/ServerTerrain.h"
@@ -1584,6 +1590,68 @@ int RunMapSplitScenario()
 // nested transitions, a zone border inside one area, the validator's audit,
 // and the MXL1 rectangles of a package without area layers.
 // ============================================================================
+// A real loopback client that records every S2cAreaChanged it receives:
+// the chain's area ids, top level first.
+struct AreaWire {
+    asio::io_context io;
+    asio::ip::tcp::socket socket{io};
+    std::mutex mutex;
+    std::vector<std::vector<std::uint32_t>> chains;
+    std::thread reader;
+    ~AreaWire()
+    {
+        boost::system::error_code ec;
+        socket.close(ec);
+        if (reader.joinable()) {
+            reader.join();
+        }
+    }
+    std::vector<std::vector<std::uint32_t>> Chains()
+    {
+        std::lock_guard lock(mutex);
+        return chains;
+    }
+};
+
+std::shared_ptr<gs::network::Session> ConnectAreaWire(asio::io_context& server_io, asio::ip::tcp::acceptor& acceptor,
+                                                      AreaWire& wire, gs::common::SessionId id)
+{
+    wire.socket.connect(asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), acceptor.local_endpoint().port()));
+    asio::ip::tcp::socket server_socket(server_io);
+    acceptor.accept(server_socket);
+    wire.reader = std::thread([&wire] {
+        try {
+            std::vector<std::uint8_t> payload;
+            for (;;) {
+                std::array<std::uint8_t, 4> header{};
+                asio::read(wire.socket, asio::buffer(header));
+                const std::uint32_t length = static_cast<std::uint32_t>(header[0]) << 24 |
+                                             static_cast<std::uint32_t>(header[1]) << 16 |
+                                             static_cast<std::uint32_t>(header[2]) << 8 | header[3];
+                payload.resize(length);
+                if (length > 0) {
+                    asio::read(wire.socket, asio::buffer(payload));
+                }
+                if (payload.empty() || payload[0] != gs::protocol::kCodecCapnp) {
+                    continue;
+                }
+                const auto parsed = gs::protocol::ParsePacket(payload);
+                if (!parsed || !parsed->packet.isAreaChanged()) {
+                    continue;
+                }
+                std::vector<std::uint32_t> chain;
+                for (const auto link : parsed->packet.getAreaChanged().getChain()) {
+                    chain.push_back(link.getId());
+                }
+                std::lock_guard lock(wire.mutex);
+                wire.chains.push_back(std::move(chain));
+            }
+        } catch (...) {
+        }
+    });
+    return std::make_shared<gs::network::Session>(std::move(server_socket), id);
+}
+
 int RunAreaRuntimeScenario()
 {
     Checks c{"AREAS"};
@@ -1656,18 +1724,31 @@ int RunAreaRuntimeScenario()
             return c.failures;
         }
         IoRunner runner;
+        asio::ip::tcp::acceptor acceptor(runner.io, asio::ip::tcp::endpoint(asio::ip::address_v4::loopback(), 0));
+        // The runner (protocol 3) receives area messages; the bystander
+        // (protocol 2) stands still in region 1 and must receive none.
+        AreaWire runner_wire;
+        AreaWire bystander_wire;
+        constexpr gs::common::SessionId kSession = 1;
+        constexpr gs::common::SessionId kBystander = 3;
+        auto runner_session = ConnectAreaWire(runner.io, acceptor, runner_wire, kSession);
+        auto bystander_session = ConnectAreaWire(runner.io, acceptor, bystander_wire, kBystander);
+        runner_session->SetProtocolVersion(gs::protocol::kAreaProtocolVersion);
+        bystander_session->SetProtocolVersion(gs::protocol::kLayeredFramesProtocolVersion);
         gs::game::WorldRuntime sim(runner.io, {}, std::move(*world), gs::game::PartitionLayout{2, 1, 1, 1, {}});
         gs::game::PartitionConfig partition;
         partition.scoring.adaptive_enabled = false;
         sim.ConfigurePartition(partition);
         sim.Start();
-        constexpr gs::common::SessionId kSession = 1;
-        sim.PostSpawn(DetachedSession(runner.io, kSession), MakeCharacter(1),
-                      gs::game::DebugSpawnOverride{110.0f, 110.0f});
-        const bool resolved = WaitFor(5000ms, [&] { return read(sim, kSession).known; });
+        sim.PostSpawn(runner_session, MakeCharacter(1), gs::game::DebugSpawnOverride{110.0f, 110.0f});
+        sim.PostSpawn(bystander_session, MakeCharacter(3), gs::game::DebugSpawnOverride{40.0f, 40.0f});
+        const bool resolved =
+            WaitFor(5000ms, [&] { return read(sim, kSession).known && read(sim, kBystander).known; });
         const auto start = read(sim, kSession);
+        const auto bystander = read(sim, kBystander);
         const auto first = sim.AreaTransitionsTotal();
-        c.Report("first-resolution-is-the-deepest-area", resolved && start.area == 4 && first == 1,
+        c.Report("first-resolution-is-the-deepest-area",
+                 resolved && start.area == 4 && bystander.area == 1 && first == 2,
                  Fmt("known=%d area=%u transitions=%llu", start.known ? 1 : 0, start.area,
                      static_cast<unsigned long long>(first)));
         // Run east: arena 4 -> town 2 -> region 1 -> (zone border inside
@@ -1701,9 +1782,25 @@ int RunAreaRuntimeScenario()
         }
         c.Report("nested-walk-sequence", areas == std::vector<std::uint32_t>{4, 2, 1, 3},
                  Fmt("areas %s, reached x=%.1f", sequence.c_str(), now.x));
-        c.Report("zone-border-inside-area-no-transition", zones.size() == 2 && transitions == 4,
-                 Fmt("zones crossed=%zu transitions=%llu (1 first + 3 area borders)", zones.size(),
+        c.Report("zone-border-inside-area-no-transition", zones.size() == 2 && transitions == 5,
+                 Fmt("zones crossed=%zu transitions=%llu (2 first + 3 area borders)", zones.size(),
                      static_cast<unsigned long long>(transitions)));
+        // What the clients received: the runner one message per transition
+        // with the full chain, the protocol 2 bystander nothing.
+        WaitFor(2000ms, [&] { return runner_wire.Chains().size() >= 4; });
+        const auto chains = runner_wire.Chains();
+        std::string received;
+        for (const auto& chain : chains) {
+            std::string text;
+            for (const auto id : chain) {
+                text += (text.empty() ? "" : ".") + std::to_string(id);
+            }
+            received += (received.empty() ? "" : " ") + (text.empty() ? std::string("-") : text);
+        }
+        const std::vector<std::vector<std::uint32_t>> expected_chains{{1, 2, 4}, {1, 2}, {1}, {3}};
+        c.Report("protocol3-client-receives-each-chain", chains == expected_chains, "received " + received);
+        c.Report("protocol2-client-receives-no-area-message", bystander_wire.Chains().empty(),
+                 Fmt("messages=%zu", bystander_wire.Chains().size()));
         const std::string end_audit = AuditNow(sim);
         c.Report("validator-area-audit", mid_audit == "OK" && end_audit == "OK",
                  "mid=" + mid_audit + " end=" + end_audit);
@@ -1711,6 +1808,8 @@ int RunAreaRuntimeScenario()
         c.Report("runtime-table", table != nullptr && table->Depth(4) == 3 && table->IsWithin(4, 1),
                  Fmt("depth(4)=%zu", table != nullptr ? table->Depth(4) : 0));
         sim.Stop();
+        runner_session.reset();
+        bystander_session.reset();
     }
     {
         // Without area layers the MXL1 rectangles are the (flat) areas.

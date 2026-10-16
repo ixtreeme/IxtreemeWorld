@@ -435,6 +435,34 @@ void ServerDecoderChecks(Check& check)
         check("server-enter-world-accept-decodes-layered-spawn", ok, error);
     }
     {
+        // Protocol 3 area message: the nested chain and the effective rules.
+        mx::map::AreaDef region{1, 0, "region", "area.region", {}, {}};
+        region.rules.pvp = mx::map::PvpMode::Free;
+        region.rules.level_min = 10;
+        region.rules.level_max = 30;
+        region.rules.forbid = mx::map::area_flag::kNoMount | mx::map::area_flag::kNoPartyInvite;
+        region.rules.music_id = 7;
+        mx::map::AreaDef town{40000, 1, "town", "area.ösz.town", {}, {}};
+        town.rules.pvp = mx::map::PvpMode::DuelOnly;
+        town.rules.ambient_id = 65000;
+        const mx::map::AreaTable table({region, town});
+        const auto payload = gs::game::MakeAreaChanged(&table, mx::map::WorldLogic{}, 40000);
+        mmowire::ServerPacket out;
+        const bool ok = mmowire::DecodeServerPacket(payload.data(), payload.size(), out, error) &&
+                        out.tag == mmowire::Tag::AreaChanged && out.areaChain.size() == 2 &&
+                        out.areaChain[0].id == 1 && out.areaChain[0].nameKey == "area.region" &&
+                        out.areaChain[1].id == 40000 && out.areaChain[1].nameKey == "area.ösz.town" &&
+                        out.pvp == 1 && out.levelMin == 10 && out.levelMax == 30 &&
+                        out.forbidden == (mx::map::area_flag::kNoMount | mx::map::area_flag::kNoPartyInvite) &&
+                        out.musicId == 7 && out.ambientId == 65000;
+        check("server-area-changed-decodes-chain-and-rules", ok, error);
+        const auto none = gs::game::MakeAreaChanged(&table, mx::map::WorldLogic{}, 0);
+        mmowire::ServerPacket empty;
+        const bool none_ok = mmowire::DecodeServerPacket(none.data(), none.size(), empty, error) &&
+                             empty.tag == mmowire::Tag::AreaChanged && empty.areaChain.empty() && empty.pvp == 0;
+        check("server-area-changed-decodes-no-area", none_ok, error);
+    }
+    {
         const auto payload = gs::game::MakeEnterWorldRejectAlreadyInWorld();
         mmowire::ServerPacket out;
         const bool ok = mmowire::DecodeServerPacket(payload.data(), payload.size(), out, error) &&
@@ -670,8 +698,8 @@ void LoopbackChecks(Check& check)
     ok = ok && client.ReadPayload(reader, payload, 3000ms) &&
          mmowire::DecodeServerPacket(payload.data(), payload.size(), response, error);
     const bool handshakeOk = ok && response.tag == mmowire::Tag::HandshakeResponse && response.result == 0 &&
-                             response.serverProtocolVersion == 2;
-    check("loopback-script-handshake-real-handler-negotiates-2", handshakeOk,
+                             response.serverProtocolVersion == gs::protocol::kProtocolVersion;
+    check("loopback-script-handshake-real-handler-negotiates-3", handshakeOk,
           Fmt("result=%u version=%u message='%s'", response.result, response.serverProtocolVersion, response.message.c_str()));
 
     const auto statsBefore = handler.Stats();
@@ -695,11 +723,11 @@ void LoopbackChecks(Check& check)
               static_cast<unsigned long long>(statsAfter.moves_dropped_entering)));
     client.Close();
 
-    // A version the servers refuse (3) gets the mismatch answer and a close.
+    // A version the servers refuse (one above theirs) gets the mismatch answer and a close.
     WireClient refused;
     mmowire::FrameReader refusedReader;
     bytes.clear();
-    mmowire::AppendFrame(bytes, mmowire::EncodeHandshakeRequest(3, "scriptwire"));
+    mmowire::AppendFrame(bytes, mmowire::EncodeHandshakeRequest(gs::protocol::kProtocolVersion + 1, "scriptwire"));
     mmowire::ServerPacket mismatch;
     const bool mismatchOk = refused.Connect(port) && refused.SendRaw(bytes) &&
                             refused.ReadPayload(refusedReader, payload, 3000ms) &&
@@ -747,7 +775,7 @@ void LoopbackChecks(Check& check)
         }
         check("engine-tcpstream-handshake-with-real-handler",
               connected && answered && hello.tag == mmowire::Tag::HandshakeResponse && hello.result == 0 &&
-                  hello.serverProtocolVersion == 2,
+                  hello.serverProtocolVersion == gs::protocol::kProtocolVersion,
               Fmt("connected=%d answered=%d polls=%d error='%s'", connected ? 1 : 0, answered ? 1 : 0, polls,
                   stream ? stream->Error().c_str() : connectError.c_str()));
     }

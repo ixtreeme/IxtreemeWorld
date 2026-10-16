@@ -5,13 +5,16 @@
 namespace gs::protocol {
 
 // Highest protocol version this build speaks.
-constexpr std::uint32_t kProtocolVersion = 2;
+constexpr std::uint32_t kProtocolVersion = 3;
 // Oldest client protocol still accepted: version 1 clients keep working
 // unchanged (they never receive anything they cannot parse).
 constexpr std::uint32_t kMinProtocolVersion = 1;
 // 3D-5C1: from this version the gameserver sends layered transform frames
 // (opcode 0x12) that carry every entity's layered volume and layer.
 constexpr std::uint32_t kLayeredFramesProtocolVersion = 2;
+// Areas: from this version the gameserver sends S2cAreaChanged when a
+// player's content area is first resolved and whenever it changes.
+constexpr std::uint32_t kAreaProtocolVersion = 3;
 
 constexpr bool IsSupportedProtocolVersion(std::uint32_t version) noexcept
 {

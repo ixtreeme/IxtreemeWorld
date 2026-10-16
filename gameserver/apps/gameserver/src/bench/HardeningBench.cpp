@@ -906,7 +906,7 @@ int RunNetStressScenario(const NetStressConfig& config)
         {
             bool all_ok = true;
             std::string detail;
-            for (const std::uint32_t version : {0u, 1u, 2u, 3u}) {
+            for (const std::uint32_t version : {0u, 1u, 2u, 3u, 4u}) {
                 const bool supported = gs::protocol::IsSupportedProtocolVersion(version);
                 TestClient client;
                 std::vector<std::uint8_t> frame;
@@ -930,7 +930,7 @@ int RunNetStressScenario(const NetStressConfig& config)
                 detail += Fmt(" v%u:%s->%u", version, accepted ? "ok" : "refused", answered);
                 client.CloseGraceful();
             }
-            check("protocol-negotiation-accepts-1-and-2-refuses-others", all_ok, detail);
+            check("protocol-negotiation-accepts-1-to-3-refuses-others", all_ok, detail);
         }
         Progress("malformed");
         // ---- H2.1: malformed packets in every pre-world state -------------

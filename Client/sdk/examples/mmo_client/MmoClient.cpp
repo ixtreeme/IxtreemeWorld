@@ -19,7 +19,8 @@
 //   proxyMesh  mesh asset id for other players/mobs (empty: others are tracked but not drawn)
 //   visualLift metres added to the drawn height (e.g. half the mesh height when its pivot is centred)
 //   proxyMaterial    material (GUID or asset id) given to every proxy (SetMaterial, SDK v5)
-//   protocolVersion  1 or 2 (default 2); 1 behaves like a pre-layered client (v2 frames, no levels)
+//   protocolVersion  1, 2 or 3 (default 3); 1 behaves like a pre-layered client (v2 frames, no levels),
+//                    2 like a client before areas (no area messages)
 //
 // Coordinates: the server is z-up (x, y, z); the engine is y-up. server (x, y, z) == engine (x, z, y).
 // Heading 0 faces +server-y (engine +Z), pi/2 faces +x. Up/Down (or W/S) move along +-engine Z,
@@ -56,7 +57,7 @@
 namespace mmowire
 {
 
-constexpr std::uint32_t kProtocolVersion = 2;          // layered frames (0x12) need >= 2
+constexpr std::uint32_t kProtocolVersion = 3;          // layered frames (0x12) need >= 2, areas >= 3
 constexpr std::uint8_t kCodecCapnp = 0;
 constexpr std::uint8_t kCodecBinary = 1;
 constexpr std::size_t kMaxPayloadSize = 64u * 1024u;    // the servers' framing limit
@@ -89,6 +90,7 @@ enum class Tag : std::uint16_t
     AttackTarget = 13,
     EntityHealthUpdate = 14,
     EntityDeath = 15,
+    AreaChanged = 16,
 };
 
 inline void Wipe(std::string& s)
@@ -658,6 +660,20 @@ struct ServerPacket
     float hpCurrent = 0.0f;
     float hpMax = 0.0f;
     std::uint32_t killerNetId = 0;
+    // Area changed (protocol 3): the chain top-level first, and the most
+    // specific area's effective rules.
+    struct AreaLink
+    {
+        std::uint32_t id = 0;
+        std::string nameKey;
+    };
+    std::vector<AreaLink> areaChain;
+    std::uint16_t pvp = 0;          // 0 peaceful, 1 duel only, 2 free
+    std::uint16_t levelMin = 0;
+    std::uint16_t levelMax = 0;
+    std::uint32_t forbidden = 0;
+    std::uint32_t musicId = 0;
+    std::uint32_t ambientId = 0;
 };
 
 inline bool ReadVec3(CapnpReader& r, const CapnpReader::StructRef& parent, unsigned pointerIndex, float out[3])
@@ -768,6 +784,31 @@ inline bool DecodeServerPacket(const std::uint8_t* payload, std::size_t size, Se
         out.netId = static_cast<std::uint32_t>(r.Bits(s, 0, 32));
         out.killerNetId = static_cast<std::uint32_t>(r.Bits(s, 32, 32));
         return true;
+    case Tag::AreaChanged:
+    {
+        // S2cAreaChanged { chain ptr[0] -> List(AreaRef); pvp u16 bits[0,16), levelMin [16,32),
+        //   levelMax [32,48), forbidden u32 [64,96), musicId [96,128), ambientId [128,160) }
+        // AreaRef { id u32 bits[0,32); nameKey Text ptr[0] }
+        out.pvp = static_cast<std::uint16_t>(r.Bits(s, 0, 16));
+        out.levelMin = static_cast<std::uint16_t>(r.Bits(s, 16, 16));
+        out.levelMax = static_cast<std::uint16_t>(r.Bits(s, 32, 16));
+        out.forbidden = static_cast<std::uint32_t>(r.Bits(s, 64, 32));
+        out.musicId = static_cast<std::uint32_t>(r.Bits(s, 96, 32));
+        out.ambientId = static_cast<std::uint32_t>(r.Bits(s, 128, 32));
+        const CapnpReader::ListRef list = r.StructList(s, 0);
+        if (!list.valid || list.count > 16)
+            return error = "bad area chain", false;
+        for (std::uint32_t i = 0; i < list.count; ++i)
+        {
+            const CapnpReader::StructRef link = r.Element(list, i);
+            ServerPacket::AreaLink area;
+            area.id = static_cast<std::uint32_t>(r.Bits(link, 0, 32));
+            if (!r.Text(link, 0, area.nameKey))
+                return error = "bad area name key", false;
+            out.areaChain.push_back(std::move(area));
+        }
+        return true;
+    }
     default:
         return error = "unexpected packet tag " + std::to_string(static_cast<unsigned>(out.tag)), false;
     }
@@ -912,7 +953,8 @@ public:
         m_proxyMesh = Param("proxyMesh");
         m_visualLift = ParamFloat("visualLift", 0.0f);
         m_proxyMaterial = Param("proxyMaterial");
-        m_protocol = ParamFloat("protocolVersion", 2.0f) < 1.5f ? 1u : mmowire::kProtocolVersion;
+        const float requested = ParamFloat("protocolVersion", static_cast<float>(mmowire::kProtocolVersion));
+        m_protocol = requested < 1.5f ? 1u : requested < 2.5f ? 2u : mmowire::kProtocolVersion;
         Log("[MMO] client script started (login " + m_loginHost + ":" + std::to_string(m_loginPort) +
             ", protocol " + std::to_string(m_protocol) + ")");
         Enter(Phase::AskUsername);
@@ -1305,6 +1347,27 @@ private:
         case Tag::EntityDeath:
             Log("[MMO] net " + std::to_string(packet.netId) + " died (killer " + std::to_string(packet.killerNetId) + ")");
             return;
+        case Tag::AreaChanged:
+        {
+            // Left: the old chain below the common prefix (innermost first);
+            // entered: the new chain below it (outermost first).
+            std::size_t common = 0;
+            while (common < m_areaChain.size() && common < packet.areaChain.size() &&
+                   m_areaChain[common].id == packet.areaChain[common].id)
+                ++common;
+            for (std::size_t i = m_areaChain.size(); i > common; --i)
+                Log("[MMO] left area " + std::to_string(m_areaChain[i - 1].id) + " '" + m_areaChain[i - 1].nameKey + "'");
+            for (std::size_t i = common; i < packet.areaChain.size(); ++i)
+                Log("[MMO] entered area " + std::to_string(packet.areaChain[i].id) + " '" + packet.areaChain[i].nameKey + "'");
+            static const char* const kPvp[] = {"peaceful", "duel only", "free"};
+            char line[160];
+            std::snprintf(line, sizeof(line), "[MMO] area rules: pvp %s, levels %u-%u, forbidden 0x%x, music %u, ambient %u",
+                packet.pvp < 3 ? kPvp[packet.pvp] : "?", packet.levelMin, packet.levelMax, packet.forbidden,
+                packet.musicId, packet.ambientId);
+            Log(line);
+            m_areaChain = std::move(packet.areaChain);
+            return;
+        }
         default:
             Log("[MMO] ignored packet tag " + std::to_string(static_cast<unsigned>(packet.tag)));
             return;
@@ -1447,6 +1510,7 @@ private:
     float m_visualLift = 0.0f;
     std::string m_proxyMaterial;
     std::uint32_t m_protocol = mmowire::kProtocolVersion;  // requested in both handshakes
+    std::vector<mmowire::ServerPacket::AreaLink> m_areaChain; // current area, top level first
     std::uint32_t m_prompt = 0;
     std::string m_username;
     std::string m_password;              // wiped as soon as the login request is queued

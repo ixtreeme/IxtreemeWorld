@@ -1120,4 +1120,15 @@ Egy cella a raszter szerinti area-ba **és annak minden ősébe** tartozik.
   tartja.
 - A PvP-szabály egyelőre csak adat: a szerver ma minden PvP-támadást
   elutasít, a kikényszerítés a PvP-harccal együtt jön.
-- Teszt: `worldbench --mode areas`.
+- **Protokoll 3** (`kAreaProtocolVersion`): minden átmenetnél a játékos
+  `S2cAreaChanged` üzenetet kap. Ebben benne van a lánca, a legfelső
+  szintű area-tól a legszűkebbig (`id`, `nameKey`), és a legszűkebb area
+  effektív szabályai (PvP, szintsáv, tiltott bitek, zene, ambient). Az üres
+  lánc azt jelenti, hogy a játékos nem áll area-ban. Hogy mely area-kból
+  lépett ki és melyekbe be, azt a kliens számolja ki: a régi és az új lánc
+  közös eleje utáni részt hasonlítja össze. Az 1-es és 2-es protokollú
+  kliens ilyen üzenetet nem kap. A példakliens (`MmoClient`) 3-as
+  protokollal kapcsolódik, és naplózza a belépést és a kilépést.
+- Teszt: `worldbench --mode areas` (valódi hálózati klienssel is, 3-as és
+  2-es protokollal), `--mode scriptwire` (a kliens dekódolója a valódi
+  Cap'n Proto üzeneten).

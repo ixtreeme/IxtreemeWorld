@@ -164,6 +164,33 @@ struct S2cEntityDeath {
   killerNetId @1 :UInt32;
 }
 
+# === AREAS (protocol 3) ===
+# A content area (docs/map-data-format.md section 15). Sent to the player
+# when its area is first resolved and every time it changes. The client
+# finds the areas it left and entered by comparing the old and new chains.
+
+enum AreaPvp {
+  peaceful @0;
+  duelOnly @1;
+  free @2;
+}
+
+struct AreaRef {
+  id @0 :UInt32;
+  nameKey @1 :Text;   # localization key
+}
+
+struct S2cAreaChanged {
+  chain @0 :List(AreaRef); # top-level area first, the most specific last; empty = no area
+  # Effective rules of the most specific area (after inheritance).
+  pvp @1 :AreaPvp;
+  levelMin @2 :UInt16;     # 0 / 0 = no recommended range
+  levelMax @3 :UInt16;
+  forbidden @4 :UInt32;    # noMount 1, noPet 2, noTeleportOut 4, noPartyInvite 8
+  musicId @5 :UInt32;      # 0 = none
+  ambientId @6 :UInt32;    # 0 = none
+}
+
 # === ROOT PACKET (union) ===
 
 struct Packet {
@@ -184,5 +211,6 @@ struct Packet {
     attackTarget @13 :C2sAttackTarget;
     entityHealthUpdate @14 :S2cEntityHealthUpdate;
     entityDeath @15 :S2cEntityDeath;
+    areaChanged @16 :S2cAreaChanged;
   }
 }

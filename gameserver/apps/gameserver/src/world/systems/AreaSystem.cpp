@@ -1,10 +1,12 @@
 #include "AreaSystem.h"
 
 #include "common/Logging.h"
+#include "protocol/Protocol.h"
 
 #include "../components/AreaComponents.h"
 #include "../components/LayerComponents.h"
 #include "../components/TransformComponents.h"
+#include "../replication/ProtocolEncoder.h"
 #include "../terrain/TerrainService.h"
 #include "../zone/Zone.h"
 
@@ -46,7 +48,6 @@ std::optional<mx::map::AreaId> ResolveArea(const TerrainService& terrain,
 void AreaSystem::Step(Zone& zone, ZoneTickContext& ctx)
 {
     for (const auto& [net_id, binding] : zone.Players()) {
-        (void)binding;
         const auto entity = zone.FindEntity(net_id);
         if (!entity.is_valid() || !entity.has<Position>()) {
             continue;
@@ -71,6 +72,12 @@ void AreaSystem::Step(Zone& zone, ZoneTickContext& ctx)
                 ctx.area_transitions->fetch_add(1, std::memory_order_relaxed);
             }
             LOG_DEBUG("area: player net {} {} -> {}{}", net_id, from, *area, first ? " (first)" : "");
+            // Protocol 3 clients learn the chain and the effective rules;
+            // older clients never receive a message they cannot parse.
+            if (binding.session && ctx.send &&
+                binding.session->ProtocolVersion() >= gs::protocol::kAreaProtocolVersion) {
+                ctx.send(binding.session, MakeAreaChanged(ctx.areas, ctx.world_logic, *area));
+            }
         }
     }
 }

@@ -291,6 +291,61 @@ std::vector<std::uint8_t> MakeDeath(std::uint32_t net_id, std::uint32_t killer_n
     return gs::protocol::SerializeToBytes(msg);
 }
 
+std::vector<std::uint8_t> MakeAreaChanged(const mx::map::AreaTable* areas,
+                                          const mx::map::WorldLogic& logic,
+                                          mx::map::AreaId area)
+{
+    struct Link {
+        mx::map::AreaId id;
+        const std::string* name_key;
+    };
+    std::vector<Link> chain;
+    if (areas != nullptr) {
+        for (mx::map::AreaId at = area; at != 0; at = areas->Parent(at)) {
+            const auto* def = areas->Find(at);
+            if (def == nullptr) {
+                break;
+            }
+            chain.push_back({at, &def->name_key});
+        }
+        std::reverse(chain.begin(), chain.end());
+    } else if (area != 0) {
+        for (const auto& zone : logic.zones) {
+            if (zone.id == area) {
+                chain.push_back({area, &zone.name});
+                break;
+            }
+        }
+    }
+    const auto& rules = areas != nullptr ? areas->Rules(area) : mx::map::AreaTable::WorldDefaults();
+    capnp::MallocMessageBuilder msg;
+    auto packet = msg.initRoot<gs::protocol::Packet>();
+    auto changed = packet.initAreaChanged();
+    auto list = changed.initChain(static_cast<unsigned>(chain.size()));
+    for (std::size_t i = 0; i < chain.size(); ++i) {
+        list[static_cast<unsigned>(i)].setId(chain[i].id);
+        list[static_cast<unsigned>(i)].setNameKey(*chain[i].name_key);
+    }
+    switch (rules.pvp) {
+    case mx::map::PvpMode::DuelOnly:
+        changed.setPvp(gs::protocol::AreaPvp::DUEL_ONLY);
+        break;
+    case mx::map::PvpMode::Free:
+        changed.setPvp(gs::protocol::AreaPvp::FREE);
+        break;
+    case mx::map::PvpMode::Inherit: // never effective
+    case mx::map::PvpMode::Peaceful:
+        changed.setPvp(gs::protocol::AreaPvp::PEACEFUL);
+        break;
+    }
+    changed.setLevelMin(rules.level_min);
+    changed.setLevelMax(rules.level_max);
+    changed.setForbidden(rules.forbidden);
+    changed.setMusicId(rules.music_id);
+    changed.setAmbientId(rules.ambient_id);
+    return gs::protocol::SerializeToBytes(msg);
+}
+
 std::vector<std::uint8_t> EncodeTransformFrame(const BorderEntitySnapshot& viewer,
                                                const std::vector<BorderEntitySnapshot>& visible,
                                                std::uint32_t zone_tick)

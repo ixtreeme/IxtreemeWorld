@@ -9,6 +9,8 @@
 #include "../components/CombatComponents.h"
 #include "../components/MovementComponents.h"
 #include "../components/TransformComponents.h"
+#include "map/MapData.h"
+#include "map/WorldAreas.h"
 
 // Sole owner of wire-format knowledge (Cap'n Proto packets + the binary
 // transform codec). The WorldRuntime and Zone never format packets; they hand
@@ -88,6 +90,12 @@ std::vector<std::uint8_t> MakeSpawn(const BorderEntitySnapshot& snapshot);
 std::vector<std::uint8_t> MakeDespawn(std::uint32_t net_id);
 std::vector<std::uint8_t> MakeHealthUpdate(std::uint32_t net_id, const Hp& hp);
 std::vector<std::uint8_t> MakeDeath(std::uint32_t net_id, std::uint32_t killer_net_id);
+// Protocol >= kAreaProtocolVersion: the player's area chain (top level
+// first) and the most specific area's effective rules. Without an area
+// table, `area` is an MXL1 rectangle of `logic` (flat, world-default rules).
+std::vector<std::uint8_t> MakeAreaChanged(const mx::map::AreaTable* areas,
+                                          const mx::map::WorldLogic& logic,
+                                          mx::map::AreaId area);
 
 // Binary per-tick transform frame: self record + visible records.
 std::vector<std::uint8_t> EncodeTransformFrame(const BorderEntitySnapshot& viewer,

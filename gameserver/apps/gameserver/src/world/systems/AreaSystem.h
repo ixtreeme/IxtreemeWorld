@@ -29,7 +29,8 @@ class AreaSystem {
 public:
     // After movement: re-resolves every player that moved since its last
     // resolution, or has none yet. A different area -- or the first one --
-    // is a transition: counted and logged.
+    // is a transition: counted, logged and, for a protocol 3 session, sent
+    // to the player as S2cAreaChanged.
     static void Step(Zone& zone, ZoneTickContext& ctx);
 };
 
