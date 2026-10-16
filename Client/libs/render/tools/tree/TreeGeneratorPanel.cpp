@@ -27,9 +27,10 @@ namespace
 {
 constexpr const char* kViewWindow = "Tree Generator";
 
-template <typename Enum>
-bool ComboEnum(const char* label, Enum& value, const char* const* names, int count)
+template <typename Enum, std::size_t Count>
+bool ComboEnum(const char* label, Enum& value, const char* const (&names)[Count])
 {
+    constexpr int count = static_cast<int>(Count);
     int current = static_cast<int>(value);
     if (!UI::Prop::Combo(label, &current, names, count))
         return false;
@@ -287,10 +288,11 @@ void TreeGeneratorPanel::RenderView()
 
         // What the view shows, in its corner.
         char line[192];
-        std::snprintf(line, sizeof(line), "%s   %d triangles   %zu leaf cards",
+        std::snprintf(line, sizeof(line), "%s   %d triangles   %zu %s",
             activePresetName_ ? activePresetName_->c_str() : "Custom",
             mesh_.stats.barkTriangles + mesh_.stats.leafTriangles,
-            mesh_.leaves.vertices.size() / 4u);
+            mesh_.leaves.vertices.size() / 4u,
+            options_.leaves.style == ixtreemetree::LeafStyle::Fronds ? "frond quads" : "leaf cards");
         ImDrawList* draw = ImGui::GetWindowDrawList();
         draw->AddText(ImVec2(origin.x + 12.0f, origin.y + 10.0f), IM_COL32(205, 210, 220, 235), line);
         draw->AddText(ImVec2(origin.x + 12.0f, origin.y + 12.0f + ImGui::GetTextLineHeight()), IM_COL32(150, 156, 168, 210),
@@ -429,11 +431,11 @@ bool TreeGeneratorPanel::RenderBranchLevel(int level)
     }
     static const char* const shapes[] = {"Uniform", "Conical", "Spherical", "Hemispherical", "Tapered cylinder", "Flame",
         "Inverse conical", "Tend flame"};
-    changed |= ComboEnum("Crown shape", options_.branch.shape[level], shapes, 8);
+    changed |= ComboEnum("Crown shape", options_.branch.shape[level], shapes);
     UI::ItemTooltip("The crown's outline: how long these branches grow for where they start on the parent (Conical: long "
                     "at the bottom, short at the top, like a fir).");
     static const char* const arrangements[] = {"Random", "Whorled", "Spiral"};
-    changed |= ComboEnum("Arrangement", options_.branch.arrangement[level], arrangements, 3);
+    changed |= ComboEnum("Arrangement", options_.branch.arrangement[level], arrangements);
     UI::ItemTooltip("Where they sit on the parent: anywhere, in rings at the same height (a fir's whorls), or one after "
                     "another, turning by 137.5 degrees (a palm's crown).");
     if (options_.branch.arrangement[level] == ixtreemetree::BranchArrangement::Whorled)
@@ -536,8 +538,10 @@ bool TreeGeneratorPanel::RenderBark()
         "The bark's material. Drop a Material from the Asset Browser here, or click to pick one; "
         "with none, the built-in bark below is used.");
     ImGui::BeginDisabled(barkMaterial_.has_value());
-    static const char* const barkTypes[] = {"Oak", "Birch", "Pine", "Willow", "Ash"};
-    ComboEnum("Built-in bark", options_.bark.type, barkTypes, 5);
+    static const char* const barkTypes[] = {"Oak", "Birch", "Pine", "Willow", "Ash", "Palm"};
+    static_assert(std::size(barkTypes) == ixtreemetree::kBarkTypeCount);
+    ComboEnum("Built-in bark", options_.bark.type, barkTypes);
+    UI::ItemTooltip("The built-in bark texture; Palm has horizontal growth rings.");
     ImGui::EndDisabled();
     bool changed = DragVec2("Texture repeat", options_.bark.textureScale, 0.02f, 0.1f, 20.0f);
     UI::ItemTooltip("How many times the bark texture wraps around each branch (x) and repeats along it (y).");
@@ -560,15 +564,40 @@ bool TreeGeneratorPanel::RenderLeaves()
                         "after changing the leaf material's texture or alpha mode, save the tree again.");
     ImGui::PopTextWrapPos();
     ImGui::BeginDisabled(leafMaterial_.has_value());
-    static const char* const leafTypes[] = {"Oak", "Ash", "Pine", "Willow", "Birch"};
-    ComboEnum("Built-in leaves", options_.leaves.type, leafTypes, 5);
+    bool changed = false;
+    static const char* const leafTypes[] = {"Oak", "Ash", "Pine", "Willow", "Birch", "Palm", "Blossom", "Snowy Pine"};
+    static_assert(std::size(leafTypes) == ixtreemetree::kLeafTypeCount);
+    if (ComboEnum("Built-in leaves", options_.leaves.type, leafTypes))
+    {
+        const auto& texture = TreeTexturePalette::Instance().Leaf(options_.leaves.type);
+        options_.leaves.atlasGridX = texture.gridX;
+        options_.leaves.atlasGridY = texture.gridY;
+        changed = true;
+    }
+    UI::ItemTooltip("The built-in leaf texture. Palm uses a 2 by 1 atlas; the others use 2 by 2.");
     ImGui::EndDisabled();
 
-    bool changed = false;
+    static const char* const styles[] = {"Cards", "Fronds"};
+    changed |= ComboEnum("Style", options_.leaves.style, styles);
+    UI::ItemTooltip("Cards grow in clusters along twigs. Fronds turn each last-level branch into one long leaf, "
+                    "with its texture running from base to tip and no bark on the midrib.");
+    const bool fronds = options_.leaves.style == ixtreemetree::LeafStyle::Fronds;
+    if (fronds)
+    {
+        changed |= UI::Prop::DragFloat("Frond width", &options_.leaves.frondWidth, 0.01f, 0.02f, 8.0f, "%.2f m");
+        UI::ItemTooltip("The full width of a frond before folding; Size variance varies it between fronds.");
+        changed |= UI::Prop::DragFloat("Frond fold", &options_.leaves.frondFold, 0.5f, -80.0f, 80.0f, "%.1f deg");
+        UI::ItemTooltip("How far each half rises from the midrib, making a V-shaped cross section.");
+        ImGui::PushTextWrapPos(0.0f);
+        ImGui::TextDisabled("Frond count, length and curve follow the last branch level. Cluster, size and tilt "
+                            "controls below apply to Cards.");
+        ImGui::PopTextWrapPos();
+    }
     changed |= UI::Prop::SliderInt("Atlas columns", &options_.leaves.atlasGridX, 1, 8);
-    UI::ItemTooltip("How many leaf images the texture holds across (the built-in textures: 2 by 2); each card shows one.");
+    UI::ItemTooltip("How many leaf images the texture holds across; each card or frond shows one.");
     changed |= UI::Prop::SliderInt("Atlas rows", &options_.leaves.atlasGridY, 1, 8);
     UI::ItemTooltip("How many leaf images the texture holds down.");
+    ImGui::BeginDisabled(fronds);
     changed |= UI::Prop::DragInt("Clusters per twig", &options_.leaves.count, 0.1f, 0, 120);
     UI::ItemTooltip("Leaf clusters along each last-level branch.");
     changed |= UI::Prop::SliderInt("Cards per cluster", &options_.leaves.cardsPerCluster, 1, 7);
@@ -578,10 +607,11 @@ bool TreeGeneratorPanel::RenderLeaves()
     UI::ItemTooltip("Where along each twig the clusters begin: 0 at its base, 1 at its tip.");
     changed |= UI::Prop::DragFloat("Size", &options_.leaves.size, 0.01f, 0.02f, 8.0f, "%.2f m");
     UI::ItemTooltip("A leaf card's width and height.");
-    changed |= UI::Prop::DragFloat("Size variance", &options_.leaves.sizeVariance, 0.01f, 0.0f, 1.0f, "%.2f");
-    UI::ItemTooltip("How much the card sizes differ: 0.3 is up to 30% smaller or larger.");
     changed |= UI::Prop::DragFloat("Tilt", &options_.leaves.angle, 0.5f, 0.0f, 90.0f, "%.1f deg");
     UI::ItemTooltip("How far the cards lean out of their cluster.");
+    ImGui::EndDisabled();
+    changed |= UI::Prop::DragFloat("Size variance", &options_.leaves.sizeVariance, 0.01f, 0.0f, 1.0f, "%.2f");
+    UI::ItemTooltip("How much card sizes or frond widths differ: 0.3 is up to 30% smaller or larger.");
     if (material)
     {
         UI::Prop::Text("Alpha cutoff", "%.2f (the material's)", material->alphaCutoff);
@@ -603,7 +633,9 @@ void TreeGeneratorPanel::RenderOutput()
         mesh_.stats.barkTriangles + mesh_.stats.leafTriangles,
         mesh_.stats.barkTriangles,
         mesh_.stats.leafTriangles);
-    UI::Prop::Text("Leaf cards", "%zu", mesh_.leaves.vertices.size() / 4u);
+    UI::Prop::Text(options_.leaves.style == ixtreemetree::LeafStyle::Fronds ? "Frond quads" : "Leaf cards",
+        "%zu", mesh_.leaves.vertices.size() / 4u);
+    UI::ItemTooltip("Four-vertex leaf sections; each frond has two quads per length segment.");
     UI::Prop::Text("Leaf area", "%.0f m2", leafCardArea_);
     UI::ItemTooltip("The leaf cards' area per tree: every view and shadow cascade draws all of it. Fewer or smaller "
                     "leaves make the cheapest forest; saving trims the texture's transparent borders away.");
