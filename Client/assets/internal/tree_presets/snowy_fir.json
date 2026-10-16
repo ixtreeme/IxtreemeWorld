@@ -1,0 +1,19 @@
+{
+  "name": "Snowy Fir", "seed": 20261016, "type": "Evergreen",
+  "bark": {"type": "Pine", "textureScale": {"x": 1, "y": 4}},
+  "branch": {
+    "levels": 2, "angle": [0, 100, 55, 0], "children": [0, 48, 6, 0],
+    "gnarliness": [0.02, 0.05, 0.08, 0], "length": [12, 4, 1, 0.5],
+    "radius": [0.3, 0.08, 0.025, 0.01], "sections": [16, 6, 3, 3],
+    "segments": [8, 5, 3, 3], "start": [0, 0.12, 0.15, 0],
+    "taper": [0.15, 0.2, 0.3, 0.5], "twist": [0, 0, 0, 0],
+    "shape": ["Uniform", "Conical", "Uniform", "Uniform"],
+    "arrangement": ["Random", "Whorled", "Random", "Random"],
+    "whorlSize": [0, 6, 0, 0], "droop": [0, 0.04, 0, 0], "forceStrength": 0
+  },
+  "leaves": {
+    "type": "SnowyPine", "style": "Cards", "cardsPerCluster": 2,
+    "angle": 40, "count": 8, "start": 0.1, "size": 0.8,
+    "sizeVariance": 0.2, "alphaTest": 0.3
+  }
+}

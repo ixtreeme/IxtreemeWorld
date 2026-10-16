@@ -1,4 +1,7 @@
 #include "tools/tree/TreeTexturePalette.h"
+#include "import_export/tree/TreeGlbExporter.h"
+#include <ixtreemetree/preset.h>
+#include <ixtreemetree/tree.h>
 #include <stb_image.h>
 
 #include <chrono>
@@ -118,6 +121,30 @@ void Test()
     double darkRow = 0, lightRow = 0;
     for (int x = 0; x < 256; ++x) { darkRow += bark.At(x, 1, 0); lightRow += bark.At(x, 12, 0); }
     Check(lightRow > darkRow + 256 * 30, "palm bark has horizontal rings");
+
+    // Exercise the real save path: cutout polygons, copied textures and distant-tree baking must
+    // also accept the segmented fronds and the new flower/snow atlases.
+    for (const char* name : {"palm_tall", "palm_curved", "snowy_fir", "blossom_shrub", "round_shrub"})
+    {
+        const auto preset = ixtreemetree::loadPresetFile(fs::path(IXTREEME_TREE_INTERNAL_DIR) / "tree_presets" /
+            (std::string(name) + ".json"));
+        if (!preset) throw std::runtime_error(std::string("Cannot load export preset ") + name);
+        ixtreemetree::Tree tree;
+        tree.options = preset->options;
+        tree_tool::TreeMaterialBinding binding;
+        binding.barkBaseColorTexturePath = palette.Bark(tree.options.bark.type).path;
+        binding.leafBaseColorTexturePath = palette.Leaf(tree.options.leaves.type).path;
+        binding.leafAlphaCutoff = tree.options.leaves.alphaTest;
+        binding.impostor.enabled = true;
+        binding.impostor.resolution = 128;
+        const auto result = tree_tool::TreeGlbExporter::SaveAsAsset(tree.generate(), workspace.root / "project", name, binding);
+        Check(result.ok && fs::exists(result.modelPath), "new preset exports a GLB asset");
+        Check(result.leafAreaReduction > 0.0f && result.leafAreaReduction < 1.0f,
+            "new leaf geometry passes the export's alpha cutout");
+        Check(result.impostorBaked, "new preset bakes a distant-tree impostor");
+        if (!result.ok) std::cerr << result.error << '\n';
+        if (!result.impostorBaked) std::cerr << result.impostorWarning << '\n';
+    }
 }
 }
 int main(int argc, char** argv)

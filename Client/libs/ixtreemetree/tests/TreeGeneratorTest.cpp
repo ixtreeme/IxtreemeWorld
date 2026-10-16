@@ -4,8 +4,10 @@
 #include "ixtreemetree/tree.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <limits>
@@ -281,6 +283,28 @@ void TestCrownShape()
         "a spherical crown is widest in the middle");
 }
 
+void TestOtherCrownShapes()
+{
+    using ixtreemetree::CrownShape;
+    auto options = LevelBranches(40);
+    options.branch.arrangement[1] = ixtreemetree::BranchArrangement::Spiral;
+    const auto reaches = [&](CrownShape shape) {
+        options.branch.shape[1] = shape;
+        const auto tips = TipCards(options);
+        return std::array<float, 3>{Reach(tips, 2.0f, 2.8f), Reach(tips, 4.0f, 5.2f), Reach(tips, 9.0f, 10.0f)};
+    };
+    auto r = reaches(CrownShape::Hemispherical);
+    Check(r[0] > 2.8f && r[2] < 1.2f, "a hemispherical crown narrows from a broad base");
+    r = reaches(CrownShape::TaperedCylinder);
+    Check(r[0] > 2.8f && r[2] > 1.4f && r[2] < 1.9f, "a tapered cylinder keeps half its width at the top");
+    r = reaches(CrownShape::Flame);
+    Check(r[1] > 2.7f && r[0] < 1.2f && r[2] < 0.7f, "a flame crown is widest above its base");
+    r = reaches(CrownShape::InverseConical);
+    Check(r[0] < 0.9f && r[2] > 2.6f, "an inverse cone widens toward the top");
+    r = reaches(CrownShape::TendFlame);
+    Check(r[1] > 2.8f && r[0] < 2.1f && r[2] > 1.4f && r[2] < 1.9f, "a tended flame retains width at both ends");
+}
+
 std::size_t DistinctHeights(const std::vector<ixtreemetree::Vec3>& tips, float step)
 {
     std::vector<long> heights;
@@ -386,16 +410,29 @@ void TestFronds()
     bool flat = true;
     bool inCell = true;
     bool joined = true;
+    bool topology = true;
+    bool uvRunsToTip = true;
+    bool upwardNormals = true;
     float lowestTip = std::numeric_limits<float>::max();
     for (std::size_t q = 0; q < quads; ++q)
     {
         const ixtreemetree::Vertex* quad = v.data() + q * 4u;
+        const auto base = static_cast<std::uint32_t>(q * 4u);
+        const std::array<std::uint32_t, 6> expectedIndices{base, base + 1u, base + 2u, base, base + 2u, base + 3u};
+        topology = topology && std::equal(expectedIndices.begin(), expectedIndices.end(), mesh.leaves.indices.begin() + q * 6u);
+        upwardNormals = upwardNormals && quad[0].normal.y >= 0.0f;
+        const auto segmentIndex = (q / 2u) % 8u;
+        const float vBase = 1.0f - static_cast<float>(segmentIndex) / 8.0f;
+        const float vTip = 1.0f - static_cast<float>(segmentIndex + 1u) / 8.0f;
+        uvRunsToTip = uvRunsToTip && std::abs(quad[0].uv.y - vBase) < 1e-6f &&
+            std::abs(quad[1].uv.y - vBase) < 1e-6f && std::abs(quad[2].uv.y - vTip) < 1e-6f &&
+            std::abs(quad[3].uv.y - vTip) < 1e-6f;
         // A parallelogram: corner 1 is corner 2 plus corner 0 minus corner 3 (what the trim assumes).
         const ixtreemetree::Vec3 expected{quad[2].position.x + quad[0].position.x - quad[3].position.x,
             quad[2].position.y + quad[0].position.y - quad[3].position.y,
             quad[2].position.z + quad[0].position.z - quad[3].position.z};
         flat = flat && Distance(expected, quad[1].position) < 1e-4f;
-        const float cellX = quad[0].uv.x < 0.5f ? 0.0f : 0.5f;
+        const float cellX = v[(q / 16u) * 64u].uv.x;
         for (int i = 0; i < 4; ++i)
             inCell = inCell && quad[i].uv.x >= cellX - 1e-6f && quad[i].uv.x <= cellX + 0.5f + 1e-6f &&
                 quad[i].uv.y >= -1e-6f && quad[i].uv.y <= 1.0f + 1e-6f;
@@ -415,7 +452,21 @@ void TestFronds()
     Check(flat, "every frond segment is flat");
     Check(inCell, "a frond shows one atlas cell");
     Check(joined, "a frond's segments meet without cracks");
+    Check(topology, "fronds use the leaf trim's exact quad index convention");
+    Check(uvRunsToTip, "frond UVs run continuously from the cell's bottom to its top");
+    Check(upwardNormals, "frond face normals point upward");
     Check(lowestTip < 9.5f, "the fronds arch down below the crown");
+    if (v.size() >= 8u)
+    {
+        const auto& l = v[0].position;
+        const auto& c = v[1].position;
+        const auto& r = v[5].position;
+        const float half = Distance(l, c);
+        const float foldedDot = ((l.x - c.x) * (r.x - c.x) + (l.y - c.y) * (r.y - c.y) +
+            (l.z - c.z) * (r.z - c.z)) / (half * half);
+        Check(std::abs(half - 0.75f) < 1e-5f, "frond width sets both half widths");
+        Check(std::abs(foldedDot + 0.8660254f) < 1e-4f, "frond fold raises both halves by fifteen degrees");
+    }
 
     // The last level has no bark: fewer bark triangles than the same tree with leaf cards.
     ixtreemetree::Tree cards;
@@ -433,11 +484,27 @@ void TestFronds()
                 rgba[(y * 64 + x) * 4 + 3] = 255;
     const ixtreemetree::LeafTrimStats trim = ixtreemetree::trimLeafCards(trimmed, rgba, 64, 32, 1);
     Check(trim.trimmedCards == quads && trim.areaAfter < trim.areaBefore * 0.9, "the leaf trim fits each frond segment");
+    bool trimPreservesPlane = true;
+    for (std::size_t q = 0; q < quads; ++q)
+    {
+        const auto& origin = v[q * 4u].position;
+        const auto& normal = v[q * 4u].normal;
+        for (std::size_t corner = 0; corner < 4u; ++corner)
+        {
+            const auto& p = trimmed.vertices[q * 4u + corner].position;
+            const float distance = (p.x - origin.x) * normal.x + (p.y - origin.y) * normal.y + (p.z - origin.z) * normal.z;
+            trimPreservesPlane = trimPreservesPlane && std::abs(distance) < 1e-4f;
+        }
+    }
+    Check(trimPreservesPlane, "trimming keeps every frond segment in its original plane");
 }
 
 void TestPresets(bool print)
 {
-    const std::vector<ixtreemetree::Preset> presets = ixtreemetree::loadAllPresets(IXTREEMETREE_PRESET_DIR);
+    std::vector<std::string> errors;
+    const std::vector<ixtreemetree::Preset> presets = ixtreemetree::loadAllPresets(IXTREEMETREE_PRESET_DIR, &errors);
+    for (const auto& error : errors) std::cerr << error << '\n';
+    Check(errors.empty(), "every preset parses without errors");
     const auto find = [&](const char* name) -> const ixtreemetree::Preset* {
         const auto it = std::find_if(presets.begin(), presets.end(), [&](const ixtreemetree::Preset& p) { return p.name == name; });
         return it == presets.end() ? nullptr : &*it;
@@ -454,6 +521,8 @@ void TestPresets(bool print)
             std::cout << preset.name << ": height " << height << " m, width " << width << " m, bark " << mesh.stats.barkTriangles
                       << " / leaf " << mesh.stats.leafTriangles << " triangles\n";
         sane = sane && !mesh.bark.vertices.empty() && std::isfinite(height) && std::isfinite(width) && height > 0.5f && height < 120.0f;
+        for (float coordinate : {mesh.bboxMin.x, mesh.bboxMin.y, mesh.bboxMin.z, mesh.bboxMax.x, mesh.bboxMax.y, mesh.bboxMax.z})
+            sane = sane && std::isfinite(coordinate);
     }
     Check(sane, "every preset grows a tree of a sane size");
 
@@ -475,6 +544,60 @@ void TestPresets(bool print)
         Check(tree.generate().leaves.vertices.empty(), "the dead tree has no leaves");
     }
     Check(dead != nullptr, "the dead tree preset loads");
+    const auto* palm = find("Palm Tall");
+    Check(palm && palm->options.leaves.style == ixtreemetree::LeafStyle::Fronds &&
+        palm->options.leaves.type == ixtreemetree::LeafType::Palm && palm->options.bark.type == ixtreemetree::BarkType::Palm &&
+        palm->options.branch.arrangement[1] == ixtreemetree::BranchArrangement::Spiral &&
+        palm->options.leaves.atlasGridX == 2 && palm->options.leaves.atlasGridY == 1 &&
+        palm->options.leaves.frondWidth == 1.6f && palm->options.leaves.frondFold == 15.0f,
+        "the palm preset reads frond style, dimensions, textures and spiral");
+    const auto* curved = find("Palm Curved");
+    Check(curved && curved->options.branch.trunkSpread == 28.0f && curved->options.branch.droop[0] == -0.05f,
+        "the curved palm reads trunk lean and upward curve");
+    const auto* snowy = find("Snowy Fir");
+    Check(snowy && snowy->options.leaves.type == ixtreemetree::LeafType::SnowyPine &&
+        snowy->options.branch.shape[1] == ixtreemetree::CrownShape::Conical, "the snowy fir reads snow and cone");
+    const auto* blossom = find("Blossom Tree");
+    Check(blossom && blossom->options.leaves.type == ixtreemetree::LeafType::Blossom &&
+        blossom->options.branch.shape[1] == ixtreemetree::CrownShape::Spherical, "the blossom tree reads flowers and sphere");
+    const auto* blossomShrub = find("Blossom Shrub");
+    Check(blossomShrub && blossomShrub->options.leaves.type == ixtreemetree::LeafType::Blossom &&
+        blossomShrub->options.branch.trunks == 5 && blossomShrub->options.branch.trunkSpread == 35.0f,
+        "the blossom shrub reads flowers and several leaning stems");
+}
+
+void TestPresetDefaultsAndNumericEnums()
+{
+    const auto path = std::filesystem::temp_directory_path() / ("ixw_tree_options_" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".json");
+    struct Cleanup
+    {
+        std::filesystem::path path;
+        ~Cleanup() { std::error_code error; std::filesystem::remove(path, error); }
+    } cleanup{path};
+    {
+        std::ofstream file(path);
+        file << "{}";
+    }
+    const auto defaults = ixtreemetree::loadPresetFile(path);
+    Check(defaults && HashOf(defaults->options) == HashOf(ixtreemetree::defaultTreeOptions()) &&
+        defaults->options.leaves.style == ixtreemetree::LeafStyle::Cards && defaults->options.leaves.frondWidth == 1.2f &&
+        defaults->options.leaves.frondFold == 15.0f, "absent keys retain all generator defaults");
+    {
+        std::ofstream file(path);
+        file << R"({"branch":{"shape":[0,1,2,7],"arrangement":[0,1,2],"whorlSize":[0,5],"droop":[-0.05,0.22],
+            "trunks":5,"trunkSpread":30},"leaves":{"style":"Fronds","frondWidth":2.3,"frondFold":25}})";
+    }
+    const auto numeric = ixtreemetree::loadPresetFile(path);
+    Check(numeric && numeric->options.branch.shape[1] == ixtreemetree::CrownShape::Conical &&
+        numeric->options.branch.shape[2] == ixtreemetree::CrownShape::Spherical &&
+        numeric->options.branch.shape[3] == ixtreemetree::CrownShape::TendFlame &&
+        numeric->options.branch.arrangement[1] == ixtreemetree::BranchArrangement::Whorled &&
+        numeric->options.branch.arrangement[2] == ixtreemetree::BranchArrangement::Spiral &&
+        numeric->options.branch.whorlSize[1] == 5 && numeric->options.branch.trunks == 5 &&
+        numeric->options.branch.trunkSpread == 30.0f && numeric->options.branch.droop[0] == -0.05f &&
+        numeric->options.leaves.frondWidth == 2.3f && numeric->options.leaves.frondFold == 25.0f,
+        "numeric enums and every new numeric field load");
 }
 
 // The trees made before the generator learned crown shapes, arrangements, droop, several trunks and
@@ -518,7 +641,9 @@ void TestExistingTreesUnchanged(bool print)
         if (golden != std::end(kGolden))
             Check(golden->hash == hash, ("an existing tree is unchanged: " + name).c_str());
     }
-    Check(actual.size() >= std::size(kGolden), "every golden tree still loads");
+    for (const auto& golden : kGolden)
+        Check(std::count_if(actual.begin(), actual.end(), [&](const auto& tree) { return tree.first == golden.name; }) == 1,
+            (std::string("golden tree still loads exactly once: ") + golden.name).c_str());
 }
 } // namespace
 
@@ -529,12 +654,14 @@ int main(int argc, char** argv)
     TestLeavesAlongTwig();
     TestDoubleCardsCross();
     TestCrownShape();
+    TestOtherCrownShapes();
     TestArrangements();
     TestDroop();
     TestTrunks();
     TestFronds();
     TestExistingTreesUnchanged(argc > 1 && std::string(argv[1]) == "--print-golden");
     TestPresets(argc > 1 && std::string(argv[1]) == "--print-golden");
+    TestPresetDefaultsAndNumericEnums();
     if (g_errors == 0)
         std::cout << "TreeGeneratorTest: all checks passed\n";
     return g_errors == 0 ? 0 : 1;

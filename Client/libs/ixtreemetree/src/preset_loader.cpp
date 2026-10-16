@@ -237,6 +237,7 @@ private:
         for (;;)
         {
             std::string key;
+            skipWhitespace();
             if (!parseString(key, error))
                 return false;
             if (!consume(':'))
@@ -458,7 +459,7 @@ void ApplyBark(const JsonValue& root, TreeOptions& options)
         {"Oak", BarkType::Oak}, {"Bark001", BarkType::Oak},
         {"Birch", BarkType::Birch}, {"Bark002", BarkType::Birch},
         {"Pine", BarkType::Pine}, {"Bark_Pine", BarkType::Pine},
-        {"Willow", BarkType::Willow}, {"Ash", BarkType::Ash}
+        {"Willow", BarkType::Willow}, {"Ash", BarkType::Ash}, {"Palm", BarkType::Palm}
     });
     options.bark.tint = ColorOr(*bark, "tint", options.bark.tint);
     options.bark.flatShading = BoolOr(*bark, "flatShading", options.bark.flatShading);
@@ -517,8 +518,14 @@ void ApplyLeaves(const JsonValue& root, TreeOptions& options)
         {"Ash", LeafType::Ash}, {"leaf_ash", LeafType::Ash}, {"ash", LeafType::Ash},
         {"Pine", LeafType::Pine}, {"leaf_pine", LeafType::Pine}, {"pine", LeafType::Pine},
         {"Willow", LeafType::Willow}, {"leaf_willow", LeafType::Willow}, {"willow", LeafType::Willow},
-        {"Birch", LeafType::Birch}, {"leaf_birch", LeafType::Birch}, {"aspen", LeafType::Birch}
+        {"Birch", LeafType::Birch}, {"leaf_birch", LeafType::Birch}, {"aspen", LeafType::Birch},
+        {"Palm", LeafType::Palm}, {"Blossom", LeafType::Blossom}, {"SnowyPine", LeafType::SnowyPine}
     });
+    options.leaves.style = EnumOr(*leaves, "style", options.leaves.style, {
+        {"Cards", LeafStyle::Cards}, {"Fronds", LeafStyle::Fronds}
+    });
+    options.leaves.frondWidth = FloatOr(*leaves, "frondWidth", options.leaves.frondWidth);
+    options.leaves.frondFold = FloatOr(*leaves, "frondFold", options.leaves.frondFold);
     if (const JsonValue* billboard = Find(*leaves, "billboard"); billboard && billboard->type == JsonValue::Type::String)
     {
         const std::string mode = ToLower(billboard->string);

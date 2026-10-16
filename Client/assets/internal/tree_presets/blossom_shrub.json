@@ -1,0 +1,18 @@
+{
+  "name": "Blossom Shrub", "seed": 61021, "type": "Deciduous",
+  "bark": {"type": "Ash", "tint": "0xB8A898FF", "textureScale": {"x": 0.5, "y": 2}},
+  "branch": {
+    "levels": 2, "trunks": 5, "trunkSpread": 35,
+    "angle": [0, 45, 35, 0], "children": [0, 7, 5, 0],
+    "gnarliness": [0.15, 0.2, 0.15, 0], "length": [1.5, 1.2, 0.6, 0.3],
+    "radius": [0.055, 0.025, 0.012, 0.01], "sections": [5, 4, 3, 3],
+    "segments": [5, 4, 3, 3], "start": [0, 0.25, 0.15, 0],
+    "taper": [0.4, 0.3, 0.2, 0.5], "twist": [0, 10, 15, 0],
+    "shape": ["Uniform", "Spherical", "Uniform", "Uniform"], "forceStrength": 0
+  },
+  "leaves": {
+    "type": "Blossom", "style": "Cards", "cardsPerCluster": 2,
+    "angle": 40, "count": 7, "start": 0.1, "size": 0.65,
+    "sizeVariance": 0.25, "alphaTest": 0.35
+  }
+}

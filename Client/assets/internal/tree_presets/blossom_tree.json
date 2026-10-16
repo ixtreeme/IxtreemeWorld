@@ -1,0 +1,18 @@
+{
+  "name": "Blossom Tree", "seed": 61020, "type": "Deciduous",
+  "bark": {"type": "Ash", "tint": "0xB8A898FF", "textureScale": {"x": 1, "y": 3}},
+  "branch": {
+    "levels": 3, "angle": [0, 65, 40, 35], "children": [0, 12, 5, 3],
+    "gnarliness": [0.1, 0.18, 0.2, 0.15], "length": [4.8, 3.6, 1.4, 0.65],
+    "radius": [0.24, 0.11, 0.045, 0.018], "sections": [10, 7, 4, 3],
+    "segments": [9, 7, 5, 3], "start": [0, 0.38, 0.2, 0.1],
+    "taper": [0.25, 0.2, 0.2, 0.1], "twist": [5, 12, 15, 20],
+    "shape": ["Uniform", "Spherical", "Uniform", "Uniform"],
+    "droop": [0, -0.02, 0.02, 0.03], "forceStrength": 0.01
+  },
+  "leaves": {
+    "type": "Blossom", "style": "Cards", "cardsPerCluster": 3,
+    "angle": 35, "count": 7, "start": 0.15, "size": 0.85,
+    "sizeVariance": 0.25, "alphaTest": 0.35
+  }
+}
