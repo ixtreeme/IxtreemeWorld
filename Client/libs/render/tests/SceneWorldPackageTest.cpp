@@ -738,6 +738,106 @@ void TestPaletteScenePersistence(const TemporaryWorkspace& workspace)
     manager.CloseScene();
 }
 
+// Areas (format section 15): the scene's area table and painted raster are
+// exported, the editor's north-to-south rows become server south-to-north
+// rows, and they survive a save and reload.
+SceneData AreaFixture()
+{
+    auto scene = Fixture(false);
+    auto& terrain = scene.terrain;
+    // West half (source columns 0..2) is region 1; source cell (column 1,
+    // row 1) is its town 2; the east half has no area.
+    terrain.areaIds.assign(static_cast<std::size_t>(terrain.cellsX) * terrain.cellsZ, 0);
+    for (std::uint32_t row = 0; row < terrain.cellsZ; ++row) {
+        for (std::uint32_t column = 0; column < 3; ++column) {
+            terrain.areaIds[static_cast<std::size_t>(row) * terrain.cellsX + column] = 1;
+        }
+    }
+    terrain.areaIds[1 * terrain.cellsX + 1] = 2;
+    map::AreaDef region{1, 0, "region", "area.region", {}, {}};
+    region.rules.pvp = map::PvpMode::Free;
+    region.rules.level_min = 5;
+    region.rules.level_max = 15;
+    region.rules.forbid = map::area_flag::kNoMount;
+    region.rules.music_id = 3;
+    map::AreaDef town{2, 1, "town", "area.town", {}, {}};
+    town.rules.pvp = map::PvpMode::Peaceful;
+    town.rules.respawn = map::AreaPoint{-1.0f, -1.0f, 0};
+    scene.areas = {region, town};
+    return scene;
+}
+
+bool SameAreas(const std::vector<map::AreaDef>& a, const std::vector<map::AreaDef>& b)
+{
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        const auto& x = a[i];
+        const auto& y = b[i];
+        const bool same_respawn = x.rules.respawn.has_value() == y.rules.respawn.has_value() &&
+            (!x.rules.respawn || (x.rules.respawn->x == y.rules.respawn->x && x.rules.respawn->y == y.rules.respawn->y &&
+                                  x.rules.respawn->volume_id == y.rules.respawn->volume_id));
+        if (x.id != y.id || x.parent_id != y.parent_id || x.name != y.name || x.name_key != y.name_key ||
+            x.rules.pvp != y.rules.pvp || x.rules.level_min != y.rules.level_min || x.rules.level_max != y.rules.level_max ||
+            x.rules.forbid != y.rules.forbid || x.rules.allow != y.rules.allow || !same_respawn ||
+            x.rules.music_id != y.rules.music_id || x.rules.ambient_id != y.rules.ambient_id || x.volumes != y.volumes)
+            return false;
+    }
+    return true;
+}
+
+void TestAreas(const TemporaryWorkspace& workspace)
+{
+    const SceneData scene = AreaFixture();
+    SceneWorldPackageResult result;
+    const auto path = workspace.root / "area_package";
+    const bool exported = ExportSceneServerWorld(path, scene, {}, Options(), result);
+    if (!exported) {
+        for (const auto& error : result.errors) std::cout << "export error: " << error << '\n';
+    }
+    map::PackageReport report;
+    const auto loaded = exported ? map::LoadServerWorld(path, map::ValidationDepth::Full, report) : std::nullopt;
+    Check("areas-exported-and-pass-full-strict-loader", exported && loaded && report.Ok() && loaded->areas &&
+        loaded->areas->Defs().size() == 2);
+    // Server cell (1, 2) is source cell (column 1, row 4 - 1 - 2 = 1).
+    Check("area-raster-rows-reversed-like-attributes", loaded && loaded->terrain.Area(-3, 1).area == 2 &&
+        loaded->terrain.Area(-5, -3).area == 1 && loaded->terrain.Area(-3, -1).area == 1 &&
+        loaded->terrain.Area(3, 0).area == 0);
+    Check("area-rules-inherit-after-export", loaded && loaded->areas && loaded->areas->Rules(2).music_id == 3 &&
+        loaded->areas->Rules(2).pvp == map::PvpMode::Peaceful && loaded->areas->Rules(2).level_min == 5 &&
+        loaded->areas->Rules(2).forbidden == map::area_flag::kNoMount && loaded->areas->Rules(2).respawn &&
+        loaded->areas->Rules(1).pvp == map::PvpMode::Free);
+
+    auto no_table = AreaFixture();
+    no_table.areas.clear();
+    Rejected("area-painted-without-a-table-is-refused", workspace.root / "area_without_table", no_table);
+    auto unknown = AreaFixture();
+    unknown.terrain.areaIds[0] = 9;
+    Rejected("area-raster-naming-an-undefined-area-is-refused", workspace.root / "area_unknown_id", unknown);
+    auto blocked_respawn = AreaFixture();
+    blocked_respawn.areas[1].rules.respawn = map::AreaPoint{-5.0f, 3.0f, 0}; // the blocked north-west cell
+    Rejected("area-respawn-on-a-blocked-cell-is-refused", workspace.root / "area_blocked_respawn", blocked_respawn);
+
+    SceneWorldPackageResult plain_result;
+    const auto plain_path = workspace.root / "no_area_package";
+    const bool plain = ExportSceneServerWorld(plain_path, Fixture(false), {}, Options(), plain_result);
+    map::PackageReport plain_report;
+    const auto plain_loaded = plain ? map::LoadServerWorld(plain_path, map::ValidationDepth::Full, plain_report) : std::nullopt;
+    Check("scene-without-areas-exports-no-area-layers", plain_loaded && !plain_loaded->areas &&
+        !fs::exists(plain_path / map::kAreaDefsFile));
+
+    auto& manager = SceneManager::Instance();
+    manager.CloseScene();
+    manager.NewScene();
+    manager.SetCurrentSceneSnapshot(scene);
+    const auto scene_path = workspace.root / "area_authoring.scene";
+    const bool saved = manager.SaveSceneAs(scene_path.string());
+    manager.CloseScene();
+    const bool reloaded = saved && manager.LoadScene(scene_path.string());
+    Check("scene-manager-reloads-area-table", reloaded && SameAreas(manager.GetCurrentScene().areas, scene.areas));
+    Check("scene-manager-reloads-area-raster", reloaded && manager.GetCurrentScene().terrain.areaIds == scene.terrain.areaIds);
+    manager.CloseScene();
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -763,6 +863,7 @@ int main(int argc, char** argv)
         TestPublication(workspace);
         TestExactScenePersistence(workspace);
         TestPaletteScenePersistence(workspace);
+        TestAreas(workspace);
     } catch (const std::exception& exception) {
         Check("unexpected-test-exception",false);
         std::cout << "test exception: " << exception.what() << '\n';

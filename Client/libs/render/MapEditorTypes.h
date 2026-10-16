@@ -524,6 +524,9 @@ struct TerrainSceneData
     // Cell attributes in the same north-to-south source rows as heights.
     // Empty is the legacy all-walkable default.
     std::vector<std::uint16_t> attributes;
+    // Most specific content area per cell (same rows as attributes; 0 = no
+    // area). Empty: the terrain has no areas.
+    std::vector<std::uint16_t> areaIds;
     std::vector<std::uint8_t> splatABytes;
     std::vector<std::uint8_t> splatBBytes;
     bool triplanarEnabled = false;

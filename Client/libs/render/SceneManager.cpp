@@ -575,6 +575,24 @@ std::vector<std::uint8_t> BuildMxChunkBytes(const TerrainSceneData& terrain,
     }
     sections.push_back(std::move(attributes));
     buildSplatSection(4, terrain.splatBBytes);
+    if (!terrain.areaIds.empty())
+    {
+        Section areas;
+        areas.type = 5;
+        areas.bytes.reserve(static_cast<size_t>(chunkSize) * chunkSize * sizeof(std::uint16_t));
+        for (std::uint32_t y = 0; y < chunkSize; ++y)
+        {
+            for (std::uint32_t x = 0; x < chunkSize; ++x)
+            {
+                const std::uint32_t gx = chunkX * chunkSize + x;
+                const std::uint32_t gy = chunkY * chunkSize + y;
+                const size_t src = static_cast<size_t>(gy) * terrain.cellsX + gx;
+                PushU16(areas.bytes, gx < terrain.cellsX && gy < terrain.cellsZ && src < terrain.areaIds.size()
+                    ? terrain.areaIds[src] : std::uint16_t{0});
+            }
+        }
+        sections.push_back(std::move(areas));
+    }
 
     constexpr std::size_t kHeaderSize = 14;
     constexpr std::size_t kTocEntrySize = 12;
@@ -655,6 +673,12 @@ bool WriteTerrainChunkSet(const std::filesystem::path& scenePath,
         terrain.attributes.size() != static_cast<size_t>(terrain.cellsX) * terrain.cellsZ)
     {
         TraceError("[TCHUNK] invalid attribute grid dimensions");
+        return false;
+    }
+    if (!terrain.areaIds.empty() &&
+        terrain.areaIds.size() != static_cast<size_t>(terrain.cellsX) * terrain.cellsZ)
+    {
+        TraceError("[TCHUNK] invalid area grid dimensions");
         return false;
     }
     terrain.chunkSizeCells = std::clamp(terrain.chunkSizeCells == 0 ? 64u : terrain.chunkSizeCells, 32u, 256u);
@@ -761,6 +785,20 @@ bool ReadTerrainChunkSet(const std::filesystem::path& sceneDir,
             const size_t dst = static_cast<size_t>(y) * terrain.cellsX + x;
             if (src < field->attributes.size())
                 terrain.attributes[dst] = field->attributes[src];
+        }
+    }
+    terrain.areaIds.clear();
+    if (!field->area_ids.empty())
+    {
+        terrain.areaIds.assign(static_cast<size_t>(terrain.cellsX) * terrain.cellsZ, 0);
+        for (std::uint32_t y = 0; y < terrain.cellsZ; ++y)
+        {
+            for (std::uint32_t x = 0; x < terrain.cellsX; ++x)
+            {
+                const size_t src = static_cast<size_t>(y) * field->manifest.world_size_cells + x;
+                if (src < field->area_ids.size())
+                    terrain.areaIds[static_cast<size_t>(y) * terrain.cellsX + x] = field->area_ids[src];
+            }
         }
     }
     const size_t splatBytes = static_cast<size_t>(terrain.cellsX) * terrain.cellsZ * 4u;
@@ -1068,6 +1106,74 @@ std::vector<UiCanvas> ReadUiCanvases(const JsonValue& root)
         SanitizeUiCanvas(canvas); result.push_back(std::move(canvas));
     }
     return result;
+}
+
+// Nested content areas: id, parent, names and the authored rules (inherit
+// values included, so a reload keeps exactly what was authored).
+std::vector<mx::map::AreaDef> ReadAreas(const JsonValue& root)
+{
+    std::vector<mx::map::AreaDef> result;
+    const auto* list = Find(root, "areas");
+    if (!list || list->type != JsonValue::Type::Array)
+        return result;
+    for (const auto& object : list->array)
+    {
+        if (object.type != JsonValue::Type::Object || result.size() >= 1024)
+            continue;
+        mx::map::AreaDef area;
+        area.id = std::min<std::uint32_t>(ReadU32(object, "id", 0), mx::map::kMaxAreaId);
+        area.parent_id = std::min<std::uint32_t>(ReadU32(object, "parent_id", 0), mx::map::kMaxAreaId);
+        area.name = ReadString(object, "name");
+        area.name_key = ReadString(object, "name_key");
+        area.rules.pvp = static_cast<mx::map::PvpMode>(std::min<std::uint32_t>(ReadU32(object, "pvp", 0), 3u));
+        area.rules.level_min = static_cast<std::uint16_t>(std::min<std::uint32_t>(ReadU32(object, "level_min", 0), 65535u));
+        area.rules.level_max = static_cast<std::uint16_t>(std::min<std::uint32_t>(ReadU32(object, "level_max", 0), 65535u));
+        area.rules.forbid = ReadU32(object, "forbid", 0);
+        area.rules.allow = ReadU32(object, "allow", 0);
+        if (ReadBool(object, "has_respawn", false))
+        {
+            float point[2] = {0.0f, 0.0f};
+            ReadFloatArray(object, "respawn", point, 2);
+            area.rules.respawn = mx::map::AreaPoint{point[0], point[1], ReadU32(object, "respawn_volume", 0)};
+        }
+        area.rules.music_id = ReadU32(object, "music_id", 0);
+        area.rules.ambient_id = ReadU32(object, "ambient_id", 0);
+        if (const auto* volumes = Find(object, "volumes"); volumes && volumes->type == JsonValue::Type::Array)
+        {
+            for (const auto& volume : volumes->array)
+            {
+                if (area.volumes.size() < 1024)
+                    area.volumes.push_back(static_cast<std::uint32_t>(std::max(0.0, volume.NumberOr(0))));
+            }
+        }
+        result.push_back(std::move(area));
+    }
+    return result;
+}
+
+void WriteAreas(std::ostream& out, const std::vector<mx::map::AreaDef>& areas)
+{
+    out << "  \"areas\": [\n";
+    for (std::size_t i = 0; i < areas.size(); ++i)
+    {
+        const auto& area = areas[i];
+        const auto& rules = area.rules;
+        out << "    {\"id\":" << area.id << ",\"parent_id\":" << area.parent_id << ",\"name\":\""
+            << EscapeJson(area.name) << "\",\"name_key\":\"" << EscapeJson(area.name_key)
+            << "\",\"pvp\":" << static_cast<unsigned>(rules.pvp) << ",\"level_min\":" << rules.level_min
+            << ",\"level_max\":" << rules.level_max << ",\"forbid\":" << rules.forbid << ",\"allow\":" << rules.allow
+            << ",\"has_respawn\":" << (rules.respawn ? "true" : "false");
+        if (rules.respawn)
+        {
+            const float point[2] = {rules.respawn->x, rules.respawn->y};
+            out << ",\"respawn\":" << FloatArray(point, 2) << ",\"respawn_volume\":" << rules.respawn->volume_id;
+        }
+        out << ",\"music_id\":" << rules.music_id << ",\"ambient_id\":" << rules.ambient_id << ",\"volumes\":[";
+        for (std::size_t v = 0; v < area.volumes.size(); ++v)
+            out << (v ? "," : "") << area.volumes[v];
+        out << "]}" << (i + 1 < areas.size() ? "," : "") << "\n";
+    }
+    out << "  ],\n";
 }
 
 void WriteUiCanvases(std::ostream& out, const std::vector<UiCanvas>& canvases)
@@ -2653,6 +2759,7 @@ bool SceneManager::LoadSceneInternal(const std::string& path)
 
     SceneData scene;
     scene.uiCanvases = ReadUiCanvases(root);
+    scene.areas = ReadAreas(root);
     const JsonValue* metadata = Find(root, "metadata");
     if (metadata)
     {
@@ -3090,6 +3197,7 @@ bool SceneManager::SaveSceneInternal(const std::string& path)
         out << "  \"terrain\": null,\n";
     }
     WriteUiCanvases(out, scene.uiCanvases);
+    WriteAreas(out, scene.areas);
     out << "  \"entities\": [\n";
 
     const size_t entityCount =

@@ -59,6 +59,7 @@ void EditorSceneRuntime::BuildSceneSnapshot(SceneData& scene, bool includeTerrai
             scene.terrain = m_context.terrain->GetTerrainSceneInfo();
         }
         scene.paletteSlots = m_context.terrain->GetPaletteSlots();
+        scene.areas = m_context.terrain->GetAreaDefs();
     }
     else if (m_context.runtimeSession)
     {
@@ -172,6 +173,7 @@ void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
         if (scene.terrain.exists)
         {
             m_context.terrain->CreateFlatTerrain(*m_context.rhi, scene.terrain);
+            m_context.terrain->SetAreaDefs(scene.areas);
             terrainMs = lap();
             if (m_context.waterBodies)
             {
@@ -183,6 +185,7 @@ void EditorSceneRuntime::ApplySceneData(const SceneData& scene)
         else
         {
             m_context.terrain->ClearTerrain();
+            m_context.terrain->SetAreaDefs({});
             if (m_context.waterBodies)
                 m_context.waterBodies->clear();
             Tracen("[SCENE] no terrain in scene");

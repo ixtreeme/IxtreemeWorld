@@ -2,6 +2,7 @@
 
 #include "MapEditorTypes.h"
 #include "UiCanvas.h"
+#include "map/WorldAreas.h"
 
 #include <array>
 #include <cstdint>
@@ -25,6 +26,9 @@ struct SceneData
     std::vector<SpotLight> spotLights;
     std::vector<MeshSceneEntity> meshEntities;
     std::vector<UiCanvas> uiCanvases;
+    // Nested content areas the terrain's areaIds name (docs/map-data-format.md
+    // section 15); exported to the server package with the raster.
+    std::vector<mx::map::AreaDef> areas;
     std::array<MapEditorPaletteSlot, 8> paletteSlots{};
     std::vector<std::string> preloadAssets;
 };

@@ -18,10 +18,12 @@ constexpr std::uint16_t kSectionHeight = 1;
 constexpr std::uint16_t kSectionSplatA = 2;
 constexpr std::uint16_t kSectionAttributes = 3;
 constexpr std::uint16_t kSectionSplatB = 4;
+constexpr std::uint16_t kSectionAreaIds = 5;
 
 struct ParsedChunk {
     std::vector<std::int16_t> heights;
     std::vector<std::uint16_t> attributes;
+    std::vector<std::uint16_t> area_ids; // empty: no area section
     std::uint32_t splat_width = 0;
     std::uint32_t splat_height = 0;
     std::vector<std::uint8_t> splat_a_rgba8;
@@ -185,6 +187,20 @@ bool ParseChunk(const std::vector<std::uint8_t>& bytes,
             chunk.attributes.resize(expected_cells);
             for (std::size_t a = 0; a < chunk.attributes.size(); ++a) {
                 chunk.attributes[a] = ReadU16LE(src + a * sizeof(std::uint16_t));
+            }
+        } else if (section_type == kSectionAreaIds) {
+            // One uint16 per cell, or one for every cell (uniform).
+            const std::size_t expected_cells =
+                static_cast<std::size_t>(expected_chunk_cells) * expected_chunk_cells;
+            if (byte_length == sizeof(std::uint16_t)) {
+                chunk.area_ids.assign(expected_cells, ReadU16LE(src));
+            } else if (byte_length == expected_cells * sizeof(std::uint16_t)) {
+                chunk.area_ids.resize(expected_cells);
+                for (std::size_t a = 0; a < chunk.area_ids.size(); ++a) {
+                    chunk.area_ids[a] = ReadU16LE(src + a * sizeof(std::uint16_t));
+                }
+            } else {
+                return false;
             }
         } else if (section_type == kSectionSplatA) {
             if (!ReadSplatSection(src, byte_length, chunk.splat_width, chunk.splat_height, chunk.splat_a_rgba8)) {
@@ -457,6 +473,22 @@ std::optional<HeightField> LoadHeightField(const AssetReadFn& read, std::string_
                     }
                     field.attributes[static_cast<std::size_t>(dst_y) * manifest->world_size_cells + dst_x] =
                         chunk.attributes[static_cast<std::size_t>(y) * manifest->chunk_size_cells + x];
+                }
+            }
+            if (!chunk.area_ids.empty()) {
+                if (field.area_ids.empty()) {
+                    field.area_ids.assign(field.attributes.size(), 0);
+                }
+                for (std::uint32_t y = 0; y < manifest->chunk_size_cells; ++y) {
+                    for (std::uint32_t x = 0; x < manifest->chunk_size_cells; ++x) {
+                        const auto dst_x = dst_x0 + x;
+                        const auto dst_y = dst_y0 + y;
+                        if (dst_x >= manifest->world_size_cells || dst_y >= manifest->world_size_cells) {
+                            continue;
+                        }
+                        field.area_ids[static_cast<std::size_t>(dst_y) * manifest->world_size_cells + dst_x] =
+                            chunk.area_ids[static_cast<std::size_t>(y) * manifest->chunk_size_cells + x];
+                    }
                 }
             }
 

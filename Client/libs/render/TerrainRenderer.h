@@ -17,6 +17,7 @@
 #include "WorldCamera.h"
 #include "InputEvent.h"
 #include "MapEditorTypes.h"
+#include "map/WorldAreas.h"
 #include "SunShadow.h"
 
 #include "IXRHIBinding.h"
@@ -297,6 +298,11 @@ public:
     void SetWaterSculptBrush(bool visible, float worldX, float worldZ, float radiusMeters, bool addMode);
     void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
     const std::array<MapEditorPaletteSlot, 8>& GetPaletteSlots() const { return m_paletteSlots; }
+    // Nested content areas the area raster names (scene data, exported with
+    // the raster). The raster itself is one of the terrain grids.
+    const std::vector<mx::map::AreaDef>& GetAreaDefs() const { return m_areaDefs; }
+    void SetAreaDefs(std::vector<mx::map::AreaDef> areas) { m_areaDefs = std::move(areas); }
+    const std::vector<std::uint16_t>& GetAreaIds() const { return m_areaIds; }
     bool ApplyPaletteSlots(ixrhi::IXRHIDevice& rhi, const std::array<MapEditorPaletteSlot, 8>& slots);
     bool ApplyPaletteSlotParams(const MapEditorPaletteSlot& slot);
     bool ApplyPaletteSlotChange(ixrhi::IXRHIDevice& rhi, const MapEditorPaletteSlot& slot);
@@ -828,6 +834,8 @@ private:
     int32_t m_loadedServerY = 0;
     std::vector<float> m_heightCmGrid;
     std::vector<std::uint16_t> m_attributes;
+    std::vector<std::uint16_t> m_areaIds; // empty = no areas; else one id per cell
+    std::vector<mx::map::AreaDef> m_areaDefs;
     std::vector<std::uint8_t> m_splatABytes;
     std::vector<std::uint8_t> m_splatBBytes;
     std::vector<uint32_t> m_dirtyChunkTexels;

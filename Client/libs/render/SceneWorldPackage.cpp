@@ -119,6 +119,14 @@ bool ExportSceneServerWorld(const std::filesystem::path& path,
         if (std::any_of(terrain.attributes.begin(), terrain.attributes.end(), [](std::uint16_t bits) {
             return (bits & map::kAttributeReservedMask) != 0;
         })) return fail("terrain attributes use unsupported reserved bits; only blocked bit 0 is defined");
+        if (!terrain.areaIds.empty() && terrain.areaIds.size() != cell_count)
+            return fail("terrain area ids must be empty or contain exactly one id per source cell");
+        // Areas (format section 15): the raster names areas of the scene's
+        // table; the strict package validation below checks the rest.
+        const bool any_area_cell = std::any_of(terrain.areaIds.begin(), terrain.areaIds.end(),
+            [](std::uint16_t id) { return id != 0; });
+        if (any_area_cell && scene.areas.empty())
+            return fail("the terrain is painted with areas but the scene defines none");
         const float half_width = terrain.widthMeters * 0.5f, half_depth = terrain.depthMeters * 0.5f;
         result.worldBounds = {-half_width, -half_depth, half_width, half_depth};
         if (half_width > map::kMaxWorldCoordinate || half_depth > map::kMaxWorldCoordinate)
@@ -190,6 +198,13 @@ bool ExportSceneServerWorld(const std::filesystem::path& path,
                 terrain.attributes[static_cast<std::size_t>(terrain.cellsZ - 1u - y) * terrain.cellsX + x];
         };
         spec.logic.spawns.push_back(map::SpawnRegion{1, 0, spawn_bounds, options.spawnVolumeId});
+        if (!scene.areas.empty()) {
+            spec.areas = scene.areas;
+            spec.area_id = [&](std::uint32_t x, std::uint32_t y) {
+                return terrain.areaIds.empty() ? std::uint16_t{0} :
+                    terrain.areaIds[static_cast<std::size_t>(terrain.cellsZ - 1u - y) * terrain.cellsX + x];
+            };
+        }
         spec.water_model = scene.waterBodies.empty() ? map::WaterModel::None : map::WaterModel::Bodies;
         for (const auto& water : scene.waterBodies) {
             spec.water_bodies.push_back({water.id,

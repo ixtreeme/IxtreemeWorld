@@ -48,6 +48,9 @@ struct HeightField {
     std::uint32_t splat_height = 0;
     std::vector<std::int16_t> heights_cm;
     std::vector<std::uint16_t> attributes;
+    // Most specific area per cell (chunk section 5), same layout as
+    // attributes; empty when no chunk carries the section.
+    std::vector<std::uint16_t> area_ids;
     std::vector<std::uint8_t> splat_a_rgba8;
     std::vector<std::uint8_t> splat_b_rgba8;
 

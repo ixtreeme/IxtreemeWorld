@@ -60,6 +60,7 @@ void ReleaseTerrainGrids(TerrainSceneData& terrain)
 {
     std::vector<float>().swap(terrain.heightCmGrid);
     std::vector<std::uint16_t>().swap(terrain.attributes);
+    std::vector<std::uint16_t>().swap(terrain.areaIds);
     std::vector<std::uint8_t>().swap(terrain.splatABytes);
     std::vector<std::uint8_t>().swap(terrain.splatBBytes);
 }
@@ -1620,6 +1621,7 @@ bool TerrainRenderer::LoadMap(ixrhi::IXRHIDevice& rhi, const std::string& mapDir
         m_mapLoaded = false;
         m_heightCmGrid.clear();
         m_attributes.clear();
+        m_areaIds.clear();
         m_splatABytes.clear();
         m_splatBBytes.clear();
         m_activeSplatLayerSpan = -1;
@@ -1690,6 +1692,12 @@ bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSc
             expectedAttributeCount, next.attributes.size());
         return false;
     }
+    if (!next.areaIds.empty() && next.areaIds.size() != expectedAttributeCount)
+    {
+        TraceError("[TERRAIN-CREATE] invalid area id count: expected=%zu actual=%zu",
+            expectedAttributeCount, next.areaIds.size());
+        return false;
+    }
 
     rhi.WaitIdle();
     m_vertexBuffer.reset();
@@ -1714,6 +1722,7 @@ bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSc
     m_waterBodies.clear();
     m_heightCmGrid.clear();
     m_attributes.clear();
+    m_areaIds.clear();
     m_splatABytes.clear();
     m_splatBBytes.clear();
     m_activeSplatLayerSpan = -1;
@@ -1738,6 +1747,7 @@ bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSc
     m_attributes = next.attributes;
     if (m_attributes.empty())
         m_attributes.assign(expectedAttributeCount, 0);
+    m_areaIds = next.areaIds;
     m_heightUndoRecorded.assign(m_heightCmGrid.size(), 0);
     m_splatWidth = std::max(1u, next.cellsX);
     m_splatHeight = std::max(1u, next.cellsZ);
@@ -1823,6 +1833,7 @@ void TerrainRenderer::ClearTerrain()
     m_waterBodies.clear();
     m_heightCmGrid.clear();
     m_attributes.clear();
+    m_areaIds.clear();
     m_splatABytes.clear();
     m_splatBBytes.clear();
     m_activeSplatLayerSpan = -1;
@@ -1877,6 +1888,7 @@ void TerrainRenderer::GetTerrainSceneData(TerrainSceneData& out) const
     // same snapshot every frame copies megabytes instead of allocating them.
     std::vector<float> heights = std::move(out.heightCmGrid);
     std::vector<std::uint16_t> attributes = std::move(out.attributes);
+    std::vector<std::uint16_t> areaIds = std::move(out.areaIds);
     std::vector<std::uint8_t> splatA = std::move(out.splatABytes);
     std::vector<std::uint8_t> splatB = std::move(out.splatBBytes);
     out = GetTerrainSceneInfo();
@@ -1884,10 +1896,12 @@ void TerrainRenderer::GetTerrainSceneData(TerrainSceneData& out) const
         return;
     heights.assign(m_heightCmGrid.begin(), m_heightCmGrid.end());
     attributes.assign(m_attributes.begin(), m_attributes.end());
+    areaIds.assign(m_areaIds.begin(), m_areaIds.end());
     splatA.assign(m_splatABytes.begin(), m_splatABytes.end());
     splatB.assign(m_splatBBytes.begin(), m_splatBBytes.end());
     out.heightCmGrid = std::move(heights);
     out.attributes = std::move(attributes);
+    out.areaIds = std::move(areaIds);
     out.splatABytes = std::move(splatA);
     out.splatBBytes = std::move(splatB);
 }
@@ -4150,6 +4164,7 @@ void TerrainRenderer::Destroy()
     m_loadedServerY = 0;
     m_heightCmGrid.clear();
     m_attributes.clear();
+    m_areaIds.clear();
     m_splatABytes.clear();
     m_splatBBytes.clear();
     m_activeSplatLayerSpan = -1;
@@ -4613,6 +4628,7 @@ bool TerrainRenderer::CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::strin
     m_spawnLocalYcm = static_cast<float>(serverY) * 100.0f;
     m_heightCmGrid.resize(field->heights_cm.size());
     m_attributes = field->attributes;
+    m_areaIds = field->area_ids;
     const uint32_t chunksX = m_chunkSizeCells > 0 ? (m_mapSizeX + m_chunkSizeCells - 1u) / m_chunkSizeCells : 0;
     const uint32_t chunksY = m_chunkSizeCells > 0 ? (m_mapSizeY + m_chunkSizeCells - 1u) / m_chunkSizeCells : 0;
     m_dirtyChunkTexels.assign(static_cast<size_t>(chunksX) * chunksY, 0);
