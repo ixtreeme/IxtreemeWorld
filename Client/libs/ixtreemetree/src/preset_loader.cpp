@@ -401,6 +401,34 @@ void ReadNumericSeries(const JsonValue& parent, const char* key, std::array<T, N
     }
 }
 
+// A per-level series of enum names (or their numbers), e.g. "shape": ["Uniform", "Conical"].
+template <typename T, size_t N>
+void ReadEnumSeries(const JsonValue& parent, const char* key, std::array<T, N>& values,
+    std::initializer_list<std::pair<const char*, T>> names)
+{
+    const JsonValue* source = Find(parent, key);
+    if (!source || source->type != JsonValue::Type::Array)
+        return;
+    const size_t count = std::min(N, source->array.size());
+    for (size_t i = 0; i < count; ++i)
+    {
+        const JsonValue& item = source->array[i];
+        if (item.type == JsonValue::Type::Number)
+        {
+            const int index = static_cast<int>(item.number);
+            if (index >= 0 && index < static_cast<int>(names.size()))
+                values[i] = (names.begin() + index)->second;
+            continue;
+        }
+        if (item.type != JsonValue::Type::String)
+            continue;
+        const std::string text = ToLower(item.string);
+        for (const auto& pair : names)
+            if (text == ToLower(pair.first))
+                values[i] = pair.second;
+    }
+}
+
 std::string PresetNameFromPath(const std::filesystem::path& path)
 {
     std::string stem = path.stem().string();
@@ -454,6 +482,18 @@ void ApplyBranch(const JsonValue& root, TreeOptions& options)
     ReadNumericSeries(*branch, "start", options.branch.start);
     ReadNumericSeries(*branch, "taper", options.branch.taper);
     ReadNumericSeries(*branch, "twist", options.branch.twist);
+    ReadEnumSeries(*branch, "shape", options.branch.shape, {
+        {"Uniform", CrownShape::Uniform}, {"Conical", CrownShape::Conical}, {"Spherical", CrownShape::Spherical},
+        {"Hemispherical", CrownShape::Hemispherical}, {"TaperedCylinder", CrownShape::TaperedCylinder},
+        {"Flame", CrownShape::Flame}, {"InverseConical", CrownShape::InverseConical}, {"TendFlame", CrownShape::TendFlame}
+    });
+    ReadEnumSeries(*branch, "arrangement", options.branch.arrangement, {
+        {"Random", BranchArrangement::Random}, {"Whorled", BranchArrangement::Whorled}, {"Spiral", BranchArrangement::Spiral}
+    });
+    ReadNumericSeries(*branch, "whorlSize", options.branch.whorlSize);
+    ReadNumericSeries(*branch, "droop", options.branch.droop);
+    options.branch.trunks = std::clamp(IntOr(*branch, "trunks", options.branch.trunks), 1, 16);
+    options.branch.trunkSpread = std::clamp(FloatOr(*branch, "trunkSpread", options.branch.trunkSpread), 0.0f, 89.0f);
 
     if (const JsonValue* force = Find(*branch, "force"); force && force->type == JsonValue::Type::Object)
     {

@@ -416,6 +416,36 @@ bool TreeGeneratorPanel::RenderBranchLevel(int level)
     UI::ItemTooltip("Rings along the branch: more bend more smoothly, and cost triangles.");
     changed |= UI::Prop::DragInt("Radial segments", &options_.branch.segments[level], 0.1f, 3, 32);
     UI::ItemTooltip("Sides around the branch: more look rounder, and cost triangles.");
+    changed |= UI::Prop::DragFloat("Droop", &options_.branch.droop[level], 0.005f, -1.0f, 1.0f, "%.3f");
+    UI::ItemTooltip("How much the branch bends toward the ground for every metre it grows (a weeping willow's twigs, a "
+                    "palm's fronds); negative bends it up.");
+    if (level == 0)
+    {
+        changed |= UI::Prop::SliderInt("Trunks", &options_.branch.trunks, 1, 16);
+        UI::ItemTooltip("Stems growing from the ground: a shrub has several.");
+        changed |= UI::Prop::DragFloat("Trunk spread", &options_.branch.trunkSpread, 0.5f, 0.0f, 89.0f, "%.1f deg");
+        UI::ItemTooltip("How far the stems lean out from upright (a single trunk leans this far too).");
+        return changed;
+    }
+    static const char* const shapes[] = {"Uniform", "Conical", "Spherical", "Hemispherical", "Tapered cylinder", "Flame",
+        "Inverse conical", "Tend flame"};
+    changed |= ComboEnum("Crown shape", options_.branch.shape[level], shapes, 8);
+    UI::ItemTooltip("The crown's outline: how long these branches grow for where they start on the parent (Conical: long "
+                    "at the bottom, short at the top, like a fir).");
+    static const char* const arrangements[] = {"Random", "Whorled", "Spiral"};
+    changed |= ComboEnum("Arrangement", options_.branch.arrangement[level], arrangements, 3);
+    UI::ItemTooltip("Where they sit on the parent: anywhere, in rings at the same height (a fir's whorls), or one after "
+                    "another, turning by 137.5 degrees (a palm's crown).");
+    if (options_.branch.arrangement[level] == ixtreemetree::BranchArrangement::Whorled)
+    {
+        int whorlSize = options_.branch.whorlSize[level] > 0 ? options_.branch.whorlSize[level] : 4;
+        if (UI::Prop::SliderInt("Whorl size", &whorlSize, 2, 16))
+        {
+            options_.branch.whorlSize[level] = whorlSize;
+            changed = true;
+        }
+        UI::ItemTooltip("Branches in each ring.");
+    }
     return changed;
 }
 

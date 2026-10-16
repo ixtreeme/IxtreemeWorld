@@ -352,6 +352,48 @@ void TestTrunks()
     Check(lowered, "a leaning stem's tip is lower than an upright one's");
 }
 
+void TestPresets(bool print)
+{
+    const std::vector<ixtreemetree::Preset> presets = ixtreemetree::loadAllPresets(IXTREEMETREE_PRESET_DIR);
+    const auto find = [&](const char* name) -> const ixtreemetree::Preset* {
+        const auto it = std::find_if(presets.begin(), presets.end(), [&](const ixtreemetree::Preset& p) { return p.name == name; });
+        return it == presets.end() ? nullptr : &*it;
+    };
+    bool sane = !presets.empty();
+    for (const ixtreemetree::Preset& preset : presets)
+    {
+        ixtreemetree::Tree tree;
+        tree.options = preset.options;
+        const ixtreemetree::TreeMesh mesh = tree.generate();
+        const float height = mesh.bboxMax.y - mesh.bboxMin.y;
+        const float width = std::max(mesh.bboxMax.x - mesh.bboxMin.x, mesh.bboxMax.z - mesh.bboxMin.z);
+        if (print)
+            std::cout << preset.name << ": height " << height << " m, width " << width << " m, bark " << mesh.stats.barkTriangles
+                      << " / leaf " << mesh.stats.leafTriangles << " triangles\n";
+        sane = sane && !mesh.bark.vertices.empty() && std::isfinite(height) && std::isfinite(width) && height > 0.5f && height < 120.0f;
+    }
+    Check(sane, "every preset grows a tree of a sane size");
+
+    const ixtreemetree::Preset* fir = find("Fir Tree");
+    Check(fir && fir->options.branch.arrangement[1] == ixtreemetree::BranchArrangement::Whorled &&
+            fir->options.branch.whorlSize[1] == 6 && fir->options.branch.shape[1] == ixtreemetree::CrownShape::Conical &&
+            fir->options.branch.droop[1] > 0.0f, "the fir preset reads its whorls, cone and droop");
+    const ixtreemetree::Preset* shrub = find("Round Shrub");
+    Check(shrub && shrub->options.branch.trunks == 6 && shrub->options.branch.trunkSpread == 40.0f &&
+            shrub->options.branch.shape[1] == ixtreemetree::CrownShape::Spherical, "the shrub preset reads its stems and sphere");
+    const ixtreemetree::Preset* willow = find("Weeping Willow");
+    Check(willow && willow->options.branch.droop[2] > 0.3f && willow->options.branch.droop[1] < 0.0f,
+        "the willow preset reads its droop both ways");
+    const ixtreemetree::Preset* dead = find("Dead Tree");
+    if (dead)
+    {
+        ixtreemetree::Tree tree;
+        tree.options = dead->options;
+        Check(tree.generate().leaves.vertices.empty(), "the dead tree has no leaves");
+    }
+    Check(dead != nullptr, "the dead tree preset loads");
+}
+
 // The trees made before the generator learned crown shapes, arrangements, droop, several trunks and
 // fronds: their new settings default to the old behaviour, so every one must come out bit for bit
 // the same.
@@ -408,6 +450,7 @@ int main(int argc, char** argv)
     TestDroop();
     TestTrunks();
     TestExistingTreesUnchanged(argc > 1 && std::string(argv[1]) == "--print-golden");
+    TestPresets(argc > 1 && std::string(argv[1]) == "--print-golden");
     if (g_errors == 0)
         std::cout << "TreeGeneratorTest: all checks passed\n";
     return g_errors == 0 ? 0 : 1;
