@@ -5,6 +5,7 @@
 #include "script/ScriptComponent.h"
 #include "particles/ParticleComponents.h"
 #include "FogSettings.h"
+#include "map/WorldAreas.h"
 
 #include <cstdint>
 #include <cstddef>
@@ -28,7 +29,8 @@ enum class MapEditorToolMode
     None,
     WaterSculpt,
     Heightmap,
-    SplatPaint
+    SplatPaint,
+    AreaPaint
 };
 
 enum class EditorPlayMode
@@ -56,6 +58,7 @@ struct MapEditorSettings
     std::uint32_t textureSlot = 4;
     float paintEdgeSmoothing = 0.5f;
     float paintCoverage = 1.0f;
+    std::uint16_t areaPaintId = 0; // AreaPaint: the area painted (0 = erase)
     bool waterSculptActive = false;
     bool waterSculptAdd = true;
     float waterSculptRadiusMeters = 3.0f;
@@ -503,6 +506,16 @@ inline MeshSceneEntity MakeEmptySceneEntity(std::uint32_t id, const std::string&
     }
     return entity;
 }
+
+// One terrain cell edge between two different content areas, in world space
+// on the terrain surface (the editor's area overlay).
+struct AreaBoundarySegment
+{
+    float a[3] = {};
+    float b[3] = {};
+    std::uint16_t first = 0;  // area on one side (0 = none)
+    std::uint16_t second = 0; // area on the other side
+};
 
 struct TerrainSceneData
 {
@@ -1053,6 +1066,13 @@ struct MapEditorCommands
     bool exportFbxAnimations = true;
     bool paletteSlotChanged = false;
     bool paletteSlotParamsChanged = false;
+    // Areas: the whole edited table, and a raster remap when an area is
+    // deleted (its cells go to its parent).
+    bool areaDefsChanged = false;
+    std::vector<mx::map::AreaDef> areaDefs;
+    bool areaRemap = false;
+    std::uint16_t areaRemapFrom = 0;
+    std::uint16_t areaRemapTo = 0;
     std::uint32_t paletteSlot = 0;
     std::string paletteAssetId;
     std::string paletteTexturePath;

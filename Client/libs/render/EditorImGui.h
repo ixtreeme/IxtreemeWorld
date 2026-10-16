@@ -224,6 +224,11 @@ public:
     // (a LOD default saved), or another library (a project opened). For caches over its entries.
     std::uint64_t AssetLibraryRevision() const;
     void SetPaletteSlots(const std::array<MapEditorPaletteSlot, 8>& slots);
+    // Areas: the table the Areas tab edits, this frame's boundary segments
+    // (owned by the terrain) and the camera the overlay projects with.
+    void SetAreaDefs(const std::vector<mx::map::AreaDef>& areas);
+    void SetAreaBoundaries(const std::vector<AreaBoundarySegment>* boundaries) { m_areaBoundaries = boundaries; }
+    void SetSceneViewCamera(const WorldCamera& camera) { m_sceneViewCamera = camera; }
     void SetEngineRoot(const std::filesystem::path& clientRoot);
     void InitializeAssetLibrary(const std::filesystem::path& clientRoot);
     void InitializeProjectAssetLibrary(const std::filesystem::path& projectRoot, const std::filesystem::path& assetRoot);
@@ -317,6 +322,7 @@ private:
     void OpenMaterialGraphAsset(const AssetLibrary::Entry& entry);
     bool InspectorShowsMaterialGraph();
     void RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& imageSize);
+    void RenderSceneViewAreaOverlay(const ImVec2& imageMin, const ImVec2& imageSize);
     void RenderMenuBar();
     bool SaveProjectAndCurrentScene(bool automatic = false);
     // True (with a status message) while Play is running: Play-mode state is never saved.
@@ -445,6 +451,8 @@ private:
     void RenderWaterSculptTool();
     void RenderTerrainSculptTool();
     void RenderTerrainPaintTool();
+    void RenderTerrainAreasTool();
+    void CommitAreaDefs();
     void RenderSplatLayerSlot(std::uint32_t slotIndex, float slotWidth);
     void RenderMaterialEditor();
     // Type-specific controls rendered inside the shared Material Editor window.
@@ -941,7 +949,12 @@ private:
     bool m_shortcutsWindowOpen = false;
     bool m_openAboutPopup = false;
     bool m_inspectorShowDebugInfo = false;  // engine ids and asset paths in the Inspector
-    int m_terrainToolTab = 0;               // Inspector > Terrain: 0 Sculpt, 1 Paint, 2 Settings
+    int m_terrainToolTab = 0;               // Inspector > Terrain: 0 Sculpt, 1 Paint, 2 Settings, 3 Areas
+    std::vector<mx::map::AreaDef> m_areaDefs; // the Areas tab's working copy of the terrain's table
+    std::uint16_t m_selectedAreaId = 0;
+    bool m_showAreaOverlay = true;
+    const std::vector<AreaBoundarySegment>* m_areaBoundaries = nullptr;
+    WorldCamera m_sceneViewCamera{};
     std::vector<ConsoleMessage> m_consoleMessages;
     std::optional<ConsoleMessage> m_statusBarMessage;
     bool m_consoleShowInfo = true;

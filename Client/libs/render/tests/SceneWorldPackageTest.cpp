@@ -15,6 +15,7 @@
 #include <iterator>
 #include <latch>
 #include <limits>
+#include <map>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -850,6 +851,20 @@ int main(int argc, char** argv)
         if (loaded) std::cout << "world=" << report.manifest.world_id << " origin=" << report.manifest.origin_x << ',' <<
             report.manifest.origin_y << " size=" << report.manifest.size_cells_x << 'x' << report.manifest.size_cells_y <<
             " heightLayer=" << loaded->terrain.Encoding().layer_version << " chunks=" << report.chunks_decoded << '\n';
+        if (loaded && loaded->areas) {
+            // What the server resolves: each area's inherited rules and how many cells it holds.
+            std::map<std::uint32_t, std::size_t> cells;
+            for (std::uint32_t y = 0; y < report.manifest.size_cells_y; ++y)
+                for (std::uint32_t x = 0; x < report.manifest.size_cells_x; ++x)
+                    if (const auto sample = loaded->terrain.AreaAt(x, y); sample.Ok()) ++cells[sample.area];
+            for (const auto& def : loaded->areas->Defs()) {
+                const auto& rules = loaded->areas->Rules(def.id);
+                std::cout << "area " << def.id << " parent=" << def.parent_id << " name=" << def.name << " cells=" <<
+                    cells[def.id] << " pvp=" << map::ToString(rules.pvp) << " levels=" << rules.level_min << '-' <<
+                    rules.level_max << " forbidden=" << rules.forbidden << " music=" << rules.music_id << '\n';
+            }
+            std::cout << "area none cells=" << cells[0] << '\n';
+        }
         return failures == 0 ? 0 : 1;
     }
     try {

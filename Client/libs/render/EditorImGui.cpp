@@ -1931,6 +1931,15 @@ bool EditorImGui::MoveFolderToFolder(const std::string& sourceSubpath, const std
     return true;
 }
 
+void EditorImGui::SetAreaDefs(const std::vector<mx::map::AreaDef>& areas)
+{
+    m_areaDefs = areas;
+    const bool selectedExists = std::any_of(m_areaDefs.begin(), m_areaDefs.end(),
+        [this](const mx::map::AreaDef& area) { return area.id == m_selectedAreaId; });
+    if (!selectedExists)
+        m_selectedAreaId = 0;
+}
+
 void EditorImGui::SetToolMode(MapEditorToolMode mode)
 {
     if (!CanUseEditorTools())

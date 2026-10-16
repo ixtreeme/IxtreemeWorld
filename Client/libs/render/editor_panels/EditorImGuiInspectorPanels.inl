@@ -3082,3 +3082,355 @@ void EditorImGui::RenderTerrainPaintTool()
     if (UI::Prop::SliderFloat("UV rotation", &materialSlot.uvRotationDegrees, -180.0f, 180.0f, "%.1f deg"))
         commitMaterialParams();
 }
+
+// ---- areas (format section 15) -------------------------------------------------------------------
+
+void EditorImGui::CommitAreaDefs()
+{
+    m_commands.areaDefsChanged = true;
+    m_commands.areaDefs = m_areaDefs;
+}
+
+void EditorImGui::RenderTerrainAreasTool()
+{
+    const auto findArea = [&](std::uint32_t id) -> mx::map::AreaDef* {
+        for (mx::map::AreaDef& area : m_areaDefs)
+        {
+            if (area.id == id)
+                return &area;
+        }
+        return nullptr;
+    };
+    // Parent walks are bounded: a scene loaded from a hand-edited file may hold a cycle.
+    const auto depthOf = [&](std::uint32_t id) {
+        int depth = 0;
+        for (std::uint32_t at = id; at != 0 && depth <= static_cast<int>(mx::map::kMaxAreaDepth); ++depth)
+        {
+            const mx::map::AreaDef* area = findArea(at);
+            if (!area)
+                break;
+            at = area->parent_id;
+        }
+        return depth;
+    };
+    const auto isWithin = [&](std::uint32_t id, std::uint32_t ancestor) {
+        for (int guard = 0; id != 0 && guard <= static_cast<int>(mx::map::kMaxAreaDepth); ++guard)
+        {
+            if (id == ancestor)
+                return true;
+            const mx::map::AreaDef* area = findArea(id);
+            if (!area)
+                return false;
+            id = area->parent_id;
+        }
+        return false;
+    };
+    const auto newArea = [&](std::uint32_t parent) {
+        std::uint32_t id = 1;
+        while (id <= mx::map::kMaxAreaId && findArea(id))
+            ++id;
+        if (id > mx::map::kMaxAreaId || m_areaDefs.size() >= 1024)
+            return;
+        mx::map::AreaDef area;
+        area.id = id;
+        area.parent_id = parent;
+        area.name = "Area " + std::to_string(id);
+        area.name_key = "area." + std::to_string(id);
+        m_areaDefs.push_back(std::move(area));
+        m_selectedAreaId = static_cast<std::uint16_t>(id);
+        CommitAreaDefs();
+    };
+    if (m_selectedAreaId != 0 && !findArea(m_selectedAreaId))
+        m_selectedAreaId = 0;
+
+    if (UI::IconButton(ICON_FA_PLUS, "Area"))
+        newArea(0);
+    UI::ItemTooltip("A new top-level area");
+    ImGui::SameLine();
+    const bool canNest = m_selectedAreaId != 0 && depthOf(m_selectedAreaId) < static_cast<int>(mx::map::kMaxAreaDepth);
+    if (!canNest)
+        ImGui::BeginDisabled();
+    if (UI::IconButton(ICON_FA_PLUS, "Sub-area"))
+        newArea(m_selectedAreaId);
+    if (!canNest)
+        ImGui::EndDisabled();
+    UI::ItemTooltip("A new area inside the selected one (a town in a region, an arena in a town)");
+    ImGui::SameLine();
+    if (m_selectedAreaId == 0)
+        ImGui::BeginDisabled();
+    if (UI::IconButton(ICON_FA_TRASH, "Delete"))
+    {
+        const std::uint16_t doomed = m_selectedAreaId;
+        const mx::map::AreaDef* area = findArea(doomed);
+        const std::uint16_t parent = area ? static_cast<std::uint16_t>(area->parent_id) : 0;
+        for (mx::map::AreaDef& child : m_areaDefs)
+        {
+            if (child.parent_id == doomed)
+                child.parent_id = parent;
+        }
+        m_areaDefs.erase(std::remove_if(m_areaDefs.begin(), m_areaDefs.end(),
+            [doomed](const mx::map::AreaDef& a) { return a.id == doomed; }), m_areaDefs.end());
+        m_commands.areaRemap = true;
+        m_commands.areaRemapFrom = doomed;
+        m_commands.areaRemapTo = parent;
+        if (m_editorSettings.areaPaintId == doomed)
+            m_editorSettings.areaPaintId = parent;
+        m_selectedAreaId = parent;
+        CommitAreaDefs();
+    }
+    if (m_selectedAreaId == 0)
+        ImGui::EndDisabled();
+    UI::ItemTooltip("Delete the selected area: its sub-areas move up a level, its painted cells go to its parent");
+
+    if (ImGui::BeginChild("##area_tree", ImVec2(0.0f, 170.0f), ImGuiChildFlags_Borders))
+    {
+        if (m_areaDefs.empty())
+            ImGui::TextDisabled("No areas yet: add one, then paint it.");
+        std::function<void(std::uint32_t, int)> drawChildren = [&](std::uint32_t parent, int depth) {
+            if (depth > static_cast<int>(mx::map::kMaxAreaDepth))
+                return;
+            for (const mx::map::AreaDef& area : m_areaDefs)
+            {
+                const bool orphan = area.parent_id == 0 || area.parent_id == area.id || !findArea(area.parent_id);
+                if (parent == 0 ? !orphan : (area.parent_id != parent || area.id == parent))
+                    continue;
+                const bool hasChildren = std::any_of(m_areaDefs.begin(), m_areaDefs.end(),
+                    [&](const mx::map::AreaDef& other) { return other.parent_id == area.id && other.id != area.id; });
+                ImGui::PushID(static_cast<int>(area.id));
+                const ImVec2 swatch = ImGui::GetCursorScreenPos();
+                const float size = ImGui::GetTextLineHeight() * 0.7f;
+                ImGui::GetWindowDrawList()->AddRectFilled(ImVec2(swatch.x, swatch.y + size * 0.25f),
+                    ImVec2(swatch.x + size, swatch.y + size * 1.25f), EditorAreaColor(static_cast<std::uint16_t>(area.id), 1.0f), 2.0f);
+                ImGui::Dummy(ImVec2(size, size));
+                ImGui::SameLine();
+                ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_SpanAvailWidth |
+                    ImGuiTreeNodeFlags_DefaultOpen;
+                if (!hasChildren)
+                    flags |= ImGuiTreeNodeFlags_Leaf;
+                if (area.id == m_selectedAreaId)
+                    flags |= ImGuiTreeNodeFlags_Selected;
+                const bool open = ImGui::TreeNodeEx("##area", flags, "%s  (%u)", area.name.c_str(), area.id);
+                if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+                    m_selectedAreaId = static_cast<std::uint16_t>(area.id);
+                if (open)
+                {
+                    drawChildren(area.id, depth + 1);
+                    ImGui::TreePop();
+                }
+                ImGui::PopID();
+            }
+        };
+        drawChildren(0, 0);
+    }
+    ImGui::EndChild();
+
+    ImGui::SeparatorText("Paint");
+    const bool painting = m_editorSettings.toolMode == MapEditorToolMode::AreaPaint;
+    const char* modes[] = {"Paint selected", "Erase"};
+    const int current = painting ? (m_editorSettings.areaPaintId == 0 ? 1 : 0) : -1;
+    const int clicked = SegmentedChoice("terrain_area_tool", modes, 2, current);
+    if (clicked >= 0)
+    {
+        if (clicked == current)
+            SetToolMode(MapEditorToolMode::None);
+        else if (clicked == 0 && m_selectedAreaId == 0)
+            m_assetStatus = "Select an area to paint";
+        else
+        {
+            m_editorSettings.areaPaintId = clicked == 0 ? m_selectedAreaId : std::uint16_t{0};
+            SetToolMode(MapEditorToolMode::AreaPaint);
+        }
+    }
+    // Painting follows the selection.
+    if (painting && m_editorSettings.areaPaintId != 0 && m_selectedAreaId != 0)
+        m_editorSettings.areaPaintId = m_selectedAreaId;
+    float diameter = 2.0f * m_editorSettings.brushRadiusMeters;
+    if (UI::Prop::SliderFloat("Diameter", &diameter, 1.0f, 100.0f, "%.1f m"))
+        m_editorSettings.brushRadiusMeters = 0.5f * std::clamp(diameter, 1.0f, 100.0f);
+    UI::Prop::Checkbox("Show in Scene View", &m_showAreaOverlay);
+    ToolHint(painting,
+        "Hold the left mouse button in the Scene View to paint. Click the tool again to stop.",
+        "Select an area and choose Paint selected, then paint in the Scene View.");
+
+    mx::map::AreaDef* area = findArea(m_selectedAreaId);
+    if (!area)
+        return;
+    ImGui::SeparatorText(area->name.empty() ? "Area" : area->name.c_str());
+    bool changed = false;
+    char text[mx::map::kMaxAreaTextBytes + 1];
+    std::snprintf(text, sizeof(text), "%s", area->name.c_str());
+    if (UI::Prop::InputText("Name", text, sizeof(text)))
+    {
+        area->name = text;
+        changed = true;
+    }
+    std::snprintf(text, sizeof(text), "%s", area->name_key.c_str());
+    if (UI::Prop::InputText("Name key", text, sizeof(text)))
+    {
+        area->name_key = text;
+        changed = true;
+    }
+    UI::ItemTooltip("The localization key the game shows the players");
+    const mx::map::AreaDef* currentParent = area->parent_id != 0 ? findArea(area->parent_id) : nullptr;
+    if (UI::Prop::BeginCombo("Parent", currentParent ? currentParent->name.c_str() : "(top level)"))
+    {
+        if (ImGui::Selectable("(top level)", area->parent_id == 0))
+        {
+            area->parent_id = 0;
+            changed = true;
+        }
+        for (const mx::map::AreaDef& other : m_areaDefs)
+        {
+            // Never under itself or one of its own sub-areas: the areas stay a tree.
+            if (other.id == area->id || isWithin(other.id, area->id) ||
+                depthOf(other.id) >= static_cast<int>(mx::map::kMaxAreaDepth))
+                continue;
+            const std::string label = other.name + "##" + std::to_string(other.id);
+            if (ImGui::Selectable(label.c_str(), other.id == area->parent_id))
+            {
+                area->parent_id = other.id;
+                changed = true;
+            }
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::SeparatorText("Rules");
+    const char* pvpModes[] = {"Inherit", "Peaceful", "Duel only", "Free"};
+    int pvp = static_cast<int>(area->rules.pvp);
+    if (UI::Prop::Combo("PvP", &pvp, pvpModes, 4))
+    {
+        area->rules.pvp = static_cast<mx::map::PvpMode>(std::clamp(pvp, 0, 3));
+        changed = true;
+    }
+    bool ownRange = area->rules.level_min != 0 || area->rules.level_max != 0;
+    if (UI::Prop::Checkbox("Own level range", &ownRange))
+    {
+        area->rules.level_min = ownRange ? std::uint16_t{1} : std::uint16_t{0};
+        area->rules.level_max = ownRange ? std::uint16_t{1} : std::uint16_t{0};
+        changed = true;
+    }
+    if (ownRange)
+    {
+        int levels[2] = {area->rules.level_min, area->rules.level_max};
+        if (UI::Prop::DragInt2("Levels", levels, 0.2f, 1, 65535))
+        {
+            levels[0] = std::clamp(levels[0], 1, 65535);
+            levels[1] = std::clamp(std::max(levels[1], levels[0]), 1, 65535);
+            area->rules.level_min = static_cast<std::uint16_t>(levels[0]);
+            area->rules.level_max = static_cast<std::uint16_t>(levels[1]);
+            changed = true;
+        }
+        UI::ItemTooltip("The recommended level range; the game shows it, it does not stop anyone");
+    }
+    struct FlagRow
+    {
+        const char* label;
+        std::uint32_t bit;
+    };
+    const FlagRow flagRows[] = {{"Mounts", mx::map::area_flag::kNoMount},
+        {"Pets", mx::map::area_flag::kNoPet},
+        {"Teleport out", mx::map::area_flag::kNoTeleportOut},
+        {"Party invites", mx::map::area_flag::kNoPartyInvite}};
+    const char* flagStates[] = {"Inherit", "Forbidden", "Allowed"};
+    for (const FlagRow& row : flagRows)
+    {
+        int state = (area->rules.forbid & row.bit) ? 1 : ((area->rules.allow & row.bit) ? 2 : 0);
+        if (UI::Prop::Combo(row.label, &state, flagStates, 3))
+        {
+            area->rules.forbid &= ~row.bit;
+            area->rules.allow &= ~row.bit;
+            if (state == 1)
+                area->rules.forbid |= row.bit;
+            else if (state == 2)
+                area->rules.allow |= row.bit;
+            changed = true;
+        }
+    }
+    bool ownRespawn = area->rules.respawn.has_value();
+    if (UI::Prop::Checkbox("Own respawn point", &ownRespawn))
+    {
+        if (ownRespawn)
+            area->rules.respawn = mx::map::AreaPoint{};
+        else
+            area->rules.respawn.reset();
+        changed = true;
+    }
+    if (area->rules.respawn)
+    {
+        float point[2] = {area->rules.respawn->x, area->rules.respawn->y};
+        if (UI::Prop::DragFloat2("Respawn x, z", point, 0.25f))
+        {
+            area->rules.respawn->x = point[0];
+            area->rules.respawn->y = point[1];
+            changed = true;
+        }
+        UI::ItemTooltip("World x and z; the export refuses a point that is not a walkable cell");
+    }
+    int music = static_cast<int>(area->rules.music_id);
+    if (UI::Prop::InputInt("Music id", &music))
+    {
+        area->rules.music_id = static_cast<std::uint32_t>(std::max(0, music));
+        changed = true;
+    }
+    UI::ItemTooltip("0: the parent's");
+    int ambient = static_cast<int>(area->rules.ambient_id);
+    if (UI::Prop::InputInt("Ambient id", &ambient))
+    {
+        area->rules.ambient_id = static_cast<std::uint32_t>(std::max(0, ambient));
+        changed = true;
+    }
+    UI::ItemTooltip("0: the parent's");
+
+    // What applies here once the inherit values are resolved (the server's rules).
+    std::vector<const mx::map::AreaDef*> chain;
+    for (std::uint32_t at = area->id; at != 0 && chain.size() <= mx::map::kMaxAreaDepth;)
+    {
+        const mx::map::AreaDef* link = findArea(at);
+        if (!link)
+            break;
+        chain.push_back(link);
+        at = link->parent_id;
+    }
+    mx::map::EffectiveAreaRules effective;
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+    {
+        const mx::map::AreaRules& own = (*it)->rules;
+        if (own.pvp != mx::map::PvpMode::Inherit)
+            effective.pvp = own.pvp;
+        if (own.level_min != 0 || own.level_max != 0)
+        {
+            effective.level_min = own.level_min;
+            effective.level_max = own.level_max;
+        }
+        effective.forbidden = (effective.forbidden | own.forbid) & ~own.allow;
+        if (own.respawn)
+            effective.respawn = own.respawn;
+        if (own.music_id != 0)
+            effective.music_id = own.music_id;
+        if (own.ambient_id != 0)
+            effective.ambient_id = own.ambient_id;
+    }
+    ImGui::SeparatorText("In effect here");
+    const char* effectivePvp[] = {"Peaceful", "Peaceful", "Duel only", "Free"};
+    UI::Prop::Text("PvP", "%s", effectivePvp[std::clamp(static_cast<int>(effective.pvp), 0, 3)]);
+    if (effective.level_min != 0)
+        UI::Prop::Text("Levels", "%u - %u", effective.level_min, effective.level_max);
+    else
+        UI::Prop::Text("Levels", "any");
+    std::string forbidden;
+    for (const FlagRow& row : flagRows)
+    {
+        if (effective.forbidden & row.bit)
+            forbidden += (forbidden.empty() ? "" : ", ") + std::string(row.label);
+    }
+    UI::Prop::Text("Forbidden", "%s", forbidden.empty() ? "nothing" : forbidden.c_str());
+    if (effective.respawn)
+        UI::Prop::Text("Respawn", "%.2f, %.2f", effective.respawn->x, effective.respawn->y);
+    else
+        UI::Prop::Text("Respawn", "the world's");
+    UI::Prop::Text("Music / ambient", "%u / %u", effective.music_id, effective.ambient_id);
+
+    if (changed)
+        CommitAreaDefs();
+}

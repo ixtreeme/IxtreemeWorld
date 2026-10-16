@@ -476,6 +476,7 @@ const char* SculptDiagToolModeName(MapEditorToolMode mode)
     {
     case MapEditorToolMode::Heightmap: return "sculpt";
     case MapEditorToolMode::SplatPaint: return "splat";
+    case MapEditorToolMode::AreaPaint: return "area";
     case MapEditorToolMode::WaterSculpt: return "water";
     case MapEditorToolMode::None:
     default: return "none";
@@ -2123,6 +2124,17 @@ void MergeMapEditorCommands(MapEditorCommands& target, const MapEditorCommands& 
         target.paletteSlotParamsChanged = true;
         target.paletteSlot = source.paletteSlot;
         target.paletteSlotData = source.paletteSlotData;
+    }
+    if (source.areaDefsChanged)
+    {
+        target.areaDefsChanged = true;
+        target.areaDefs = source.areaDefs;
+    }
+    if (source.areaRemap)
+    {
+        target.areaRemap = true;
+        target.areaRemapFrom = source.areaRemapFrom;
+        target.areaRemapTo = source.areaRemapTo;
     }
     if (source.terrainTriplanarChanged)
     {
@@ -5491,7 +5503,8 @@ int RunGame(NativeWindow& window,
                 const MapEditorSettings editorSettings = editorImGui.GetMapEditorSettings();
                 const bool terrainToolActiveForDiag =
                     editorSettings.toolMode == MapEditorToolMode::Heightmap ||
-                    editorSettings.toolMode == MapEditorToolMode::SplatPaint;
+                    editorSettings.toolMode == MapEditorToolMode::SplatPaint ||
+                    editorSettings.toolMode == MapEditorToolMode::AreaPaint;
                 // Button events only: with a terrain tool active every mouse move logged ~8 lines (each
                 // flushed to the log file) while painting/sculpting.
                 const bool sculptDiagButtonEvent =
@@ -5655,7 +5668,8 @@ int RunGame(NativeWindow& window,
 
                 const bool terrainToolActive =
                     editorSettings.toolMode == MapEditorToolMode::Heightmap ||
-                    editorSettings.toolMode == MapEditorToolMode::SplatPaint;
+                    editorSettings.toolMode == MapEditorToolMode::SplatPaint ||
+                    editorSettings.toolMode == MapEditorToolMode::AreaPaint;
                 const bool rightMouseButtonEvent =
                     (event.type == InputEvent::MouseDown || event.type == InputEvent::MouseUp) &&
                     event.button == MouseButton_Right;
@@ -12351,6 +12365,14 @@ int RunGame(NativeWindow& window,
                         SceneManager::Instance().MarkDirty();
                     }
                 }
+                if (commands.areaRemap)
+                    terrain.RemapAreaId(commands.areaRemapFrom, commands.areaRemapTo);
+                if (commands.areaDefsChanged)
+                {
+                    terrain.SetAreaDefs(commands.areaDefs);
+                    editorImGui.SetAreaDefs(terrain.GetAreaDefs());
+                    SceneManager::Instance().MarkDirty();
+                }
                 if (commands.paletteSlotParamsChanged)
                 {
                     if (!terrain.ApplyPaletteSlotParams(commands.paletteSlotData))
@@ -14850,6 +14872,11 @@ int RunGame(NativeWindow& window,
             engineStats.impostorCacheMb = static_cast<double>(impostorStats.bytes) / (1024.0 * 1024.0);
             editorImGui.ClearSceneViewGizmo();
             editorImGui.SetSceneViewSelectionOutline({});
+            // Area overlay: the camera to project with and this frame's boundaries.
+            editorImGui.SetSceneViewCamera(camera);
+            editorImGui.SetAreaBoundaries(terrainOk ? &terrain.GetAreaBoundaries() : nullptr);
+            if (terrainOk && terrain.ConsumeAreaRasterEdited())
+                SceneManager::Instance().MarkDirty();
             if (runtimeSession->IsMapEditorOpen() && editorPlay.state.mode == EditorPlayMode::Edit)
             {
                 const SceneGizmoTarget gizmoTarget = BuildSceneGizmoTarget(

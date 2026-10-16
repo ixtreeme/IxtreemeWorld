@@ -1491,6 +1491,7 @@ const char* TeditToolModeName(MapEditorToolMode mode)
     case MapEditorToolMode::WaterSculpt: return "water";
     case MapEditorToolMode::Heightmap: return "sculpt";
     case MapEditorToolMode::SplatPaint: return "splat";
+    case MapEditorToolMode::AreaPaint: return "area";
     case MapEditorToolMode::None:
     default: return "none";
     }
@@ -1748,6 +1749,7 @@ bool TerrainRenderer::CreateFlatTerrain(ixrhi::IXRHIDevice& rhi, const TerrainSc
     if (m_attributes.empty())
         m_attributes.assign(expectedAttributeCount, 0);
     m_areaIds = next.areaIds;
+    ++m_areaRasterRevision;
     m_heightUndoRecorded.assign(m_heightCmGrid.size(), 0);
     m_splatWidth = std::max(1u, next.cellsX);
     m_splatHeight = std::max(1u, next.cellsZ);
@@ -3416,7 +3418,7 @@ void TerrainRenderer::SetMapEditorSettings(const MapEditorSettings& settings)
     const MapEditorToolMode previousMode = m_editorToolMode;
     const MapEditorTool previousTool = m_editorTool;
     if (m_editorStrokeActive && (settings.toolMode != m_editorToolMode || settings.tool != m_editorTool ||
-        settings.textureSlot != m_editorTextureSlot ||
+        settings.textureSlot != m_editorTextureSlot || settings.areaPaintId != m_editorAreaPaintId ||
         std::clamp(settings.brushRadiusMeters, 0.5f, 50.0f) != m_editorBrushRadiusMeters ||
         std::clamp(settings.paintEdgeSmoothing, 0.0f, 1.0f) != m_editorPaintEdgeSmoothing ||
         std::clamp(settings.paintCoverage, 0.0f, 1.0f) != m_editorPaintCoverage))
@@ -3424,7 +3426,9 @@ void TerrainRenderer::SetMapEditorSettings(const MapEditorSettings& settings)
     m_editorToolMode = settings.toolMode;
     m_editorTerrainToolActive =
         settings.toolMode == MapEditorToolMode::Heightmap ||
-        settings.toolMode == MapEditorToolMode::SplatPaint;
+        settings.toolMode == MapEditorToolMode::SplatPaint ||
+        settings.toolMode == MapEditorToolMode::AreaPaint;
+    m_editorAreaPaintId = settings.areaPaintId;
     m_editorTool = settings.tool;
     m_editorBrushRadiusMeters = std::clamp(settings.brushRadiusMeters, 0.5f, 50.0f);
     m_editorBrushStrength = std::clamp(settings.brushStrength, 0.1f, 5.0f);
@@ -4629,6 +4633,7 @@ bool TerrainRenderer::CreateMapBuffers(ixrhi::IXRHIDevice& rhi, const std::strin
     m_heightCmGrid.resize(field->heights_cm.size());
     m_attributes = field->attributes;
     m_areaIds = field->area_ids;
+    ++m_areaRasterRevision;
     const uint32_t chunksX = m_chunkSizeCells > 0 ? (m_mapSizeX + m_chunkSizeCells - 1u) / m_chunkSizeCells : 0;
     const uint32_t chunksY = m_chunkSizeCells > 0 ? (m_mapSizeY + m_chunkSizeCells - 1u) / m_chunkSizeCells : 0;
     m_dirtyChunkTexels.assign(static_cast<size_t>(chunksX) * chunksY, 0);
@@ -5199,6 +5204,145 @@ bool TerrainRenderer::RaycastEditorBrush(const WorldCamera& camera,
     return false;
 }
 
+void TerrainRenderer::RecordAreaUndo(size_t index)
+{
+    if (index >= m_areaIds.size() || (index < m_areaUndoRecorded.size() && m_areaUndoRecorded[index]))
+        return;
+    if (index < m_areaUndoRecorded.size())
+        m_areaUndoRecorded[index] = 1;
+    m_currentUndo.areas.push_back({index, m_areaIds[index]});
+}
+
+// Writes the brush's area into every cell whose centre lies within the brush
+// radius of the stroke segment since the last application (no gaps when the
+// mouse moves fast). Grid units: cell (x, y) spans [x, x+1) x [y, y+1).
+void TerrainRenderer::ApplyAreaBrush(float centerGridX, float centerGridY)
+{
+    const std::size_t cells = static_cast<std::size_t>(m_mapSizeX) * m_mapSizeY;
+    if (cells == 0)
+        return;
+    if (m_areaIds.size() != cells)
+        m_areaIds.assign(cells, 0);
+    if (m_areaUndoRecorded.size() != cells)
+        m_areaUndoRecorded.assign(cells, 0);
+    const float startX = m_editorHasPaintAnchor ? m_editorPaintAnchorGridX : centerGridX;
+    const float startY = m_editorHasPaintAnchor ? m_editorPaintAnchorGridY : centerGridY;
+    m_editorHasPaintAnchor = true;
+    m_editorPaintAnchorGridX = centerGridX;
+    m_editorPaintAnchorGridY = centerGridY;
+    const float radius = m_editorBrushRadiusMeters / std::max(m_cellScaleMeters, 0.001f);
+    const float dx = centerGridX - startX;
+    const float dy = centerGridY - startY;
+    const float lengthSq = dx * dx + dy * dy;
+    const int minX = std::max(0, static_cast<int>(std::floor(std::min(startX, centerGridX) - radius)));
+    const int minY = std::max(0, static_cast<int>(std::floor(std::min(startY, centerGridY) - radius)));
+    const int maxX = std::min(static_cast<int>(m_mapSizeX) - 1, static_cast<int>(std::ceil(std::max(startX, centerGridX) + radius)));
+    const int maxY = std::min(static_cast<int>(m_mapSizeY) - 1, static_cast<int>(std::ceil(std::max(startY, centerGridY) + radius)));
+    bool changed = false;
+    for (int y = minY; y <= maxY; ++y)
+    {
+        for (int x = minX; x <= maxX; ++x)
+        {
+            const float px = static_cast<float>(x) + 0.5f;
+            const float py = static_cast<float>(y) + 0.5f;
+            const float t = lengthSq > 0.0f ? std::clamp(((px - startX) * dx + (py - startY) * dy) / lengthSq, 0.0f, 1.0f) : 0.0f;
+            const float ex = px - (startX + t * dx);
+            const float ey = py - (startY + t * dy);
+            if (ex * ex + ey * ey > radius * radius)
+                continue;
+            const size_t index = static_cast<size_t>(y) * m_mapSizeX + static_cast<size_t>(x);
+            if (m_areaIds[index] == m_editorAreaPaintId)
+                continue;
+            RecordAreaUndo(index);
+            m_areaIds[index] = m_editorAreaPaintId;
+            changed = true;
+        }
+    }
+    if (changed)
+    {
+        ++m_areaRasterRevision;
+        m_areaRasterEdited = true;
+    }
+}
+
+void TerrainRenderer::RemapAreaId(std::uint16_t from, std::uint16_t to)
+{
+    bool changed = false;
+    for (std::uint16_t& id : m_areaIds)
+    {
+        if (id == from)
+        {
+            id = to;
+            changed = true;
+        }
+    }
+    if (changed)
+    {
+        ++m_areaRasterRevision;
+        m_areaRasterEdited = true;
+    }
+}
+
+const std::vector<AreaBoundarySegment>& TerrainRenderer::GetAreaBoundaries()
+{
+    const std::size_t cells = static_cast<std::size_t>(m_mapSizeX) * m_mapSizeY;
+    if (cells == 0 || m_areaIds.size() != cells ||
+        m_heightCmGrid.size() != static_cast<std::size_t>(m_heightGridWidth) * m_heightGridHeight)
+    {
+        m_areaBoundaries.clear();
+        m_areaBoundaryRaster = ~0ull;
+        return m_areaBoundaries;
+    }
+    if (m_areaBoundaryRaster == m_areaRasterRevision && m_areaBoundaryVisual == m_visualRevision)
+        return m_areaBoundaries;
+    m_areaBoundaryRaster = m_areaRasterRevision;
+    m_areaBoundaryVisual = m_visualRevision;
+    m_areaBoundaries.clear();
+    // Grid vertex (gx, gy) in world space: x grows east, source rows grow
+    // south (world z falls), lifted a little above the surface.
+    const auto vertex = [&](std::uint32_t gx, std::uint32_t gy, float out[3]) {
+        out[0] = static_cast<float>(gx) * m_cellScaleMeters - m_spawnLocalXcm * 0.01f;
+        out[1] = m_heightCmGrid[static_cast<std::size_t>(gy) * m_heightGridWidth + gx] * 0.01f + 0.2f;
+        out[2] = m_spawnLocalYcm * 0.01f - static_cast<float>(gy) * m_cellScaleMeters;
+    };
+    const auto at = [&](std::uint32_t x, std::uint32_t y) { return m_areaIds[static_cast<std::size_t>(y) * m_mapSizeX + x]; };
+    constexpr std::size_t kMaxSegments = 400000;
+    for (std::uint32_t y = 0; y < m_mapSizeY && m_areaBoundaries.size() < kMaxSegments; ++y)
+    {
+        for (std::uint32_t x = 0; x <= m_mapSizeX; ++x)
+        {
+            // West edge of cell x (the east edge of the last cell).
+            const std::uint16_t west = x > 0 ? at(x - 1, y) : 0;
+            const std::uint16_t east = x < m_mapSizeX ? at(x, y) : 0;
+            if (west == east)
+                continue;
+            AreaBoundarySegment segment;
+            vertex(x, y, segment.a);
+            vertex(x, y + 1, segment.b);
+            segment.first = west;
+            segment.second = east;
+            m_areaBoundaries.push_back(segment);
+        }
+    }
+    for (std::uint32_t y = 0; y <= m_mapSizeY && m_areaBoundaries.size() < kMaxSegments; ++y)
+    {
+        for (std::uint32_t x = 0; x < m_mapSizeX; ++x)
+        {
+            const std::uint16_t north = y > 0 ? at(x, y - 1) : 0;
+            const std::uint16_t south = y < m_mapSizeY ? at(x, y) : 0;
+            if (north == south)
+                continue;
+            AreaBoundarySegment segment;
+            vertex(x, y, segment.a);
+            vertex(x + 1, y, segment.b);
+            segment.first = north;
+            segment.second = south;
+            m_areaBoundaries.push_back(segment);
+        }
+    }
+    return m_areaBoundaries;
+}
+
 void TerrainRenderer::BeginEditorStroke()
 {
     if (m_editorStrokeActive)
@@ -5210,6 +5354,7 @@ void TerrainRenderer::BeginEditorStroke()
     m_currentUndo = {};
     std::fill(m_heightUndoRecorded.begin(), m_heightUndoRecorded.end(), 0);
     std::fill(m_splatUndoRecorded.begin(), m_splatUndoRecorded.end(), 0);
+    std::fill(m_areaUndoRecorded.begin(), m_areaUndoRecorded.end(), 0);
 }
 
 void TerrainRenderer::EndEditorStroke()
@@ -5220,7 +5365,7 @@ void TerrainRenderer::EndEditorStroke()
     m_editorStrokeActive = false;
     m_editorHasPaintAnchor = false;
     m_editorHasFlattenTarget = false;
-    if (m_currentUndo.heights.empty() && m_currentUndo.splats.empty())
+    if (m_currentUndo.heights.empty() && m_currentUndo.splats.empty() && m_currentUndo.areas.empty())
         return;
 
     m_undoStack.push_back(std::move(m_currentUndo));
@@ -5360,6 +5505,12 @@ void TerrainRenderer::ApplyEditorBrush(ixrhi::IXRHIDevice& rhi, double deltaSeco
         centerGridY > static_cast<float>(m_heightGridHeight - 1u))
     {
         m_editorHasPaintAnchor = false;
+        return;
+    }
+
+    if (m_editorToolMode == MapEditorToolMode::AreaPaint)
+    {
+        ApplyAreaBrush(centerGridX, centerGridY);
         return;
     }
 
@@ -5661,6 +5812,17 @@ void TerrainRenderer::UndoLastEditorStroke(ixrhi::IXRHIDevice& rhi)
 
     EditorUndoEntry entry = std::move(m_undoStack.back());
     m_undoStack.pop_back();
+
+    if (!entry.areas.empty())
+    {
+        for (auto it = entry.areas.rbegin(); it != entry.areas.rend(); ++it)
+        {
+            if (it->index < m_areaIds.size())
+                m_areaIds[it->index] = it->oldId;
+        }
+        ++m_areaRasterRevision;
+        m_areaRasterEdited = true;
+    }
 
     if (!entry.heights.empty() && m_vertexBuffer)
     {

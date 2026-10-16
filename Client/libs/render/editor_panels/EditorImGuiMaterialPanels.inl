@@ -532,6 +532,13 @@ void EditorImGui::RenderSelectedTerrainInspector()
             RenderTerrainPaintTool();
             ImGui::EndTabItem();
         }
+        if (ImGui::BeginTabItem(ICON_FA_MAP "  Areas"))
+        {
+            shownTab = 3;
+            ImGui::Spacing();
+            RenderTerrainAreasTool();
+            ImGui::EndTabItem();
+        }
         if (ImGui::BeginTabItem(ICON_FA_GEAR "  Settings"))
         {
             shownTab = 2;
@@ -598,7 +605,7 @@ void EditorImGui::RenderSelectedTerrainInspector()
         SetToolMode(MapEditorToolMode::None);
     }
 
-    if (shownTab == 0 || shownTab == 1)
+    if (shownTab == 0 || shownTab == 1 || shownTab == 3)
     {
         ImGui::Spacing();
         if (UI::IconButton(ICON_FA_UNDO, "Undo Last Stroke"))
@@ -1099,7 +1106,8 @@ void EditorImGui::RenderInspector()
     // A brush tool lives in the Inspector of what it edits: when that is no longer selected, the
     // Scene View goes back to picking objects.
     const MapEditorToolMode toolMode = m_editorSettings.toolMode;
-    if (((toolMode == MapEditorToolMode::Heightmap || toolMode == MapEditorToolMode::SplatPaint) && !m_terrainState.selected) ||
+    if (((toolMode == MapEditorToolMode::Heightmap || toolMode == MapEditorToolMode::SplatPaint ||
+             toolMode == MapEditorToolMode::AreaPaint) && !m_terrainState.selected) ||
         (toolMode == MapEditorToolMode::WaterSculpt && !m_waterBodyState.selected))
         SetToolMode(MapEditorToolMode::None);
 

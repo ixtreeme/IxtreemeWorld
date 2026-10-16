@@ -303,6 +303,19 @@ public:
     const std::vector<mx::map::AreaDef>& GetAreaDefs() const { return m_areaDefs; }
     void SetAreaDefs(std::vector<mx::map::AreaDef> areas) { m_areaDefs = std::move(areas); }
     const std::vector<std::uint16_t>& GetAreaIds() const { return m_areaIds; }
+    // The area brush, an undo of it and a remap set this; the editor
+    // consumes it to mark the scene dirty.
+    bool ConsumeAreaRasterEdited()
+    {
+        const bool edited = m_areaRasterEdited;
+        m_areaRasterEdited = false;
+        return edited;
+    }
+    // Every cell of `from` becomes `to` (an area was deleted).
+    void RemapAreaId(std::uint16_t from, std::uint16_t to);
+    // Cell edges between different areas (and the outer edges of painted
+    // cells), on the terrain surface; rebuilt after a raster or height change.
+    const std::vector<AreaBoundarySegment>& GetAreaBoundaries();
     bool ApplyPaletteSlots(ixrhi::IXRHIDevice& rhi, const std::array<MapEditorPaletteSlot, 8>& slots);
     bool ApplyPaletteSlotParams(const MapEditorPaletteSlot& slot);
     bool ApplyPaletteSlotChange(ixrhi::IXRHIDevice& rhi, const MapEditorPaletteSlot& slot);
@@ -836,6 +849,15 @@ private:
     std::vector<std::uint16_t> m_attributes;
     std::vector<std::uint16_t> m_areaIds; // empty = no areas; else one id per cell
     std::vector<mx::map::AreaDef> m_areaDefs;
+    std::uint16_t m_editorAreaPaintId = 0;
+    bool m_areaRasterEdited = false;
+    std::uint64_t m_areaRasterRevision = 0;
+    std::uint64_t m_areaBoundaryRaster = ~0ull; // revisions the boundaries were built for
+    std::uint64_t m_areaBoundaryVisual = ~0ull;
+    std::vector<AreaBoundarySegment> m_areaBoundaries;
+    std::vector<std::uint8_t> m_areaUndoRecorded;
+    void ApplyAreaBrush(float centerGridX, float centerGridY);
+    void RecordAreaUndo(size_t index);
     std::vector<std::uint8_t> m_splatABytes;
     std::vector<std::uint8_t> m_splatBBytes;
     std::vector<uint32_t> m_dirtyChunkTexels;
@@ -856,10 +878,16 @@ private:
         std::array<std::uint8_t, 8> oldWeights{};
     };
 
+    struct AreaUndo
+    {
+        size_t index = 0;
+        std::uint16_t oldId = 0;
+    };
     struct EditorUndoEntry
     {
         std::vector<HeightUndo> heights;
         std::vector<SplatUndo> splats;
+        std::vector<AreaUndo> areas;
     };
 
     EditorUndoEntry m_currentUndo;

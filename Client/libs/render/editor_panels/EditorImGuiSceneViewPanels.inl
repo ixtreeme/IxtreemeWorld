@@ -259,6 +259,7 @@ void EditorImGui::RenderSceneViewDropTarget()
                 drawList->AddLine(a, b, outlineColor, 2.5f);
             }
         }
+        RenderSceneViewAreaOverlay(imageMin, imageSize);
         RenderSceneViewGizmo(imageMin, imageSize);
     }
     else if (avail.x > 1.0f && avail.y > 1.0f)
@@ -348,6 +349,59 @@ void EditorImGui::RenderSceneViewDropTarget()
     }
     ImGui::End();
     ImGui::PopStyleVar();
+}
+
+
+// A stable, well spread colour per area id (0 = no area).
+ImU32 EditorAreaColor(std::uint16_t id, float alpha)
+{
+    if (id == 0)
+        return ImGui::ColorConvertFloat4ToU32(ImVec4(1.0f, 1.0f, 1.0f, alpha));
+    float r = 1.0f, g = 1.0f, b = 1.0f;
+    ImGui::ColorConvertHSVtoRGB(std::fmod(static_cast<float>(id) * 0.6180339f, 1.0f), 0.65f, 1.0f, r, g, b);
+    return ImGui::ColorConvertFloat4ToU32(ImVec4(r, g, b, alpha));
+}
+
+// Area overlay: the cell edges between different areas, projected onto the Scene View while the
+// terrain's Areas tab is open. A segment takes the colour of its deeper area; the selected area's
+// edges are thicker.
+void EditorImGui::RenderSceneViewAreaOverlay(const ImVec2& imageMin, const ImVec2& imageSize)
+{
+    if (!m_showAreaOverlay || m_terrainToolTab != 3 || !m_terrainState.selected || !m_areaBoundaries ||
+        m_areaBoundaries->empty() || imageSize.x <= 1.0f || imageSize.y <= 1.0f)
+        return;
+    std::vector<std::uint8_t> depth(static_cast<std::size_t>(mx::map::kMaxAreaId) + 1u, 0);
+    for (const mx::map::AreaDef& area : m_areaDefs)
+    {
+        std::uint8_t levels = 0;
+        for (std::uint32_t at = area.id; at != 0 && levels <= mx::map::kMaxAreaDepth; ++levels)
+        {
+            const auto it = std::find_if(m_areaDefs.begin(), m_areaDefs.end(),
+                [at](const mx::map::AreaDef& a) { return a.id == at; });
+            if (it == m_areaDefs.end())
+                break;
+            at = it->parent_id;
+        }
+        if (area.id <= mx::map::kMaxAreaId)
+            depth[area.id] = levels;
+    }
+    const auto width = static_cast<std::uint32_t>(imageSize.x);
+    const auto height = static_cast<std::uint32_t>(imageSize.y);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->PushClipRect(imageMin, ImVec2(imageMin.x + imageSize.x, imageMin.y + imageSize.y), true);
+    for (const AreaBoundarySegment& segment : *m_areaBoundaries)
+    {
+        float ax = 0.0f, ay = 0.0f, bx = 0.0f, by = 0.0f;
+        if (!WorldProjectToScreen(m_sceneViewCamera, WorldVec3{segment.a[0], segment.a[1], segment.a[2]}, width, height, ax, ay) ||
+            !WorldProjectToScreen(m_sceneViewCamera, WorldVec3{segment.b[0], segment.b[1], segment.b[2]}, width, height, bx, by))
+            continue;
+        const std::uint16_t shown = depth[segment.second] >= depth[segment.first] ? segment.second : segment.first;
+        const bool selected = m_selectedAreaId != 0 &&
+            (segment.first == m_selectedAreaId || segment.second == m_selectedAreaId);
+        drawList->AddLine(ImVec2(imageMin.x + ax, imageMin.y + ay), ImVec2(imageMin.x + bx, imageMin.y + by),
+            EditorAreaColor(shown, 0.95f), selected ? 3.0f : 1.5f);
+    }
+    drawList->PopClipRect();
 }
 
 void EditorImGui::RenderSceneViewGizmo(const ImVec2& imageMin, const ImVec2& imageSize)

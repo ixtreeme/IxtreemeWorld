@@ -31,6 +31,8 @@ target_link_libraries(IXEngineAsset
     PUBLIC
         IXEngineCommon
         IXEngineDebug
+        # MapEditorTypes.h (scene types) names the shared map formats.
+        IXEngineMapData
         efsw::efsw
         OpenEXR::OpenEXR
 )
