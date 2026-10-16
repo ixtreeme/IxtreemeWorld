@@ -352,6 +352,89 @@ void TestTrunks()
     Check(lowered, "a leaning stem's tip is lower than an upright one's");
 }
 
+// A palm: a straight trunk, 12 fronds at its top in a spiral, arching down.
+ixtreemetree::TreeOptions PalmOptions()
+{
+    ixtreemetree::TreeOptions options = LevelBranches(12);
+    options.branch.arrangement[1] = ixtreemetree::BranchArrangement::Spiral;
+    options.branch.start[1] = 0.95f;
+    options.branch.angle[1] = 70.0f;
+    options.branch.length[1] = 4.0f;
+    options.branch.sections[1] = 8;
+    options.branch.droop[1] = 0.2f;
+    options.leaves.style = ixtreemetree::LeafStyle::Fronds;
+    options.leaves.atlasGridX = 2;
+    options.leaves.atlasGridY = 1;
+    options.leaves.frondWidth = 1.5f;
+    return options;
+}
+
+float Distance(ixtreemetree::Vec3 a, ixtreemetree::Vec3 b)
+{
+    return std::sqrt((a.x - b.x) * (a.x - b.x) + (a.y - b.y) * (a.y - b.y) + (a.z - b.z) * (a.z - b.z));
+}
+
+void TestFronds()
+{
+    ixtreemetree::Tree tree;
+    tree.options = PalmOptions();
+    const ixtreemetree::TreeMesh mesh = tree.generate();
+    const std::vector<ixtreemetree::Vertex>& v = mesh.leaves.vertices;
+    const std::size_t quads = v.size() / 4u;
+    Check(quads == 12u * 8u * 2u && mesh.leaves.indices.size() == quads * 6u, "a frond is two quads a segment");
+
+    bool flat = true;
+    bool inCell = true;
+    bool joined = true;
+    float lowestTip = std::numeric_limits<float>::max();
+    for (std::size_t q = 0; q < quads; ++q)
+    {
+        const ixtreemetree::Vertex* quad = v.data() + q * 4u;
+        // A parallelogram: corner 1 is corner 2 plus corner 0 minus corner 3 (what the trim assumes).
+        const ixtreemetree::Vec3 expected{quad[2].position.x + quad[0].position.x - quad[3].position.x,
+            quad[2].position.y + quad[0].position.y - quad[3].position.y,
+            quad[2].position.z + quad[0].position.z - quad[3].position.z};
+        flat = flat && Distance(expected, quad[1].position) < 1e-4f;
+        const float cellX = quad[0].uv.x < 0.5f ? 0.0f : 0.5f;
+        for (int i = 0; i < 4; ++i)
+            inCell = inCell && quad[i].uv.x >= cellX - 1e-6f && quad[i].uv.x <= cellX + 0.5f + 1e-6f &&
+                quad[i].uv.y >= -1e-6f && quad[i].uv.y <= 1.0f + 1e-6f;
+        // The same half's next segment (two quads on) starts where this one ends.
+        const std::size_t segment = (q / 2u) % 8u;
+        if (segment + 1u < 8u)
+        {
+            const ixtreemetree::Vertex* next = quad + 8;
+            joined = joined && Distance(next[0].position, quad[3].position) < 1e-5f &&
+                Distance(next[1].position, quad[2].position) < 1e-5f;
+        }
+        else
+        {
+            lowestTip = std::min(lowestTip, quad[2].position.y);
+        }
+    }
+    Check(flat, "every frond segment is flat");
+    Check(inCell, "a frond shows one atlas cell");
+    Check(joined, "a frond's segments meet without cracks");
+    Check(lowestTip < 9.5f, "the fronds arch down below the crown");
+
+    // The last level has no bark: fewer bark triangles than the same tree with leaf cards.
+    ixtreemetree::Tree cards;
+    cards.options = PalmOptions();
+    cards.options.leaves.style = ixtreemetree::LeafStyle::Cards;
+    Check(mesh.stats.barkTriangles < cards.generate().stats.barkTriangles && mesh.stats.barkTriangles > 0,
+        "fronds draw no bark of their own");
+
+    // The export's trim takes them: a texture visible only in a narrow band down each cell's middle.
+    ixtreemetree::LeafMesh trimmed = mesh.leaves;
+    std::vector<std::uint8_t> rgba(64 * 32 * 4, 0);
+    for (int y = 0; y < 32; ++y)
+        for (int x = 0; x < 64; ++x)
+            if (x % 32 >= 10 && x % 32 < 22)
+                rgba[(y * 64 + x) * 4 + 3] = 255;
+    const ixtreemetree::LeafTrimStats trim = ixtreemetree::trimLeafCards(trimmed, rgba, 64, 32, 1);
+    Check(trim.trimmedCards == quads && trim.areaAfter < trim.areaBefore * 0.9, "the leaf trim fits each frond segment");
+}
+
 void TestPresets(bool print)
 {
     const std::vector<ixtreemetree::Preset> presets = ixtreemetree::loadAllPresets(IXTREEMETREE_PRESET_DIR);
@@ -449,6 +532,7 @@ int main(int argc, char** argv)
     TestArrangements();
     TestDroop();
     TestTrunks();
+    TestFronds();
     TestExistingTreesUnchanged(argc > 1 && std::string(argv[1]) == "--print-golden");
     TestPresets(argc > 1 && std::string(argv[1]) == "--print-golden");
     if (g_errors == 0)

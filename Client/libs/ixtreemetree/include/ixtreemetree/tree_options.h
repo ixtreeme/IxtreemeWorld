@@ -30,6 +30,10 @@ enum class CrownShape : std::uint8_t { Uniform, Conical, Spherical, Hemispherica
 // Where a level's branches sit around their parent: anywhere, in rings (a fir's whorls) or one after
 // another at the golden angle (a palm's crown).
 enum class BranchArrangement : std::uint8_t { Random, Whorled, Spiral };
+// Cards: leaf cards in clusters along the last level's branches. Fronds: each last-level branch is one
+// long leaf (a palm's or a fern's), a ribbon along it showing one atlas cell, its base at the cell's
+// bottom; those branches then have no bark.
+enum class LeafStyle : std::uint8_t { Cards, Fronds };
 
 struct TreeOptions
 {
@@ -83,6 +87,9 @@ struct TreeOptions
         float sizeVariance = 0.2f;
         std::uint32_t tint = 0xFFFFFFFFu;
         float alphaTest = 0.5f;
+        LeafStyle style = LeafStyle::Cards;
+        float frondWidth = 1.2f;  // m (sizeVariance varies it)
+        float frondFold = 15.0f;  // degrees each half rises from the midrib
     } leaves;
 };
 

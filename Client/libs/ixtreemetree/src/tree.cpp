@@ -210,8 +210,11 @@ BranchEnd GenerateBranch(const TreeOptions& options,
         axes.push_back(currentDirection);
     }
 
+    const int maxLevel = std::clamp(options.branch.levels, 0, kMaxBranchLevels - 1);
+    // A frond's branch is its midrib: the leaf shows it, no bark is drawn.
+    const bool frond = level >= maxLevel && options.leaves.style == LeafStyle::Fronds;
     const std::uint32_t baseVertex = static_cast<std::uint32_t>(mesh.bark.vertices.size());
-    for (int ring = 0; ring <= sections; ++ring)
+    for (int ring = 0; ring <= sections && !frond; ++ring)
     {
         const float t = static_cast<float>(ring) / static_cast<float>(sections);
         const float radius = baseRadius * (1.0f - (1.0f - taper) * t);
@@ -233,7 +236,7 @@ BranchEnd GenerateBranch(const TreeOptions& options,
     }
 
     const int stride = radialSegments + 1;
-    for (int ring = 0; ring < sections; ++ring)
+    for (int ring = 0; ring < sections && !frond; ++ring)
     {
         for (int seg = 0; seg < radialSegments; ++seg)
         {
@@ -246,7 +249,6 @@ BranchEnd GenerateBranch(const TreeOptions& options,
     }
 
     const BranchEnd end{centers.back(), axes.back()};
-    const int maxLevel = std::clamp(options.branch.levels, 0, kMaxBranchLevels - 1);
     if (level >= maxLevel)
     {
         terminalBranches.push_back(TerminalBranch{centers, axes});
@@ -332,6 +334,72 @@ void AddLeafQuad(TreeMesh& mesh, Vec3 center, Vec3 normal, Vec3 tangent, float s
     IncludeBounds(mesh, p1);
     IncludeBounds(mesh, p2);
     IncludeBounds(mesh, p3);
+}
+
+// A quad in AddLeafQuad's corner order: p0 (uMin, vMax), p1 (uMax, vMax), p2 (uMax, vMin), p3 (uMin, vMin),
+// drawn as (0, 1, 2) and (0, 2, 3), so the export's leaf trim works on it too. Its normal faces up.
+void AddLeafQuadCorners(TreeMesh& mesh, Vec3 p0, Vec3 p1, Vec3 p2, Vec3 p3, Vec2 uvMin, Vec2 uvMax)
+{
+    Vec3 normal = Normalize(Cross(Sub(p1, p0), Sub(p3, p0)));
+    if (normal.y < 0.0f)
+        normal = Mul(normal, -1.0f);
+    const std::uint32_t base = static_cast<std::uint32_t>(mesh.leaves.vertices.size());
+    mesh.leaves.vertices.push_back(Vertex{p0, normal, Vec2{uvMin.x, uvMax.y}});
+    mesh.leaves.vertices.push_back(Vertex{p1, normal, Vec2{uvMax.x, uvMax.y}});
+    mesh.leaves.vertices.push_back(Vertex{p2, normal, Vec2{uvMax.x, uvMin.y}});
+    mesh.leaves.vertices.push_back(Vertex{p3, normal, Vec2{uvMin.x, uvMin.y}});
+    mesh.leaves.indices.insert(mesh.leaves.indices.end(), {base, base + 1u, base + 2u, base, base + 2u, base + 3u});
+    for (const Vec3& p : {p0, p1, p2, p3})
+        IncludeBounds(mesh, p);
+}
+
+// Each last-level branch becomes a frond: a ribbon along it, its two halves rising from the midrib by
+// the fold angle, the atlas cell's bottom at its base and its top at its tip. Both halves keep one
+// offset from the midrib the whole way, so every segment is a parallelogram (flat: the trim stays
+// exact) and neighbours share their edges (no cracks).
+void GenerateFronds(const TreeOptions& options, Rng& rng, TreeMesh& mesh, const std::vector<TerminalBranch>& branches)
+{
+    const int atlasGridX = std::clamp(options.leaves.atlasGridX, 1, 8);
+    const int atlasGridY = std::clamp(options.leaves.atlasGridY, 1, 8);
+    const float fold = xm::DegreesToRadians(std::clamp(options.leaves.frondFold, -80.0f, 80.0f));
+    const float variance = std::clamp(options.leaves.sizeVariance, 0.0f, 1.0f);
+    for (const TerminalBranch& branch : branches)
+    {
+        if (branch.centers.size() < 2)
+            continue;
+        const int cellX = rng.uniformInt(0, atlasGridX - 1);
+        const int cellY = rng.uniformInt(0, atlasGridY - 1);
+        const float u0 = static_cast<float>(cellX) / static_cast<float>(atlasGridX);
+        const float u1 = static_cast<float>(cellX + 1) / static_cast<float>(atlasGridX);
+        const float uMid = 0.5f * (u0 + u1);
+        const float vTop = static_cast<float>(cellY) / static_cast<float>(atlasGridY);
+        const float vBottom = static_cast<float>(cellY + 1) / static_cast<float>(atlasGridY);
+        const float width = std::max(0.02f, options.leaves.frondWidth * (1.0f + rng.uniform(-variance, variance)));
+
+        const Vec3 axis = Normalize(branch.axes.front());
+        Vec3 side = Cross(axis, Vec3{0.0f, 1.0f, 0.0f});
+        if (Length(side) < 0.05f)
+        {
+            Vec3 up{};
+            BuildFrame(axis, side, up);
+        }
+        side = Normalize(side);
+        const Vec3 rise = Normalize(Cross(side, axis));
+        const float half = 0.5f * width;
+        const Vec3 left = Add(Mul(side, -half * xm::Cos(fold)), Mul(rise, half * xm::Sin(fold)));
+        const Vec3 right = Add(Mul(side, half * xm::Cos(fold)), Mul(rise, half * xm::Sin(fold)));
+
+        const std::size_t rings = branch.centers.size();
+        for (std::size_t i = 0; i + 1 < rings; ++i)
+        {
+            const Vec3 a = branch.centers[i];
+            const Vec3 b = branch.centers[i + 1];
+            const float vA = vBottom + (vTop - vBottom) * static_cast<float>(i) / static_cast<float>(rings - 1);
+            const float vB = vBottom + (vTop - vBottom) * static_cast<float>(i + 1) / static_cast<float>(rings - 1);
+            AddLeafQuadCorners(mesh, Add(a, left), a, b, Add(b, left), Vec2{u0, vB}, Vec2{uMid, vA});
+            AddLeafQuadCorners(mesh, a, Add(a, right), Add(b, right), b, Vec2{uMid, vB}, Vec2{u1, vA});
+        }
+    }
 }
 
 void GenerateLeaves(const TreeOptions& options, Rng& rng, TreeMesh& mesh, const std::vector<TerminalBranch>& branches)
@@ -457,7 +525,10 @@ TreeMesh Tree::generate() const
             GenerateBranch(options, rng, mesh, 0, origin, direction, terminalBranches, scale);
         }
     }
-    GenerateLeaves(options, rng, mesh, terminalBranches);
+    if (options.leaves.style == LeafStyle::Fronds)
+        GenerateFronds(options, rng, mesh, terminalBranches);
+    else
+        GenerateLeaves(options, rng, mesh, terminalBranches);
 
     if (mesh.bark.vertices.empty() && mesh.leaves.vertices.empty())
     {
