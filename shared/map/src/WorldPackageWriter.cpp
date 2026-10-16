@@ -143,6 +143,46 @@ std::vector<std::uint8_t> EncodeWorldLogic(const WorldLogic& logic)
     return out;
 }
 
+std::vector<std::uint8_t> EncodeAreaDefs(const PackageWriteSpec& spec)
+{
+    capnp::MallocMessageBuilder message;
+    auto root = message.initRoot<package_schema::AreaDefs>();
+    auto list = root.initAreas(static_cast<unsigned>(spec.areas.size()));
+    for (std::size_t i = 0; i < spec.areas.size(); ++i) {
+        const AreaDef& def = spec.areas[i];
+        auto area = list[static_cast<unsigned>(i)];
+        area.setId(static_cast<std::uint16_t>(def.id));
+        area.setParentId(static_cast<std::uint16_t>(def.parent_id));
+        area.setName(def.name);
+        area.setNameKey(def.name_key);
+        auto rules = area.initRules();
+        rules.setPvp(static_cast<package_schema::PvpMode>(static_cast<std::uint16_t>(def.rules.pvp)));
+        rules.setLevelMin(def.rules.level_min);
+        rules.setLevelMax(def.rules.level_max);
+        rules.setForbid(def.rules.forbid);
+        rules.setAllow(def.rules.allow);
+        if (def.rules.respawn) {
+            rules.setHasRespawn(true);
+            auto point = rules.initRespawn();
+            point.setX(def.rules.respawn->x);
+            point.setY(def.rules.respawn->y);
+            point.setVolumeId(def.rules.respawn->volume_id);
+        }
+        rules.setMusicId(def.rules.music_id);
+        rules.setAmbientId(def.rules.ambient_id);
+        auto volumes = area.initVolumes(static_cast<unsigned>(def.volumes.size()));
+        for (std::size_t v = 0; v < def.volumes.size(); ++v) {
+            volumes.set(static_cast<unsigned>(v), def.volumes[v]);
+        }
+    }
+    if (spec.patch_areas) {
+        spec.patch_areas(root);
+    }
+    const auto words = capnp::messageToFlatArray(message);
+    const auto bytes = words.asBytes();
+    return std::vector<std::uint8_t>(bytes.begin(), bytes.end());
+}
+
 std::vector<std::uint8_t> EncodeChunk(const PackageWriteSpec& spec, std::uint32_t chunk_x, std::uint32_t chunk_y)
 {
     const std::uint32_t n = spec.chunk_size_cells;
@@ -153,7 +193,21 @@ std::vector<std::uint8_t> EncodeChunk(const PackageWriteSpec& spec, std::uint32_
     const std::uint32_t cells_y = std::min(n, size_y - chunk_y * n);
     const bool int32 = spec.height_encoding && spec.height_encoding->int32_samples;
     const bool splats = spec.splat_size > 0;
-    const std::uint16_t section_count = splats ? 4 : 2;
+    // The area section goes last, after the splats, so the other sections
+    // keep their table positions with or without areas.
+    const bool areas = spec.format_version == kManifestVersionCurrent && spec.HasAreas();
+    std::vector<std::uint16_t> area_cells;
+    bool area_uniform = true;
+    if (areas) {
+        area_cells.reserve(static_cast<std::size_t>(cells_x) * cells_y);
+        for (std::uint32_t y = 0; y < cells_y; ++y) {
+            for (std::uint32_t x = 0; x < cells_x; ++x) {
+                area_cells.push_back(spec.area_id ? spec.area_id(chunk_x * n + x, chunk_y * n + y) : std::uint16_t{0});
+                area_uniform = area_uniform && area_cells.back() == area_cells.front();
+            }
+        }
+    }
+    const std::uint16_t section_count = static_cast<std::uint16_t>((splats ? 4 : 2) + (areas ? 1 : 0));
     const std::size_t height_bytes = static_cast<std::size_t>(cells_x + 1) * (cells_y + 1) * (int32 ? 4u : 2u);
     const std::size_t attribute_bytes = static_cast<std::size_t>(cells_x) * cells_y * 2;
     const std::size_t splat_bytes = splats ? 4u + static_cast<std::size_t>(spec.splat_size) * spec.splat_size * 4u : 0;
@@ -162,9 +216,11 @@ std::vector<std::uint8_t> EncodeChunk(const PackageWriteSpec& spec, std::uint32_
     const auto attribute_offset = static_cast<std::uint32_t>(height_offset + height_bytes);
     const auto splat_a_offset = static_cast<std::uint32_t>(attribute_offset + attribute_bytes);
     const auto splat_b_offset = static_cast<std::uint32_t>(splat_a_offset + splat_bytes);
+    const auto area_offset = static_cast<std::uint32_t>(splat_b_offset + splat_bytes);
+    const std::size_t area_bytes = !areas ? 0 : area_uniform ? 2u : area_cells.size() * 2u;
 
     std::vector<std::uint8_t> out;
-    out.reserve(splat_b_offset + splat_bytes);
+    out.reserve(area_offset + area_bytes);
     PutU32(out, kChunkFileMagic);
     PutU16(out, kChunkFileVersion);
     PutU16(out, static_cast<std::uint16_t>(chunk_x));
@@ -183,6 +239,9 @@ std::vector<std::uint8_t> EncodeChunk(const PackageWriteSpec& spec, std::uint32_
     if (splats) {
         toc(kSectionSplatA, kElementRgba8Image, splat_a_offset, splat_bytes);
         toc(kSectionSplatB, kElementRgba8Image, splat_b_offset, splat_bytes);
+    }
+    if (areas) {
+        toc(kSectionAreaIds, area_uniform ? kElementAreaUniform : kElementAreaGrid, area_offset, area_bytes);
     }
     for (std::uint32_t y = 0; y <= cells_y; ++y) {
         for (std::uint32_t x = 0; x <= cells_x; ++x) {
@@ -212,6 +271,15 @@ std::vector<std::uint8_t> EncodeChunk(const PackageWriteSpec& spec, std::uint32_
             PutU16(out, static_cast<std::uint16_t>(spec.splat_size));
             PutU16(out, static_cast<std::uint16_t>(spec.splat_size));
             out.insert(out.end(), image->begin(), image->begin() + static_cast<std::ptrdiff_t>(pixels));
+        }
+    }
+    if (areas) {
+        if (area_uniform) {
+            PutU16(out, area_cells.front());
+        } else {
+            for (const std::uint16_t id : area_cells) {
+                PutU16(out, id);
+            }
         }
     }
     return out;
@@ -274,6 +342,18 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
             return result;
         }
     }
+    if (spec.HasAreas()) {
+        if (legacy) {
+            result.error = "areas (areaIds + areaDefs) require manifest format version 3";
+            return result;
+        }
+        for (const AreaDef& def : spec.areas) {
+            if (def.id > kMaxAreaId || def.parent_id > kMaxAreaId) {
+                result.error = "area ids must fit the uint16 raster (<= 65535)";
+                return result;
+            }
+        }
+    }
     std::error_code ec;
     if (!spec.overwrite && fs::exists(out_dir / "map.manifest", ec)) {
         result.error = "refusing to overwrite the existing package at " + PathForDiagnostic(out_dir);
@@ -312,6 +392,9 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
     }
     if (!legacy && spec.layered_world) {
         files.emplace_back("layered_world.mx3d", EncodeLayeredWorld(*spec.layered_world));
+    }
+    if (!legacy && spec.HasAreas()) {
+        files.emplace_back(kAreaDefsFile, EncodeAreaDefs(spec));
     }
 
     if (legacy) {
@@ -366,6 +449,10 @@ PackageWriteResult WritePackage(const fs::path& out_dir, const PackageWriteSpec&
         }
         if (spec.water_model == WaterModel::Bodies) {
             decls.push_back({package_schema::LayerKind::WATER_BODIES, true, package_schema::LayerAudience::SERVER, "water_bodies.mxws", 1u});
+        }
+        if (spec.HasAreas()) {
+            decls.push_back({package_schema::LayerKind::AREA_IDS, true, package_schema::LayerAudience::SHARED, "", 1u});
+            decls.push_back({package_schema::LayerKind::AREA_DEFS, true, package_schema::LayerAudience::SHARED, kAreaDefsFile, 1u});
         }
         auto layers = manifest.initLayers(static_cast<unsigned>(decls.size()));
         for (std::size_t i = 0; i < decls.size(); ++i) {

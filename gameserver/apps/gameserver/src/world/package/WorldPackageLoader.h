@@ -29,6 +29,8 @@ struct LoadedWorld {
     mx::map::ServerWater water; // declared water capability (MAP-3)
     std::optional<mx::map::LayeredWorld> layered_world; // optional 3D-2 package sidecar
     mx::map::WorldLogic logic;
+    // Nested areas (areaIds + areaDefs); absent = the MXL1 areas in logic.
+    std::optional<mx::map::AreaTable> areas;
     std::vector<MobSpawnPoint> spawn_points;
     std::string mob_types_config; // absolute path, loaded and checked
     std::size_t mob_type_count = 0;

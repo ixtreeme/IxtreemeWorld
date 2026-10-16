@@ -12,6 +12,7 @@
 #include "map/LayeredWorld.h"
 #include "map/ServerTerrain.h"
 #include "map/ServerWater.h"
+#include "map/WorldAreas.h"
 
 // Strict world-package reader/validator (MAP-1, geometry MAP-2). Format contract:
 // docs/map-data-format.md. The legacy MapData.h loaders stay unchanged for
@@ -42,10 +43,13 @@ inline constexpr std::uint16_t kSectionHeight = 1;     // elementFormat 1: int16
 inline constexpr std::uint16_t kSectionSplatA = 2;     // elementFormat 4: u16 w, u16 h, RGBA8
 inline constexpr std::uint16_t kSectionAttributes = 3; // elementFormat 3: uint16 LE bitfield
 inline constexpr std::uint16_t kSectionSplatB = 4;     // elementFormat 4
+inline constexpr std::uint16_t kSectionAreaIds = 5;    // elementFormat 5 (grid) or 6 (uniform)
 inline constexpr std::uint8_t kElementInt16 = 1;
 inline constexpr std::uint8_t kElementInt32 = 2; // explicit height encoding (height v2/v3)
 inline constexpr std::uint8_t kElementU16Bitfield = 3;
 inline constexpr std::uint8_t kElementRgba8Image = 4;
+inline constexpr std::uint8_t kElementAreaGrid = 5;    // uint16 area id per cell
+inline constexpr std::uint8_t kElementAreaUniform = 6; // one uint16 area id for every cell
 inline constexpr std::size_t kChunkHeaderBytes = 14;
 inline constexpr std::size_t kChunkTocEntryBytes = 12;
 inline constexpr std::uint16_t kMaxChunkSections = 16;
@@ -67,6 +71,8 @@ inline constexpr std::uint64_t kMaxManifestBytes = 1ull << 20;
 inline constexpr std::uint64_t kMaxChunkFileBytes = 256ull << 20;
 inline constexpr std::uint64_t kMaxWorldLogicBytes = 16ull << 20;
 inline constexpr std::uint64_t kMaxSpawnFileBytes = 16ull << 20;
+inline constexpr std::uint64_t kMaxAreaDefsBytes = 1ull << 20;
+inline constexpr const char* kAreaDefsFile = "areas.mxar"; // writer default
 inline constexpr const char* kLayeredWorldFile = "layered_world.mx3d";
 
 // ---- structured issues -------------------------------------------------------
@@ -104,6 +110,7 @@ enum class PackageErrorCode : std::uint16_t {
     ChunkAttributeReservedBits = 305,
     ChunkSplatGeometry = 306,
     ChunkEdgeMismatch = 307,
+    ChunkAreaUnknown = 308,  // a raster cell names an area the table lacks
     WorldLogicHeaderInvalid = 400,
     WorldLogicTruncated = 401,
     WorldLogicTrailingData = 402,
@@ -122,6 +129,14 @@ enum class PackageErrorCode : std::uint16_t {
     WorldLogicNoPlayerSpawn = 415,
     WorldLogicSpawnBlocked = 416,
     WorldLogicSpawnVolumeInvalid = 417, // 3D-5B layered player spawn
+    AreaDefsCorrupt = 440,     // areaDefs: not one bounded message, or too many areas
+    AreaIdInvalid = 441,
+    AreaIdDuplicate = 442,
+    AreaParentInvalid = 443,   // missing parent, cycle or too deep
+    AreaRuleInvalid = 444,
+    AreaRespawnInvalid = 445,
+    AreaVolumeInvalid = 446,
+    AreaLayersInconsistent = 447, // areaIds/areaDefs not declared together, or next to MXL1 areas
     SpawnsSyntax = 500,
     SpawnsFieldInvalid = 501,
     SpawnsOutOfBounds = 502,
@@ -198,6 +213,8 @@ enum class LayerKind : std::uint16_t {
     MobSpawns = 5,
     Water = 6,       // client MXWB render data (never read by the server)
     WaterBodies = 7, // MXWS server water bodies (MAP-3)
+    AreaIds = 8,     // chunk section 5: most specific area per cell
+    AreaDefs = 9,    // nested area definitions and rules (Cap'n Proto)
 };
 const char* ToString(LayerKind kind) noexcept;
 
@@ -342,6 +359,10 @@ struct ServerWorldData {
     std::vector<std::uint32_t> startup_chunks; // streaming: the startup set
     ServerWater water;                         // declared water capability (MAP-3)
     std::optional<LayeredWorld> layered_world; // optional 3D-2 package sidecar
+    // Present iff the package declares the areaIds + areaDefs layers; the
+    // terrain chunks then carry the area raster. Without them the MXL1
+    // rectangles in `logic` are the (flat, rule-less) areas.
+    std::optional<AreaTable> areas;
 };
 
 // Number of LoadServerWorld calls in this process (diagnostic: proves that

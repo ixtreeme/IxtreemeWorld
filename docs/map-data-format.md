@@ -127,6 +127,8 @@ LayerDecl { kind: LayerKind; required: Bool; audience: server|client|shared;
 | `mobSpawns` (5) | fájl | mob_spawns v1 | opcionális; ha van, szigorúan betölti |
 | `water` (6) | fájl | MXWB (kliens-render adat) | nem validálja, nem olvassa (`LAYER_NOT_VALIDATED` info) |
 | `waterBodies` (7) | fájl | MXWS v1 (5a.) | a manifest `water.model = bodies` mellett kötelező; szigorúan betölti |
+| `areaIds` (8) | chunk-szekció 5 | uint16 area-id cellánként (rács vagy egyenletes, 15.) | a `areaDefs`-szel együtt; betölti |
+| `areaDefs` (9) | fájl | Cap'n Proto `AreaDefs` (15.) | az `areaIds`-szel együtt; szigorúan betölti |
 
 (`cx`, `cy` = az adott chunk cellái; teljes chunknál = `chunkSizeCells`.)
 
@@ -1033,3 +1035,68 @@ teljes collisionbizonyíték. Water/underwater, unknown support, hibás current
 pose és volume-váltás külön elutasítás; nincs terrain/nearest-floor fallback.
 Production movement, spatial/AOI, ghost, migration és packet aktiválás
 ehhez a mérföldkőhöz még nem tartozik.
+
+## 15. Area-k: `areaIds` + `areaDefs` (2026-10-16)
+
+Az area egy tartalmi terület, a Metin-stílusú map utódja, és **egymásba
+ágyazható**: egy vidékben egy város, a városban egy aréna. A futásidejű
+szimulációs zóna (szerver-partíció) ettől független marad (R2).
+
+### Rétegek
+| kind | Tárolás | Tartalom |
+|---|---|---|
+| `areaIds` (8) | chunk-szekció 5 | cellánként a **legszűkebb** area azonosítója, `uint16` (0 = nincs area) |
+| `areaDefs` (9) | fájl (`areas.mxar`) | egy Cap'n Proto `AreaDefs` üzenet (séma: `world_package_manifest.capnp`) |
+
+- A kettőt csak együtt lehet deklarálni (`AREA_LAYERS_INCONSISTENT` 447),
+  csak manifest v3-ban. Közönségük `server` vagy `shared`, verziójuk 1.
+- Ha deklarálva vannak, az MXL1 `areas` rekordszáma 0 kell legyen (447): az
+  area-knak egyetlen forrása van. A régi, lapos téglalap-area-k a két réteg
+  nélkül változatlanul érvényesek.
+- **Szekció 5:** `elementFormat` 5 = rács (`cx·cy` darab `uint16`, soronként),
+  6 = egyenletes (egyetlen `uint16` a chunk minden cellájára). Deklarált
+  rétegnél minden chunkban pontosan egyszer szerepel
+  (`CHUNK_SECTION_MISSING`), mérete pontosan `cx·cy·2`, illetve 2 bájt
+  (`CHUNK_SECTION_SIZE`). Minden nem nulla érték a táblában létező area
+  (`CHUNK_AREA_UNKNOWN` 308). A v2 olvasó ezt a szekciót ismeretlenként
+  kihagyja.
+
+### Area-definíció
+`id` 1..65535, egyedi (`AREA_ID_INVALID` 441, `AREA_ID_DUPLICATE` 442);
+`parentId` 0 (legfelső szint) vagy egy létező, másik area. Kör nem lehet, a
+fa legfeljebb 16 szintes (`AREA_PARENT_INVALID` 443). A `name` és a
+`nameKey` (lokalizációs kulcs) legfeljebb 128 bájt. Legfeljebb 1024 area
+lehet, és a fájl egyetlen, határolt bejárással olvasott üzenet
+(`AREA_DEFS_CORRUPT` 440).
+
+| Szabály | Öröklés | Érvényesség (`AREA_RULE_INVALID` 444) |
+|---|---|---|
+| `pvp` | `inherit` = a szülőé | `inherit`, `peaceful`, `duelOnly` vagy `free` |
+| `levelMin` / `levelMax` (ajánlott szintsáv) | 0/0 = a szülőé | különben 1 ≤ min ≤ max |
+| `forbid` / `allow` bitek | effektív = (szülő ∪ forbid) ∖ allow | csak ismert bitek: noMount 1, noPet 2, noTeleportOut 4, noPartyInvite 8; forbid ∩ allow = ∅ |
+| `respawn` (`hasRespawn`) | nincs = a szülőé | a világon belül; terepen járható cella, köteten ott, ahol a sütött actor elfér (`AREA_RESPAWN_INVALID` 445) |
+| `musicId`, `ambientId` | 0 = a szülőé | – |
+
+A világ alapértékei (a legfelső szintű area szülője): `peaceful`, nincs
+szintsáv, semmi nincs tiltva, nincs újraéledési pont, se zene, se ambient.
+Egy szabálybit tiltását a szerver akkor kényszeríti ki, amikor az érintett
+rendszer (mount, háziállat, teleport, party) elkészül.
+
+`volumes`: rétegzett kötetek, amelyek **egészükben** ehhez az area-hoz
+tartoznak (egy barlang, egy dungeon-emelet). A kötetnek léteznie kell a
+`layered_world.mx3d`-ben, és egy kötet csak egy area-é lehet
+(`AREA_VOLUME_INVALID` 446). Egy köteten álló pont area-ja a kötet area-ja,
+ha van ilyen, különben a raszteré.
+
+### Tagság és hivatkozások
+Egy cella a raszter szerinti area-ba **és annak minden ősébe** tartozik.
+
+- **Játékos spawn-régió:** az `areaId`-nak a táblában kell lennie
+  (`WORLDLOGIC_REFERENCE_INVALID` 409). A középpont area-ja az `areaId`
+  lehet, vagy annak egy alterülete (`WORLDLOGIC_SPAWN_OUTSIDE_ZONE` 410).
+- **Mob spawn (v2):** ugyanez a pont area-jára (`SPAWNS_FIELD_INVALID` 501).
+  Streaming betöltésnél ezt csak a már betöltött chunkokra ellenőrzi a
+  szerver. A teljes ellenőrzést az offline validálás (Full) adja, ami minden
+  chunkot betölt.
+- Streaming esetén az induló halmaz a terepen lévő újraéledési pontok
+  chunkjait is tartalmazza.

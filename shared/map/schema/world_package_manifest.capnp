@@ -54,6 +54,8 @@ enum LayerKind {
   mobSpawns @5;    # text spawn table (mob_spawns format v1)
   water @6;        # MXWB water bodies (client render data; the server does not read it)
   waterBodies @7;  # MXWS server water bodies (MAP-3; with water.model = bodies)
+  areaIds @8;      # chunk section 5, uint16 area id per cell (grid or uniform)
+  areaDefs @9;     # AreaDefs message below: nested areas and their rules
 }
 
 enum LayerAudience {
@@ -138,4 +140,51 @@ struct MapManifest {
   chunks @16 :List(ChunkRef);    # v3: exactly one entry per chunk grid cell
   heightEncoding @17 :HeightEncoding; # manifest v3, height layer version 2 or 3
   water @18 :WaterDecl;          # v3 (MAP-3): the water capability of the world
+}
+
+# ---- areas (areaIds + areaDefs layers) ----------------------------------------
+# An area is a content region (a Metin-style map's successor). Areas nest: a
+# town inside a region, an arena inside the town. The areaIds chunk section
+# stores the MOST SPECIFIC area of every cell (0 = no area); a cell belongs to
+# that area and to all of its ancestors. Every rule left at its inherit value
+# takes the parent's effective value; a top-level area inherits the world
+# defaults (peaceful, no level range, nothing forbidden, no respawn point, no
+# music or ambient). Format contract: docs/map-data-format.md section 15.
+
+enum PvpMode {
+  inherit @0;
+  peaceful @1;    # no player may attack another
+  duelOnly @2;    # only agreed duels
+  free @3;        # open player combat
+}
+
+struct AreaPoint {
+  x @0 :Float32;
+  y @1 :Float32;
+  volumeId @2 :UInt32;   # 0 = on the terrain, else a layered volume
+}
+
+struct AreaRules {
+  pvp @0 :PvpMode;
+  levelMin @1 :UInt16;   # levelMin = levelMax = 0: inherit; else 1 <= min <= max
+  levelMax @2 :UInt16;
+  forbid @3 :UInt32;     # flag bits forbidden here and below
+  allow @4 :UInt32;      # flag bits allowed again (cancels an inherited forbid)
+  hasRespawn @5 :Bool;   # false: inherit the parent's respawn point
+  respawn @6 :AreaPoint;
+  musicId @7 :UInt32;    # 0 = inherit
+  ambientId @8 :UInt32;  # 0 = inherit
+}
+
+struct AreaDef {
+  id @0 :UInt16;         # 1 .. 65535, unique
+  parentId @1 :UInt16;   # 0 = top level
+  name @2 :Text;         # authoring / diagnostic name
+  nameKey @3 :Text;      # localization key shown to players
+  rules @4 :AreaRules;
+  volumes @5 :List(UInt32); # layered volumes that belong to this area as a whole
+}
+
+struct AreaDefs {
+  areas @0 :List(AreaDef);
 }

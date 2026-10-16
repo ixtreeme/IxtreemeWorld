@@ -341,7 +341,7 @@ struct FileAccess {
 bool IsChunkSectionKind(LayerKind kind) noexcept
 {
     return kind == LayerKind::Height || kind == LayerKind::Attributes ||
-           kind == LayerKind::SplatA || kind == LayerKind::SplatB;
+           kind == LayerKind::SplatA || kind == LayerKind::SplatB || kind == LayerKind::AreaIds;
 }
 
 bool IsValidWorldId(const std::string& id) noexcept
@@ -568,12 +568,12 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                                      "each kind at most once");
                         continue;
                     }
-                    if (layer.raw_kind > static_cast<std::uint16_t>(LayerKind::WaterBodies)) {
+                    if (layer.raw_kind > static_cast<std::uint16_t>(LayerKind::AreaDefs)) {
                         if (layer.required) {
                             issues.Error(PackageErrorCode::LayerUnsupported,
                                          lsite,
                                          "unknown required layer kind " + std::to_string(layer.raw_kind),
-                                         "a kind this reader supports (0..6)");
+                                         "a kind this reader supports (0..9)");
                         } else {
                             issues.Info(PackageErrorCode::LayerSkipped,
                                         lsite,
@@ -627,7 +627,9 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
                                              layer.kind == LayerKind::Attributes ||
                                              layer.kind == LayerKind::WorldLogic ||
                                              layer.kind == LayerKind::MobSpawns ||
-                                             layer.kind == LayerKind::WaterBodies;
+                                             layer.kind == LayerKind::WaterBodies ||
+                                             layer.kind == LayerKind::AreaIds ||
+                                             layer.kind == LayerKind::AreaDefs;
                     if (server_data && layer.audience == LayerAudience::Client) {
                         issues.Error(PackageErrorCode::LayerDeclInvalid,
                                      lsite,
@@ -895,9 +897,13 @@ bool ParseManifest(const std::vector<std::uint8_t>& bytes, PackageManifest& out,
 
 struct ChunkPlan {
     bool splat_declared = false; // v3: declared => present in every chunk
+    bool areas_declared = false; // v3: areaIds declared => present in every chunk
     bool strict_v3 = false;
     bool decode_client = false;  // Full depth
     HeightEncoding encoding;     // height element format + storage
+    // Area ids of the areaDefs table (index = id); a raster cell must name 0
+    // or one of them. Shared, so the streaming chunk source keeps a copy.
+    std::shared_ptr<const std::vector<bool>> known_areas;
 };
 
 struct DecodedChunk {
@@ -917,6 +923,8 @@ std::uint8_t ExpectedElementFormat(std::uint16_t type, const HeightEncoding& enc
     case kSectionSplatA:
     case kSectionSplatB:
         return kElementRgba8Image;
+    case kSectionAreaIds:
+        return kElementAreaGrid; // or kElementAreaUniform
     default:
         return 0;
     }
@@ -933,6 +941,8 @@ const char* SectionLayerName(std::uint16_t type) noexcept
         return "splatA";
     case kSectionSplatB:
         return "splatB";
+    case kSectionAreaIds:
+        return "areaIds";
     default:
         return "chunk";
     }
@@ -1013,6 +1023,7 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
 
     struct Section {
         std::uint16_t type = 0;
+        std::uint8_t element = 0;
         std::uint64_t offset = 0;
         std::uint64_t length = 0;
         std::size_t toc_offset = 0;
@@ -1028,12 +1039,16 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
         s.offset = LoadU32(bytes.data() + toc + 4);
         s.length = LoadU32(bytes.data() + toc + 8);
         s.toc_offset = toc;
+        s.element = element;
         const std::string field = "toc[" + std::to_string(i) + "]";
-        const std::uint8_t expected_element = ExpectedElementFormat(s.type, plan.encoding);
+        // The area section exists from manifest v3 on; a v2 reader ignores it.
+        const std::uint8_t expected_element =
+            s.type == kSectionAreaIds && !plan.strict_v3 ? std::uint8_t{0}
+                                                         : ExpectedElementFormat(s.type, plan.encoding);
         if (expected_element == 0) {
             if (plan.strict_v3) {
                 issues.Error(PackageErrorCode::ChunkTocInvalid, at("chunk", field, static_cast<std::int64_t>(toc)),
-                             "unknown section type " + std::to_string(s.type), "1..4 (declared layers)");
+                             "unknown section type " + std::to_string(s.type), "1..5 (declared layers)");
             } else {
                 issues.Warning(PackageErrorCode::ChunkTocInvalid, at("chunk", field, static_cast<std::int64_t>(toc)),
                                "unknown section type " + std::to_string(s.type) + " ignored (v2)");
@@ -1044,10 +1059,13 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
                              at(SectionLayerName(s.type), field, static_cast<std::int64_t>(toc)),
                              "section type " + std::to_string(s.type) + " appears twice", "at most once");
             }
-            if (element != expected_element) {
+            const bool area_uniform = s.type == kSectionAreaIds && element == kElementAreaUniform;
+            if (element != expected_element && !area_uniform) {
                 issues.Error(PackageErrorCode::ChunkTocInvalid,
                              at(SectionLayerName(s.type), field + ".elementFormat", static_cast<std::int64_t>(toc + 2)),
-                             "elementFormat " + std::to_string(element), std::to_string(expected_element));
+                             "elementFormat " + std::to_string(element),
+                             s.type == kSectionAreaIds ? std::string("5 (grid) or 6 (uniform)")
+                                                       : std::to_string(expected_element));
             }
             if (plan.strict_v3 && reserved != 0) {
                 issues.Error(PackageErrorCode::ChunkTocInvalid,
@@ -1059,6 +1077,12 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
                 issues.Error(PackageErrorCode::ChunkTocInvalid,
                              at(SectionLayerName(s.type), field, static_cast<std::int64_t>(toc)),
                              "splat section present but no splat layer is declared",
+                             "declared layers only");
+            }
+            if (plan.strict_v3 && s.type == kSectionAreaIds && !plan.areas_declared) {
+                issues.Error(PackageErrorCode::ChunkTocInvalid,
+                             at(SectionLayerName(s.type), field, static_cast<std::int64_t>(toc)),
+                             "area section present but no areaIds layer is declared",
                              "declared layers only");
             }
         }
@@ -1102,6 +1126,7 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
     const Section* attr = nullptr;
     const Section* splat_a = nullptr;
     const Section* splat_b = nullptr;
+    const Section* areas = nullptr;
     for (const auto& s : found) {
         if (s.type == kSectionHeight) {
             height = &s;
@@ -1111,6 +1136,8 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
             splat_a = &s;
         } else if (s.type == kSectionSplatB) {
             splat_b = &s;
+        } else if (s.type == kSectionAreaIds && plan.strict_v3) {
+            areas = &s;
         }
     }
     if (height == nullptr) {
@@ -1124,6 +1151,10 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
     if (plan.strict_v3 && plan.splat_declared && (splat_a == nullptr || splat_b == nullptr)) {
         issues.Error(PackageErrorCode::ChunkSectionMissing, at("splatA", "toc", kChunkHeaderBytes),
                      "a declared splat layer is missing from this chunk", "splat A and B in every chunk");
+    }
+    if (plan.strict_v3 && plan.areas_declared && areas == nullptr) {
+        issues.Error(PackageErrorCode::ChunkSectionMissing, at("areaIds", "toc", kChunkHeaderBytes),
+                     "no area section", "section type 5 in every chunk (areaIds is declared)");
     }
     if (issues.ErrorCount() != errors_before) {
         return false;
@@ -1144,6 +1175,18 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
                      "attribute section is " + std::to_string(attr->length) + " bytes",
                      std::to_string(cell_count * 2) + " = " + std::to_string(cells_x) + "x" +
                          std::to_string(cells_y) + " cells x uint16");
+    }
+    if (areas != nullptr) {
+        const bool uniform = areas->element == kElementAreaUniform;
+        const std::uint64_t expected = uniform ? 2 : cell_count * 2;
+        if (areas->length != expected) {
+            issues.Error(PackageErrorCode::ChunkSectionSize,
+                         at("areaIds", "length", static_cast<std::int64_t>(areas->toc_offset + 8)),
+                         "area section is " + std::to_string(areas->length) + " bytes",
+                         uniform ? std::string("2 (one uint16 for every cell)")
+                                 : std::to_string(expected) + " = " + std::to_string(cells_x) + "x" +
+                                       std::to_string(cells_y) + " cells x uint16");
+        }
     }
     if (issues.ErrorCount() != errors_before) {
         return false;
@@ -1179,6 +1222,45 @@ bool DecodeChunk(const std::vector<std::uint8_t>& bytes,
             ++reserved_cells;
         }
         out.attributes[i] = value;
+    }
+    if (areas != nullptr) {
+        // Every cell names 0 (no area) or an area of the areaDefs table.
+        // No table (it failed and is reported on its own): ids unchecked.
+        const auto known = [&](std::uint16_t id) {
+            return id == 0 || !plan.known_areas ||
+                   (id < plan.known_areas->size() && (*plan.known_areas)[id]);
+        };
+        std::uint64_t unknown_cells = 0;
+        std::int64_t first_unknown = -1;
+        std::uint16_t first_id = 0;
+        const std::uint8_t* zp = bytes.data() + areas->offset;
+        if (areas->element == kElementAreaUniform) {
+            out.area_uniform = LoadU16(zp);
+            if (!known(out.area_uniform)) {
+                unknown_cells = cell_count;
+                first_unknown = static_cast<std::int64_t>(areas->offset);
+                first_id = out.area_uniform;
+            }
+        } else {
+            out.area_ids.resize(static_cast<std::size_t>(cell_count));
+            for (std::size_t i = 0; i < out.area_ids.size(); ++i) {
+                const std::uint16_t id = LoadU16(zp + i * 2);
+                if (!known(id)) {
+                    if (first_unknown < 0) {
+                        first_unknown = static_cast<std::int64_t>(areas->offset + i * 2);
+                        first_id = id;
+                    }
+                    ++unknown_cells;
+                }
+                out.area_ids[i] = id;
+            }
+        }
+        if (unknown_cells > 0) {
+            issues.Error(PackageErrorCode::ChunkAreaUnknown, at("areaIds", "cells", first_unknown),
+                         std::to_string(unknown_cells) + " cell(s) name an unknown area (first: " +
+                             std::to_string(first_id) + ")",
+                         "0 (no area) or an id of the areaDefs table");
+        }
     }
     out.resident = true;
     if (reserved_cells > 0) {
@@ -1495,7 +1577,8 @@ bool ParseWorldLogic(const std::vector<std::uint8_t>& bytes,
 void ValidateWorldLogic(const WorldLogic& logic,
                         const std::string& file,
                         const GridGeometry& geometry,
-                        Issues& issues, WarpPolicy policy)
+                        Issues& issues, WarpPolicy policy,
+                        const AreaTable* areas)
 {
     const Rect world{static_cast<float>(geometry.MinX()), static_cast<float>(geometry.MinY()),
                      static_cast<float>(geometry.MaxX()), static_cast<float>(geometry.MaxY())};
@@ -1563,6 +1646,20 @@ void ValidateWorldLogic(const WorldLogic& logic,
             // areaId 0 = no area: a world-level spawn region (areas are
             // optional metadata, the player spawn region is not). It only has
             // to lie inside the world.
+            if (!InsideRect(s.bounds, world)) {
+                issues.Error(PackageErrorCode::WorldLogicOutOfBounds, at(field + ".bounds"),
+                             "spawn " + RectText(s.bounds), "inside the world " + RectText(world));
+            }
+            continue;
+        }
+        if (areas != nullptr) {
+            // Nested areas: the reference must exist; whether the centre lies
+            // in it is the raster's answer (ValidateAgainstTerrain).
+            if (!areas->Contains(s.zone_id)) {
+                issues.Error(PackageErrorCode::WorldLogicReferenceInvalid, at(field + ".areaId"),
+                             "spawn references area " + std::to_string(s.zone_id),
+                             "an id of the areaDefs table, or 0 (no area)");
+            }
             if (!InsideRect(s.bounds, world)) {
                 issues.Error(PackageErrorCode::WorldLogicOutOfBounds, at(field + ".bounds"),
                              "spawn " + RectText(s.bounds), "inside the world " + RectText(world));
@@ -1713,7 +1810,9 @@ void ValidateLayeredSpawns(const WorldLogic& logic,
 void ValidateAgainstTerrain(const WorldLogic& logic,
                             const std::string& file,
                             const ServerTerrain& terrain,
-                            Issues& issues)
+                            Issues& issues,
+                            const AreaTable* areas,
+                            const std::string& areas_file)
 {
     for (std::size_t i = 0; i < logic.warps.size(); ++i) {
         const auto& w = logic.warps[i];
@@ -1734,6 +1833,20 @@ void ValidateAgainstTerrain(const WorldLogic& logic,
         if (!FiniteRect(s.bounds)) {
             continue; // already reported
         }
+        if (areas != nullptr && s.zone_id != 0) {
+            // A whole volume may belong to an area; otherwise the raster
+            // names the most specific area under the centre.
+            const AreaId volume_area = s.volume_id != 0 ? areas->VolumeArea(s.volume_id) : 0;
+            const auto sample = terrain.Area(s.bounds.CenterX(), s.bounds.CenterY());
+            const AreaId at_centre = volume_area != 0 ? volume_area : sample.area;
+            if ((volume_area != 0 || sample.Ok()) && !areas->IsWithin(at_centre, s.zone_id)) {
+                issues.Error(PackageErrorCode::WorldLogicSpawnOutsideZone,
+                             IssueSite{"worldLogic", file, "spawns[" + std::to_string(i) + "].areaId"},
+                             "spawn region centre (" + Str(s.bounds.CenterX()) + "," + Str(s.bounds.CenterY()) +
+                                 ") lies in area " + std::to_string(at_centre),
+                             "inside area " + std::to_string(s.zone_id) + " or one of its sub-areas");
+            }
+        }
         if (s.volume_id != 0) {
             continue; // 3D-5B: a layered spawn stands on its volume, not the terrain
         }
@@ -1744,6 +1857,249 @@ void ValidateAgainstTerrain(const WorldLogic& logic,
                          "spawn region centre (" + Str(s.bounds.CenterX()) + "," + Str(s.bounds.CenterY()) +
                              ") is not walkable",
                          "a walkable centre cell (players are placed there)");
+        }
+    }
+    if (areas == nullptr) {
+        return;
+    }
+    const auto& defs = areas->Defs();
+    for (std::size_t i = 0; i < defs.size(); ++i) {
+        const auto& respawn = defs[i].rules.respawn;
+        if (!respawn || respawn->volume_id != 0) {
+            continue; // a volume respawn point was checked against its volume
+        }
+        const auto cell = terrain.Cell(respawn->x, respawn->y);
+        if (cell.status != TerrainStatus::OutsideWorld && !cell.Walkable()) {
+            issues.Error(PackageErrorCode::AreaRespawnInvalid,
+                         IssueSite{"areaDefs", areas_file, "areas[" + std::to_string(i) + "].rules.respawn"},
+                         "respawn point (" + Str(respawn->x) + "," + Str(respawn->y) + ") is " +
+                             (cell.Ok() ? "a blocked cell" : ToString(cell.status)),
+                         "a walkable cell (players are placed there)");
+        }
+    }
+}
+
+// ---- areas (areaIds + areaDefs, docs/map-data-format.md section 15) --------------
+
+// One Cap'n Proto AreaDefs message, read with the manifest's bounded
+// traversal. The rules one area can break on its own are checked here; the
+// rules between areas follow in ValidateAreaDefs.
+bool ParseAreaDefs(const std::vector<std::uint8_t>& bytes,
+                   const std::string& file,
+                   std::vector<AreaDef>& out,
+                   Issues& issues)
+{
+    const IssueSite site{"areaDefs", file};
+    if (bytes.empty() || bytes.size() % sizeof(capnp::word) != 0) {
+        issues.Error(PackageErrorCode::AreaDefsCorrupt, site,
+                     "size " + std::to_string(bytes.size()) + " is not a whole number of 8-byte words",
+                     "a Cap'n Proto AreaDefs message (unpacked, with segment table)");
+        return false;
+    }
+    std::vector<capnp::word> words(bytes.size() / sizeof(capnp::word));
+    std::memcpy(words.data(), bytes.data(), bytes.size());
+    capnp::ReaderOptions options;
+    options.traversalLimitInWords = std::max<std::uint64_t>(64, words.size() * 4);
+    options.nestingLimit = 16;
+    const std::size_t errors_before = issues.ErrorCount();
+    try {
+        capnp::FlatArrayMessageReader reader(kj::ArrayPtr<const capnp::word>(words.data(), words.size()),
+                                             options);
+        if (reader.getEnd() != words.data() + words.size()) {
+            issues.Error(PackageErrorCode::AreaDefsCorrupt, site, "trailing bytes after the message",
+                         "exactly one message");
+            return false;
+        }
+        const auto areas = reader.getRoot<package_schema::AreaDefs>().getAreas();
+        if (areas.size() > kMaxWorldLogicRecords) {
+            issues.Error(PackageErrorCode::AreaDefsCorrupt, IssueSite{"areaDefs", file, "areas"},
+                         std::to_string(areas.size()) + " areas", "<= " + std::to_string(kMaxWorldLogicRecords));
+            return false;
+        }
+        out.reserve(areas.size());
+        for (std::uint32_t i = 0; i < areas.size(); ++i) {
+            const auto area = areas[i];
+            const std::string field = "areas[" + std::to_string(i) + "]";
+            auto at = [&](const char* sub) { return IssueSite{"areaDefs", file, field + sub}; };
+            AreaDef def;
+            def.id = area.getId();
+            def.parent_id = area.getParentId();
+            def.name = area.getName().cStr();
+            def.name_key = area.getNameKey().cStr();
+            if (def.id == 0) {
+                issues.Error(PackageErrorCode::AreaIdInvalid, at(".id"), "area id 0", "1 .. 65535 (0 = no area)");
+            }
+            if (def.name.size() > kMaxAreaTextBytes || def.name_key.size() > kMaxAreaTextBytes) {
+                issues.Error(PackageErrorCode::AreaRuleInvalid, at(".name"),
+                             "name " + std::to_string(def.name.size()) + " / nameKey " +
+                                 std::to_string(def.name_key.size()) + " bytes",
+                             "<= " + std::to_string(kMaxAreaTextBytes) + " bytes each");
+            }
+            const auto rules = area.getRules();
+            const auto raw_pvp = static_cast<std::uint16_t>(rules.getPvp());
+            if (raw_pvp > static_cast<std::uint16_t>(PvpMode::Free)) {
+                issues.Error(PackageErrorCode::AreaRuleInvalid, at(".rules.pvp"),
+                             "pvp mode " + std::to_string(raw_pvp), "inherit, peaceful, duelOnly or free (0..3)");
+            } else {
+                def.rules.pvp = static_cast<PvpMode>(raw_pvp);
+            }
+            def.rules.level_min = rules.getLevelMin();
+            def.rules.level_max = rules.getLevelMax();
+            const bool own_range = def.rules.level_min != 0 || def.rules.level_max != 0;
+            if (own_range && (def.rules.level_min == 0 || def.rules.level_max < def.rules.level_min)) {
+                issues.Error(PackageErrorCode::AreaRuleInvalid, at(".rules.levelMin"),
+                             "level range " + std::to_string(def.rules.level_min) + " .. " +
+                                 std::to_string(def.rules.level_max),
+                             "0 .. 0 (inherit) or 1 <= levelMin <= levelMax");
+            }
+            def.rules.forbid = rules.getForbid();
+            def.rules.allow = rules.getAllow();
+            if (((def.rules.forbid | def.rules.allow) & ~area_flag::kKnown) != 0) {
+                issues.Error(PackageErrorCode::AreaRuleInvalid, at(".rules.forbid"),
+                             "unknown flag bits in forbid " + std::to_string(def.rules.forbid) + " / allow " +
+                                 std::to_string(def.rules.allow),
+                             "noMount 1, noPet 2, noTeleportOut 4, noPartyInvite 8");
+            }
+            if ((def.rules.forbid & def.rules.allow) != 0) {
+                issues.Error(PackageErrorCode::AreaRuleInvalid, at(".rules.allow"),
+                             "flag bits both forbidden and allowed", "disjoint forbid and allow");
+            }
+            if (rules.getHasRespawn()) {
+                const auto point = rules.getRespawn();
+                def.rules.respawn = AreaPoint{point.getX(), point.getY(), point.getVolumeId()};
+            }
+            def.rules.music_id = rules.getMusicId();
+            def.rules.ambient_id = rules.getAmbientId();
+            const auto volumes = area.getVolumes();
+            if (volumes.size() > kMaxWorldLogicRecords) {
+                issues.Error(PackageErrorCode::AreaVolumeInvalid, at(".volumes"),
+                             std::to_string(volumes.size()) + " volumes",
+                             "<= " + std::to_string(kMaxWorldLogicRecords));
+            } else {
+                for (const std::uint32_t volume : volumes) {
+                    def.volumes.push_back(volume);
+                }
+            }
+            out.push_back(std::move(def));
+        }
+    } catch (const kj::Exception& error) {
+        issues.Error(PackageErrorCode::AreaDefsCorrupt, site,
+                     std::string("Cap'n Proto decode failed: ") + error.getDescription().cStr(),
+                     "a valid AreaDefs message");
+        return false;
+    } catch (const std::exception& error) {
+        issues.Error(PackageErrorCode::AreaDefsCorrupt, site, std::string("decode failed: ") + error.what());
+        return false;
+    }
+    return issues.ErrorCount() == errors_before;
+}
+
+// Rules between areas: unique ids; every parent exists, no cycle, at most
+// kMaxAreaDepth levels; a respawn point inside the world, and on a volume
+// where the baked actor fits; every listed volume exists and belongs to one
+// area only. (A terrain respawn point's cell is checked against the terrain.)
+void ValidateAreaDefs(const std::vector<AreaDef>& defs,
+                      const std::string& file,
+                      const GridGeometry& geometry,
+                      const std::optional<LayeredWorld>& layered,
+                      Issues& issues)
+{
+    auto at = [&](std::size_t i, const char* sub) {
+        return IssueSite{"areaDefs", file, "areas[" + std::to_string(i) + "]" + sub};
+    };
+    std::unordered_map<AreaId, std::size_t> index;
+    for (std::size_t i = 0; i < defs.size(); ++i) {
+        if (defs[i].id != 0 && !index.emplace(defs[i].id, i).second) {
+            issues.Error(PackageErrorCode::AreaIdDuplicate, at(i, ".id"),
+                         "area id " + std::to_string(defs[i].id) + " already used", "unique area ids");
+        }
+    }
+    for (std::size_t i = 0; i < defs.size(); ++i) {
+        const auto& def = defs[i];
+        if (def.parent_id == 0) {
+            continue;
+        }
+        if (def.parent_id == def.id) {
+            issues.Error(PackageErrorCode::AreaParentInvalid, at(i, ".parentId"),
+                         "area " + std::to_string(def.id) + " is its own parent", "another area, or 0 (top level)");
+            continue;
+        }
+        if (!index.contains(def.parent_id)) {
+            issues.Error(PackageErrorCode::AreaParentInvalid, at(i, ".parentId"),
+                         "parent " + std::to_string(def.parent_id) + " does not exist",
+                         "an id of this table, or 0 (top level)");
+            continue;
+        }
+        // Walk up: back at this area = a cycle; a missing ancestor is
+        // reported at that ancestor.
+        std::size_t depth = 1;
+        bool cycle = false;
+        for (AreaId up = def.parent_id; up != 0 && depth <= defs.size();) {
+            ++depth;
+            if (up == def.id) {
+                cycle = true;
+                break;
+            }
+            const auto it = index.find(up);
+            if (it == index.end()) {
+                break;
+            }
+            up = defs[it->second].parent_id;
+        }
+        if (cycle) {
+            issues.Error(PackageErrorCode::AreaParentInvalid, at(i, ".parentId"),
+                         "area " + std::to_string(def.id) + " is its own ancestor (parent cycle)",
+                         "a tree of areas");
+        } else if (depth > kMaxAreaDepth) {
+            issues.Error(PackageErrorCode::AreaParentInvalid, at(i, ".parentId"),
+                         "area " + std::to_string(def.id) + " is " + std::to_string(depth) + " levels deep",
+                         "<= " + std::to_string(kMaxAreaDepth) + " levels");
+        }
+    }
+    std::unordered_map<std::uint32_t, AreaId> volume_owner;
+    for (std::size_t i = 0; i < defs.size(); ++i) {
+        const auto& def = defs[i];
+        if (const auto& respawn = def.rules.respawn) {
+            const std::string what = "respawn point (" + Str(respawn->x) + "," + Str(respawn->y) + ")";
+            if (!geometry.Contains(respawn->x, respawn->y)) {
+                issues.Error(PackageErrorCode::AreaRespawnInvalid, at(i, ".rules.respawn"), what,
+                             "finite, inside the world (half-open)");
+            } else if (respawn->volume_id != 0) {
+                if (!layered || !layered->clearance_profile) {
+                    issues.Error(PackageErrorCode::AreaRespawnInvalid, at(i, ".rules.respawn.volumeId"),
+                                 what + " on volume " + std::to_string(respawn->volume_id) +
+                                     ": the package has no layered world with a clearance bake",
+                                 "a layered_world sidecar (MX3D v4) that contains the volume");
+                } else {
+                    const LayerActorProfile actor{layered->clearance_profile->actor_radius_m,
+                                                  layered->clearance_profile->actor_height_m};
+                    const auto placed =
+                        ResolveLayerActorPlacement(*layered, actor, respawn->volume_id, respawn->x, respawn->y);
+                    if (!placed.Ok()) {
+                        issues.Error(PackageErrorCode::AreaRespawnInvalid, at(i, ".rules.respawn.volumeId"),
+                                     what + " on volume " + std::to_string(respawn->volume_id) + " is " +
+                                         ToString(placed.status),
+                                     "a point of a walkable volume where the baked actor fits");
+                    }
+                }
+            }
+        }
+        for (const std::uint32_t volume : def.volumes) {
+            const bool exists = layered && std::any_of(layered->volumes.begin(), layered->volumes.end(),
+                                                       [&](const LayerVolume& v) { return v.id == volume; });
+            if (!exists) {
+                issues.Error(PackageErrorCode::AreaVolumeInvalid, at(i, ".volumes"),
+                             "volume " + std::to_string(volume) + " is not in the layered world",
+                             "a volume of layered_world.mx3d");
+                continue;
+            }
+            const auto [owner, inserted] = volume_owner.emplace(volume, def.id);
+            if (!inserted) {
+                issues.Error(PackageErrorCode::AreaVolumeInvalid, at(i, ".volumes"),
+                             "volume " + std::to_string(volume) + " already belongs to area " +
+                                 std::to_string(owner->second),
+                             "each volume in at most one area");
+            }
         }
     }
 }
@@ -1862,6 +2218,8 @@ void ParseSpawns(const std::vector<std::uint8_t>& bytes,
                  const GridGeometry& geometry,
                  std::uint16_t version,
                  const WorldLogic& logic,
+                 const AreaTable* areas,
+                 const ServerTerrain& terrain,
                  std::vector<SpawnRecord>& out,
                  Issues& issues)
 {
@@ -1970,9 +2328,18 @@ void ParseSpawns(const std::vector<std::uint8_t>& bytes,
                          "unique nonzero spawn_id within world package");
             continue;
         }
-        if (record.area_id != 0 && std::none_of(logic.zones.begin(), logic.zones.end(),
-                [&](const auto& area) { return area.id == record.area_id &&
-                    area.bounds.ContainsHalfOpen(record.x, record.y); })) {
+        // With nested areas the raster answers; a chunk the streaming
+        // loader has not read yet is checked by the Full validation.
+        const auto area_holds = [&] {
+            if (areas == nullptr) {
+                return std::any_of(logic.zones.begin(), logic.zones.end(), [&](const auto& area) {
+                    return area.id == record.area_id && area.bounds.ContainsHalfOpen(record.x, record.y);
+                });
+            }
+            const auto sample = terrain.Area(record.x, record.y);
+            return areas->Contains(record.area_id) && (!sample.Ok() || areas->IsWithin(sample.area, record.area_id));
+        };
+        if (record.area_id != 0 && !area_holds()) {
             issues.Error(PackageErrorCode::SpawnsFieldInvalid, site, "invalid area_id or centre outside area",
                          "0 (world) or existing containing area");
             continue;
@@ -2029,6 +2396,7 @@ const char* ToString(PackageErrorCode code) noexcept
     case PackageErrorCode::ChunkAttributeReservedBits: return "CHUNK_ATTRIBUTE_RESERVED_BITS";
     case PackageErrorCode::ChunkSplatGeometry: return "CHUNK_SPLAT_GEOMETRY";
     case PackageErrorCode::ChunkEdgeMismatch: return "CHUNK_EDGE_MISMATCH";
+    case PackageErrorCode::ChunkAreaUnknown: return "CHUNK_AREA_UNKNOWN";
     case PackageErrorCode::WorldLogicHeaderInvalid: return "WORLDLOGIC_HEADER_INVALID";
     case PackageErrorCode::WorldLogicTruncated: return "WORLDLOGIC_TRUNCATED";
     case PackageErrorCode::WorldLogicTrailingData: return "WORLDLOGIC_TRAILING_DATA";
@@ -2047,6 +2415,14 @@ const char* ToString(PackageErrorCode code) noexcept
     case PackageErrorCode::WorldLogicNoPlayerSpawn: return "WORLDLOGIC_NO_PLAYER_SPAWN";
     case PackageErrorCode::WorldLogicSpawnBlocked: return "WORLDLOGIC_SPAWN_BLOCKED";
     case PackageErrorCode::WorldLogicSpawnVolumeInvalid: return "WORLDLOGIC_SPAWN_VOLUME_INVALID";
+    case PackageErrorCode::AreaDefsCorrupt: return "AREA_DEFS_CORRUPT";
+    case PackageErrorCode::AreaIdInvalid: return "AREA_ID_INVALID";
+    case PackageErrorCode::AreaIdDuplicate: return "AREA_ID_DUPLICATE";
+    case PackageErrorCode::AreaParentInvalid: return "AREA_PARENT_INVALID";
+    case PackageErrorCode::AreaRuleInvalid: return "AREA_RULE_INVALID";
+    case PackageErrorCode::AreaRespawnInvalid: return "AREA_RESPAWN_INVALID";
+    case PackageErrorCode::AreaVolumeInvalid: return "AREA_VOLUME_INVALID";
+    case PackageErrorCode::AreaLayersInconsistent: return "AREA_LAYERS_INCONSISTENT";
     case PackageErrorCode::SpawnsSyntax: return "SPAWNS_SYNTAX";
     case PackageErrorCode::SpawnsFieldInvalid: return "SPAWNS_FIELD_INVALID";
     case PackageErrorCode::SpawnsOutOfBounds: return "SPAWNS_OUT_OF_BOUNDS";
@@ -2094,6 +2470,8 @@ const char* ToString(LayerKind kind) noexcept
     case LayerKind::MobSpawns: return "mobSpawns";
     case LayerKind::Water: return "water";
     case LayerKind::WaterBodies: return "waterBodies";
+    case LayerKind::AreaIds: return "areaIds";
+    case LayerKind::AreaDefs: return "areaDefs";
     }
     return "unknown";
 }
@@ -2420,6 +2798,37 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                         }
                     }
                 }
+                // ---- areas (areaIds + areaDefs, section 15) ----
+                // Read before any chunk: each chunk's raster is checked
+                // against the table while it decodes.
+                const LayerInfo* area_ids_layer = manifest.FindLayer(LayerKind::AreaIds);
+                const LayerInfo* area_defs_layer = manifest.FindLayer(LayerKind::AreaDefs);
+                plan.areas_declared = area_ids_layer != nullptr;
+                if ((area_ids_layer == nullptr) != (area_defs_layer == nullptr)) {
+                    issues.Error(PackageErrorCode::AreaLayersInconsistent, IssueSite{"manifest", kManifestFile, "layers"},
+                                 std::string("only ") + (area_ids_layer != nullptr ? "areaIds" : "areaDefs") +
+                                     " is declared",
+                                 "areaIds and areaDefs together, or neither");
+                } else if (area_defs_layer != nullptr) {
+                    if (const auto bytes = files.Read(area_defs_layer->file, kMaxAreaDefsBytes, IssueSite{"areaDefs"})) {
+                        const std::size_t before = issues.ErrorCount();
+                        std::vector<AreaDef> defs;
+                        if (ParseAreaDefs(*bytes, area_defs_layer->file, defs, issues)) {
+                            ValidateAreaDefs(defs, area_defs_layer->file, geometry, data.layered_world, issues);
+                        }
+                        if (issues.ErrorCount() == before) {
+                            auto known = std::make_shared<std::vector<bool>>(static_cast<std::size_t>(kMaxAreaId) + 1);
+                            for (const auto& def : defs) {
+                                (*known)[def.id] = true;
+                            }
+                            plan.known_areas = std::move(known);
+                            data.areas = AreaTable(std::move(defs));
+                        }
+                    }
+                }
+                const AreaTable* areas = data.areas ? &*data.areas : nullptr;
+                const std::string areas_file = area_defs_layer != nullptr ? area_defs_layer->file : std::string();
+
                 std::vector<TerrainChunk> chunks(manifest.chunks.size());
                 bool any_splat = false;
                 std::uint32_t splat_w = 0, splat_h = 0;
@@ -2482,7 +2891,15 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                                                       IssueSite{"worldLogic"})) {
                         const std::size_t before = issues.ErrorCount();
                         if (ParseWorldLogic(*bytes, logic_layer->file, data.logic, issues)) {
-                            ValidateWorldLogic(data.logic, logic_layer->file, geometry, issues, options.warp_policy);
+                            if (areas != nullptr && !data.logic.zones.empty()) {
+                                issues.Error(PackageErrorCode::AreaLayersInconsistent,
+                                             IssueSite{"worldLogic", logic_layer->file, "areas"},
+                                             std::to_string(data.logic.zones.size()) +
+                                                 " MXL1 areas next to the areaDefs table",
+                                             "no MXL1 areas when areaDefs is declared (one source of areas)");
+                            }
+                            ValidateWorldLogic(data.logic, logic_layer->file, geometry, issues, options.warp_policy,
+                                               areas);
                             ValidateLayeredSpawns(data.logic, logic_layer->file, data.layered_world, issues);
                         }
                         logic_ok = issues.ErrorCount() == before;
@@ -2505,6 +2922,13 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                     for (const auto& warp : data.logic.warps) {
                         add(warp.target_x, warp.target_y);
                     }
+                    if (areas != nullptr) {
+                        for (const auto& def : areas->Defs()) {
+                            if (def.rules.respawn && def.rules.respawn->volume_id == 0) {
+                                add(def.rules.respawn->x, def.rules.respawn->y);
+                            }
+                        }
+                    }
                     std::sort(startup.begin(), startup.end());
                     startup.erase(std::unique(startup.begin(), startup.end()), startup.end());
                     for (const std::uint32_t index : startup) {
@@ -2517,7 +2941,7 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                 report.resident_terrain_bytes = data.terrain.ResidentBytes();
                 if (logic_ok && issues.ErrorCount() == 0) {
                     const std::size_t before = issues.ErrorCount();
-                    ValidateAgainstTerrain(data.logic, logic_layer->file, data.terrain, issues);
+                    ValidateAgainstTerrain(data.logic, logic_layer->file, data.terrain, issues, areas, areas_file);
                     logic_ok = issues.ErrorCount() == before;
                 }
                 data.chunk_source = std::make_shared<PackageChunkSource>(report.root, manifest, plan);
@@ -2535,7 +2959,7 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                                                              IssueSite{"mobSpawns"})) {
                         const std::size_t before = issues.ErrorCount();
                         ParseSpawns(*bytes, spawn_layer->file, geometry, spawn_layer->version,
-                                    data.logic, data.spawns, issues);
+                                    data.logic, areas, data.terrain, data.spawns, issues);
                         spawn_ok = issues.ErrorCount() == before;
                         data.spawn_layer_present = true;
                     }
@@ -2588,6 +3012,10 @@ std::optional<ServerWorldData> LoadServerWorld(const fs::path& package_root,
                         break;
                     case LayerKind::WaterBodies:
                         layer.status = water_ok ? LayerStatus::Loaded : LayerStatus::Absent;
+                        break;
+                    case LayerKind::AreaIds:
+                    case LayerKind::AreaDefs:
+                        layer.status = areas != nullptr ? LayerStatus::Loaded : LayerStatus::Absent;
                         break;
                     case LayerKind::Water:
                         if (!layer.required && !files.Exists(layer.file)) {

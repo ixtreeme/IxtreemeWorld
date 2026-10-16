@@ -1248,6 +1248,223 @@ int RunWorldPackageScenario(const std::string& fixtures_out)
         emit("many_chunks_v3", many);
     }
 
+    // ===== areas: areaIds + areaDefs (format section 15) ========================
+    {
+        // Region 1 (the west half) holds town 2, the town holds arena 3; the
+        // east half has no area. Chunk (0,0) is all region (a uniform
+        // section), chunk (0,1) mixes town and arena (a grid), the east chunks
+        // are uniform 0.
+        using mx::map::AreaDef;
+        using mx::map::PvpMode;
+        namespace flag = mx::map::area_flag;
+        const auto areas_spec = [] {
+            auto spec = BaseSpec();
+            spec.logic.zones.clear();
+            spec.logic.spawns = {{1, 2, {40.0f, 160.0f, 50.0f, 170.0f}}}; // centre in the arena, inside the town
+            spec.mob_spawns_version = 2;
+            spec.mob_spawns_required = true;
+            spec.mob_spawns = std::string("spawn_id=1 area_id=1 mob_type_id=1 x=50 y=50 count=2 radius=5\n");
+            AreaDef region{1, 0, "region", "area.region", {}, {}};
+            region.rules.pvp = PvpMode::Free;
+            region.rules.level_min = 10;
+            region.rules.level_max = 30;
+            region.rules.forbid = flag::kNoMount;
+            region.rules.music_id = 5;
+            region.rules.respawn = mx::map::AreaPoint{100.0f, 100.0f, 0};
+            AreaDef town{2, 1, "town", "area.town", {}, {}};
+            town.rules.pvp = PvpMode::Peaceful;
+            town.rules.forbid = flag::kNoPet;
+            town.rules.ambient_id = 9;
+            AreaDef arena{3, 2, "arena", "area.arena", {}, {}};
+            arena.rules.pvp = PvpMode::DuelOnly;
+            arena.rules.allow = flag::kNoMount; // mounts allowed again in the arena
+            arena.rules.level_min = 20;
+            arena.rules.level_max = 25;
+            spec.areas = {region, town, arena};
+            spec.area_id = [](std::uint32_t cx, std::uint32_t cy) -> std::uint16_t {
+                if (cx >= 32) {
+                    return 0;
+                }
+                if (cy < 32) {
+                    return 1;
+                }
+                return cx >= 8 && cx < 16 && cy >= 40 && cy < 48 ? 3 : 2;
+            };
+            return spec;
+        };
+        {
+            const auto dir = c.Dir("areas_nested");
+            const bool written = Write(dir, areas_spec());
+            const auto loaded = Load(dir);
+            bool raster = false;
+            bool rules = false;
+            bool tree = false;
+            std::string detail = loaded.First();
+            if (written && loaded.world && loaded.world->areas) {
+                const auto& t = loaded.world->terrain;
+                const auto& a = *loaded.world->areas;
+                const auto* c00 = t.ChunkAt(0, 0);
+                const auto* c01 = t.ChunkAt(0, 1);
+                raster = t.Area(20.0f, 20.0f).area == 1 && t.Area(200.0f, 20.0f).area == 0 &&
+                         t.Area(45.0f, 165.0f).area == 3 && t.Area(100.0f, 200.0f).area == 2 &&
+                         t.Area(300.0f, 20.0f).status == mx::map::TerrainStatus::OutsideWorld &&
+                         c00 != nullptr && c00->area_ids.empty() && c00->area_uniform == 1 && c01 != nullptr &&
+                         c01->area_ids.size() == 32u * 32u &&
+                         loaded.report.resident_terrain_bytes == 4ull * (33 * 33 * 2 + 32 * 32 * 2) + 32 * 32 * 2;
+                const auto& arena = a.Rules(3);
+                const auto& town = a.Rules(2);
+                const auto& world = a.Rules(0);
+                rules = arena.pvp == PvpMode::DuelOnly && arena.level_min == 20 && arena.level_max == 25 &&
+                        arena.forbidden == flag::kNoPet && arena.music_id == 5 && arena.ambient_id == 9 &&
+                        arena.respawn && arena.respawn->x == 100.0f && town.pvp == PvpMode::Peaceful &&
+                        town.level_min == 10 && town.level_max == 30 &&
+                        town.forbidden == (flag::kNoMount | flag::kNoPet) && world.pvp == PvpMode::Peaceful &&
+                        world.forbidden == 0 && !world.respawn && a.Rules(1).pvp == PvpMode::Free;
+                tree = a.Depth(3) == 3 && a.Depth(1) == 1 && a.Depth(0) == 0 && a.IsWithin(3, 1) &&
+                       a.IsWithin(3, 3) && !a.IsWithin(1, 3) && !a.IsWithin(0, 1) && a.CommonAncestor(3, 1) == 1 &&
+                       a.CommonAncestor(3, 2) == 2 && a.CommonAncestor(3, 0) == 0;
+                detail = Fmt("area(20,20)=%u (200,20)=%u (45,165)=%u (100,200)=%u resident=%llu arena pvp=%s "
+                             "lvl=%u..%u forbidden=%u music=%u ambient=%u",
+                             t.Area(20.0f, 20.0f).area, t.Area(200.0f, 20.0f).area, t.Area(45.0f, 165.0f).area,
+                             t.Area(100.0f, 200.0f).area,
+                             static_cast<unsigned long long>(loaded.report.resident_terrain_bytes),
+                             mx::map::ToString(arena.pvp), arena.level_min, arena.level_max, arena.forbidden,
+                             arena.music_id, arena.ambient_id);
+            }
+            c.Report("areas-nested-raster", raster, detail);
+            c.Report("areas-nested-rules-inherit", rules, detail);
+            c.Report("areas-nested-tree", tree, detail);
+            // Streaming: the chunk source checks a later chunk's raster
+            // against the same table.
+            gs::game::WorldLoadRequest request;
+            request.package_root = dir;
+            request.mob_types_config = IXTREEME_DEFAULT_MOB_TYPES_CONFIG;
+            request.residency = mx::map::ResidencyMode::Streaming;
+            mx::map::PackageReport report;
+            const auto streamed = gs::game::LoadWorldPackage(request, report);
+            bool later_chunk = false;
+            if (streamed && streamed->chunk_source) {
+                const auto chunk = streamed->chunk_source->Load(2); // chunk (0,1)
+                later_chunk = chunk.ok && chunk.chunk && chunk.chunk->area_ids.size() == 32u * 32u;
+            }
+            c.Report("areas-streaming-chunk-source", streamed.has_value() && streamed->areas && later_chunk,
+                     Fmt("load=%s chunk(0,1) grid=%d", streamed ? "ok" : "REFUSED", later_chunk ? 1 : 0));
+            ExpectLoaded(c, "areas-nested-full-validation", dir, ValidationDepth::Full);
+        }
+        {
+            // A whole layered volume belongs to an area.
+            auto spec = areas_spec();
+            mx::map::LayerVolume cave;
+            cave.id = 7;
+            cave.name = "cave";
+            cave.bounds = {150.0f, 150.0f, 200.0f, 200.0f};
+            cave.min_z = -20.0f;
+            cave.max_z = -5.0f;
+            spec.layered_world = mx::map::LayeredWorld{};
+            spec.layered_world->volumes.push_back(cave);
+            AreaDef cave_area{4, 1, "cave", "area.cave", {}, {7}};
+            spec.areas.push_back(cave_area);
+            const auto dir = c.Dir("areas_volume");
+            Write(dir, spec);
+            const auto loaded = Load(dir);
+            const bool ok = loaded.world && loaded.world->areas && loaded.world->areas->VolumeArea(7) == 4 &&
+                            loaded.world->areas->VolumeArea(8) == 0;
+            c.Report("areas-volume-membership", ok,
+                     Fmt("load=%s volume 7 -> area %u", loaded.world ? "ok" : "REFUSED",
+                         loaded.world && loaded.world->areas ? loaded.world->areas->VolumeArea(7) : 0u));
+            spec.areas.push_back(AreaDef{5, 0, "cave2", "area.cave2", {}, {7}});
+            ExpectSpecRejected(c, "areas-volume-in-two-areas", spec, PackageErrorCode::AreaVolumeInvalid);
+        }
+        // ---- rejections, one per rule ----
+        auto with = [&](const char* name, PackageErrorCode code, const std::function<void(mx::map::PackageWriteSpec&)>& edit) {
+            auto spec = areas_spec();
+            edit(spec);
+            ExpectSpecRejected(c, name, spec, code);
+        };
+        with("areas-raster-unknown-id", PackageErrorCode::ChunkAreaUnknown, [](auto& s) {
+            s.area_id = [](std::uint32_t cx, std::uint32_t) -> std::uint16_t { return cx >= 32 ? 44 : 1; };
+            s.logic.spawns = {{1, 1, {40.0f, 60.0f, 50.0f, 70.0f}}};
+        });
+        with("areas-id-zero", PackageErrorCode::AreaIdInvalid, [](auto& s) { s.areas.push_back(AreaDef{0, 0, "x", "x", {}, {}}); });
+        with("areas-id-duplicate", PackageErrorCode::AreaIdDuplicate, [](auto& s) { s.areas.push_back(AreaDef{2, 0, "x", "x", {}, {}}); });
+        with("areas-parent-missing", PackageErrorCode::AreaParentInvalid, [](auto& s) { s.areas[1].parent_id = 77; });
+        with("areas-parent-self", PackageErrorCode::AreaParentInvalid, [](auto& s) { s.areas[1].parent_id = 2; });
+        with("areas-parent-cycle", PackageErrorCode::AreaParentInvalid, [](auto& s) { s.areas[0].parent_id = 3; });
+        with("areas-too-deep", PackageErrorCode::AreaParentInvalid, [](auto& s) {
+            for (std::uint32_t id = 4; id <= 17; ++id) {
+                s.areas.push_back(AreaDef{id, id - 1, "deep", "area.deep", {}, {}}); // 3 + 14 = 17 levels
+            }
+        });
+        with("areas-rule-level-range", PackageErrorCode::AreaRuleInvalid, [](auto& s) {
+            s.areas[2].rules.level_min = 30;
+            s.areas[2].rules.level_max = 10;
+        });
+        with("areas-rule-level-min-zero", PackageErrorCode::AreaRuleInvalid, [](auto& s) {
+            s.areas[2].rules.level_min = 0;
+            s.areas[2].rules.level_max = 10;
+        });
+        with("areas-rule-unknown-flag", PackageErrorCode::AreaRuleInvalid, [](auto& s) { s.areas[1].rules.forbid = 0x100; });
+        with("areas-rule-forbid-and-allow", PackageErrorCode::AreaRuleInvalid, [](auto& s) {
+            s.areas[1].rules.forbid = flag::kNoPet;
+            s.areas[1].rules.allow = flag::kNoPet;
+        });
+        with("areas-rule-unknown-pvp", PackageErrorCode::AreaRuleInvalid, [](auto& s) {
+            s.patch_areas = [](mx::map::package_schema::AreaDefs::Builder& root) {
+                root.getAreas()[0].getRules().setPvp(static_cast<mx::map::package_schema::PvpMode>(7));
+            };
+        });
+        with("areas-rule-long-name", PackageErrorCode::AreaRuleInvalid, [](auto& s) { s.areas[0].name_key = std::string(200, 'k'); });
+        with("areas-respawn-outside-world", PackageErrorCode::AreaRespawnInvalid, [](auto& s) {
+            s.areas[0].rules.respawn = mx::map::AreaPoint{999.0f, 999.0f, 0};
+        });
+        with("areas-respawn-blocked", PackageErrorCode::AreaRespawnInvalid, [](auto& s) {
+            s.areas[0].rules.respawn = mx::map::AreaPoint{45.0f, 45.0f, 0}; // the blocked 3x3 patch
+        });
+        with("areas-respawn-volume-without-layers", PackageErrorCode::AreaRespawnInvalid, [](auto& s) {
+            s.areas[0].rules.respawn = mx::map::AreaPoint{100.0f, 100.0f, 7};
+        });
+        with("areas-volume-unknown", PackageErrorCode::AreaVolumeInvalid, [](auto& s) { s.areas[0].volumes = {7}; });
+        with("areas-only-ids-declared", PackageErrorCode::AreaLayersInconsistent, [](auto& s) {
+            s.patch_manifest = [](mx::map::package_schema::MapManifest::Builder& manifest) {
+                for (auto layer : manifest.getLayers()) {
+                    if (layer.getKind() == mx::map::package_schema::LayerKind::AREA_DEFS) {
+                        layer.setKind(static_cast<mx::map::package_schema::LayerKind>(99));
+                        layer.setRequired(false);
+                    }
+                }
+            };
+        });
+        with("areas-next-to-mxl1-areas", PackageErrorCode::AreaLayersInconsistent, [](auto& s) {
+            s.logic.zones = {{1, "west", {0.0f, 0.0f, 128.0f, 256.0f}}};
+        });
+        with("areas-spawn-region-unknown-area", PackageErrorCode::WorldLogicReferenceInvalid,
+             [](auto& s) { s.logic.spawns[0].zone_id = 9; });
+        with("areas-spawn-region-outside-area", PackageErrorCode::WorldLogicSpawnOutsideZone, [](auto& s) {
+            s.logic.spawns = {{1, 3, {95.0f, 195.0f, 105.0f, 205.0f}}}; // centre in the town, not the arena
+        });
+        with("areas-mob-spawn-wrong-area", PackageErrorCode::SpawnsFieldInvalid, [](auto& s) {
+            s.mob_spawns = std::string("spawn_id=1 area_id=2 mob_type_id=1 x=50 y=50 count=2 radius=5\n");
+        });
+        {
+            const auto dir = c.Dir("areas_defs_garbage");
+            Write(dir, areas_spec());
+            WriteAll(dir / mx::map::kAreaDefsFile, std::vector<std::uint8_t>{1, 2, 3, 4, 5, 6, 7});
+            ExpectRejected(c, "areas-defs-not-a-message", dir, PackageErrorCode::AreaDefsCorrupt);
+        }
+        {
+            // Only the areas make this v2 spec invalid (v1 spawn table, splats).
+            auto legacy = areas_spec();
+            legacy.format_version = 2;
+            legacy.splat_size = 8;
+            legacy.mob_spawns_version = 1;
+            legacy.mob_spawns_required = false;
+            legacy.mob_spawns = std::string("mob_type_id=1 x=50 y=50 count=2 radius=5\n");
+            const auto result = mx::map::WritePackage(c.Dir("areas_legacy_v2"), legacy);
+            c.Report("areas-writer-refuses-v2", !result.ok && result.error.find("areas") != std::string::npos,
+                     "error=\"" + result.error + "\"");
+        }
+    }
+
     fs::remove_all(c.root, ec);
     std::printf("WORLDPACKAGE-DONE passes=%d failures=%d skipped=%d\n", c.passes, c.failures, c.skipped);
     return c.failures;

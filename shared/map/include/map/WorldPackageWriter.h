@@ -11,6 +11,7 @@
 #include "map/LayeredWorld.h"
 #include "map/ServerTerrain.h"
 #include "map/ServerWater.h"
+#include "map/WorldAreas.h"
 #include "schema/world_package_manifest.capnp.h"
 
 // World-package writer: the single implementation of the format contract's
@@ -58,6 +59,14 @@ struct PackageWriteSpec {
     std::vector<WaterBodyRect> water_bodies;
     // Optional 3D-2 sidecar. Empty keeps the package fully legacy-compatible.
     std::optional<LayeredWorld> layered_world;
+    // Nested areas (v3, section 15): the areaDefs file and layer, plus an
+    // area section in every chunk -- uniform when the whole chunk is one
+    // area. Neither set: no area layers (the MXL1 areas in `logic` stay).
+    std::vector<AreaDef> areas;
+    // Most specific area of cell (cx, cy), cx in [0, size_x), cy in [0, size_y).
+    std::function<std::uint16_t(std::uint32_t cx, std::uint32_t cy)> area_id;
+    // Test hook: last-moment edits of the areaDefs message (corrupt fixtures).
+    std::function<void(package_schema::AreaDefs::Builder&)> patch_areas;
     // Existing map.manifest in the target is never replaced unless set.
     bool overwrite = false;
     // Test hook: last-moment edits of the manifest message (corrupt fixtures).
@@ -66,6 +75,10 @@ struct PackageWriteSpec {
     std::uint32_t SizeY() const noexcept
     {
         return size_cells_y != 0 ? size_cells_y : size_cells_x;
+    }
+    bool HasAreas() const noexcept
+    {
+        return !areas.empty() || static_cast<bool>(area_id);
     }
 };
 
@@ -79,6 +92,7 @@ PackageWriteResult WritePackage(const std::filesystem::path& out_dir, const Pack
 
 std::vector<std::uint8_t> EncodeWorldLogic(const WorldLogic& logic);
 std::vector<std::uint8_t> EncodeWaterBodies(const std::vector<WaterBodyRect>& bodies);
+std::vector<std::uint8_t> EncodeAreaDefs(const PackageWriteSpec& spec);
 // One chunk file; a partial edge chunk carries only its in-world cells.
 std::vector<std::uint8_t> EncodeChunk(const PackageWriteSpec& spec, std::uint32_t chunk_x, std::uint32_t chunk_y);
 

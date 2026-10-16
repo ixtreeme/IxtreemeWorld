@@ -33,6 +33,7 @@ add_library(IXEngineMapData STATIC
     src/LayerActorMovement.cpp
     src/ServerTerrain.cpp
     src/ServerWater.cpp
+    src/WorldAreas.cpp
     src/WorldPackage.cpp
     src/WorldPackageWriter.cpp
 )

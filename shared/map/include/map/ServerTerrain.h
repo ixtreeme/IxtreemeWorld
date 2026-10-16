@@ -129,6 +129,18 @@ struct CellSample {
     }
 };
 
+// Most specific area of a cell (areaIds layer). Without the layer every cell
+// with data answers area 0.
+struct AreaSample {
+    TerrainStatus status = TerrainStatus::OutsideWorld;
+    std::uint32_t area = 0; // meaningful only when status == Ok; 0 = no area
+
+    bool Ok() const noexcept
+    {
+        return status == TerrainStatus::Ok;
+    }
+};
+
 struct TerrainChunk {
     std::uint32_t x = 0; // stable chunk key = (x, y) in the chunk grid
     std::uint32_t y = 0;
@@ -137,6 +149,10 @@ struct TerrainChunk {
     std::vector<std::int16_t> heights16;   // (cells_x+1)*(cells_y+1), row-major, y outer
     std::vector<std::int32_t> heights32;   // used instead of heights16 for int32 encoding
     std::vector<std::uint16_t> attributes; // cells_x*cells_y, row-major
+    // Area raster: one id per cell (row-major), or area_uniform for every
+    // cell while area_ids is empty (also the state without the layer).
+    std::vector<std::uint16_t> area_ids;
+    std::uint16_t area_uniform = 0;
     bool resident = false;                 // loader: decoded and valid
 
     std::size_t Bytes() const noexcept;
@@ -228,6 +244,10 @@ public:
     SegmentSample Segment(double x0, double y0, double x1, double y1) const noexcept;
     // One cell by its global cell index (0..cells-1).
     CellSample CellAt(std::uint32_t cell_x, std::uint32_t cell_y) const noexcept;
+    // Most specific area at a world point / of a global cell (same statuses
+    // as Cell / CellAt).
+    AreaSample Area(double x, double y) const noexcept;
+    AreaSample AreaAt(std::uint32_t cell_x, std::uint32_t cell_y) const noexcept;
     // Global cell index of a world point (world-unit rule, half-open); false
     // outside the world / for non-finite input.
     bool CellIndexOf(double x, double y, std::uint32_t& cell_x, std::uint32_t& cell_y) const noexcept;

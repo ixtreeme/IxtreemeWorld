@@ -75,7 +75,7 @@ const char* ToString(TerrainStatus status) noexcept
 std::size_t TerrainChunk::Bytes() const noexcept
 {
     return heights16.size() * sizeof(std::int16_t) + heights32.size() * sizeof(std::int32_t) +
-           attributes.size() * sizeof(std::uint16_t);
+           attributes.size() * sizeof(std::uint16_t) + area_ids.size() * sizeof(std::uint16_t);
 }
 
 bool TerrainChunk::HasSamples(bool int32_samples) const noexcept
@@ -413,6 +413,42 @@ CellSample ServerTerrain::CellAt(std::uint32_t cell_x, std::uint32_t cell_y) con
         return {TerrainStatus::InvalidData, 0};
     }
     return {TerrainStatus::Ok, chunk->attributes[index]};
+}
+
+AreaSample ServerTerrain::Area(double x, double y) const noexcept
+{
+    std::uint32_t cell_x = 0, cell_y = 0;
+    if (slot_count_ == 0 || !CellIndexOf(x, y, cell_x, cell_y)) {
+        return {TerrainStatus::OutsideWorld, 0};
+    }
+    return AreaAt(cell_x, cell_y);
+}
+
+AreaSample ServerTerrain::AreaAt(std::uint32_t cell_x, std::uint32_t cell_y) const noexcept
+{
+    if (slot_count_ == 0 || cell_x >= geometry_.cells_x || cell_y >= geometry_.cells_y) {
+        return {TerrainStatus::OutsideWorld, 0};
+    }
+    const std::uint32_t cx = cell_x / geometry_.chunk_cells;
+    const std::uint32_t cy = cell_y / geometry_.chunk_cells;
+    const TerrainChunk* chunk = ChunkAt(cx, cy);
+    if (chunk == nullptr) {
+        return {TerrainStatus::NotResident, 0};
+    }
+    const std::uint32_t lx = cell_x - cx * geometry_.chunk_cells;
+    const std::uint32_t ly = cell_y - cy * geometry_.chunk_cells;
+    const std::size_t index = static_cast<std::size_t>(ly) * chunk->cells_x + lx;
+    // A chunk published as invalid has no cells at all.
+    if (lx >= chunk->cells_x || ly >= chunk->cells_y || index >= chunk->attributes.size()) {
+        return {TerrainStatus::InvalidData, 0};
+    }
+    if (chunk->area_ids.empty()) {
+        return {TerrainStatus::Ok, chunk->area_uniform};
+    }
+    if (index >= chunk->area_ids.size()) {
+        return {TerrainStatus::InvalidData, 0};
+    }
+    return {TerrainStatus::Ok, chunk->area_ids[index]};
 }
 
 SegmentSample ServerTerrain::Segment(double x0, double y0, double x1, double y1) const noexcept

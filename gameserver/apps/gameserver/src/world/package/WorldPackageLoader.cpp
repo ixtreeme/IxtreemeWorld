@@ -83,6 +83,7 @@ std::optional<LoadedWorld> LoadWorldPackage(const WorldLoadRequest& request, mx:
     world.water = std::move(data->water);
     world.layered_world = std::move(data->layered_world);
     world.logic = std::move(data->logic);
+    world.areas = std::move(data->areas);
     world.mob_types_config = types_path.string();
     world.mob_type_count = registry.Size();
     world.report = report;
