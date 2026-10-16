@@ -294,6 +294,15 @@ std::vector<ZonePartition*> ZoneManager::GetActiveLeaves() const
     return leaves;
 }
 
+std::size_t ZoneManager::ActiveLeafCount() const noexcept
+{
+    std::size_t count = 0;
+    for (const auto& root : partition_roots_) {
+        count += CountActiveLeaves(root.get());
+    }
+    return count;
+}
+
 bool ZoneManager::PlanSplit(ZoneId zone_id,
                             SplitPlan& out_plan,
                             SplitRejectReason* out_reason,
@@ -347,6 +356,13 @@ bool ZoneManager::PlanSplit(ZoneId zone_id,
     const float half_h = (bounds.max_y - bounds.min_y) * 0.5f;
     if (half_w < region->min_zone_size || half_h < region->min_zone_size) {
         return reject(SplitRejectReason::TooSmall);
+    }
+    // One leaf becomes four. Every active leaf is a live zone the supervisor
+    // walks each pass, and that pass grows faster than linearly with the
+    // count (RegionDefinition.h: 4096 empty zones = 77 ms, over the 50 ms
+    // tick), so the per-region depth and size limits alone do not bound it.
+    if (ActiveLeafCount() + 3 > max_active_leaves_) {
+        return reject(SplitRejectReason::ZoneBudget);
     }
 
     // Quadtree children tile the parent exactly (shared cut point, no gaps by

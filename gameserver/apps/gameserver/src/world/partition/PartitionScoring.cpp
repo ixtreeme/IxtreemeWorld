@@ -282,6 +282,8 @@ const char* PartitionNoopReasonName(PartitionNoopReason reason) noexcept
         return "split-not-eligible";
     case PartitionNoopReason::SplitMinSize:
         return "split-min-size";
+    case PartitionNoopReason::SplitZoneBudget:
+        return "split-zone-budget";
     case PartitionNoopReason::MergeNotEligible:
         return "merge-not-eligible";
     case PartitionNoopReason::MergeNotSustained:

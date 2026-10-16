@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -92,6 +93,7 @@ enum class SplitRejectReason : std::uint8_t {
     NotLeaf,
     MaxDepth,
     TooSmall,
+    ZoneBudget, // the split would exceed the world's max_active_zones
 };
 
 inline const char* SplitRejectReasonName(SplitRejectReason reason) noexcept
@@ -111,6 +113,8 @@ inline const char* SplitRejectReasonName(SplitRejectReason reason) noexcept
         return "max-depth";
     case SplitRejectReason::TooSmall:
         return "min-size";
+    case SplitRejectReason::ZoneBudget:
+        return "zone-budget";
     case SplitRejectReason::None:
     default:
         return "none";
@@ -171,6 +175,21 @@ inline void CollectActiveLeaves(ZonePartition* root, std::vector<ZonePartition*>
     for (auto& child : root->children) {
         CollectActiveLeaves(child.get(), out);
     }
+}
+
+inline std::size_t CountActiveLeaves(const ZonePartition* root) noexcept
+{
+    if (root == nullptr) {
+        return 0;
+    }
+    if (root->IsActiveLeaf()) {
+        return 1;
+    }
+    std::size_t count = 0;
+    for (const auto& child : root->children) {
+        count += CountActiveLeaves(child.get());
+    }
+    return count;
 }
 
 // Deterministic depth-first enumeration of every INTERNAL node (potential

@@ -6,6 +6,7 @@
 
 #include "../WorldConstants.h"
 #include "PartitionScoring.h"
+#include "RegionDefinition.h"
 
 // Runtime-bound partition configuration (§14-15). Field defaults match the
 // gameserver.conf.example keys and the in-code Config defaults they replace.
@@ -24,6 +25,9 @@ struct PartitionConfig {
     float resident_budget = 2000.0f;
     int max_partition_depth = 4;
     float min_zone_size_m = 500.0f;
+    // World-wide cap on active leaf zones after runtime splits. Defaults to
+    // the bootstrap cap, the largest count with a measured supervisor cost.
+    int max_active_zones = static_cast<int>(kMaxInitialLeafZones);
     // Adaptive split scoring (phase 2): candidate evaluation, boundary /
     // migration / replication / instability penalties, min-improvement gate.
     PartitionScoringConfig scoring;
@@ -40,6 +44,7 @@ struct ValidatedPartitionConfig {
 //  - min_zone_size >= 2 * AOI radius (ghost border needs a non-degenerate
 //    interior; a zone narrower than that is all border)
 //  - max_depth in [1, 8]
+//  - max_active_zones >= 1
 //  - tick/resident budgets > 0, sustained window >= 1s, cooldowns >= 0s.
 inline ValidatedPartitionConfig ValidatePartitionConfig(const PartitionConfig& in)
 {
@@ -82,6 +87,11 @@ inline ValidatedPartitionConfig ValidatePartitionConfig(const PartitionConfig& i
     if (out.effective.max_partition_depth < 1 || out.effective.max_partition_depth > 8) {
         out.warnings.emplace_back("partition: max_partition_depth outside [1,8], using 4");
         out.effective.max_partition_depth = 4;
+    }
+    if (out.effective.max_active_zones < 1) {
+        out.warnings.emplace_back("partition: max_active_zones must be >= 1, using " +
+                                  std::to_string(kMaxInitialLeafZones));
+        out.effective.max_active_zones = static_cast<int>(kMaxInitialLeafZones);
     }
     const float kMinSafeZone = 2.0f * kAoiRadiusMeters;
     if (!(out.effective.min_zone_size_m >= kMinSafeZone)) {

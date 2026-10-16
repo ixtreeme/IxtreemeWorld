@@ -450,6 +450,7 @@ enum class PartitionNoopReason : std::uint8_t {
     SplitMaxDepth,
     SplitNotEligible,  // not a leaf / commands pending / below threshold
     SplitMinSize,      // plan rejected: geometry below the zone floor
+    SplitZoneBudget,   // plan rejected: max_active_zones reached
     // Merge-specific:
     MergeNotEligible,      // not a 4-leaf quadtree group / child not active
     MergeNotSustained,     // group sustained-low window not matured

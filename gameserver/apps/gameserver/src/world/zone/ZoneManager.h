@@ -183,6 +183,14 @@ public:
     // Applies validated region limits (config binding). Supervisor only,
     // before any split runs.
     void ApplyRegionLimits(int max_partition_depth, float min_zone_size_m);
+    // World-wide cap on active leaf zones (partition max_active_zones). A
+    // split nets three more leaves, so PlanSplit refuses one that would end
+    // above the cap. Supervisor only, like ApplyRegionLimits.
+    void SetActiveLeafBudget(std::size_t max_active_leaves) noexcept
+    {
+        max_active_leaves_ = max_active_leaves;
+    }
+    std::size_t ActiveLeafCount() const noexcept;
 
     // Binds the world-space load field mapping to every zone (existing and
     // future): each zone sizes its local load-bin rectangle to its own bounds
@@ -239,6 +247,7 @@ private:
     std::vector<RegionDefinition> regions_;
     ZoneId next_zone_id_ = 1;
     LoadFieldMapping load_field_mapping_{};
+    std::size_t max_active_leaves_ = kMaxInitialLeafZones;
 };
 
 } // namespace gs::game

@@ -977,3 +977,25 @@ a dokumentált MAP-3 határok szerint értendők. A cache nem garantál
 éhezésmentességet a munkakészletnél kisebb budgettel; ezt a mérésekben
 külön kell megmutatni. Gameplay, kliens, login és DB-fejlesztés nem része
 ennek a csomagnak.
+
+## Futásidejű zónakorlát (2026-10-15)
+
+A MAP-3 előtti döntési lista 1. pontja és a MAP-4 státusz „globális futásidejű
+ASF zónabudget” tétele elkészült.
+
+- `partition_max_active_zones` (alapérték 1024 = `kMaxInitialLeafZones`, a
+  legnagyobb zónaszám, amelynek supervisor-költsége mérve van): a
+  `ZoneManager::PlanSplit` elutasítja azt a szétvágást, amely után az aktív
+  levélzónák száma meghaladná a korlátot. A why-not rekord részlete
+  `zone-budget`, osztálya `split-zone-budget`.
+- Miért kell: a régiónkénti mélység és minimális zónaméret nem korlátozza az
+  összeget (16×16 régió × 4⁴ levél is megengedett), a supervisor-kör pedig a
+  zónaszámmal gyorsabban nő, mint lineárisan: 4096 üres zóna 77 ms, ami több
+  az 50 ms-os ticknél (`RegionDefinition.h`, `worldbench --mode bootstrap`).
+- Érvénytelen érték (< 1): figyelmeztetés, és az alapérték lép életbe.
+  Ha a kezdeti zónák már kitöltik a korlátot, induláskor figyelmeztetés jelzi,
+  hogy futásidejű split nem lesz.
+- Teszt: `worldbench --mode mapsplit` – `testmap-zone-budget-refused-with-diagnostic`,
+  `testmap-zone-budget-freed-by-merge`, `zone-budget-invalid-falls-back`.
+  Mutációs ellenőrzés: a feltétel kivétele, `>=` határ, a konfiguráció át nem
+  adása és a validálás kivétele egyaránt elbuktatja a teszteket.

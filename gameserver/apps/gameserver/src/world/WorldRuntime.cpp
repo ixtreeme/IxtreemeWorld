@@ -42,6 +42,20 @@ std::uint64_t CurrentThreadCpuUs() {
 #endif
     return 0; // NOT MEASURED on unsupported platforms, never derived from wall work.
 }
+
+// Why-not class of a split the plan refused (the detail literal names the
+// exact reason).
+PartitionNoopReason NoopReasonOf(SplitRejectReason reason) noexcept
+{
+    switch (reason) {
+    case SplitRejectReason::TooSmall:
+        return PartitionNoopReason::SplitMinSize;
+    case SplitRejectReason::ZoneBudget:
+        return PartitionNoopReason::SplitZoneBudget;
+    default:
+        return PartitionNoopReason::SplitNotEligible;
+    }
+}
 }
 
 
@@ -1882,9 +1896,7 @@ void WorldRuntime::ExecutePartitionControl()
             case ZoneScheduler::SplitGate::BelowThreshold:
             case ZoneScheduler::SplitGate::Pass:
             default:
-                record.noop_reason = plan_reason == SplitRejectReason::TooSmall
-                                         ? PartitionNoopReason::SplitMinSize
-                                         : PartitionNoopReason::SplitNotEligible;
+                record.noop_reason = NoopReasonOf(plan_reason);
                 break;
             }
             record.detail = gate != ZoneScheduler::SplitGate::Pass
@@ -2313,8 +2325,7 @@ bool WorldRuntime::RunSplitTransaction(ZoneId zone_id, bool forced, const SplitC
             record.timestamp = std::chrono::steady_clock::now();
             record.zone_id = zone_id;
             record.executed = false;
-            record.noop_reason = plan_reason == SplitRejectReason::TooSmall ? PartitionNoopReason::SplitMinSize
-                                                                            : PartitionNoopReason::SplitNotEligible;
+            record.noop_reason = NoopReasonOf(plan_reason);
             record.detail = SplitRejectReasonName(plan_reason);
             RecordPartitionDecision(std::move(record), false, false);
         }
@@ -2865,10 +2876,11 @@ void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
     scheduler_.config.tick_budget_ms = e.tick_budget_ms;
 
     zones_.ApplyRegionLimits(e.max_partition_depth, e.min_zone_size_m);
+    zones_.SetActiveLeafBudget(static_cast<std::size_t>(e.max_active_zones));
     effective_partition_config_ = e;
 
     LOG_INFO("partition config effective: split>{:.2f} merge<{:.2f} sustained={}s cooldowns={}s/"
-             "{}s tick_budget={:.1f}ms residents={:.0f} depth<={} minsize={:.0f}m",
+             "{}s tick_budget={:.1f}ms residents={:.0f} depth<={} minsize={:.0f}m active_zones<={}",
              e.split_load_threshold,
              e.merge_load_threshold,
              e.sustained_window_seconds,
@@ -2877,7 +2889,13 @@ void WorldRuntime::ConfigurePartition(const PartitionConfig& config)
              e.tick_budget_ms,
              e.resident_budget,
              e.max_partition_depth,
-             e.min_zone_size_m);
+             e.min_zone_size_m,
+             e.max_active_zones);
+    if (static_cast<int>(zones_.ActiveLeafCount()) + 3 > e.max_active_zones) {
+        LOG_WARN("partition: {} active zones leave no room under max_active_zones={}; runtime splits are off",
+                 zones_.ActiveLeafCount(),
+                 e.max_active_zones);
+    }
     const auto& s = e.scoring;
     LOG_INFO("partition scoring effective: adaptive={} min_improvement={:.2f} band={:.0f}m "
              "hotspot>={:.2f}x{} weights=[bal={:.2f} bnd={:.2f} mig={:.2f} rep={:.2f} inst={:.2f} "

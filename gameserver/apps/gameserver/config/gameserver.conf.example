@@ -106,6 +106,10 @@ partition_tick_budget_ms=16.0
 partition_resident_budget=2000
 partition_max_depth=4
 partition_min_zone_size_m=500.0
+# World-wide cap on active zones after runtime splits; a split that would
+# go above it is refused (why-not detail "zone-budget"). Depth and min size
+# are per region and do not bound the total. Default = the bootstrap cap.
+partition_max_active_zones=1024
 
 # Adaptive split scoring (Adaptive Simulation Fabric phase 2). Read-only
 # scorer over the Continuous Load Field: it evaluates a few deterministic

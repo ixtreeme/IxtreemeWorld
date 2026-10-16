@@ -1522,6 +1522,56 @@ int RunMapSplitScenario()
                      refusal.refused ? 1 : 0, refusal.detail.c_str(), refusal.committed ? 1 : 0, leaves));
         sim.Stop();
     }
+    {
+        // World-wide zone budget. The 4 region leaves plus one split (7) fit
+        // under max_active_zones=7; a second split (10) must be refused with
+        // its own diagnostic, and merging the first back frees the room.
+        IoRunner runner;
+        gs::game::WorldRuntime sim(runner.io, {}, LoadBenchTestWorld(), gs::game::PartitionLayout{});
+        gs::game::PartitionConfig partition;
+        partition.scoring.adaptive_enabled = false;
+        partition.min_zone_size_m = 240.0f;
+        partition.max_active_zones = 7;
+        sim.ConfigurePartition(partition);
+        sim.Start();
+        std::this_thread::sleep_for(300ms);
+        auto leaf_count = [&sim] {
+            return ReadWorld(sim, [](const WorldSnapshot& snap) { return snap.zones.GetActiveLeaves().size(); });
+        };
+        const auto b = sim.Terrain().Bounds();
+        const auto first = LeafAt(sim, b.min_x + 100.0f, b.min_y + 100.0f);
+        const auto second = LeafAt(sim, b.max_x - 100.0f, b.max_y - 100.0f);
+        const bool split = ForceSplit(sim, first);
+        const std::size_t after_split = leaf_count();
+        const auto refusal = ForceSplitExpectRefusal(sim, second);
+        const std::size_t after_refusal = leaf_count();
+        c.Report("testmap-zone-budget-refused-with-diagnostic",
+                 first != second && split && after_split == 7 && refusal.refused && !refusal.committed &&
+                     refusal.detail == "zone-budget" &&
+                     refusal.reason == gs::game::PartitionNoopReason::SplitZoneBudget && after_refusal == 7,
+                 Fmt("zones %u/%u: split=%d leaves=%zu, then refused=%d detail=\"%s\" committed=%d leaves=%zu", first,
+                     second, split ? 1 : 0, after_split, refusal.refused ? 1 : 0, refusal.detail.c_str(),
+                     refusal.committed ? 1 : 0, after_refusal));
+        const bool merged = ForceMerge(sim, first);
+        const std::size_t after_merge = leaf_count();
+        const bool split_again = merged && ForceSplit(sim, second);
+        const std::size_t after_second = leaf_count();
+        c.Report("testmap-zone-budget-freed-by-merge",
+                 merged && after_merge == 4 && split_again && after_second == 7,
+                 Fmt("merge=%d leaves=%zu, second split=%d leaves=%zu", merged ? 1 : 0, after_merge,
+                     split_again ? 1 : 0, after_second));
+        sim.Stop();
+    }
+    {
+        gs::game::PartitionConfig partition;
+        partition.max_active_zones = 0;
+        const auto validated = gs::game::ValidatePartitionConfig(partition);
+        c.Report("zone-budget-invalid-falls-back",
+                 validated.effective.max_active_zones == static_cast<int>(gs::game::kMaxInitialLeafZones) &&
+                     validated.warnings.size() == 1,
+                 Fmt("max_active_zones=0 -> %d, warnings=%zu", validated.effective.max_active_zones,
+                     validated.warnings.size()));
+    }
     std::error_code ec;
     fs::remove_all(fs::temp_directory_path() / "ixw_mapruntime", ec);
     std::printf("MAPSPLIT-DONE passes=%d failures=%d\n", c.passes, c.failures);

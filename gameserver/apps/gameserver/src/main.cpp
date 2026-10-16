@@ -541,6 +541,8 @@ gs::game::PartitionConfig ResolvePartitionConfig(const gs::common::Config& confi
         config.GetInt("partition_max_depth").value_or(out.max_partition_depth);
     out.min_zone_size_m =
         static_cast<float>(GetDoubleOr(config, "partition_min_zone_size_m", out.min_zone_size_m));
+    out.max_active_zones =
+        config.GetInt("partition_max_active_zones").value_or(out.max_active_zones);
 
     // Adaptive split scoring (phase 2). min_zone_size_m is mirrored from the
     // effective partition floor by WorldRuntime::ConfigurePartition, never
