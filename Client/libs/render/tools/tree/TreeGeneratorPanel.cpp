@@ -138,6 +138,45 @@ std::filesystem::path DefaultPresetDir()
     return std::filesystem::current_path() / "assets" / "internal" / "tree_presets";
 #endif
 }
+
+bool EditGrowthCurve(const char* label, ixtreemetree::GrowthCurve& curve, float lo, float hi)
+{
+    bool changed = false;
+    ImGui::PushID(label);
+    ImGui::TextUnformatted(label);
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const ImVec2 size(std::max(120.0f, ImGui::GetContentRegionAvail().x), 76.0f);
+    ImGui::InvisibleButton("curve", size);
+    auto* draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(origin, {origin.x+size.x,origin.y+size.y}, IM_COL32(24,29,35,255), 3);
+    for (int i=0; i<5; ++i)
+    {
+        const float x=origin.x+8+(size.x-16)*i/4;
+        draw->AddLine({x,origin.y+4},{x,origin.y+size.y-4},IM_COL32(56,62,71,255));
+        auto point=[&](int j) { return ImVec2(origin.x+8+(size.x-16)*j/4,
+            origin.y+size.y-8-(size.y-16)*std::clamp((curve.values[j]-lo)/(hi-lo),0.0f,1.0f)); };
+        if (i) draw->AddLine(point(i-1),point(i),IM_COL32(144,196,108,255),2);
+        draw->AddCircleFilled(point(i),4,IM_COL32(194,224,136,255));
+    }
+    if (ImGui::IsItemActive())
+    {
+        const auto mouse=ImGui::GetIO().MousePos;
+        const int i=std::clamp(int(std::round((mouse.x-origin.x-8)/(size.x-16)*4)),0,4);
+        curve.values[i]=std::clamp(lo+(origin.y+size.y-8-mouse.y)/(size.y-16)*(hi-lo),lo,hi);
+        changed=true;
+    }
+    UI::ItemTooltip("Drag the five control points. Left: base of parent / branch. Right: tip.");
+    for (int i=0; i<5; ++i)
+    {
+        if (i) ImGui::SameLine();
+        ImGui::PushID(i);
+        ImGui::SetNextItemWidth((size.x-32)/5);
+        changed |= ImGui::DragFloat("##value", &curve.values[i], (hi-lo)*0.002f, lo, hi, "%.2f");
+        ImGui::PopID();
+    }
+    ImGui::PopID();
+    return changed;
+}
 }
 
 TreeGeneratorPanel::TreeGeneratorPanel(std::filesystem::path presetDir)
@@ -159,6 +198,7 @@ void TreeGeneratorPanel::SetAssetLibrary(AssetLibrary* assetLibrary)
 
 void TreeGeneratorPanel::Show()
 {
+    LoadPresets();
     open_ = true;
     inspectorRequested_ = true;
     ImGui::SetWindowFocus(kViewWindow);
@@ -202,6 +242,12 @@ void TreeGeneratorPanel::LoadPresets()
     presetsLoaded_ = true;
     std::vector<std::string> errors;
     presets_ = ixtreemetree::loadAllPresets(presetDir_, &errors);
+    const auto projectPresets = ProjectManager::Instance().ProjectRoot() / "TreePresets";
+    if (std::filesystem::is_directory(projectPresets))
+    {
+        auto custom = ixtreemetree::loadAllPresets(projectPresets, &errors);
+        presets_.insert(presets_.end(), custom.begin(), custom.end());
+    }
     for (const std::string& error : errors)
         TraceError("[TREE-2] preset_load_failed: %s", error.c_str());
     Tracenf("[TREE-2] loaded %zu presets from %s",
@@ -213,7 +259,7 @@ void TreeGeneratorPanel::ApplyPreset(size_t presetIndex)
 {
     if (presetIndex >= presets_.size())
         return;
-    // (The materials stay: a preset is the shape.)
+    if (usePresetMaterials_) { barkMaterial_.reset(); leafMaterial_.reset(); }
     const ixtreemetree::Preset& preset = presets_[presetIndex];
     options_ = preset.options;
     activePresetName_ = preset.name;
@@ -259,9 +305,35 @@ void TreeGeneratorPanel::RenderPresetSelector()
         ImGui::EndCombo();
     }
     UI::ItemTooltip("A ready-made tree shape to start from; changing any setting below makes it Custom.");
+    ImGui::Checkbox("Use preset's built-in materials", &usePresetMaterials_);
+    UI::ItemTooltip("When applying a preset, use its built-in bark and leaf textures. Disable to keep custom material assignments.");
 
     if (presets_.empty())
         ImGui::TextDisabled("No presets found in %s", presetDir_.generic_string().c_str());
+    ImGui::InputText("Preset name", presetName_, sizeof(presetName_));
+    UI::ItemTooltip("Name for the growth settings saved in the project's TreePresets folder.");
+    if (ImGui::Button("Save growth preset"))
+    {
+        const auto root = ProjectManager::Instance().ProjectRoot();
+        if (root.empty()) status_ = "Open a project before saving a preset.";
+        else
+        {
+            std::error_code ec;
+            const auto dir = root / "TreePresets";
+            std::filesystem::create_directories(dir, ec);
+            const auto id = std::chrono::steady_clock::now().time_since_epoch().count();
+            const auto path = dir / ("tree_" + std::to_string(id) + ".json");
+            std::string error;
+            const std::string name = presetName_[0] ? presetName_ : "Custom Tree";
+            if (!ec && ixtreemetree::savePresetFile(path, {name, options_}, &error))
+            { LoadPresets(); activePresetName_=name; status_="Saved growth preset: " + name; }
+            else status_ = ec ? ec.message() : error;
+        }
+    }
+    UI::ItemTooltip("Save an editable growth recipe as a new project preset; existing presets are kept.");
+    ImGui::SameLine();
+    if (ImGui::Button("Reload presets")) LoadPresets();
+    UI::ItemTooltip("Read built-in presets and the current project's TreePresets folder again.");
 }
 
 void TreeGeneratorPanel::RenderView()
@@ -358,6 +430,8 @@ bool TreeGeneratorPanel::RenderBranches()
     bool changed = false;
     changed |= UI::Prop::SliderInt("Branch levels", &options_.branch.levels, 0, ixtreemetree::kMaxBranchLevels - 1);
     UI::ItemTooltip("How many times the branches split: 0 is a bare trunk; each level grows from the one before.");
+    changed |= ImGui::Checkbox("Organic growth", &options_.branch.organic);
+    UI::ItemTooltip("Continuous branch attachments, smooth growth paths, parent and branch profiles. Older presets keep their original model until enabled.");
     activeBranchLevel_ = std::clamp(activeBranchLevel_, 0, std::clamp(options_.branch.levels, 0, ixtreemetree::kMaxBranchLevels - 1));
     // Old TREE-1 selftest anchor: BeginTable("TreeBranchLevels" used to live here before the tabbed level editor.
     if (ImGui::BeginTabBar("TreeBranchLevelTabs"))
@@ -406,7 +480,7 @@ bool TreeGeneratorPanel::RenderBranchLevel(int level)
     }
     changed |= UI::Prop::DragFloat("Length", &options_.branch.length[level], 0.05f, 0.1f, 100.0f, "%.2f m");
     UI::ItemTooltip(level == 0 ? "The trunk's length." : "These branches' length.");
-    changed |= UI::Prop::DragFloat("Radius", &options_.branch.radius[level], 0.01f, 0.01f, 5.0f, "%.3f m");
+    changed |= UI::Prop::DragFloat("Radius", &options_.branch.radius[level], 0.001f, options_.branch.organic ? 0.001f : 0.01f, 5.0f, "%.3f m");
     UI::ItemTooltip("The radius at the base.");
     changed |= UI::Prop::DragFloat("Taper", &options_.branch.taper[level], 0.01f, 0.0f, 1.0f, "%.2f");
     UI::ItemTooltip("The radius at the tip, as a share of the radius at the base.");
@@ -421,6 +495,37 @@ bool TreeGeneratorPanel::RenderBranchLevel(int level)
     changed |= UI::Prop::DragFloat("Droop", &options_.branch.droop[level], 0.005f, -1.0f, 1.0f, "%.3f");
     UI::ItemTooltip("How much the branch bends toward the ground for every metre it grows (a weeping willow's twigs, a "
                     "palm's fronds); negative bends it up.");
+    if (options_.branch.organic)
+    {
+        ImGui::SeparatorText("Variation and growth profiles");
+        changed |= UI::Prop::SliderFloat("Length variation", &options_.branch.lengthVariance[level], 0.0f, 0.95f);
+        UI::ItemTooltip("Random length variation between branches of this level: 0.2 is up to 20% shorter or longer.");
+        changed |= UI::Prop::SliderFloat("Radius variation", &options_.branch.radiusVariance[level], 0.0f, 0.95f);
+        UI::ItemTooltip("Random variation of the radius at each branch's base.");
+        if (level > 0)
+        {
+            changed |= UI::Prop::DragFloat("Angle variation", &options_.branch.angleVariance[level], 0.2f, 0.0f, 60.0f, "%.1f deg");
+            UI::ItemTooltip("Random angular deviation from the parent-relative growth angle, in degrees.");
+            changed |= UI::Prop::DragFloat("Azimuth variation", &options_.branch.azimuthVariance[level], 0.2f, 0.0f, 180.0f, "%.1f deg");
+            UI::ItemTooltip("Random rotation around the parent; loosens regular whorls and alternating side shoots.");
+            changed |= UI::Prop::SliderFloat("Distribution exponent", &options_.branch.distribution[level], 0.2f, 5.0f);
+            UI::ItemTooltip("1 distributes attachments evenly; larger values concentrate branches toward the parent's base.");
+            changed |= UI::Prop::SliderFloat("Parent scale influence", &options_.branch.scaleInheritance[level], 0.0f, 1.0f);
+            UI::ItemTooltip("How strongly ancestor crown profiles shrink this level. Lower values retain fine shoots near the crown tip.");
+            if (ImGui::TreeNode("Parent profiles"))
+            {
+                changed |= EditGrowthCurve("Length along parent", options_.branch.lengthProfile[level], 0, 2);
+                changed |= EditGrowthCurve("Angle along parent", options_.branch.angleProfile[level], 0, 2);
+                ImGui::TreePop();
+            }
+        }
+        if (ImGui::TreeNode("Branch profiles"))
+        {
+            changed |= EditGrowthCurve("Radius along branch", options_.branch.radiusProfile[level], 0, 2);
+            changed |= EditGrowthCurve("Bend along branch (degrees)", options_.branch.bendProfile[level], -90, 90);
+            ImGui::TreePop();
+        }
+    }
     if (level == 0)
     {
         changed |= UI::Prop::SliderInt("Trunks", &options_.branch.trunks, 1, 16);
@@ -434,10 +539,10 @@ bool TreeGeneratorPanel::RenderBranchLevel(int level)
     changed |= ComboEnum("Crown shape", options_.branch.shape[level], shapes);
     UI::ItemTooltip("The crown's outline: how long these branches grow for where they start on the parent (Conical: long "
                     "at the bottom, short at the top, like a fir).");
-    static const char* const arrangements[] = {"Random", "Whorled", "Spiral"};
+    static const char* const arrangements[] = {"Random", "Whorled", "Spiral", "Alternating"};
     changed |= ComboEnum("Arrangement", options_.branch.arrangement[level], arrangements);
     UI::ItemTooltip("Where they sit on the parent: anywhere, in rings at the same height (a fir's whorls), or one after "
-                    "another, turning by 137.5 degrees (a palm's crown).");
+                    "another, turning by 137.5 degrees (a palm's crown). Alternating grows side shoots on opposite sides.");
     if (options_.branch.arrangement[level] == ixtreemetree::BranchArrangement::Whorled)
     {
         int whorlSize = options_.branch.whorlSize[level] > 0 ? options_.branch.whorlSize[level] : 4;
@@ -534,16 +639,16 @@ bool TreeGeneratorPanel::RenderBark()
 {
     if (!ImGui::CollapsingHeader(ICON_FA_TREE " Bark", ImGuiTreeNodeFlags_DefaultOpen))
         return false;
-    RenderMaterialField("Material", "bark", barkMaterial_, barkMaterialColor_,
+    bool changed = RenderMaterialField("Material", "bark", barkMaterial_, barkMaterialColor_,
         "The bark's material. Drop a Material from the Asset Browser here, or click to pick one; "
         "with none, the built-in bark below is used.");
     ImGui::BeginDisabled(barkMaterial_.has_value());
-    static const char* const barkTypes[] = {"Oak", "Birch", "Pine", "Willow", "Ash", "Palm"};
+    static const char* const barkTypes[] = {"Oak", "Birch", "Pine", "Willow", "Ash", "Palm", "Larch"};
     static_assert(std::size(barkTypes) == ixtreemetree::kBarkTypeCount);
-    ComboEnum("Built-in bark", options_.bark.type, barkTypes);
+    changed |= ComboEnum("Built-in bark", options_.bark.type, barkTypes);
     UI::ItemTooltip("The built-in bark texture; Palm has horizontal growth rings.");
     ImGui::EndDisabled();
-    bool changed = DragVec2("Texture repeat", options_.bark.textureScale, 0.02f, 0.1f, 20.0f);
+    changed |= DragVec2("Texture repeat", options_.bark.textureScale, 0.02f, 0.1f, 20.0f);
     UI::ItemTooltip("How many times the bark texture wraps around each branch (x) and repeats along it (y).");
     ImGui::Spacing();
     return changed;
@@ -565,7 +670,7 @@ bool TreeGeneratorPanel::RenderLeaves()
     ImGui::PopTextWrapPos();
     ImGui::BeginDisabled(leafMaterial_.has_value());
     bool changed = false;
-    static const char* const leafTypes[] = {"Oak", "Ash", "Pine", "Willow", "Birch", "Palm", "Blossom", "Snowy Pine"};
+    static const char* const leafTypes[] = {"Oak", "Ash", "Pine", "Willow", "Birch", "Palm", "Blossom", "Snowy Pine", "Golden Larch"};
     static_assert(std::size(leafTypes) == ixtreemetree::kLeafTypeCount);
     if (ComboEnum("Built-in leaves", options_.leaves.type, leafTypes))
     {
@@ -598,6 +703,17 @@ bool TreeGeneratorPanel::RenderLeaves()
     changed |= UI::Prop::SliderInt("Atlas rows", &options_.leaves.atlasGridY, 1, 8);
     UI::ItemTooltip("How many leaf images the texture holds down.");
     ImGui::BeginDisabled(fronds);
+    changed |= ImGui::Checkbox("Align leaves to twigs", &options_.leaves.twigAligned);
+    UI::ItemTooltip("Grow each card from its twig along the twig's direction, with its stalk attached to the wood.");
+    if (options_.leaves.twigAligned)
+    {
+        changed |= UI::Prop::DragFloat("Clusters per metre", &options_.leaves.density, 0.1f, 0.0f, 64.0f, "%.1f");
+        UI::ItemTooltip("Zero uses the fixed Clusters per twig count; otherwise density follows twig length.");
+        changed |= UI::Prop::SliderFloat("Card width / length", &options_.leaves.aspect, 0.1f, 3.0f);
+        UI::ItemTooltip("Width relative to length: below 1 makes narrow sprays, above 1 makes broad cards.");
+        changed |= UI::Prop::SliderFloat("Size at twig tip", &options_.leaves.tipScale, 0.05f, 2.0f);
+        UI::ItemTooltip("Card size at the twig tip relative to its base; below 1 makes foliage taper.");
+    }
     changed |= UI::Prop::DragInt("Clusters per twig", &options_.leaves.count, 0.1f, 0, 120);
     UI::ItemTooltip("Leaf clusters along each last-level branch.");
     changed |= UI::Prop::SliderInt("Cards per cluster", &options_.leaves.cardsPerCluster, 1, 7);
@@ -641,6 +757,8 @@ void TreeGeneratorPanel::RenderOutput()
                     "leaves make the cheapest forest; saving trims the texture's transparent borders away.");
     UI::Prop::Text("Height", "%.1f m", mesh_.bboxMax.y - mesh_.bboxMin.y);
     UI::Prop::Text("Generated in", "%.2f ms", mesh_.stats.generationMs);
+    if (mesh_.stats.budgetLimited)
+        UI::StatusWarning("Generation limit reached. Reduce branch counts, resolution or leaf density.");
     ImGui::Checkbox("Bake distant-tree impostor", &bakeImpostor_);
     UI::ItemTooltip("Save an atlas of the tree for distant views. The game uses lit billboards beyond the chosen distance.");
     if (bakeImpostor_)
@@ -676,6 +794,8 @@ TreeMaterialBinding TreeGeneratorPanel::CurrentMaterialBinding()
     binding.leafMaterial = leafMaterial_;
     binding.barkBaseColorTexturePath = bark.path;
     binding.leafBaseColorTexturePath = leaf.path;
+    ColorFromU32(options_.bark.tint, binding.barkTint.data());
+    ColorFromU32(options_.leaves.tint, binding.leafTint.data());
     binding.leafAlphaCutoff = options_.leaves.alphaTest;
     binding.impostor.enabled = bakeImpostor_;
     binding.impostor.distance = impostorDistance_;
@@ -689,11 +809,28 @@ TreePreviewStyle TreeGeneratorPanel::CurrentPreviewStyle() const
     const TreePaletteTexture& bark = TreeTexturePalette::Instance().Bark(options_.bark.type);
     const TreePaletteTexture& leaf = TreeTexturePalette::Instance().Leaf(options_.leaves.type);
     TreePreviewStyle style{};
-    style.barkColor = barkMaterial_ ? barkMaterialColor_ : MultiplyColor(bark.previewColor, options_.bark.tint);
-    style.leafColor = leafMaterial_ ? leafMaterialColor_ : MultiplyColor(leaf.previewColor, options_.leaves.tint);
+    style.barkColor = MultiplyColor({1,1,1,1}, options_.bark.tint);
+    style.leafColor = MultiplyColor({1,1,1,1}, options_.leaves.tint);
+    style.barkTexture = bark.path;
+    style.leafTexture = leaf.path;
     style.leafAlphaCutoff = options_.leaves.alphaTest;
     style.barkTextured = options_.bark.textured;
+    if (!style.barkTextured) style.barkColor = MultiplyColor(bark.previewColor,options_.bark.tint);
+    style.barkColor[3]=1;
     style.leafTextured = true;
+    auto material = [&](const std::optional<Guid>& guid, std::filesystem::path& path, auto& color, bool leafSurface) {
+        if (!guid) return;
+        if (const auto* m=MaterialAssetManager::Instance().getOrLoad(*guid))
+        {
+            color={m->baseColor[0],m->baseColor[1],m->baseColor[2],m->baseColor[3]};
+            path.clear();
+            if (m->baseColorTexture)
+                if (const auto resolved=AssetDatabase::Instance().resolveGuid(*m->baseColorTexture)) path=*resolved;
+            if (leafSurface) style.leafAlphaCutoff=m->alphaMode==MaterialAsset::AlphaMode::Mask ? m->alphaCutoff : 0;
+        }
+    };
+    material(barkMaterial_,style.barkTexture,style.barkColor,false);
+    material(leafMaterial_,style.leafTexture,style.leafColor,true);
     return style;
 }
 
@@ -732,6 +869,11 @@ void TreeGeneratorPanel::RenderSavePopup(bool& savedAsset)
             if (result.ok)
             {
                 status_ = "Saved: " + result.modelPath.filename().string();
+                auto recipePath = result.modelPath;
+                recipePath.replace_extension(".tree.json");
+                std::string recipeError;
+                if (!ixtreemetree::savePresetFile(recipePath, {assetName_,options_}, &recipeError))
+                    status_ += " (growth recipe: " + recipeError + ")";
                 if (result.impostorBaked) status_ += " (distant impostor ready)";
                 else if (!result.impostorWarning.empty()) status_ += " (impostor unavailable: " + result.impostorWarning + ")";
                 if (result.leafAreaReduction > 0.0f)

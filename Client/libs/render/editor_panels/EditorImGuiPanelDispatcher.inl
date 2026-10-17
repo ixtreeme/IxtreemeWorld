@@ -148,6 +148,7 @@ void EditorImGui::RenderTreeGeneratorPanel()
     if (!m_treeGeneratorPanel)
         return;
     m_treeGeneratorPanel->SetAssetLibrary(m_assetLibrary.get());
+    m_treeGeneratorPanel->SetTextureProvider(m_textureProvider);
     m_treeGeneratorPanel->RenderView();
 }
 

@@ -152,36 +152,52 @@ bool WriteGlb(const ixtreemetree::TreeMesh& mesh,
               const std::string& name,
               const std::string& barkTextureUri,
               const std::string& leafTextureUri,
+              const std::array<float,4>& barkColor,
+              const std::array<float,4>& leafColor,
               float leafAlphaCutoff,
               std::uint64_t* outBinarySizeBytes)
 {
     std::vector<BufferView> views;
     std::vector<std::uint8_t> bin;
-    const BufferView barkVertices = AppendVertices(bin, mesh.bark.vertices);
-    views.push_back(barkVertices);
-    const BufferView barkIndices = AppendIndices(bin, mesh.bark.indices);
-    views.push_back(barkIndices);
-    const BufferView leafVertices = AppendVertices(bin, mesh.leaves.vertices);
-    views.push_back(leafVertices);
-    const BufferView leafIndices = AppendIndices(bin, mesh.leaves.indices);
-    views.push_back(leafIndices);
+    std::ostringstream primitives,accessors;
+    int surfaceCount=0;
+    auto surface = [&](const auto& source, int material) {
+        if (source.vertices.empty() || source.indices.empty()) return;
+        const auto vertexView=views.size();
+        views.push_back(AppendVertices(bin,source.vertices));
+        const auto indexView=views.size();
+        views.push_back(AppendIndices(bin,source.indices));
+        const int base=surfaceCount*4;
+        if (surfaceCount++) { primitives << ','; accessors << ','; }
+        primitives << "{\"attributes\":{\"POSITION\":" << base << ",\"NORMAL\":" << base+1
+            << ",\"TEXCOORD_0\":" << base+2 << "},\"indices\":" << base+3 << ",\"material\":" << material << ",\"mode\":4}";
+        ixtreemetree::Vec3 lo{},hi{}; Bounds(source.vertices,lo,hi);
+        accessors << "{\"bufferView\":" << vertexView << ",\"byteOffset\":0,\"componentType\":5126,\"count\":" << source.vertices.size()
+            << ",\"type\":\"VEC3\",\"min\":" << Vec3Json(lo) << ",\"max\":" << Vec3Json(hi) << "},"
+            << "{\"bufferView\":" << vertexView << ",\"byteOffset\":12,\"componentType\":5126,\"count\":" << source.vertices.size() << ",\"type\":\"VEC3\"},"
+            << "{\"bufferView\":" << vertexView << ",\"byteOffset\":24,\"componentType\":5126,\"count\":" << source.vertices.size() << ",\"type\":\"VEC2\"},"
+            << "{\"bufferView\":" << indexView << ",\"componentType\":5125,\"count\":" << source.indices.size() << ",\"type\":\"SCALAR\"}";
+    };
+    surface(mesh.bark,0); surface(mesh.leaves,1);
+    if (!surfaceCount) return false;
     Align4(bin);
-
-    ixtreemetree::Vec3 barkMin{}, barkMax{}, leafMin{}, leafMax{};
-    Bounds(mesh.bark.vertices, barkMin, barkMax);
-    Bounds(mesh.leaves.vertices, leafMin, leafMax);
+    auto colorJson = [](const auto& color) {
+        std::ostringstream stream;
+        stream << '[' << color[0] << ',' << color[1] << ',' << color[2] << ',' << color[3] << ']';
+        return stream.str();
+    };
 
     std::ostringstream json;
     json << "{\"asset\":{\"version\":\"2.0\",\"generator\":\"ixtreemetree\"},"
          << "\"scene\":0,\"scenes\":[{\"nodes\":[0]}],"
          << "\"nodes\":[{\"mesh\":0,\"name\":\"" << EscapeJson(name) << "\"}],"
          << "\"materials\":["
-         << "{\"name\":\"bark\",\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.42,0.26,0.12,1],";
+         << "{\"name\":\"bark\",\"pbrMetallicRoughness\":{\"baseColorFactor\":" << colorJson(barkColor) << ',';
     if (!barkTextureUri.empty())
         json << "\"baseColorTexture\":{\"index\":0},";
     json << "\"metallicFactor\":0,\"roughnessFactor\":0.82}},"
-         << "{\"name\":\"leaves\",\"alphaMode\":\"MASK\",\"alphaCutoff\":" << leafAlphaCutoff
-         << ",\"pbrMetallicRoughness\":{\"baseColorFactor\":[0.22,0.56,0.22,1],";
+         << "{\"name\":\"leaves\",\"doubleSided\":true,\"alphaMode\":\"MASK\",\"alphaCutoff\":" << leafAlphaCutoff
+         << ",\"pbrMetallicRoughness\":{\"baseColorFactor\":" << colorJson(leafColor) << ',';
     if (!leafTextureUri.empty())
         json << "\"baseColorTexture\":{\"index\":" << (barkTextureUri.empty() ? 0 : 1) << "},";
     json << "\"metallicFactor\":0,\"roughnessFactor\":0.7}}],";
@@ -212,8 +228,7 @@ bool WriteGlb(const ixtreemetree::TreeMesh& mesh,
     }
     json
          << "\"meshes\":[{\"name\":\"" << EscapeJson(name) << "\",\"primitives\":["
-         << "{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0,\"mode\":4},"
-         << "{\"attributes\":{\"POSITION\":4,\"NORMAL\":5,\"TEXCOORD_0\":6},\"indices\":7,\"material\":1,\"mode\":4}]}],"
+         << primitives.str() << "]}],"
          << "\"buffers\":[{\"byteLength\":" << bin.size() << "}],\"bufferViews\":[";
     for (std::size_t i = 0; i < views.size(); ++i)
     {
@@ -222,15 +237,7 @@ bool WriteGlb(const ixtreemetree::TreeMesh& mesh,
         if (views[i].stride) json << ",\"byteStride\":" << views[i].stride;
         json << ",\"target\":" << views[i].target << "}";
     }
-    json << "],\"accessors\":["
-         << "{\"bufferView\":0,\"byteOffset\":0,\"componentType\":5126,\"count\":" << mesh.bark.vertices.size() << ",\"type\":\"VEC3\",\"min\":" << Vec3Json(barkMin) << ",\"max\":" << Vec3Json(barkMax) << "},"
-         << "{\"bufferView\":0,\"byteOffset\":12,\"componentType\":5126,\"count\":" << mesh.bark.vertices.size() << ",\"type\":\"VEC3\"},"
-         << "{\"bufferView\":0,\"byteOffset\":24,\"componentType\":5126,\"count\":" << mesh.bark.vertices.size() << ",\"type\":\"VEC2\"},"
-         << "{\"bufferView\":1,\"byteOffset\":0,\"componentType\":5125,\"count\":" << mesh.bark.indices.size() << ",\"type\":\"SCALAR\"},"
-         << "{\"bufferView\":2,\"byteOffset\":0,\"componentType\":5126,\"count\":" << mesh.leaves.vertices.size() << ",\"type\":\"VEC3\",\"min\":" << Vec3Json(leafMin) << ",\"max\":" << Vec3Json(leafMax) << "},"
-         << "{\"bufferView\":2,\"byteOffset\":12,\"componentType\":5126,\"count\":" << mesh.leaves.vertices.size() << ",\"type\":\"VEC3\"},"
-         << "{\"bufferView\":2,\"byteOffset\":24,\"componentType\":5126,\"count\":" << mesh.leaves.vertices.size() << ",\"type\":\"VEC2\"},"
-         << "{\"bufferView\":3,\"byteOffset\":0,\"componentType\":5125,\"count\":" << mesh.leaves.indices.size() << ",\"type\":\"SCALAR\"}]}";
+    json << "],\"accessors\":[" << accessors.str() << "]}";
 
     std::string jsonText = json.str();
     while ((jsonText.size() % 4u) != 0u)
@@ -412,7 +419,7 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
     };
     std::string dependencyError;
     std::filesystem::path barkTexturePath = materialTexture(barkMaterial);
-    if (barkTexturePath.empty())
+    if (barkTexturePath.empty() && !barkMaterial)
         barkTexturePath =
             CopyTextureDependency(materialBinding.barkBaseColorTexturePath, textureDir, "bark_basecolor", dependencyError);
     if (!dependencyError.empty())
@@ -421,7 +428,7 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
         return result;
     }
     std::filesystem::path leafTexturePath = materialTexture(leafMaterial);
-    if (leafTexturePath.empty())
+    if (leafTexturePath.empty() && !leafMaterial)
         leafTexturePath =
             CopyTextureDependency(materialBinding.leafBaseColorTexturePath, textureDir, "leaves_basecolor", dependencyError);
     if (!dependencyError.empty())
@@ -430,6 +437,15 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
         return result;
     }
     const float leafAlphaCutoff = leafMaterial ? leafMaterial->alphaCutoff : materialBinding.leafAlphaCutoff;
+    auto colorFactor = [](const MaterialAsset* material, const std::filesystem::path& texture,
+        std::array<float,4> fallback, const std::array<float,4>& tint) {
+        if (material) return material->baseColor;
+        if (!texture.empty()) fallback={1,1,1,1};
+        for (int i=0;i<4;++i) fallback[i]*=tint[i];
+        return fallback;
+    };
+    const auto barkColor=colorFactor(barkMaterial,barkTexturePath,{0.42f,0.26f,0.12f,1},materialBinding.barkTint);
+    const auto leafColor=colorFactor(leafMaterial,leafTexturePath,{0.22f,0.56f,0.22f,1},materialBinding.leafTint);
     std::uint64_t binarySizeBytes = 0;
     // The leaf cards cut to the visible part of their atlas cells (a convex polygon around the leaf):
     // the texture's transparent parts are then not rasterized in every view and shadow cascade (the
@@ -483,6 +499,8 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
             safeName,
             RelativeUri(barkTexturePath, modelDir),
             RelativeUri(leafTexturePath, modelDir),
+            barkColor,
+            leafColor,
             leafAlphaCutoff,
             &binarySizeBytes))
     {
@@ -521,7 +539,7 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
     {
         GltfMaterialSource bark{};
         bark.name = "bark";
-        bark.baseColor = {0.42f, 0.26f, 0.12f, 1.0f};
+        bark.baseColor = barkColor;
         bark.roughness = 0.82f;
         bark.emissive = {0.0f, 0.0f, 0.0f, 1.0f};  // as a glTF material reads (strength 1)
         bark.baseColorTexturePath = barkTexturePath;
@@ -535,7 +553,7 @@ TreeExportResult TreeGlbExporter::SaveAsAsset(const ixtreemetree::TreeMesh& mesh
     {
         GltfMaterialSource leaves{};
         leaves.name = "leaves";
-        leaves.baseColor = {0.22f, 0.56f, 0.22f, 1.0f};
+        leaves.baseColor = leafColor;
         leaves.roughness = 0.7f;
         leaves.emissive = {0.0f, 0.0f, 0.0f, 1.0f};
         leaves.alphaMode = "mask";

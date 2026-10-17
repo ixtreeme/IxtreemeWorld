@@ -624,6 +624,7 @@ void ApplyEditorStyle()
 
 void EditorImGui::SetTextureProvider(ixeditor::graphics::IEditorTextureProvider* provider)
 {
+    if (m_treeGeneratorPanel) m_treeGeneratorPanel->SetTextureProvider(provider);
     m_textureProvider = provider;
 }
 
@@ -3273,6 +3274,7 @@ void EditorImGui::Destroy()
 {
     // Release node editor contexts before the backend destroys the ImGui context.
     m_materialGraphPanel.reset();
+    if (m_treeGeneratorPanel) m_treeGeneratorPanel->SetTextureProvider(nullptr);
     // Generic teardown only: preview UI registrations release through the
     // provider (backend stays alive for pool/descriptor teardown, which the
     // frame owner performs through the backend adapter afterwards).

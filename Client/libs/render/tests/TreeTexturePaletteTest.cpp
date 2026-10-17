@@ -3,8 +3,14 @@
 #include <ixtreemetree/preset.h>
 #include <ixtreemetree/tree.h>
 #include <stb_image.h>
+#include <MaterialAssetManager.h>
+#include <assimp/Importer.hpp>
+#include <assimp/material.h>
+#include <assimp/postprocess.h>
+#include <assimp/scene.h>
 
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -72,10 +78,12 @@ void Test()
     const auto barkPath = palette.Bark(BarkType::Palm).path;
     Check(palette.Leaf(LeafType::Palm).gridX == 2 && palette.Leaf(LeafType::Palm).gridY == 1,
         "palm has two tall atlas cells");
-    for (const auto& path : {palmPath, blossomPath, snowyPath, barkPath})
+    const auto larchPath = palette.Leaf(LeafType::Larch).path;
+    const auto larchBarkPath = palette.Bark(BarkType::Larch).path;
+    for (const auto& path : {palmPath, blossomPath, snowyPath, barkPath, larchPath, larchBarkPath})
     {
         const Image image(path);
-        const int expected = path == barkPath ? 256 : 512;
+        const int expected = path == barkPath || path == larchBarkPath ? 256 : 512;
         Check(image.width == expected && image.height == expected, "texture has the intended size");
         const auto relative = fs::relative(path, workspace.root);
         Check(Bytes(path) == Bytes(fs::path(IXTREEME_TREE_INTERNAL_DIR) / relative),
@@ -124,7 +132,8 @@ void Test()
 
     // Exercise the real save path: cutout polygons, copied textures and distant-tree baking must
     // also accept the segmented fronds and the new flower/snow atlases.
-    for (const char* name : {"palm_tall", "palm_curved", "snowy_fir", "blossom_shrub", "round_shrub"})
+    for (const char* name : {"palm_tall", "palm_curved", "fir_tree", "snowy_fir", "blossom_tree",
+        "blossom_shrub", "round_shrub", "weeping_willow", "dead_tree", "golden_larch"})
     {
         const auto preset = ixtreemetree::loadPresetFile(fs::path(IXTREEME_TREE_INTERNAL_DIR) / "tree_presets" /
             (std::string(name) + ".json"));
@@ -135,16 +144,62 @@ void Test()
         binding.barkBaseColorTexturePath = palette.Bark(tree.options.bark.type).path;
         binding.leafBaseColorTexturePath = palette.Leaf(tree.options.leaves.type).path;
         binding.leafAlphaCutoff = tree.options.leaves.alphaTest;
+        auto tint=[](std::uint32_t c) {
+            return std::array<float,4>{float(c>>24&255)/255,float(c>>16&255)/255,float(c>>8&255)/255,float(c&255)/255};
+        };
+        binding.barkTint=tint(tree.options.bark.tint);
+        binding.leafTint=tint(tree.options.leaves.tint);
         binding.impostor.enabled = true;
         binding.impostor.resolution = 128;
         const auto result = tree_tool::TreeGlbExporter::SaveAsAsset(tree.generate(), workspace.root / "project", name, binding);
         Check(result.ok && fs::exists(result.modelPath), "new preset exports a GLB asset");
-        Check(result.leafAreaReduction > 0.0f && result.leafAreaReduction < 1.0f,
+        Check(tree.options.leaves.count==0 || (result.leafAreaReduction > 0.0f && result.leafAreaReduction < 1.0f),
             "new leaf geometry passes the export's alpha cutout");
         Check(result.impostorBaked, "new preset bakes a distant-tree impostor");
         if (!result.ok) std::cerr << result.error << '\n';
         if (!result.impostorBaked) std::cerr << result.impostorWarning << '\n';
+        Assimp::Importer importer;
+        const auto* imported=importer.ReadFile(result.modelPath.string(),aiProcess_ValidateDataStructure);
+        Check(imported && imported->mNumMeshes==(tree.options.leaves.count==0 ? 1u : 2u),
+            "saved presets import as valid geometry without empty leaf primitives");
+        if (!imported) std::cerr<<importer.GetErrorString()<<'\n';
+        if (imported)
+        {
+            for (unsigned int i=0;i<imported->mNumMeshes;++i)
+            {
+                const auto* material=imported->mMaterials[imported->mMeshes[i]->mMaterialIndex];
+                aiColor4D color;
+                Check(material->Get(AI_MATKEY_BASE_COLOR,color)==AI_SUCCESS,"GLB preserves PBR base color");
+                const auto expected=i==0 ? binding.barkTint : binding.leafTint;
+                for (int channel=0;channel<4;++channel)
+                    Check(std::abs(color[channel]-expected[channel])<1e-5f,"GLB uses preset tint without an extra green multiplier");
+                const auto materialPath=result.materialFolder/(i==0 ? "bark.material" : "leaves.material");
+                const auto* native=MaterialAssetManager::Instance().getOrLoad(AssetDatabase::Instance().getOrCreateGuid(materialPath));
+                Check(native!=nullptr,"engine material loads");
+                if (native)
+                    for (int channel=0;channel<4;++channel)
+                        Check(std::abs(native->baseColor[channel]-expected[channel])<1e-5f,"engine materials match the GLB colors");
+                if (i==1)
+                {
+                    int twoSided=0;
+                    Check(material->Get(AI_MATKEY_TWOSIDED,twoSided)==AI_SUCCESS && twoSided==1,
+                        "leaf and frond surfaces remain visible from both sides after export");
+                }
+            }
+        }
     }
+    ixtreemetree::Tree frondOnly;
+    frondOnly.options=ixtreemetree::defaultTreeOptions();
+    frondOnly.options.branch.organic=true; frondOnly.options.branch.levels=0;
+    frondOnly.options.leaves.style=ixtreemetree::LeafStyle::Fronds;
+    tree_tool::TreeMaterialBinding binding;
+    binding.leafBaseColorTexturePath=palmPath;
+    binding.impostor.enabled=true; binding.impostor.resolution=128;
+    const auto result=tree_tool::TreeGlbExporter::SaveAsAsset(frondOnly.generate(),workspace.root/"project","frond_only",binding);
+    Assimp::Importer importer;
+    const auto* imported=result.ok ? importer.ReadFile(result.modelPath.string(),aiProcess_ValidateDataStructure) : nullptr;
+    Check(imported && imported->mNumMeshes==1,"a leaf-only plant exports without an empty bark primitive");
+    Check(result.impostorBaked,"a leaf-only plant bakes an impostor");
 }
 }
 int main(int argc, char** argv)

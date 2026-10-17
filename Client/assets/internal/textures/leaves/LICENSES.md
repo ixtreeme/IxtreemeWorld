@@ -11,3 +11,7 @@ The `*_leaf.png` files in this folder are procedurally generated project assets.
 and `../bark/palm_bark.png` are also generated procedurally by the project's
 `TreeTexturePalette.cpp`, without third-party code, models, textures or other input.
 
+`golden_larch.png` (512x512 RGBA, 2x2 needle-spray atlas) and
+`../bark/larch_bark.png` (256x256 RGBA, longitudinal fissures) are likewise
+generated entirely by `TreeTexturePalette.cpp`, without third-party input.
+

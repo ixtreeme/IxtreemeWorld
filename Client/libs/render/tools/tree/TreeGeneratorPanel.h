@@ -26,6 +26,7 @@ public:
     explicit TreeGeneratorPanel(std::filesystem::path presetDir = {});
 
     void SetAssetLibrary(AssetLibrary* assetLibrary);
+    void SetTextureProvider(ixeditor::graphics::IEditorTextureProvider* provider) { preview_.SetTextureProvider(provider); }
     void Show();
     bool IsOpen() const { return open_; }
     // The Tree Generator window: the preview only.
@@ -69,6 +70,7 @@ private:
     bool savePopupRequested_ = false;
     bool firstOpenLogged_ = false;
     bool presetsLoaded_ = false;
+    bool usePresetMaterials_ = true;
     int activeBranchLevel_ = 0;
     ixtreemetree::TreeOptions options_;
     ixtreemetree::TreeMesh mesh_;
@@ -79,6 +81,7 @@ private:
     int impostorResolution_ = 256;
     TreePreviewRenderer preview_;
     char assetName_[96]{};
+    char presetName_[96] = "Custom Tree";
     std::string status_;
 };
 }

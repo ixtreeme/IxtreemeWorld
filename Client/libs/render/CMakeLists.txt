@@ -510,6 +510,17 @@ if(BUILD_TESTING AND NOT ANDROID)
             MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
     endif()
     add_test(NAME TreeTexturePaletteTest COMMAND TreeTexturePaletteTest)
+    add_executable(TreeAuthoringTest tests/TreeAuthoringTest.cpp)
+    target_link_libraries(TreeAuthoringTest PRIVATE IXEngineRender)
+    target_compile_features(TreeAuthoringTest PRIVATE cxx_std_20)
+    target_compile_definitions(TreeAuthoringTest PRIVATE
+        IXTREEME_TREE_INTERNAL_DIR="${CLIENT_ROOT}/assets/internal")
+    if(MSVC)
+        set_target_properties(TreeAuthoringTest PROPERTIES
+            MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+    endif()
+    add_test(NAME TreeAuthoringTest COMMAND TreeAuthoringTest)
+    set_tests_properties(TreeAuthoringTest PROPERTIES TIMEOUT 90)
 
     add_executable(FbxImportTest tests/FbxImportTest.cpp)
     target_link_libraries(FbxImportTest PRIVATE IXEngineRender)

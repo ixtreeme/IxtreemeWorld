@@ -1,0 +1,41 @@
+{
+  "name": "Golden Larch - Organic",
+  "seed": 20261017,
+  "type": "Evergreen",
+  "bark": {"type": "Larch", "textureScale": {"x": 2, "y": 7}},
+  "branch": {
+    "organic": true,
+    "levels": 3,
+    "length": [12, 4.3, 1.4, 0.65],
+    "radius": [0.23, 0.058, 0.016, 0.004],
+    "children": [1, 48, 13, 4],
+    "sections": [24, 12, 7, 4],
+    "segments": [12, 7, 4, 3],
+    "start": [0, 0.25, 0.08, 0.1],
+    "angle": [0, 87, 62, 48],
+    "taper": [0.025, 0.06, 0.04, 0.02],
+    "gnarliness": [0.012, 0.08, 0.12, 0.16],
+    "twist": [3, 9, 7, 0],
+    "droop": [0, 0.025, 0.04, 0.04],
+    "shape": ["Uniform", "Uniform", "Uniform", "Uniform"],
+    "arrangement": ["Random", "Whorled", "Alternating", "Alternating"],
+    "whorlSize": [0, 5, 0, 0],
+    "lengthVariance": [0.015, 0.22, 0.25, 0.25],
+    "scaleInheritance": [1, 1, 0.55, 0.4],
+    "radiusProfile": [[1.35,1,0.95,1,1], [1,1,0.9,0.7,0.5], [1,1,0.8,0.7,0.5], [1,1,1,0.8,0.5]],
+    "radiusVariance": [0.03, 0.22, 0.15, 0.15],
+    "angleVariance": [0, 10, 18, 22],
+    "azimuthVariance": [0, 18, 18, 30],
+    "lengthProfile": [[1,1,1,1,1], [1,1.02,0.76,0.43,0.04], [0.8,1,0.9,0.6,0.18], [0.7,1,0.8,0.6,0.3]],
+    "angleProfile": [[1,1,1,1,1], [1.05,1,0.98,0.85,0.65], [1.1,1,0.95,0.8,0.7], [1,1,1,0.9,0.7]],
+    "bendProfile": [[0,0.4,-0.3,0.2,0], [0,-7,-5,3,18], [0,-8,-10,-4,12], [0,-8,-9,-1,14]],
+    "forceStrength": 0
+  },
+  "leaves": {
+    "type": "Larch", "twigAligned": true,
+    "cardsPerCluster": 2, "atlasGridX": 2, "atlasGridY": 2,
+    "count": 5, "density": 9, "start": 0.05,
+    "size": 0.62, "aspect": 0.85, "tipScale": 0.65,
+    "sizeVariance": 0.3, "angle": 24, "alphaTest": 0.27
+  }
+}

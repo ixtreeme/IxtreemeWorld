@@ -1,300 +1,98 @@
 #include "TreePreviewRenderer.h"
-
-#include "math/IXMath.h"
-
+#include "asset/ExrImage.h"
 #include <imgui.h>
-
-#include <algorithm>
-#include <cmath>
-#include <cstring>
-#include <vector>
-
+#include <stb_image.h>
 namespace tree_tool
 {
 namespace
 {
-namespace xm = ixtreeme::math;
-
-ImU32 Color(const std::array<float, 4>& value)
+PreviewImage LoadImage(const std::filesystem::path& path)
 {
-    const auto byte = [](float v) {
-        return static_cast<int>(std::clamp(v, 0.0f, 1.0f) * 255.0f + 0.5f);
-    };
-    return IM_COL32(byte(value[0]), byte(value[1]), byte(value[2]), byte(value[3]));
-}
-
-struct ProjectedPoint
-{
-    ImVec2 screen;
-    float depth = 0.0f;
-};
-
-struct PreviewTriangle
-{
-    ImVec2 a;
-    ImVec2 b;
-    ImVec2 c;
-    float depth = 0.0f;
-    ImU32 fill = 0;
-    ImU32 line = 0;
-    bool outline = false;
-};
-
-xm::Vec3 ToMath(const ixtreemetree::Vec3& v)
-{
-    return {v.x, v.y, v.z};
-}
-
-ixtreemetree::Vec3 ToTree(xm::Vec3 v)
-{
-    return {v.x, v.y, v.z};
-}
-
-ixtreemetree::Vec3 Sub(const ixtreemetree::Vec3& a, const ixtreemetree::Vec3& b)
-{
-    return ToTree(ToMath(a) - ToMath(b));
-}
-
-ixtreemetree::Vec3 Cross(const ixtreemetree::Vec3& a, const ixtreemetree::Vec3& b)
-{
-    return ToTree(xm::Cross(ToMath(a), ToMath(b)));
-}
-
-ixtreemetree::Vec3 Normalize(ixtreemetree::Vec3 v)
-{
-    return ToTree(xm::SafeNormalize(ToMath(v), {0.0f, 1.0f, 0.0f}));
-}
-
-float Dot(const ixtreemetree::Vec3& a, const ixtreemetree::Vec3& b)
-{
-    return xm::Dot(ToMath(a), ToMath(b));
-}
-
-std::array<float, 4> ShadeColor(std::array<float, 4> color, float shade)
-{
-    color[0] = std::clamp(color[0] * shade, 0.0f, 1.0f);
-    color[1] = std::clamp(color[1] * shade, 0.0f, 1.0f);
-    color[2] = std::clamp(color[2] * shade, 0.0f, 1.0f);
-    return color;
-}
-
-ProjectedPoint Project(const ixtreemetree::Vec3& p,
-                       const ixtreemetree::Vec3& center,
-                       float radius,
-                       ImVec2 origin,
-                       ImVec2 size,
-                       float yaw,
-                       float pitch,
-                       float zoom)
-{
-    const float cy = xm::Cos(yaw);
-    const float sy = xm::Sin(yaw);
-    const float cp = xm::Cos(pitch);
-    const float sp = xm::Sin(pitch);
-    const ixtreemetree::Vec3 local = Sub(p, center);
-    const float x = local.x * cy - local.z * sy;
-    const float z = local.x * sy + local.z * cy;
-    const float y = local.y * cp - z * sp;
-    const float depth = local.y * sp + z * cp;
-    const float scale = (std::min(size.x, size.y) * 0.45f * zoom) / std::max(radius, 0.1f);
-    return {{origin.x + size.x * 0.5f + x * scale, origin.y + size.y * 0.52f - y * scale}, depth};
-}
-
-void PushSurfaceTriangles(std::vector<PreviewTriangle>& triangles,
-                          const std::vector<ixtreemetree::Vertex>& vertices,
-                          const std::vector<std::uint32_t>& indices,
-                          const ixtreemetree::Vec3& center,
-                          float radius,
-                          ImVec2 origin,
-                          ImVec2 size,
-                          float yaw,
-                          float pitch,
-                          float zoom,
-                          const std::array<float, 4>& baseColor,
-                          bool textured,
-                          bool leafSurface)
-{
-    const ixtreemetree::Vec3 lightDir = Normalize({-0.35f, 0.85f, 0.45f});
-    for (std::size_t i = 0; i + 2u < indices.size(); i += 3u)
+    PreviewImage image;
+    if (path.empty()) return image;
+    if (client::asset::IsExrPath(path))
     {
-        const ixtreemetree::Vertex& va = vertices[indices[i + 0u]];
-        const ixtreemetree::Vertex& vb = vertices[indices[i + 1u]];
-        const ixtreemetree::Vertex& vc = vertices[indices[i + 2u]];
-        const ProjectedPoint a = Project(va.position, center, radius, origin, size, yaw, pitch, zoom);
-        const ProjectedPoint b = Project(vb.position, center, radius, origin, size, yaw, pitch, zoom);
-        const ProjectedPoint c = Project(vc.position, center, radius, origin, size, yaw, pitch, zoom);
-        const ixtreemetree::Vec3 faceNormal = Normalize(Cross(Sub(vb.position, va.position), Sub(vc.position, va.position)));
-        float shade = 0.34f + std::max(0.0f, Dot(faceNormal, lightDir)) * 0.66f;
-        if (textured)
-        {
-            const float uv = (va.uv.x + vb.uv.x + vc.uv.x + va.uv.y + vb.uv.y + vc.uv.y) * 8.0f;
-            shade *= 0.88f + xm::Sin(uv) * 0.08f;
-        }
-        std::array<float, 4> fillColor = ShadeColor(baseColor, shade);
-        if (leafSurface)
-        {
-            const float centerU = (va.uv.x + vb.uv.x + vc.uv.x) / 3.0f;
-            const float centerV = (va.uv.y + vb.uv.y + vc.uv.y) / 3.0f;
-            const float maskHint = 1.0f - std::max(xm::Abs(centerU - 0.5f), xm::Abs(centerV - 0.5f)) * 1.6f;
-            fillColor[3] = std::clamp(fillColor[3] * (0.72f + maskHint * 0.22f), 0.24f, 0.92f);
-        }
-        PreviewTriangle tri{};
-        tri.a = a.screen;
-        tri.b = b.screen;
-        tri.c = c.screen;
-        tri.depth = (a.depth + b.depth + c.depth) / 3.0f;
-        tri.fill = Color(fillColor);
-        tri.line = leafSurface ? IM_COL32(25, 42, 24, 70) : IM_COL32(38, 27, 19, 70);
-        tri.outline = leafSurface;
-        triangles.push_back(tri);
+        std::string error;
+        if (auto exr=client::asset::LoadExr(path,error))
+        { image.width=exr->width; image.height=exr->height; image.pixels=client::asset::ExrRgba8(*exr,client::asset::ExrByteMode::Preview); }
     }
+    else
+    {
+        int channels=0;
+        if (auto* p=stbi_load(path.string().c_str(),&image.width,&image.height,&channels,4))
+        { image.pixels.assign(p,p+std::size_t(image.width)*image.height*4); stbi_image_free(p); }
+    }
+    return image;
 }
 }
-
-bool TreePreviewRenderer::SameKey(const CacheKey& a, const CacheKey& b)
+TreePreviewRenderer::~TreePreviewRenderer() { ReleaseTexture(); }
+void TreePreviewRenderer::ReleaseTexture()
 {
-    const auto sameStyle = [](const TreePreviewStyle& x, const TreePreviewStyle& y) {
-        return x.barkColor == y.barkColor && x.leafColor == y.leafColor && x.leafAlphaCutoff == y.leafAlphaCutoff &&
-            x.barkTextured == y.barkTextured && x.leafTextured == y.leafTextured;
-    };
-    return a.meshRevision == b.meshRevision && a.yaw == b.yaw && a.pitch == b.pitch && a.zoom == b.zoom &&
-        a.radius == b.radius && a.center.x == b.center.x && a.center.y == b.center.y && a.center.z == b.center.z &&
-        std::memcmp(a.rect, b.rect, sizeof(a.rect)) == 0 && sameStyle(a.style, b.style);
+    if (provider_ && texture_.IsValid()) provider_->ReleasePreviewTexture(texture_);
+    texture_={};
 }
-
-void TreePreviewRenderer::ResetView()
+void TreePreviewRenderer::SetTextureProvider(ixeditor::graphics::IEditorTextureProvider* provider)
 {
-    yaw_ = -0.65f;
-    pitch_ = 0.25f;
-    zoom_ = 1.0f;
+    if (provider_==provider) return;
+    ReleaseTexture(); provider_=provider; dirty_=true;
 }
-
-void TreePreviewRenderer::ResetView(const ixtreemetree::TreeMesh& mesh)
-{
-    ResetView();
-    FitToMesh(mesh);
-}
-
+void TreePreviewRenderer::ResetView() { view_.yaw=-0.65f; view_.pitch=0.12f; view_.zoom=1; dirty_=true; }
+void TreePreviewRenderer::ResetView(const ixtreemetree::TreeMesh& mesh) { ResetView(); FitToMesh(mesh); }
 void TreePreviewRenderer::FitToMesh(const ixtreemetree::TreeMesh& mesh)
 {
-    center_ = {
-        (mesh.bboxMin.x + mesh.bboxMax.x) * 0.5f,
-        (mesh.bboxMin.y + mesh.bboxMax.y) * 0.5f,
-        (mesh.bboxMin.z + mesh.bboxMax.z) * 0.5f,
-    };
-    const float dx = mesh.bboxMax.x - mesh.bboxMin.x;
-    const float dy = mesh.bboxMax.y - mesh.bboxMin.y;
-    const float dz = mesh.bboxMax.z - mesh.bboxMin.z;
-    radius_ = std::max(0.6f, xm::Sqrt(dx * dx + dy * dy + dz * dz) * 0.5f);
-    zoom_ = 1.0f;
-    hasFit_ = true;
+    const auto a=mesh.bboxMin,b=mesh.bboxMax;
+    view_.center={(a.x+b.x)*0.5f,(a.y+b.y)*0.5f,(a.z+b.z)*0.5f};
+    view_.radius=std::max({0.6f,(b.y-a.y)*0.55f,std::hypot(b.x-a.x,b.z-a.z)*0.5f});
+    hasFit_=true; dirty_=true;
 }
-
-void TreePreviewRenderer::Render(const ixtreemetree::TreeMesh& mesh, float width, float height, const TreePreviewStyle& style)
+void TreePreviewRenderer::Render(const ixtreemetree::TreeMesh& mesh,float width,float height,const TreePreviewStyle& style)
 {
-    const ImVec2 imageSize(std::max(128.0f, width), std::max(160.0f, height));
-    if (!hasFit_ && !mesh.bark.vertices.empty())
-        FitToMesh(mesh);
-    ImGui::InvisibleButton("##TreePreviewCanvas", imageSize, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle);
-    const bool hovered = ImGui::IsItemHovered();
-    const bool active = ImGui::IsItemActive();
-    const ImVec2 min = ImGui::GetItemRectMin();
-    const ImVec2 max = ImGui::GetItemRectMax();
-    const ImVec2 size(max.x - min.x, max.y - min.y);
-    ImDrawList* draw = ImGui::GetWindowDrawList();
-    draw->AddRectFilled(min, max, IM_COL32(28, 32, 40, 255), 6.0f);
-    draw->AddRect(min, max, IM_COL32(90, 100, 120, 255), 6.0f);
-
-    if (hovered)
+    const ImVec2 size(std::max(128.0f,width),std::max(160.0f,height));
+    if (!hasFit_) FitToMesh(mesh);
+    ImGui::InvisibleButton("##TreePreviewCanvas",size,ImGuiButtonFlags_MouseButtonLeft);
+    const auto origin=ImGui::GetItemRectMin();
+    if (ImGui::IsItemHovered())
     {
-        const float wheel = ImGui::GetIO().MouseWheel;
-        if (wheel != 0.0f)
-            zoom_ = std::clamp(zoom_ + wheel * 0.08f, 0.45f, 2.4f);
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) ResetView(mesh);
+        if (ImGui::GetIO().MouseWheel!=0)
+        { view_.zoom=std::clamp(view_.zoom+ImGui::GetIO().MouseWheel*0.1f,0.4f,4.0f); dirty_=true; }
     }
-    if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+    if (ImGui::IsItemActive() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
     {
-        const ImVec2 delta = ImGui::GetIO().MouseDelta;
-        yaw_ += delta.x * 0.01f;
-        pitch_ = std::clamp(pitch_ + delta.y * 0.008f, -1.0f, 1.0f);
+        view_.yaw+=ImGui::GetIO().MouseDelta.x*0.01f;
+        view_.pitch=std::clamp(view_.pitch+ImGui::GetIO().MouseDelta.y*0.008f,-1.2f,1.2f); dirty_=true;
     }
-
-    CacheKey key{};
-    key.meshRevision = meshRevision_;
-    key.yaw = yaw_;
-    key.pitch = pitch_;
-    key.zoom = zoom_;
-    key.radius = radius_;
-    key.center = center_;
-    key.rect[0] = min.x;
-    key.rect[1] = min.y;
-    key.rect[2] = size.x;
-    key.rect[3] = size.y;
-    key.style = style;
-    if (!cacheValid_ || !SameKey(key, cachedKey_))
+    const float scale=std::min(1.5f,1200.0f/std::max(size.x,size.y));
+    const int w=std::max(1,int(size.x*scale)),h=std::max(1,int(size.y*scale));
+    if (w!=view_.width || h!=view_.height) { view_.width=w; view_.height=h; dirty_=true; }
+    if (!(style==style_))
     {
-        std::vector<PreviewTriangle> triangles;
-        triangles.reserve(mesh.bark.indices.size() / 3u + mesh.leaves.indices.size() / 3u);
-        PushSurfaceTriangles(triangles,
-            mesh.bark.vertices,
-            mesh.bark.indices,
-            center_,
-            radius_,
-            min,
-            size,
-            yaw_,
-            pitch_,
-            zoom_,
-            style.barkColor,
-            style.barkTextured,
-            false);
-        std::array<float, 4> leafColor = style.leafColor;
-        leafColor[3] = std::clamp(leafColor[3] * (1.0f - style.leafAlphaCutoff * 0.22f), 0.25f, 0.9f);
-        PushSurfaceTriangles(triangles,
-            mesh.leaves.vertices,
-            mesh.leaves.indices,
-            center_,
-            radius_,
-            min,
-            size,
-            yaw_,
-            pitch_,
-            zoom_,
-            leafColor,
-            style.leafTextured,
-            true);
-        std::sort(triangles.begin(), triangles.end(), [](const PreviewTriangle& a, const PreviewTriangle& b) {
-            return a.depth > b.depth;
-        });
-        cached_.clear();
-        cached_.reserve(triangles.size());
-        for (const PreviewTriangle& tri : triangles)
+        if (style.barkTexture!=style_.barkTexture) bark_=LoadImage(style.barkTexture);
+        if (style.leafTexture!=style_.leafTexture) leaves_=LoadImage(style.leafTexture);
+        style_=style; dirty_=true;
+    }
+    if (dirty_ && provider_ && provider_->IsReady())
+    {
+        if (texturesDirty_)
         {
-            CachedTriangle out{};
-            out.a[0] = tri.a.x;
-            out.a[1] = tri.a.y;
-            out.b[0] = tri.b.x;
-            out.b[1] = tri.b.y;
-            out.c[0] = tri.c.x;
-            out.c[1] = tri.c.y;
-            out.fill = tri.fill;
-            out.line = tri.line;
-            out.outline = tri.outline;
-            cached_.push_back(out);
+            bark_=LoadImage(style.barkTexture); leaves_=LoadImage(style.leafTexture); texturesDirty_=false;
         }
-        cachedKey_ = key;
-        cacheValid_ = true;
+        if (bark_.pixels.empty() && !style.barkTexture.empty()) bark_=LoadImage(style.barkTexture);
+        if (leaves_.pixels.empty() && !style.leafTexture.empty()) leaves_=LoadImage(style.leafTexture);
+        const auto image=RasterTreePreview(mesh,view_,
+            {style.barkTextured?&bark_:nullptr,style.barkColor,0,false},
+            {style.leafTextured?&leaves_:nullptr,style.leafColor,style.leafAlphaCutoff,true});
+        ReleaseTexture();
+        texture_=provider_->UploadPreviewTexture(image.pixels.data(),image.width,image.height,"Tree Generator");
+        dirty_=!texture_.IsValid();
     }
-    for (const CachedTriangle& tri : cached_)
+    auto* draw=ImGui::GetWindowDrawList();
+    if (provider_ && texture_.IsValid())
     {
-        const ImVec2 a(tri.a[0], tri.a[1]);
-        const ImVec2 b(tri.b[0], tri.b[1]);
-        const ImVec2 c(tri.c[0], tri.c[1]);
-        draw->AddTriangleFilled(a, b, c, tri.fill);
-        if (tri.outline)
-            draw->AddTriangle(a, b, c, tri.line, 0.7f);
+        if (auto* id=provider_->GetPreviewTexture(texture_))
+            draw->AddImage(reinterpret_cast<ImTextureID>(id),origin,{origin.x+size.x,origin.y+size.y});
+        else dirty_=true;
     }
-
-    if (mesh.bark.vertices.empty())
-        draw->AddText(ImVec2(min.x + 16.0f, min.y + 16.0f), IM_COL32(200, 205, 214, 255), "No preview mesh");
+    else draw->AddText({origin.x+12,origin.y+12},IM_COL32_WHITE,"Preview renderer unavailable");
 }
 }

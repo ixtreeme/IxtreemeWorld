@@ -20,7 +20,7 @@ namespace
 {
 namespace xm = ixtreeme::math;
 
-enum class BarkStyle { Stripes, Rings };
+enum class BarkStyle { Stripes, Rings, Fissures };
 
 struct PaletteSpec
 {
@@ -41,6 +41,7 @@ constexpr PaletteSpec kBarkSpecs[]{
     {"Willow", "textures/bark/willow_bark.png", {0.48f, 0.42f, 0.28f, 0.78f}, {120, 107, 75, 255}, {67, 72, 51, 255}},
     {"Ash", "textures/bark/ash_bark.png", {0.56f, 0.52f, 0.44f, 0.78f}, {142, 132, 111, 255}, {74, 70, 62, 255}},
     {"Palm", "textures/bark/palm_bark.png", {0.52f, 0.42f, 0.30f, 0.78f}, {138, 112, 80, 255}, {74, 58, 40, 255}, 2, 2, BarkStyle::Rings},
+    {"Larch", "textures/bark/larch_bark.png", {0.72f, 0.58f, 0.39f, 1.0f}, {196, 163, 117, 255}, {110, 88, 57, 255}, 2, 2, BarkStyle::Fissures},
 };
 
 constexpr PaletteSpec kLeafSpecs[]{
@@ -52,6 +53,7 @@ constexpr PaletteSpec kLeafSpecs[]{
     {"Palm", "textures/leaves/palm_frond.png", {0.27f, 0.52f, 0.22f, 0.82f}, {72, 138, 54, 235}, {36, 88, 32, 240}, 2, 1},
     {"Blossom", "textures/leaves/blossom_leaf.png", {0.93f, 0.66f, 0.77f, 0.82f}, {246, 178, 206, 235}, {206, 96, 146, 240}},
     {"SnowyPine", "textures/leaves/snowy_pine_leaf.png", {0.55f, 0.66f, 0.62f, 0.82f}, {39, 105, 62, 235}, {18, 66, 42, 240}},
+    {"Larch", "textures/leaves/golden_larch.png", {0.83f, 0.65f, 0.18f, 1.0f}, {222, 180, 43, 255}, {117, 120, 34, 255}},
 };
 static_assert(std::size(kBarkSpecs) == ixtreemetree::kBarkTypeCount);
 static_assert(std::size(kLeafSpecs) == ixtreemetree::kLeafTypeCount);
@@ -205,6 +207,40 @@ void LeafPixel(const PaletteSpec& spec, std::uint32_t x, std::uint32_t y, std::u
     const int variant = cellY * spec.gridX + cellX;
     const float localX = ((static_cast<float>(x % cellWidth) + 0.5f) / static_cast<float>(cellWidth)) * 2.0f - 1.0f;
     const float localY = ((static_cast<float>(y % cellHeight) + 0.5f) / static_cast<float>(cellHeight)) * 2.0f - 1.0f;
+    if (std::strcmp(spec.label, "Larch") == 0)
+    {
+        // Own needle spray: a curved shoot with alternating short-shoot rosettes.
+        auto distance = [&](float ax, float ay, float bx, float by) {
+            const float dx=bx-ax, dy=by-ay;
+            const float t=std::clamp(((localX-ax)*dx+(localY-ay)*dy)/(dx*dx+dy*dy+1e-8f),0.0f,1.0f);
+            return std::hypot(localX-ax-t*dx,localY-ay-t*dy);
+        };
+        const float stem = 0.035f * std::sin((1-localY)*2 + variant);
+        float d = (localY > -0.92f && localY < 0.94f) ? std::abs(localX-stem) : 10.0f;
+        const bool wood = d < 0.012f;
+        for (int shoot=0; shoot<14; ++shoot)
+        {
+            const float s=(shoot+1.0f)/15.0f;
+            const float sign=shoot%2 ? -1.0f : 1.0f;
+            const float sy=0.82f-1.64f*s;
+            const float sx=0.035f*std::sin((1-sy)*2+variant);
+            const float reach=0.22f+0.37f*std::sin(s*xm::Pi);
+            for (int needle=0; needle<7; ++needle)
+            {
+                const float angle=-0.9f+needle*0.22f+0.08f*variant;
+                const float endX=sx+sign*reach*std::cos(angle);
+                const float endY=sy-reach*std::sin(angle)-0.12f;
+                d=std::min(d,distance(sx,sy,endX,endY));
+            }
+        }
+        const float mask=1-SmoothStep(0.006f,0.016f,d);
+        const float variation=0.5f+0.5f*std::sin(localY*31+variant*7+localX*9);
+        r=wood ? 109 : MixByte(178,249,variation);
+        g=wood ? 83 : MixByte(146,207,variation);
+        b=wood ? 39 : MixByte(27,71,variation);
+        a=static_cast<std::uint8_t>(255*mask);
+        return;
+    }
     const bool frond = std::strcmp(spec.label, "Palm") == 0;
     const bool blossom = std::strcmp(spec.label, "Blossom") == 0;
     if (frond || blossom)
@@ -314,6 +350,17 @@ bool WriteFallbackPng(const std::filesystem::path& path, const PaletteSpec& spec
                 continue;
             }
 
+            if (spec.barkStyle == BarkStyle::Fissures)
+            {
+                const float warp = 2.1f * std::sin(y * 0.02454369f) + 0.7f * std::sin(y * 0.09817477f);
+                const float crease = std::pow(0.5f + 0.5f * std::sin((x + warp) * 0.19634954f), 18.0f);
+                const float grain = 0.5f + 0.5f * std::sin(x * 1.5707963f + std::sin(y * 0.04908738f));
+                const float amount = std::clamp(crease * 0.85f + grain * 0.12f, 0.0f, 1.0f);
+                for (int channel=0; channel<3; ++channel)
+                    raw.push_back(MixByte(spec.baseColor[channel],spec.accentColor[channel],amount));
+                raw.push_back(255u);
+                continue;
+            }
             const std::uint32_t n = (x * 37u + y * 53u + ((x ^ y) * 11u)) & 0xffu;
             const bool stripe = spec.barkStyle == BarkStyle::Rings
                 ? ((y + (x / 16u) % 3u) % 24u) < 6u : (((x / 7u + y * 3u) % 23u) < 4u);

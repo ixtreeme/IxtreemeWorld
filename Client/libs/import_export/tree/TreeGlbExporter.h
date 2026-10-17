@@ -6,6 +6,7 @@
 #include <ixtreemetree/tree_mesh.h>
 
 #include <filesystem>
+#include <array>
 #include <optional>
 #include <string>
 
@@ -31,6 +32,8 @@ struct TreeMaterialBinding
     std::optional<Guid> leafMaterial;
     std::filesystem::path barkBaseColorTexturePath;
     std::filesystem::path leafBaseColorTexturePath;
+    std::array<float, 4> barkTint{1,1,1,1};
+    std::array<float, 4> leafTint{1,1,1,1};
     float leafAlphaCutoff = 0.5f;  // for a made leaf material
     bool trimTransparentLeafBorders = true;  // see trimLeafCards
     TreeImpostorSettings impostor;
