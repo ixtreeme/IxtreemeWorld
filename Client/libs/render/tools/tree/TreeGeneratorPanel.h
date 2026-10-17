@@ -57,6 +57,7 @@ private:
     std::filesystem::path InternalRoot() const;
 
     std::filesystem::path presetDir_;
+    std::filesystem::path projectRoot_;
     AssetLibrary* assetLibrary_ = nullptr;
     std::vector<ixtreemetree::Preset> presets_;
     std::optional<std::string> activePresetName_;

@@ -180,7 +180,8 @@ bool EditGrowthCurve(const char* label, ixtreemetree::GrowthCurve& curve, float 
 }
 
 TreeGeneratorPanel::TreeGeneratorPanel(std::filesystem::path presetDir)
-    : presetDir_(presetDir.empty() ? DefaultPresetDir() : std::move(presetDir))
+    : presetDir_(std::filesystem::absolute(presetDir.empty() ? DefaultPresetDir() : std::move(presetDir)).lexically_normal()),
+      projectRoot_(ProjectManager::Instance().ProjectRoot())
 {
     options_ = ixtreemetree::defaultTreeOptions();
     barkMaterialColor_[3] = 0.86f;
@@ -194,6 +195,16 @@ TreeGeneratorPanel::TreeGeneratorPanel(std::filesystem::path presetDir)
 void TreeGeneratorPanel::SetAssetLibrary(AssetLibrary* assetLibrary)
 {
     assetLibrary_ = assetLibrary;
+    const auto root = ProjectManager::Instance().ProjectRoot();
+    if (root != projectRoot_)
+    {
+        // Material GUIDs belong to the previous project's asset database.
+        projectRoot_ = root;
+        barkMaterial_.reset();
+        leafMaterial_.reset();
+        TreeTexturePalette::Instance().EnsureLoaded(InternalRoot());
+        preview_.InvalidateMesh();
+    }
 }
 
 void TreeGeneratorPanel::Show()
@@ -563,7 +574,7 @@ bool TreeGeneratorPanel::RenderMaterialField(const char* label,
                                              const char* tooltip)
 {
     ImGui::PushID(slotName);
-    std::string name = "None (built-in)";
+    std::string name = "Built-in texture";
     if (material)
     {
         const std::optional<std::filesystem::path> path = AssetDatabase::Instance().resolveGuid(*material);
@@ -596,7 +607,7 @@ bool TreeGeneratorPanel::RenderMaterialField(const char* label,
     }
     if (ImGui::BeginPopup("PickMaterial"))
     {
-        if (ImGui::Selectable("None (built-in)", !material))
+        if (ImGui::Selectable("Built-in texture", !material))
             cleared = true;
         if (assetLibrary_)
         {

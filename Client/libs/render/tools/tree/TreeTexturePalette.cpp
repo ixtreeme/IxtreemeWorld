@@ -474,9 +474,9 @@ const TreePaletteTexture& TreeTexturePalette::Leaf(ixtreemetree::LeafType type) 
 
 void TreeTexturePalette::Load(const std::filesystem::path& internalRoot)
 {
-    const std::filesystem::path root = internalRoot.empty()
+    const std::filesystem::path root = std::filesystem::absolute(internalRoot.empty()
         ? (std::filesystem::current_path() / "assets" / "internal")
-        : internalRoot;
+        : internalRoot).lexically_normal();
 
     for (std::size_t i = 0; i < std::size(kBarkSpecs); ++i)
     {

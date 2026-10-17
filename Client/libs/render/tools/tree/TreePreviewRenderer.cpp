@@ -2,6 +2,9 @@
 #include "asset/ExrImage.h"
 #include <imgui.h>
 #include <stb_image.h>
+#include <fstream>
+#include <iterator>
+#include <limits>
 namespace tree_tool
 {
 namespace
@@ -18,9 +21,15 @@ PreviewImage LoadImage(const std::filesystem::path& path)
     }
     else
     {
+        // filesystem::path keeps Windows Unicode names intact when opening the file.
+        std::ifstream file(path,std::ios::binary);
+        const std::vector<unsigned char> bytes(std::istreambuf_iterator<char>{file},std::istreambuf_iterator<char>{});
         int channels=0;
-        if (auto* p=stbi_load(path.string().c_str(),&image.width,&image.height,&channels,4))
-        { image.pixels.assign(p,p+std::size_t(image.width)*image.height*4); stbi_image_free(p); }
+        if (!bytes.empty() && bytes.size()<=std::size_t(std::numeric_limits<int>::max()))
+        {
+            if (auto* p=stbi_load_from_memory(bytes.data(),static_cast<int>(bytes.size()),&image.width,&image.height,&channels,4))
+            { image.pixels.assign(p,p+std::size_t(image.width)*image.height*4); stbi_image_free(p); }
+        }
     }
     return image;
 }
@@ -67,8 +76,8 @@ void TreePreviewRenderer::Render(const ixtreemetree::TreeMesh& mesh,float width,
     if (w!=view_.width || h!=view_.height) { view_.width=w; view_.height=h; dirty_=true; }
     if (!(style==style_))
     {
-        if (style.barkTexture!=style_.barkTexture) bark_=LoadImage(style.barkTexture);
-        if (style.leafTexture!=style_.leafTexture) leaves_=LoadImage(style.leafTexture);
+        if (style.barkTexture!=style_.barkTexture || style.leafTexture!=style_.leafTexture)
+            texturesDirty_=true;
         style_=style; dirty_=true;
     }
     if (dirty_ && provider_ && provider_->IsReady())
@@ -77,8 +86,14 @@ void TreePreviewRenderer::Render(const ixtreemetree::TreeMesh& mesh,float width,
         {
             bark_=LoadImage(style.barkTexture); leaves_=LoadImage(style.leafTexture); texturesDirty_=false;
         }
-        if (bark_.pixels.empty() && !style.barkTexture.empty()) bark_=LoadImage(style.barkTexture);
-        if (leaves_.pixels.empty() && !style.leafTexture.empty()) leaves_=LoadImage(style.leafTexture);
+        textureWarning_.clear();
+        if (style.barkTextured && !style.barkTexture.empty() && bark_.pixels.empty())
+            textureWarning_="Bark texture unavailable";
+        if (style.leafTextured && !style.leafTexture.empty() && leaves_.pixels.empty())
+        {
+            if (!textureWarning_.empty()) textureWarning_+='\n';
+            textureWarning_+="Leaf texture unavailable";
+        }
         const auto image=RasterTreePreview(mesh,view_,
             {style.barkTextured?&bark_:nullptr,style.barkColor,0,false},
             {style.leafTextured?&leaves_:nullptr,style.leafColor,style.leafAlphaCutoff,true});
@@ -94,5 +109,11 @@ void TreePreviewRenderer::Render(const ixtreemetree::TreeMesh& mesh,float width,
         else dirty_=true;
     }
     else draw->AddText({origin.x+12,origin.y+12},IM_COL32_WHITE,"Preview renderer unavailable");
+    if (!textureWarning_.empty())
+    {
+        const ImVec2 warningOrigin{origin.x+8,origin.y+size.y-48};
+        draw->AddRectFilled(warningOrigin,{origin.x+size.x-8,origin.y+size.y-8},IM_COL32(35,25,15,235));
+        draw->AddText({warningOrigin.x+4,warningOrigin.y+3},IM_COL32(255,195,80,255),textureWarning_.c_str());
+    }
 }
 }

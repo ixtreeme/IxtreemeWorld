@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <chrono>
 
 namespace
 {
@@ -21,6 +22,7 @@ public:
     using Handle=ixeditor::graphics::EditorTextureHandle;
     int uploads=0,releases=0;
     Handle active{};
+    std::vector<unsigned char> uploadedPixels;
     bool IsReady() const override { return true; }
     void BeginBackendFrame() override {}
     bool IsBackendFrameActive() const override { return true; }
@@ -33,6 +35,8 @@ public:
     Handle UploadPreviewTexture(const void* pixels,std::uint32_t width,std::uint32_t height,const char*) override
     {
         Check(pixels && width>0 && height>0,"editor uploads rendered pixels");
+        const auto* bytes=static_cast<const unsigned char*>(pixels);
+        uploadedPixels.assign(bytes,bytes+std::size_t(width)*height*4);
         active={std::uint64_t(++uploads)}; return active;
     }
     void ReleasePreviewTexture(Handle handle) override
@@ -54,16 +58,67 @@ void TestEditorPreview()
         ixtreemetree::TreeMesh mesh;
         mesh.bark.vertices={{{-1,0,0}},{{1,0,0}},{{0,2,0}}};
         mesh.bark.indices={0,1,2}; mesh.bboxMin={-1,0,0}; mesh.bboxMax={1,2,0};
-        auto frame=[&] {
+        auto frame=[&](const tree_tool::TreePreviewStyle& style=tree_tool::TreePreviewStyle{}) {
             ImGui::NewFrame(); ImGui::SetNextWindowSize({400,400},ImGuiCond_Always);
-            ImGui::Begin("Preview test"); renderer.Render(mesh,256,256); ImGui::End(); ImGui::Render();
+            ImGui::Begin("Preview test"); renderer.Render(mesh,256,256,style); ImGui::End(); ImGui::Render();
+        };
+        auto goldenPixelCount=[&] {
+            int count=0;
+            for (std::size_t i=0;i<provider.uploadedPixels.size();i+=4)
+                count+=provider.uploadedPixels[i]>provider.uploadedPixels[i+2]+60 &&
+                    provider.uploadedPixels[i+1]>provider.uploadedPixels[i+2]+40;
+            return count;
         };
         frame(); frame();
         Check(provider.uploads==1,"unchanged editor previews reuse their texture");
         renderer.InvalidateMesh(); frame();
         Check(provider.uploads==2 && provider.releases==1,"regeneration replaces and releases the preview texture");
+        struct TextureWorkspace
+        {
+            std::filesystem::path previous=std::filesystem::current_path();
+            std::filesystem::path root=std::filesystem::temp_directory_path()/
+                ("ix_tree_preview_"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            TextureWorkspace() { std::filesystem::create_directories(root/u8"árvíztűrő projekt"); }
+            ~TextureWorkspace()
+            {
+                std::filesystem::current_path(previous);
+                std::error_code ec; std::filesystem::remove_all(root,ec);
+            }
+        } workspace;
+        const auto source=workspace.root/"source.png";
+        const unsigned char gold[]={235,180,35,255,235,180,35,255,235,180,35,255,235,180,35,255};
+        Check(stbi_write_png(source.string().c_str(),2,2,4,gold,8)!=0,"test texture writes");
+        const auto unicodeTexture=workspace.root/u8"árvíztűrő projekt"/u8"日本語"/"bark.png";
+        std::filesystem::create_directories(unicodeTexture.parent_path());
+        std::filesystem::copy_file(source,unicodeTexture);
+        tree_tool::TreePreviewStyle textured;
+        textured.barkTexture=unicodeTexture;
+        frame(textured);
+        Check(goldenPixelCount()>100,"preview textures load from Hungarian project paths");
+        std::filesystem::current_path(workspace.root);
+        auto& palette=tree_tool::TreeTexturePalette::Instance();
+        palette.EnsureLoaded("internal");
+        Check(palette.Leaf(ixtreemetree::LeafType::Larch).path.is_absolute(),
+            "built-in texture paths remain absolute across project working-directory changes");
+        textured.barkTexture=palette.Leaf(ixtreemetree::LeafType::Larch).path;
+        std::filesystem::copy_file(source,textured.barkTexture,std::filesystem::copy_options::overwrite_existing);
+        std::filesystem::current_path(workspace.root/u8"árvíztűrő projekt");
+        frame(textured);
+        Check(goldenPixelCount()>100 && renderer.TextureWarning().empty(),
+            "built-in preview textures still render after switching to a new project directory");
+        textured.barkTexture=workspace.root/"missing.png";
+        textured.leafTexture=workspace.root/"missing-leaf.png";
+        frame(textured);
+        Check(renderer.TextureWarning().find("Bark")!=std::string::npos &&
+            renderer.TextureWarning().find("Leaf")!=std::string::npos,
+            "missing textures report the affected surfaces instead of silently turning gray");
+        std::filesystem::copy_file(source,textured.barkTexture);
+        std::filesystem::copy_file(source,textured.leafTexture);
+        renderer.InvalidateMesh(); frame(textured);
+        Check(renderer.TextureWarning().empty() && goldenPixelCount()>100,
+            "regeneration reloads repaired textures and clears the warning");
         renderer.SetTextureProvider(nullptr);
-        Check(provider.releases==2,"editor teardown detaches the texture provider safely");
+        Check(provider.releases==provider.uploads,"editor teardown detaches the texture provider safely");
     }
     ImGui::DestroyContext(context);
 }

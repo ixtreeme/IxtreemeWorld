@@ -21,6 +21,12 @@ az új ágnövekedést az **Organic growth** kapcsoló engedélyezi.
 A növekedési preset a paramétereket és a beépített textúraválasztást tárolja.
 Az egyedi materialok GUID-hozzárendelését az exportált modell tárolja.
 
+Az előnézet projekt- vagy assetmentés nélkül is használja a beépített textúrákat.
+A **Built-in texture** materialmező ezt jelzi. Projektváltáskor az előző projekt
+egyedi material-hozzárendelései törlődnek, a fa paraméterei megmaradnak. A beépített
+textúrák teljes útvonalat használnak; betöltési hibánál az előnézet jelzi, hogy
+a kéreg vagy a lomb textúrája hiányzik. A preset újbóli alkalmazása újratölti őket.
+
 ## Mi változott
 
 | Terület | Működés |
@@ -49,6 +55,15 @@ generálási keret és minden preset mentés/visszatöltés utáni geometriai az
 három nézet renderelése, kérésre valódi GLB- és impostorexport. Ablak nélküli
 ImGui-teszt ellenőrzi a szerkesztő előnézetének feltöltését, gyorsítótárát,
 regenerálását és a textúra felszabadítását.
+Külön ellenőrzés fedi az Unicode fájlneveket, a munkamappaváltás után is textúrázott
+előnézetet, valamint a hiányzó textúrák jelzését és helyreállítását.
+
+2026-10-17: a materialbetöltési javítás teljes Release-buildje és 36/36 CTestje
+sikeres. A natív szerkesztőben a Golden Larch - Organic előnézete projekt nélkül,
+majd új, üres projekt létrehozása után is textúrázott; a fa nem lett assetként mentve.
+A felhasználónál látott eredeti szürke állapotot ebben a buildben nem sikerült
+reprodukálni; a javítás a relatív útvonalat, a projektváltáskor megmaradó egyedi
+materialokat és a néma textúrabetöltési hibát kezeli.
 
 Példa egy új, még nem létező kimeneti mappával:
 
