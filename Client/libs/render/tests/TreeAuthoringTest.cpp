@@ -117,6 +117,12 @@ void TestEditorPreview()
         renderer.InvalidateMesh(); frame(textured);
         Check(renderer.TextureWarning().empty() && goldenPixelCount()>100,
             "regeneration reloads repaired textures and clears the warning");
+        const auto previousPixels=provider.uploadedPixels;
+        const auto previousUploads=provider.uploads;
+        textured.lighting.exposure=1;
+        frame(textured);
+        Check(provider.uploads==previousUploads+1 && provider.uploadedPixels!=previousPixels,
+            "changing preview lighting refreshes a cached preview without regenerating geometry");
         renderer.SetTextureProvider(nullptr);
         Check(provider.releases==provider.uploads,"editor teardown detaches the texture provider safely");
     }
@@ -159,6 +165,38 @@ void TestCutoutDepth()
         shadowPixels += image.pixels[i]==0 && image.pixels[i+2]>100 && shadowed.pixels[i+2]+15<image.pixels[i+2];
     Check(shadowPixels>5,"alpha-tested leaves cast shadows onto visible surfaces behind them");
 }
+void TestPreviewLighting()
+{
+    using namespace tree_tool;
+    ixtreemetree::TreeMesh mesh;
+    mesh.bark.vertices={{{-0.8f,-0.8f,0},{0,0,-1},{0,1}},{{0.8f,-0.8f,0},{0,0,-1},{1,1}},
+        {{0.8f,0.8f,0},{0,0,-1},{1,0}},{{-0.8f,0.8f,0},{0,0,-1},{0,0}}};
+    mesh.bark.indices={0,1,2,0,2,3}; mesh.bboxMin={-0.8f,-0.8f,0}; mesh.bboxMax={0.8f,0.8f,0};
+    PreviewView view; view.width=view.height=128; view.center={0,0,0}; view.radius=1;
+    view.yaw=view.pitch=0; view.shadows=false;
+    view.lighting.ambient=0; view.lighting.intensity=1; view.lighting.azimuth=0; view.lighting.elevation=45;
+    const auto away=RasterTreePreview(mesh,view,{},{});
+    view.lighting.azimuth=180;
+    const auto toward=RasterTreePreview(mesh,view,{},{});
+    const auto center=(64*128+64)*4;
+    Check(away.pixels[center]==0 && toward.pixels[center]>200 && away.depth==toward.depth,
+        "sun direction changes surface lighting while preserving silhouette and depth");
+    view.lighting.azimuth=0; view.lighting.ambient=0.2f;
+    const auto filled=RasterTreePreview(mesh,view,{},{});
+    Check(filled.pixels[center]>100,"ambient fill lights surfaces facing away from the sun");
+    mesh.leaves.vertices=mesh.bark.vertices; mesh.leaves.indices=mesh.bark.indices;
+    mesh.bark.vertices.clear(); mesh.bark.indices.clear();
+    view.lighting.ambient=0; view.lighting.transmission=0;
+    const auto opaque=RasterTreePreview(mesh,view,{}, {nullptr,{1,1,1,1},0,true});
+    view.lighting.transmission=1; view.lighting.intensity=0.25f;
+    const auto transmitted=RasterTreePreview(mesh,view,{}, {nullptr,{1,1,1,1},0,true});
+    view.lighting.exposure=1;
+    const auto exposed=RasterTreePreview(mesh,view,{}, {nullptr,{1,1,1,1},0,true});
+    Check(opaque.pixels[center]==0 && transmitted.pixels[center]>100 &&
+        exposed.pixels[center]>transmitted.pixels[center]+30,
+        "leaf transmission and exposure control backlit foliage independently");
+}
+
 void WritePresetGallery(const std::filesystem::path& destination)
 {
     namespace fs=std::filesystem;
@@ -272,6 +310,7 @@ int main(int argc,char** argv)
     try
     {
         TestCutoutDepth();
+        TestPreviewLighting();
         TestEditorPreview();
         Larch(argc==3 && std::string(argv[1])=="--write-preview" ? std::filesystem::path(argv[2]) : std::filesystem::path{});
         if (argc==3 && std::string(argv[1])=="--write-gallery") WritePresetGallery(argv[2]);

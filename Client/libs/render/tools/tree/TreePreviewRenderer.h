@@ -11,6 +11,8 @@ struct TreePreviewStyle
     float leafAlphaCutoff=0.5f;
     bool barkTextured=true, leafTextured=true;
     std::filesystem::path barkTexture, leafTexture;
+    PreviewLighting lighting{};
+    bool shadows=true;
     bool operator==(const TreePreviewStyle&) const = default;
 };
 class TreePreviewRenderer

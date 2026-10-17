@@ -645,6 +645,77 @@ void TestExistingTreesUnchanged(bool print)
         Check(std::count_if(actual.begin(), actual.end(), [&](const auto& tree) { return tree.first == golden.name; }) == 1,
             (std::string("golden tree still loads exactly once: ") + golden.name).c_str());
 }
+void TestCrownAndFoliageProfiles()
+{
+    using namespace ixtreemetree;
+    Tree tree; tree.options=LevelBranches(32);
+    auto& o=tree.options;
+    o.branch.organic=true; o.branch.radius[1]=0.01f;
+    o.leaves.count=0;
+    const auto original=tree.generate();
+    o.crown.width=1.4f; o.crown.depth=0.8f; o.crown.base=0;
+    o.crown.profile.values.fill(1); o.crown.offset={0.25f,-0.1f};
+    Check(MeshHash(original)==HashOf(o),"disabled crown settings leave geometry and RNG unchanged");
+    o.crown.enabled=true;
+    const auto pruned=tree.generate();
+    Check(original.bboxMax.x>2 && pruned.bboxMax.x<1.67f && pruned.bboxMin.x>-1.17f &&
+        pruned.bboxMax.z<0.72f && pruned.bboxMin.z>-0.92f,
+        "elliptical crown pruning respects both radii and the horizontal offset");
+    Check(pruned.bark.indices.size()==original.bark.indices.size(),
+        "pruned branches retain their capped tube topology");
+    o.branch.sections[1]=31;
+    const auto fine=tree.generate();
+    Check(std::abs(fine.bboxMax.x-pruned.bboxMax.x)<0.03f && std::abs(fine.bboxMax.z-pruned.bboxMax.z)<0.03f,
+        "crown pruning does not depend on tube tessellation");
+    o.crown.base=0.75f;
+    const auto highCrown=tree.generate();
+    Check(highCrown.bark.vertices.size()<fine.bark.vertices.size(),"raising the crown base removes lower branches");
+    const std::size_t trunkVertices=(o.branch.sections[0]+1)*(o.branch.segments[0]+1)+1;
+    bool aboveBase=highCrown.bark.vertices.size()>trunkVertices;
+    for (std::size_t i=trunkVertices;i<highCrown.bark.vertices.size();++i)
+        aboveBase &= highCrown.bark.vertices[i].position.y>=7.48f;
+    Check(aboveBase,"branches below the crown envelope are omitted while the trunk remains");
+    o.crown.profile.values={1,0.85f,0.6f,0.3f,0.01f};
+    Check(HashOf(o)!=MeshHash(highCrown),"the crown radius curve changes the actual branch geometry");
+
+    tree.options=LevelBranches(1); o.branch.organic=true;
+    o.leaves.twigAligned=true; o.leaves.start=0; o.leaves.count=40;
+    o.leaves.size=0.2f; o.leaves.angle=0; o.leaves.sizeVariance=0;
+    const auto full=tree.generate();
+    o.leaves.densityProfile.values={0,0,0,1,1};
+    const auto tips=tree.generate();
+    Check(tips.leaves.vertices.size()==15u*4u && tips.leaves.vertices.size()<full.leaves.vertices.size(),
+        "integrated foliage density changes the cluster count");
+    bool outer=true;
+    for (std::size_t card=0;card<tips.leaves.vertices.size()/4;++card)
+    {
+        const auto p=CardCenter(tips.leaves,card);
+        outer &= std::hypot(p.x,p.z)>1.49f;
+    }
+    Check(outer,"zero-density inner regions remain bare rather than retaining uniformly spaced leaves");
+    o.leaves.densityProfile.values.fill(0);
+    Check(tree.generate().leaves.vertices.empty(),"a zero foliage density curve produces no cards");
+    o.leaves.densityProfile.values.fill(1); o.leaves.sizeProfile.values.fill(0.5f);
+    const auto small=tree.generate();
+    auto cardLength=[](const auto& mesh) {
+        const auto a=mesh.leaves.vertices[0].position,b=mesh.leaves.vertices[3].position;
+        return std::sqrt((a.x-b.x)*(a.x-b.x)+(a.y-b.y)*(a.y-b.y)+(a.z-b.z)*(a.z-b.z));
+    };
+    Check(small.leaves.vertices.size()==full.leaves.vertices.size() &&
+        std::abs(cardLength(small)*2-cardLength(full))<1e-5f,"the foliage size curve scales cards independently of density");
+    o.leaves.sizeProfile.values.fill(0);
+    Check(tree.generate().leaves.vertices.empty(),"a zero foliage size curve omits degenerate cards");
+    o.leaves.sizeProfile.values.fill(1); o.leaves.count=1; o.leaves.start=0.9f;
+    const auto withoutLeader=tree.generate();
+    o.branch.tipFoliageLength[0]=0.5f;
+    const auto withLeader=tree.generate();
+    bool leafyLeader=false;
+    for (std::size_t card=0;card<withLeader.leaves.vertices.size()/4;++card)
+        leafyLeader |= CardCenter(withLeader.leaves,card).y>9.4f;
+    Check(withLeader.leaves.vertices.size()==withoutLeader.leaves.vertices.size()+4 && leafyLeader,
+        "parent shoots can carry apical foliage while retaining their child branches");
+}
+
 void TestOrganicGrowth()
 {
     using namespace ixtreemetree;
@@ -694,6 +765,10 @@ void TestOrganicGrowth()
     const auto path=std::filesystem::temp_directory_path() / ("ixw_tree_roundtrip_"+
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".json");
     std::string error;
+    o.crown.enabled=true; o.crown.width=2.1f; o.crown.depth=1.5f; o.crown.base=0.2f; o.crown.offset={0.2f,-0.1f};
+    o.branch.tipFoliageLength[0]=0.7f;
+    o.leaves.densityProfile.values={0,0.2f,0.5f,1,0.4f};
+    o.leaves.sizeProfile.values={1,0.7f,1.2f,0.6f,0.2f};
     auto presets=loadAllPresets(IXTREEMETREE_PRESET_DIR);
     presets.push_back({"Edited \"organic\" tree",o});
     for (const auto& preset:presets)
@@ -707,6 +782,7 @@ void TestOrganicGrowth()
                 loaded->options.leaves.alphaTest==preset.options.leaves.alphaTest,"round trip retains material settings");
     }
     std::error_code ec; std::filesystem::remove(path,ec);
+    o.crown.enabled=false;
     o.branch.levels=3; o.branch.children.fill(128); o.branch.sections.fill(2); o.branch.segments.fill(3);
     o.leaves.density=0; o.leaves.count=0;
     const auto limited=tree.generate();
@@ -761,6 +837,7 @@ int main(int argc, char** argv)
     TestPresets(argc > 1 && std::string(argv[1]) == "--print-golden");
     TestPresetDefaultsAndNumericEnums();
     TestOrganicGrowth();
+    TestCrownAndFoliageProfiles();
     TestAlternatingShoots();
     if (g_errors == 0)
         std::cout << "TreeGeneratorTest: all checks passed\n";

@@ -509,6 +509,7 @@ void ApplyBranch(const JsonValue& root, TreeOptions& options)
     ReadNumericSeries(*branch, "azimuthVariance", options.branch.azimuthVariance);
     ReadNumericSeries(*branch, "distribution", options.branch.distribution);
     ReadNumericSeries(*branch, "scaleInheritance", options.branch.scaleInheritance);
+    ReadNumericSeries(*branch, "tipFoliageLength", options.branch.tipFoliageLength);
     auto curves = [&](const char* key, auto& target) {
         const auto* source = Find(*branch, key);
         if (!source || source->type != JsonValue::Type::Array) return;
@@ -540,6 +541,19 @@ void ApplyBranch(const JsonValue& root, TreeOptions& options)
     }
 }
 
+void ApplyCrown(const JsonValue& root, TreeOptions& options)
+{
+    const auto* crown=Find(root,"crown");
+    if (!crown || crown->type!=JsonValue::Type::Object) return;
+    auto& c=options.crown;
+    c.enabled=BoolOr(*crown,"enabled",c.enabled);
+    c.width=std::clamp(FloatOr(*crown,"width",c.width),0.05f,100.0f);
+    c.depth=std::clamp(FloatOr(*crown,"depth",c.depth),0.05f,100.0f);
+    c.base=std::clamp(FloatOr(*crown,"base",c.base),0.0f,0.95f);
+    c.offset=Vec2Or(*crown,"offset",c.offset);
+    ReadNumericSeries(*crown,"profile",c.profile.values);
+}
+
 void ApplyLeaves(const JsonValue& root, TreeOptions& options)
 {
     const JsonValue* leaves = Find(root, "leaves");
@@ -562,6 +576,8 @@ void ApplyLeaves(const JsonValue& root, TreeOptions& options)
     options.leaves.aspect = FloatOr(*leaves, "aspect", options.leaves.aspect);
     options.leaves.density = FloatOr(*leaves, "density", options.leaves.density);
     options.leaves.tipScale = FloatOr(*leaves, "tipScale", options.leaves.tipScale);
+    ReadNumericSeries(*leaves,"densityProfile",options.leaves.densityProfile.values);
+    ReadNumericSeries(*leaves,"sizeProfile",options.leaves.sizeProfile.values);
     if (const JsonValue* billboard = Find(*leaves, "billboard"); billboard && billboard->type == JsonValue::Type::String)
     {
         const std::string mode = ToLower(billboard->string);
@@ -624,6 +640,7 @@ std::optional<Preset> loadPresetFile(const std::filesystem::path& path, std::str
     });
     ApplyBark(root, preset.options);
     ApplyBranch(root, preset.options);
+    ApplyCrown(root, preset.options);
     ApplyLeaves(root, preset.options);
     return preset;
 }
@@ -663,6 +680,7 @@ bool savePresetFile(const std::filesystem::path& path, const Preset& preset, std
     TREE_SERIES(whorlSize); TREE_SERIES(droop); TREE_SERIES(lengthVariance); TREE_SERIES(radiusVariance);
     TREE_SERIES(angleVariance); TREE_SERIES(azimuthVariance); TREE_SERIES(distribution);
     TREE_SERIES(scaleInheritance);
+    TREE_SERIES(tipFoliageLength);
 #undef TREE_SERIES
     auto curves = [&](const char* key, const auto& values) {
         out << ",\n\"" << key << "\":[";
@@ -680,7 +698,11 @@ bool savePresetFile(const std::filesystem::path& path, const Preset& preset, std
     out << ",\n\"organic\":" << o.branch.organic << ",\"trunks\":" << o.branch.trunks
         << ",\"trunkSpread\":" << o.branch.trunkSpread << ",\"forceStrength\":" << o.branch.forceStrength
         << ",\"forceDirection\":{\"x\":" << o.branch.forceDirection.x << ",\"y\":" << o.branch.forceDirection.y
-        << ",\"z\":" << o.branch.forceDirection.z << "}},\n\"leaves\":{\"type\":" << int(o.leaves.type)
+        << ",\"z\":" << o.branch.forceDirection.z << "}},\n\"crown\":{\"enabled\":" << o.crown.enabled
+        << ",\"width\":" << o.crown.width << ",\"depth\":" << o.crown.depth << ",\"base\":" << o.crown.base
+        << ",\"offset\":{\"x\":" << o.crown.offset.x << ",\"y\":" << o.crown.offset.y << '}';
+    series("profile",o.crown.profile.values);
+    out << "},\n\"leaves\":{\"type\":" << int(o.leaves.type)
         << ",\"style\":" << int(o.leaves.style);
 #define TREE_LEAF(field) out << ",\n\"" #field "\":" << o.leaves.field
     TREE_LEAF(cardsPerCluster); TREE_LEAF(atlasGridX); TREE_LEAF(atlasGridY); TREE_LEAF(angle);
@@ -688,6 +710,8 @@ bool savePresetFile(const std::filesystem::path& path, const Preset& preset, std
     TREE_LEAF(alphaTest); TREE_LEAF(frondWidth); TREE_LEAF(frondFold); TREE_LEAF(twigAligned);
     TREE_LEAF(aspect); TREE_LEAF(density); TREE_LEAF(tipScale);
 #undef TREE_LEAF
+    series("densityProfile",o.leaves.densityProfile.values);
+    series("sizeProfile",o.leaves.sizeProfile.values);
     out << "}\n}\n";
     out.flush();
     if (!out.good() && errorOut) *errorOut = "Failed writing " + path.string();

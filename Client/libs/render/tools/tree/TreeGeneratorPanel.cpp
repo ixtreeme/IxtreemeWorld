@@ -399,6 +399,7 @@ bool TreeGeneratorPanel::RenderInspector()
     bool regenerate = false;
     regenerate |= RenderGeneral();
     regenerate |= RenderBranches();
+    regenerate |= RenderCrown();
     regenerate |= RenderBark();
     regenerate |= RenderLeaves();
     if (regenerate)
@@ -406,6 +407,7 @@ bool TreeGeneratorPanel::RenderInspector()
         activePresetName_.reset();
         Regenerate();
     }
+    RenderPreviewSettings();
     RenderOutput();
     RenderSavePopup(savedAsset);
     return savedAsset;
@@ -476,10 +478,37 @@ bool TreeGeneratorPanel::RenderBranches()
     return changed;
 }
 
+bool TreeGeneratorPanel::RenderCrown()
+{
+    if (!ImGui::CollapsingHeader(ICON_FA_TREE " Crown silhouette")) return false;
+    ImGui::BeginDisabled(!options_.branch.organic);
+    bool changed=ImGui::Checkbox("Prune to crown envelope",&options_.crown.enabled);
+    UI::ItemTooltip("Shorten organic branches at an elliptical crown boundary. The trunk is retained; leaf cards can extend beyond the branch boundary.");
+    ImGui::BeginDisabled(!options_.crown.enabled);
+    changed |= UI::Prop::DragFloat("Radius X",&options_.crown.width,0.05f,0.05f,100.0f,"%.2f m");
+    changed |= UI::Prop::DragFloat("Radius Z",&options_.crown.depth,0.05f,0.05f,100.0f,"%.2f m");
+    changed |= UI::Prop::SliderFloat("Crown base",&options_.crown.base,0.0f,0.95f);
+    UI::ItemTooltip("Height of the crown base as a fraction of trunk length. Branches below it are omitted.");
+    changed |= DragVec2("Center X / Z",options_.crown.offset,0.02f,-20.0f,20.0f);
+    UI::ItemTooltip("Shift the crown sideways to shape a leaning or asymmetric canopy.");
+    changed |= EditGrowthCurve("Crown radius: bottom to top",options_.crown.profile,0.0f,1.5f);
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    if (!options_.branch.organic) ImGui::TextDisabled("Enable Organic growth to use crown pruning.");
+    return changed;
+}
+
 bool TreeGeneratorPanel::RenderBranchLevel(int level)
 {
     bool changed = false;
     ImGui::Spacing();
+    if (options_.branch.organic && level<options_.branch.levels)
+    {
+        ImGui::BeginDisabled(!options_.leaves.twigAligned || options_.leaves.style!=ixtreemetree::LeafStyle::Cards);
+        changed |= UI::Prop::DragFloat("Tip foliage length",&options_.branch.tipFoliageLength[level],0.01f,0.0f,5.0f,"%.2f m");
+        UI::ItemTooltip("Additional foliage along this parent shoot's tip, including the trunk leader. Requires Align leaves to twigs and Cards style. Zero disables it.");
+        ImGui::EndDisabled();
+    }
     if (level > 0)
     {
         changed |= UI::Prop::DragInt("Count per parent", &options_.branch.children[level], 0.1f, 0, 120);
@@ -724,6 +753,13 @@ bool TreeGeneratorPanel::RenderLeaves()
         UI::ItemTooltip("Width relative to length: below 1 makes narrow sprays, above 1 makes broad cards.");
         changed |= UI::Prop::SliderFloat("Size at twig tip", &options_.leaves.tipScale, 0.05f, 2.0f);
         UI::ItemTooltip("Card size at the twig tip relative to its base; below 1 makes foliage taper.");
+        if (ImGui::TreeNode("Foliage profiles"))
+        {
+            changed |= EditGrowthCurve("Cluster density: twig base to tip",options_.leaves.densityProfile,0.0f,1.0f);
+            UI::ItemTooltip("Relative density along the leaf-bearing part of each twig. Zero creates a bare region; one uses the full cluster count.");
+            changed |= EditGrowthCurve("Card size: twig base to tip",options_.leaves.sizeProfile,0.0f,2.0f);
+            ImGui::TreePop();
+        }
     }
     changed |= UI::Prop::DragInt("Clusters per twig", &options_.leaves.count, 0.1f, 0, 120);
     UI::ItemTooltip("Leaf clusters along each last-level branch.");
@@ -745,11 +781,26 @@ bool TreeGeneratorPanel::RenderLeaves()
     }
     else
     {
-        UI::Prop::DragFloat("Alpha cutoff", &options_.leaves.alphaTest, 0.01f, 0.0f, 1.0f, "%.2f");
+        changed |= UI::Prop::DragFloat("Alpha cutoff", &options_.leaves.alphaTest, 0.01f, 0.0f, 1.0f, "%.2f");
         UI::ItemTooltip("Texels less opaque than this are cut out of the leaf cards.");
     }
     ImGui::Spacing();
     return changed;
+}
+
+void TreeGeneratorPanel::RenderPreviewSettings()
+{
+    if (!ImGui::CollapsingHeader(ICON_FA_SUN " Preview lighting")) return;
+    UI::Prop::SliderFloat("Sun azimuth",&lighting_.azimuth,-180.0f,180.0f,"%.0f deg");
+    UI::Prop::SliderFloat("Sun elevation",&lighting_.elevation,5.0f,85.0f,"%.0f deg");
+    UI::Prop::SliderFloat("Sun intensity",&lighting_.intensity,0.0f,3.0f);
+    UI::Prop::SliderFloat("Ambient fill",&lighting_.ambient,0.0f,1.0f);
+    UI::Prop::SliderFloat("Leaf transmission",&lighting_.transmission,0.0f,1.0f);
+    UI::ItemTooltip("Light transmitted through the back of a leaf card.");
+    UI::Prop::SliderFloat("Exposure",&lighting_.exposure,-3.0f,3.0f,"%.2f EV");
+    ImGui::Checkbox("Leaf cutout shadows",&previewShadows_);
+    if (ImGui::Button("Reset lighting")) { lighting_={}; previewShadows_=true; }
+    ImGui::TextWrapped("Preview lighting only. Exported materials use the scene's lighting.");
 }
 
 void TreeGeneratorPanel::RenderOutput()
@@ -820,6 +871,8 @@ TreePreviewStyle TreeGeneratorPanel::CurrentPreviewStyle() const
     const TreePaletteTexture& bark = TreeTexturePalette::Instance().Bark(options_.bark.type);
     const TreePaletteTexture& leaf = TreeTexturePalette::Instance().Leaf(options_.leaves.type);
     TreePreviewStyle style{};
+    style.lighting=lighting_;
+    style.shadows=previewShadows_;
     style.barkColor = MultiplyColor({1,1,1,1}, options_.bark.tint);
     style.leafColor = MultiplyColor({1,1,1,1}, options_.leaves.tint);
     style.barkTexture = bark.path;

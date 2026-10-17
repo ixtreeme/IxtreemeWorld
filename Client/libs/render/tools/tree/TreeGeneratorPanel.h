@@ -44,10 +44,12 @@ private:
     void ApplyPreset(size_t presetIndex);
     bool RenderGeneral();
     bool RenderBranches();
+    bool RenderCrown();
     bool RenderBranchLevel(int level);
     bool RenderBark();
     bool RenderLeaves();
     void RenderOutput();
+    void RenderPreviewSettings();
     void RenderSavePopup(bool& savedAsset);
     // A material slot: an asset field the user drops a Material on (or picks one from the list).
     bool RenderMaterialField(const char* label, const char* slotName, std::optional<Guid>& material,
@@ -81,6 +83,8 @@ private:
     float impostorTransition_ = 30.0f;
     int impostorResolution_ = 256;
     TreePreviewRenderer preview_;
+    PreviewLighting lighting_{};
+    bool previewShadows_ = true;
     char assetName_[96]{};
     char presetName_[96] = "Custom Tree";
     std::string status_;

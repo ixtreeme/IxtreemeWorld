@@ -99,12 +99,24 @@ struct TreeOptions
             GrowthCurve{{0,0,0,0,0}}, GrowthCurve{{0,0,0,0,0}}}; // elevation in degrees
         std::array<float, kMaxBranchLevels> distribution{1,1,1,1}; // >1 concentrates near parent base
         std::array<float, kMaxBranchLevels> scaleInheritance{1,1,1,1}; // influence of ancestors' length scales
+        std::array<float, kMaxBranchLevels> tipFoliageLength{}; // additional foliage on parent shoot tips, metres
         int trunks = 1;            // stems from the ground (a shrub has several)
         float trunkSpread = 0.0f;  // how far the stems lean from upright, degrees
 
         Vec3 forceDirection{0.0f, 1.0f, 0.0f};
         float forceStrength = 0.05f;
     } branch;
+
+    // Optional world-space pruning envelope for organic branches. The trunk is retained.
+    struct Crown
+    {
+        bool enabled = false;
+        float width = 4.0f; // half-width along X, metres
+        float depth = 4.0f; // half-width along Z, metres
+        float base = 0.2f;  // fraction of authored trunk height
+        Vec2 offset{};      // horizontal X/Z offset, metres
+        GrowthCurve profile{{1,1,0.8f,0.45f,0.05f}}; // radius from crown base to top
+    } crown;
 
     struct Leaves
     {
@@ -126,6 +138,8 @@ struct TreeOptions
         float aspect = 1.0f; // card width / length
         float density = 0.0f; // clusters / metre; zero uses count per twig
         float tipScale = 1.0f;
+        GrowthCurve densityProfile{}; // relative clusters along a twig (0..1), twigAligned only
+        GrowthCurve sizeProfile{};    // relative card size along a twig (0..2), twigAligned only
     } leaves;
 };
 

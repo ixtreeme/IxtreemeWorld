@@ -79,6 +79,7 @@ void TreePreviewRenderer::Render(const ixtreemetree::TreeMesh& mesh,float width,
         if (style.barkTexture!=style_.barkTexture || style.leafTexture!=style_.leafTexture)
             texturesDirty_=true;
         style_=style; dirty_=true;
+        view_.lighting=style.lighting; view_.shadows=style.shadows;
     }
     if (dirty_ && provider_ && provider_->IsReady())
     {

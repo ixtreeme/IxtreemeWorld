@@ -315,10 +315,24 @@ BranchEnd GenerateBranch(const TreeOptions& options,
 
 // The organic model samples a fixed-resolution growth path, independently of the
 // render tessellation. Changing tube resolution must not move branch attachments.
+bool InsideCrown(const TreeOptions& o, Vec3 p)
+{
+    const auto& c=o.crown;
+    const float height=std::max(0.1f,o.branch.length[0]);
+    const float base=std::clamp(c.base,0.0f,0.95f)*height;
+    if (p.y<base || p.y>height) return false;
+    const float radius=std::max(0.001f,c.profile.evaluate((p.y-base)/(height-base)));
+    const float x=(p.x-c.offset.x)/std::max(0.05f,c.width);
+    const float z=(p.z-c.offset.y)/std::max(0.05f,c.depth);
+    return x*x+z*z<=radius*radius;
+}
+
 void GenerateOrganicBranch(const TreeOptions& o, Rng& rng, TreeMesh& mesh, int level,
     Vec3 origin, Vec3 direction, std::vector<TerminalBranch>& terminals,
     int& branchBudget, float scale = 1.0f)
 {
+    const bool prune=o.crown.enabled && level>0;
+    if (prune && !InsideCrown(o,origin)) return;
     if (--branchBudget < 0 || mesh.bark.vertices.size() > 1500000u)
     {
         mesh.stats.budgetLimited = true;
@@ -353,8 +367,40 @@ void GenerateOrganicBranch(const TreeOptions& o, Rng& rng, TreeMesh& mesh, int l
     for (int i = 1; i <= samples; ++i)
     {
         const float t = static_cast<float>(i) / samples;
-        path.centers.push_back(Add(path.centers.back(), Mul(axisAt(t - 0.5f / samples), length / samples)));
+        Vec3 next=Add(path.centers.back(), Mul(axisAt(t - 0.5f / samples), length / samples));
+        if (prune && !InsideCrown(o,next))
+        {
+            // End the growth path at the envelope, then taper and cap the shortened branch normally.
+            Vec3 inside=path.centers.back(),outside=next;
+            for (int step=0;step<12;++step)
+            {
+                const Vec3 middle=Mix(inside,outside,0.5f);
+                if (InsideCrown(o,middle)) inside=middle; else outside=middle;
+            }
+            if (Length(Sub(inside,path.centers.back()))>0.0001f)
+            {
+                path.centers.push_back(inside);
+                path.axes.push_back(axisAt(t));
+            }
+            break;
+        }
+        path.centers.push_back(next);
         path.axes.push_back(axisAt(t));
+    }
+    if (path.centers.size()<2) return;
+    if (level<lastLevel && b.tipFoliageLength[level]>0 && o.leaves.twigAligned && o.leaves.style==LeafStyle::Cards)
+    {
+        float pathLength=0;
+        for (std::size_t i=1;i<path.centers.size();++i) pathLength+=Length(Sub(path.centers[i],path.centers[i-1]));
+        const float start=1-std::clamp(b.tipFoliageLength[level]/std::max(0.001f,pathLength),0.0f,1.0f);
+        TerminalBranch tip;
+        for (int i=0;i<=16;++i)
+        {
+            Vec3 axis{};
+            tip.centers.push_back(PointAlong(path,start+(1-start)*i/16.0f,axis));
+            tip.axes.push_back(axis);
+        }
+        terminals.push_back(std::move(tip));
     }
     const bool frond = level == lastLevel && o.leaves.style == LeafStyle::Fronds;
     const auto base = static_cast<std::uint32_t>(mesh.bark.vertices.size());
@@ -617,21 +663,47 @@ void GenerateTwigLeaves(const TreeOptions& o, Rng& rng, TreeMesh& mesh, const st
     const int columns = std::clamp(l.atlasGridX, 1, 8), rows = std::clamp(l.atlasGridY, 1, 8);
     const int cards = std::clamp(l.cardsPerCluster, 1, 7);
     const float start = std::clamp(l.start, 0.0f, 0.98f);
+    // Integrate the piecewise-linear density profile, then invert its CDF. This changes
+    // both cluster count and spacing without rejection noise or clusters in zero-density regions.
+    std::array<float,5> weights{},cdf{};
+    for (int i=0;i<5;++i) weights[i]=std::clamp(l.densityProfile.values[i],0.0f,1.0f);
+    for (int i=1;i<5;++i) cdf[i]=cdf[i-1]+(weights[i-1]+weights[i])*0.125f;
+    const bool uniform=std::all_of(weights.begin(),weights.end(),[](float w){return w==1;});
+    auto placement=[&](float q) {
+        if (uniform) return q;
+        const float target=q*cdf[4];
+        for (int i=0;i<4;++i)
+        {
+            if (target>cdf[i+1] || cdf[i+1]<=cdf[i]) continue;
+            float low=0,high=1;
+            for (int step=0;step<16;++step)
+            {
+                const float f=(low+high)*0.5f;
+                const float area=0.25f*(weights[i]*f+(weights[i+1]-weights[i])*f*f*0.5f);
+                if (cdf[i]+area<target) low=f; else high=f;
+            }
+            return (i+(low+high)*0.5f)*0.25f;
+        }
+        return 1.0f;
+    };
     for (const auto& branch : branches)
     {
         float length = 0;
         for (std::size_t j = 1; j < branch.centers.size(); ++j)
             length += Length(Sub(branch.centers[j], branch.centers[j-1]));
-        const int count = std::clamp(l.density > 0 ? static_cast<int>(std::ceil(length * (1-start) * l.density)) : l.count, 0, 256);
+        const int baseCount = std::clamp(l.density > 0 ? static_cast<int>(std::ceil(length * (1-start) * l.density)) : l.count, 0, 256);
+        const int count=uniform ? baseCount : static_cast<int>(std::ceil(baseCount*cdf[4]));
         for (int i = 0; i < count && mesh.leaves.vertices.size() < 400000u; ++i)
         {
-            const float t = start + (1-start) * (i + rng.uniform(0.15f, 0.85f)) / count;
+            const float t = start + (1-start) * placement((i + rng.uniform(0.15f, 0.85f)) / count);
             Vec3 axis{};
             const Vec3 attachment = PointAlong(branch, t, axis);
             Vec3 right{}, up{};
             BuildFrame(axis, right, up);
+            const float cardScale=std::clamp(l.sizeProfile.evaluate(t),0.0f,2.0f);
+            if (cardScale<=0) continue;
             const float size = std::max(0.01f, std::min(l.size, length * 1.4f) * (1 + rng.uniform(-1,1) * std::clamp(l.sizeVariance,0.0f,0.95f)) *
-                (1 + (std::clamp(l.tipScale,0.05f,2.0f)-1) * t));
+                (1 + (std::clamp(l.tipScale,0.05f,2.0f)-1) * t) * cardScale);
             const float rotation = rng.uniform(0, xm::Pi);
             for (int card = 0; card < cards; ++card)
             {
