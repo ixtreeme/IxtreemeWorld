@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <algorithm>
 
 namespace ixtreemetree
 {
@@ -22,18 +23,31 @@ struct Vec3
 };
 
 enum class TreeType : std::uint8_t { Deciduous, Evergreen };
-enum class BarkType : std::uint8_t { Oak, Birch, Pine, Willow, Ash, Palm };
+enum class BarkType : std::uint8_t { Oak, Birch, Pine, Willow, Ash, Palm, Larch };
 // Palm: frond images (2 x 1 atlas, see LeafStyle::Fronds); Blossom: flower clusters; SnowyPine: needles
 // with snow on top.
-enum class LeafType : std::uint8_t { Oak, Ash, Pine, Willow, Birch, Palm, Blossom, SnowyPine };
-constexpr int kBarkTypeCount = static_cast<int>(BarkType::Palm) + 1;
-constexpr int kLeafTypeCount = static_cast<int>(LeafType::SnowyPine) + 1;
+enum class LeafType : std::uint8_t { Oak, Ash, Pine, Willow, Birch, Palm, Blossom, SnowyPine, Larch };
+constexpr int kBarkTypeCount = static_cast<int>(BarkType::Larch) + 1;
+constexpr int kLeafTypeCount = static_cast<int>(LeafType::Larch) + 1;
 // A crown's outline: how long a branch grows for where it starts on its parent (the shape ratios of
 // Weber and Penn, "Creation and Rendering of Realistic Trees", 1995). Uniform: every one the same.
 enum class CrownShape : std::uint8_t { Uniform, Conical, Spherical, Hemispherical, TaperedCylinder, Flame, InverseConical, TendFlame };
 // Where a level's branches sit around their parent: anywhere, in rings (a fir's whorls) or one after
 // another at the golden angle (a palm's crown).
-enum class BranchArrangement : std::uint8_t { Random, Whorled, Spiral };
+enum class BranchArrangement : std::uint8_t { Random, Whorled, Spiral, Alternating };
+
+// Five equally spaced control points. Parent profiles use attachment position;
+// branch profiles use distance from the base. Piecewise linear, no overshoot.
+struct GrowthCurve
+{
+    std::array<float, 5> values{1, 1, 1, 1, 1};
+    float evaluate(float t) const
+    {
+        const float p = std::clamp(t, 0.0f, 1.0f) * 4.0f;
+        const int i = std::min(3, static_cast<int>(p));
+        return values[i] + (values[i + 1] - values[i]) * (p - i);
+    }
+};
 // Cards: leaf cards in clusters along the last level's branches. Fronds: each last-level branch is one
 // long leaf (a palm's or a fern's), a ribbon along it showing one atlas cell, its base at the cell's
 // bottom; those branches then have no bark.
@@ -71,6 +85,20 @@ struct TreeOptions
         std::array<BranchArrangement, kMaxBranchLevels> arrangement{};
         std::array<int, kMaxBranchLevels> whorlSize{};  // branches a ring (Whorled); 0: 4
         std::array<float, kMaxBranchLevels> droop{};    // bend toward the ground a metre grown; negative bends up
+        // Opt-in authoring model. Legacy presets retain their original geometry and RNG sequence.
+        bool organic = false;
+        std::array<float, kMaxBranchLevels> lengthVariance{};
+        std::array<float, kMaxBranchLevels> radiusVariance{};
+        std::array<float, kMaxBranchLevels> angleVariance{}; // degrees
+        std::array<float, kMaxBranchLevels> azimuthVariance{}; // degrees
+        std::array<GrowthCurve, kMaxBranchLevels> lengthProfile{};
+        std::array<GrowthCurve, kMaxBranchLevels> angleProfile{};
+        std::array<GrowthCurve, kMaxBranchLevels> radiusProfile{};
+        std::array<GrowthCurve, kMaxBranchLevels> bendProfile{
+            GrowthCurve{{0,0,0,0,0}}, GrowthCurve{{0,0,0,0,0}},
+            GrowthCurve{{0,0,0,0,0}}, GrowthCurve{{0,0,0,0,0}}}; // elevation in degrees
+        std::array<float, kMaxBranchLevels> distribution{1,1,1,1}; // >1 concentrates near parent base
+        std::array<float, kMaxBranchLevels> scaleInheritance{1,1,1,1}; // influence of ancestors' length scales
         int trunks = 1;            // stems from the ground (a shrub has several)
         float trunkSpread = 0.0f;  // how far the stems lean from upright, degrees
 
@@ -94,6 +122,10 @@ struct TreeOptions
         LeafStyle style = LeafStyle::Cards;
         float frondWidth = 1.2f;  // m (sizeVariance varies it)
         float frondFold = 15.0f;  // degrees each half rises from the midrib
+        bool twigAligned = false;
+        float aspect = 1.0f; // card width / length
+        float density = 0.0f; // clusters / metre; zero uses count per twig
+        float tipScale = 1.0f;
     } leaves;
 };
 

@@ -9,6 +9,10 @@
 #include <map>
 #include <sstream>
 #include <string_view>
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <type_traits>
 
 namespace ixtreemetree
 {
@@ -329,6 +333,10 @@ template <typename T>
 T EnumOr(const JsonValue& object, const char* key, T fallback, std::initializer_list<std::pair<const char*, T>> values)
 {
     const JsonValue* value = Find(object, key);
+    if (value && value->type == JsonValue::Type::Number)
+        for (const auto& pair : values)
+            if (value->number == static_cast<int>(pair.second))
+                return pair.second;
     if (!value || value->type != JsonValue::Type::String)
         return fallback;
 
@@ -459,7 +467,7 @@ void ApplyBark(const JsonValue& root, TreeOptions& options)
         {"Oak", BarkType::Oak}, {"Bark001", BarkType::Oak},
         {"Birch", BarkType::Birch}, {"Bark002", BarkType::Birch},
         {"Pine", BarkType::Pine}, {"Bark_Pine", BarkType::Pine},
-        {"Willow", BarkType::Willow}, {"Ash", BarkType::Ash}, {"Palm", BarkType::Palm}
+        {"Willow", BarkType::Willow}, {"Ash", BarkType::Ash}, {"Palm", BarkType::Palm}, {"Larch", BarkType::Larch}
     });
     options.bark.tint = ColorOr(*bark, "tint", options.bark.tint);
     options.bark.flatShading = BoolOr(*bark, "flatShading", options.bark.flatShading);
@@ -489,10 +497,34 @@ void ApplyBranch(const JsonValue& root, TreeOptions& options)
         {"Flame", CrownShape::Flame}, {"InverseConical", CrownShape::InverseConical}, {"TendFlame", CrownShape::TendFlame}
     });
     ReadEnumSeries(*branch, "arrangement", options.branch.arrangement, {
-        {"Random", BranchArrangement::Random}, {"Whorled", BranchArrangement::Whorled}, {"Spiral", BranchArrangement::Spiral}
+        {"Random", BranchArrangement::Random}, {"Whorled", BranchArrangement::Whorled}, {"Spiral", BranchArrangement::Spiral},
+        {"Alternating", BranchArrangement::Alternating}
     });
     ReadNumericSeries(*branch, "whorlSize", options.branch.whorlSize);
     ReadNumericSeries(*branch, "droop", options.branch.droop);
+    options.branch.organic = BoolOr(*branch, "organic", options.branch.organic);
+    ReadNumericSeries(*branch, "lengthVariance", options.branch.lengthVariance);
+    ReadNumericSeries(*branch, "radiusVariance", options.branch.radiusVariance);
+    ReadNumericSeries(*branch, "angleVariance", options.branch.angleVariance);
+    ReadNumericSeries(*branch, "azimuthVariance", options.branch.azimuthVariance);
+    ReadNumericSeries(*branch, "distribution", options.branch.distribution);
+    ReadNumericSeries(*branch, "scaleInheritance", options.branch.scaleInheritance);
+    auto curves = [&](const char* key, auto& target) {
+        const auto* source = Find(*branch, key);
+        if (!source || source->type != JsonValue::Type::Array) return;
+        for (std::size_t i=0; i<std::min(target.size(),source->array.size()); ++i)
+        {
+            const auto& points = source->array[i];
+            if (points.type != JsonValue::Type::Array) continue;
+            for (std::size_t j=0; j<std::min<std::size_t>(5,points.array.size()); ++j)
+                if (points.array[j].type == JsonValue::Type::Number)
+                    target[i].values[j] = static_cast<float>(points.array[j].number);
+        }
+    };
+    curves("lengthProfile", options.branch.lengthProfile);
+    curves("angleProfile", options.branch.angleProfile);
+    curves("radiusProfile", options.branch.radiusProfile);
+    curves("bendProfile", options.branch.bendProfile);
     options.branch.trunks = std::clamp(IntOr(*branch, "trunks", options.branch.trunks), 1, 16);
     options.branch.trunkSpread = std::clamp(FloatOr(*branch, "trunkSpread", options.branch.trunkSpread), 0.0f, 89.0f);
 
@@ -519,13 +551,17 @@ void ApplyLeaves(const JsonValue& root, TreeOptions& options)
         {"Pine", LeafType::Pine}, {"leaf_pine", LeafType::Pine}, {"pine", LeafType::Pine},
         {"Willow", LeafType::Willow}, {"leaf_willow", LeafType::Willow}, {"willow", LeafType::Willow},
         {"Birch", LeafType::Birch}, {"leaf_birch", LeafType::Birch}, {"aspen", LeafType::Birch},
-        {"Palm", LeafType::Palm}, {"Blossom", LeafType::Blossom}, {"SnowyPine", LeafType::SnowyPine}
+        {"Palm", LeafType::Palm}, {"Blossom", LeafType::Blossom}, {"SnowyPine", LeafType::SnowyPine}, {"Larch", LeafType::Larch}
     });
     options.leaves.style = EnumOr(*leaves, "style", options.leaves.style, {
         {"Cards", LeafStyle::Cards}, {"Fronds", LeafStyle::Fronds}
     });
     options.leaves.frondWidth = FloatOr(*leaves, "frondWidth", options.leaves.frondWidth);
     options.leaves.frondFold = FloatOr(*leaves, "frondFold", options.leaves.frondFold);
+    options.leaves.twigAligned = BoolOr(*leaves, "twigAligned", options.leaves.twigAligned);
+    options.leaves.aspect = FloatOr(*leaves, "aspect", options.leaves.aspect);
+    options.leaves.density = FloatOr(*leaves, "density", options.leaves.density);
+    options.leaves.tipScale = FloatOr(*leaves, "tipScale", options.leaves.tipScale);
     if (const JsonValue* billboard = Find(*leaves, "billboard"); billboard && billboard->type == JsonValue::Type::String)
     {
         const std::string mode = ToLower(billboard->string);
@@ -590,6 +626,72 @@ std::optional<Preset> loadPresetFile(const std::filesystem::path& path, std::str
     ApplyBranch(root, preset.options);
     ApplyLeaves(root, preset.options);
     return preset;
+}
+
+bool savePresetFile(const std::filesystem::path& path, const Preset& preset, std::string* errorOut)
+{
+    std::ofstream out(path, std::ios::trunc);
+    if (!out)
+    {
+        if (errorOut) *errorOut = "Cannot write " + path.string();
+        return false;
+    }
+    out.imbue(std::locale::classic());
+    out << std::setprecision(std::numeric_limits<float>::max_digits10) << std::boolalpha;
+    const auto& o = preset.options;
+    out << "{\n\"name\":" << std::quoted(preset.name) << ",\n\"seed\":" << o.seed
+        << ",\n\"type\":" << int(o.type) << ",\n\"bark\":{\"type\":" << int(o.bark.type)
+        << ",\"tint\":" << o.bark.tint << ",\"flatShading\":" << o.bark.flatShading
+        << ",\"textured\":" << o.bark.textured << ",\"textureScale\":{\"x\":" << o.bark.textureScale.x
+        << ",\"y\":" << o.bark.textureScale.y << "}},\n\"branch\":{\"levels\":" << o.branch.levels;
+    auto series = [&](const char* key, const auto& values) {
+        out << ",\n\"" << key << "\":[";
+        bool first = true;
+        for (const auto& value : values)
+        {
+            if (!first) out << ',';
+            first = false;
+            if constexpr (std::is_enum_v<std::decay_t<decltype(value)>>) out << int(value);
+            else out << value;
+        }
+        out << ']';
+    };
+#define TREE_SERIES(field) series(#field, o.branch.field)
+    TREE_SERIES(angle); TREE_SERIES(children); TREE_SERIES(gnarliness); TREE_SERIES(length);
+    TREE_SERIES(radius); TREE_SERIES(sections); TREE_SERIES(segments); TREE_SERIES(start);
+    TREE_SERIES(taper); TREE_SERIES(twist); TREE_SERIES(shape); TREE_SERIES(arrangement);
+    TREE_SERIES(whorlSize); TREE_SERIES(droop); TREE_SERIES(lengthVariance); TREE_SERIES(radiusVariance);
+    TREE_SERIES(angleVariance); TREE_SERIES(azimuthVariance); TREE_SERIES(distribution);
+    TREE_SERIES(scaleInheritance);
+#undef TREE_SERIES
+    auto curves = [&](const char* key, const auto& values) {
+        out << ",\n\"" << key << "\":[";
+        for (std::size_t i=0; i<values.size(); ++i)
+        {
+            if (i) out << ',';
+            out << '[';
+            for (int j=0; j<5; ++j) { if (j) out << ','; out << values[i].values[j]; }
+            out << ']';
+        }
+        out << ']';
+    };
+    curves("lengthProfile", o.branch.lengthProfile); curves("angleProfile", o.branch.angleProfile);
+    curves("radiusProfile", o.branch.radiusProfile); curves("bendProfile", o.branch.bendProfile);
+    out << ",\n\"organic\":" << o.branch.organic << ",\"trunks\":" << o.branch.trunks
+        << ",\"trunkSpread\":" << o.branch.trunkSpread << ",\"forceStrength\":" << o.branch.forceStrength
+        << ",\"forceDirection\":{\"x\":" << o.branch.forceDirection.x << ",\"y\":" << o.branch.forceDirection.y
+        << ",\"z\":" << o.branch.forceDirection.z << "}},\n\"leaves\":{\"type\":" << int(o.leaves.type)
+        << ",\"style\":" << int(o.leaves.style);
+#define TREE_LEAF(field) out << ",\n\"" #field "\":" << o.leaves.field
+    TREE_LEAF(cardsPerCluster); TREE_LEAF(atlasGridX); TREE_LEAF(atlasGridY); TREE_LEAF(angle);
+    TREE_LEAF(count); TREE_LEAF(start); TREE_LEAF(size); TREE_LEAF(sizeVariance); TREE_LEAF(tint);
+    TREE_LEAF(alphaTest); TREE_LEAF(frondWidth); TREE_LEAF(frondFold); TREE_LEAF(twigAligned);
+    TREE_LEAF(aspect); TREE_LEAF(density); TREE_LEAF(tipScale);
+#undef TREE_LEAF
+    out << "}\n}\n";
+    out.flush();
+    if (!out.good() && errorOut) *errorOut = "Failed writing " + path.string();
+    return out.good();
 }
 
 std::vector<Preset> loadAllPresets(const std::filesystem::path& presetDir, std::vector<std::string>* errorsOut)

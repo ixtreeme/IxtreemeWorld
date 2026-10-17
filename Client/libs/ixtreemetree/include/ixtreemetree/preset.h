@@ -16,6 +16,7 @@ struct Preset
 };
 
 std::optional<Preset> loadPresetFile(const std::filesystem::path& path, std::string* errorOut = nullptr);
+bool savePresetFile(const std::filesystem::path& path, const Preset& preset, std::string* errorOut = nullptr);
 std::vector<Preset> loadAllPresets(const std::filesystem::path& presetDir, std::vector<std::string>* errorsOut = nullptr);
 
 std::optional<Preset> loadPreset(const std::filesystem::path& path, std::string* error = nullptr);

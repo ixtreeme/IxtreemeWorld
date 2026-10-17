@@ -38,6 +38,7 @@ struct TreeMesh
         int barkTriangles = 0;
         int leafTriangles = 0;
         float generationMs = 0.0f;
+        bool budgetLimited = false;
     } stats;
 };
 }

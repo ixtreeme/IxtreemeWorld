@@ -645,6 +645,104 @@ void TestExistingTreesUnchanged(bool print)
         Check(std::count_if(actual.begin(), actual.end(), [&](const auto& tree) { return tree.first == golden.name; }) == 1,
             (std::string("golden tree still loads exactly once: ") + golden.name).c_str());
 }
+void TestOrganicGrowth()
+{
+    using namespace ixtreemetree;
+    Tree tree;
+    tree.options=defaultTreeOptions();
+    auto& o=tree.options;
+    o.branch.organic=true; o.branch.levels=1;
+    o.branch.forceStrength=0; o.branch.gnarliness.fill(0); o.branch.twist.fill(0);
+    o.branch.sections={2,4,3,3}; o.branch.segments={6,4,3,3};
+    o.branch.children[1]=9; o.branch.start[1]=0.2f;
+    o.branch.angle[1]=90; o.branch.lengthVariance[1]=0.23f;
+    o.leaves.twigAligned=true; o.leaves.angle=0; o.leaves.density=4; o.leaves.aspect=0.6f;
+    const auto coarse=tree.generate();
+    const std::size_t trunkVertices=3*7+1, branchVertices=5*5+1;
+    std::vector<float> heights;
+    for (int child=0; child<9; ++child)
+    {
+        float height=0;
+        for (int side=0;side<4;++side) height+=coarse.bark.vertices[trunkVertices+child*branchVertices+side].position.y;
+        heights.push_back(height/4);
+    }
+    std::sort(heights.begin(),heights.end());
+    Check(std::adjacent_find(heights.begin(),heights.end(),[](float a,float b){return std::abs(a-b)<1e-4f;})==heights.end(),
+        "organic branches attach continuously instead of snapping to trunk rings");
+    o.branch.sections[0]=32; o.branch.sections[1]=24;
+    const auto fine=tree.generate();
+    bool same=coarse.leaves.vertices.size()==fine.leaves.vertices.size();
+    for (std::size_t i=0;same && i<coarse.leaves.vertices.size();++i)
+    {
+        const auto a=coarse.leaves.vertices[i].position,b=fine.leaves.vertices[i].position;
+        same = a.x==b.x && a.y==b.y && a.z==b.z;
+    }
+    Check(same,"tessellation does not move organic twigs, random variation or leaves");
+    const auto& leaves=coarse.leaves.vertices;
+    Check(!leaves.empty() && std::abs(leaves[3].position.y-leaves[0].position.y)<1e-5f,
+        "twig-aligned cards follow a horizontal twig instead of world up");
+    const auto original=HashOf(o);
+    o.branch.lengthProfile[1].values={1,0.8f,0.5f,0.2f,0.05f};
+    Check(HashOf(o)!=original,"parent length profiles change the generated crown");
+    const auto straight=HashOf(o);
+    o.branch.bendProfile[1].values={0,-20,-30,10,40};
+    Check(HashOf(o)!=straight,"bend profiles affect growth");
+    const GrowthCurve curve{{0,1,0,2,1}};
+    Check(curve.evaluate(0.125f)==0.5f && curve.evaluate(0.75f)==2 && curve.evaluate(1)==1,
+        "growth curves interpolate and include both endpoints");
+
+    const auto path=std::filesystem::temp_directory_path() / ("ixw_tree_roundtrip_"+
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".json");
+    std::string error;
+    auto presets=loadAllPresets(IXTREEMETREE_PRESET_DIR);
+    presets.push_back({"Edited \"organic\" tree",o});
+    for (const auto& preset:presets)
+    {
+        Check(savePresetFile(path,preset,&error),"growth preset saves");
+        const auto loaded=loadPresetFile(path,&error);
+        Check(loaded && loaded->name==preset.name && HashOf(loaded->options)==HashOf(preset.options),
+            "saving and reloading every preset reproduces exactly the same mesh");
+        if (loaded)
+            Check(loaded->options.bark.tint==preset.options.bark.tint && loaded->options.leaves.tint==preset.options.leaves.tint &&
+                loaded->options.leaves.alphaTest==preset.options.leaves.alphaTest,"round trip retains material settings");
+    }
+    std::error_code ec; std::filesystem::remove(path,ec);
+    o.branch.levels=3; o.branch.children.fill(128); o.branch.sections.fill(2); o.branch.segments.fill(3);
+    o.leaves.density=0; o.leaves.count=0;
+    const auto limited=tree.generate();
+    Check(limited.stats.budgetLimited && limited.bark.vertices.size()<2000000,
+        "organic authoring enforces and reports its generation budget");
+    o.branch.levels=2; o.branch.children[1]=1; o.branch.children[2]=0; o.leaves.count=2;
+    Check(!tree.generate().leaves.vertices.empty(),"shoots that stop early in the hierarchy still carry leaves");
+    o.branch.levels=1; o.branch.children[1]=3; o.branch.sections[1]=5;
+    o.leaves.style=ixtreemetree::LeafStyle::Fronds;
+    const auto fronds=tree.generate();
+    Check(fronds.leaves.vertices.size()==3u*5u*2u*4u,"organic fronds respect the authored segment count");
+}
+
+void TestAlternatingShoots()
+{
+    for (bool organic : {false,true})
+    {
+        ixtreemetree::Tree tree;
+        tree.options=ixtreemetree::defaultTreeOptions();
+        auto& o=tree.options;
+        o.branch.organic=organic; o.branch.levels=1;
+        o.branch.children[1]=8; o.branch.angle[1]=90;
+        o.branch.gnarliness.fill(0); o.branch.twist.fill(0); o.branch.forceStrength=0;
+        o.branch.arrangement[1]=ixtreemetree::BranchArrangement::Alternating;
+        o.leaves.twigAligned=true; o.leaves.angle=0; o.leaves.count=1;
+        o.leaves.cardsPerCluster=1; o.leaves.start=0.98f; o.leaves.size=0.1f;
+        const auto mesh=tree.generate();
+        Check(mesh.leaves.vertices.size()==32,"alternating shoots carry one card per twig");
+        for (std::size_t i=0; i<mesh.leaves.vertices.size()/4; ++i)
+        {
+            const auto p=CardCenter(mesh.leaves,i);
+            Check(std::abs(p.x)<1e-4f && (i%2==0 ? p.z>1 : p.z<-1),
+                "alternating shoots grow on opposite sides in both growth models");
+        }
+    }
+}
 } // namespace
 
 int main(int argc, char** argv)
@@ -662,6 +760,8 @@ int main(int argc, char** argv)
     TestExistingTreesUnchanged(argc > 1 && std::string(argv[1]) == "--print-golden");
     TestPresets(argc > 1 && std::string(argv[1]) == "--print-golden");
     TestPresetDefaultsAndNumericEnums();
+    TestOrganicGrowth();
+    TestAlternatingShoots();
     if (g_errors == 0)
         std::cout << "TreeGeneratorTest: all checks passed\n";
     return g_errors == 0 ? 0 : 1;

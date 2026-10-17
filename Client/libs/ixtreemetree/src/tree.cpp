@@ -296,6 +296,8 @@ BranchEnd GenerateBranch(const TreeOptions& options,
                 rng.uniform(-0.15f, 0.15f);
         else if (arrangement == BranchArrangement::Spiral)
             around = spiralStart + kGoldenAngle * static_cast<float>(child);
+        else if (arrangement == BranchArrangement::Alternating)
+            around = xm::Pi * static_cast<float>(child % 2);
         else
             around = rng.uniform(0.0f, xm::TwoPi);
         const Vec3 radial = Normalize(Add(Mul(right, xm::Cos(around)), Mul(up, xm::Sin(around))));
@@ -311,14 +313,159 @@ BranchEnd GenerateBranch(const TreeOptions& options,
     return end;
 }
 
-void AddLeafQuad(TreeMesh& mesh, Vec3 center, Vec3 normal, Vec3 tangent, float size, Vec2 uvMin, Vec2 uvMax)
+// The organic model samples a fixed-resolution growth path, independently of the
+// render tessellation. Changing tube resolution must not move branch attachments.
+void GenerateOrganicBranch(const TreeOptions& o, Rng& rng, TreeMesh& mesh, int level,
+    Vec3 origin, Vec3 direction, std::vector<TerminalBranch>& terminals,
+    int& branchBudget, float scale = 1.0f)
+{
+    if (--branchBudget < 0 || mesh.bark.vertices.size() > 1500000u)
+    {
+        mesh.stats.budgetLimited = true;
+        return;
+    }
+    const auto& b = o.branch;
+    const int lastLevel = std::clamp(b.levels, 0, kMaxBranchLevels - 1);
+    const int sections = std::clamp(b.sections[level], 2, 64);
+    const int sides = std::clamp(b.segments[level], 3, 32);
+    const float length = std::max(0.02f, b.length[level] * scale *
+        (1 + rng.uniform(-1, 1) * std::clamp(b.lengthVariance[level], 0.0f, 0.95f)));
+    const float radius = std::max(0.0005f, b.radius[level] * std::sqrt(scale) *
+        (1 + rng.uniform(-1, 1) * std::clamp(b.radiusVariance[level], 0.0f, 0.95f)));
+    direction = Normalize(direction);
+    Vec3 side{}, rise{};
+    BuildFrame(direction, side, rise);
+    // Smooth, low-frequency wandering: one set of coefficients per branch.
+    const float noiseA = rng.uniform(-1, 1) * b.gnarliness[level];
+    const float noiseB = rng.uniform(-1, 1) * b.gnarliness[level];
+    const float phase = rng.uniform(0, xm::TwoPi);
+    auto axisAt = [&](float t) {
+        const float elevation = xm::DegreesToRadians(b.bendProfile[level].evaluate(t)) - b.droop[level] * length * t;
+        Vec3 axis = RotateAroundAxis(direction, side, -elevation);
+        axis = Add(axis, Add(Mul(side, noiseA * std::sin(t * xm::TwoPi + phase) * t),
+                            Mul(rise, noiseB * std::sin(t * xm::Pi) * t)));
+        return Normalize(Add(axis, Mul(Normalize(b.forceDirection), b.forceStrength * length * t)));
+    };
+    TerminalBranch path;
+    constexpr int samples = 64;
+    path.centers.push_back(origin);
+    path.axes.push_back(axisAt(0));
+    for (int i = 1; i <= samples; ++i)
+    {
+        const float t = static_cast<float>(i) / samples;
+        path.centers.push_back(Add(path.centers.back(), Mul(axisAt(t - 0.5f / samples), length / samples)));
+        path.axes.push_back(axisAt(t));
+    }
+    const bool frond = level == lastLevel && o.leaves.style == LeafStyle::Fronds;
+    const auto base = static_cast<std::uint32_t>(mesh.bark.vertices.size());
+    Vec3 previousRight = side;
+    for (int ring = 0; ring <= sections && !frond; ++ring)
+    {
+        const float t = static_cast<float>(ring) / sections;
+        Vec3 axis{};
+        const Vec3 center = PointAlong(path, t, axis);
+        // Parallel transport avoids the visible frame flips of world-up frames.
+        Vec3 right = Normalize(Sub(previousRight, Mul(axis, Dot(previousRight, axis))));
+        previousRight = right;
+        right = RotateAroundAxis(right, axis, xm::DegreesToRadians(b.twist[level]) * t);
+        const Vec3 up = Normalize(Cross(axis, right));
+        const float r = radius * std::max(0.001f, b.radiusProfile[level].evaluate(t)) *
+            (1 - (1 - std::clamp(b.taper[level], 0.001f, 1.0f)) * t);
+        for (int j = 0; j <= sides; ++j)
+        {
+            const float u = static_cast<float>(j) / sides;
+            const Vec3 normal = Add(Mul(right, std::cos(u * xm::TwoPi)), Mul(up, std::sin(u * xm::TwoPi)));
+            const Vec3 p = Add(center, Mul(normal, r));
+            mesh.bark.vertices.push_back({p, normal, {u * o.bark.textureScale.x, t * o.bark.textureScale.y}});
+            IncludeBounds(mesh, p);
+        }
+    }
+    for (int ring = 0; ring < sections && !frond; ++ring)
+        for (int j = 0; j < sides; ++j)
+        {
+            const auto a = base + ring * (sides + 1) + j;
+            const auto c = a + sides + 1;
+            mesh.bark.indices.insert(mesh.bark.indices.end(), {a,c,a+1,a+1,c,c+1});
+        }
+    if (!frond)
+    {
+        // Close the small tip; no open tube is visible when the camera looks down a branch.
+        const auto cap = static_cast<std::uint32_t>(mesh.bark.vertices.size());
+        mesh.bark.vertices.push_back({path.centers.back(), path.axes.back(), {0.5f, 1}});
+        const auto tip = base + sections * (sides + 1);
+        for (int j = 0; j < sides; ++j)
+            mesh.bark.indices.insert(mesh.bark.indices.end(), {tip+j, cap, tip+j+1});
+    }
+    if (level >= lastLevel)
+    {
+        if (frond)
+        {
+            TerminalBranch sampled;
+            for (int ring=0; ring<=sections; ++ring)
+            {
+                Vec3 axis{};
+                sampled.centers.push_back(PointAlong(path,float(ring)/sections,axis));
+                sampled.axes.push_back(axis);
+            }
+            path=std::move(sampled);
+        }
+        terminals.push_back(std::move(path));
+        return;
+    }
+    const int childLevel = level + 1;
+    const int count = std::clamp(static_cast<int>(b.children[childLevel] * std::sqrt(scale)), 0, 128);
+    if (count == 0)
+    {
+        // An adaptive hierarchy can stop before the last configured level.
+        // Such a shoot is still a leaf-bearing terminal, including at the crown tip.
+        terminals.push_back(std::move(path));
+        return;
+    }
+    const float start = std::clamp(b.start[childLevel], 0.0f, 0.98f);
+    const int whorlSize = std::clamp(b.whorlSize[childLevel] > 0 ? b.whorlSize[childLevel] : 4, 1, 16);
+    const int whorls = std::max(1, (count + whorlSize - 1) / whorlSize);
+    const float rotation = rng.uniform(0, xm::TwoPi);
+    for (int child = 0; child < count && branchBudget > 0; ++child)
+    {
+        const auto arrangement = b.arrangement[childLevel];
+        float q = (child + rng.uniform(0.18f, 0.82f)) / std::max(1, count);
+        float around = rng.uniform(0, xm::TwoPi);
+        if (arrangement == BranchArrangement::Whorled)
+        {
+            q = (child / whorlSize + 0.5f + rng.uniform(-0.12f, 0.12f)) / whorls;
+            around = rotation + (child / whorlSize) * 2.39996323f + (child % whorlSize) * xm::TwoPi / whorlSize;
+        }
+        else if (arrangement == BranchArrangement::Spiral)
+            around = rotation + child * 2.39996323f;
+        else if (arrangement == BranchArrangement::Alternating)
+            around = (child % 2) * xm::Pi;
+        q = std::pow(std::clamp(q, 0.001f, 0.999f), std::clamp(b.distribution[childLevel], 0.2f, 5.0f));
+        const float t = start + (0.985f - start) * q;
+        Vec3 parentAxis{};
+        const Vec3 attachment = PointAlong(path, t, parentAxis);
+        Vec3 right{}, up{};
+        BuildFrame(parentAxis, right, up);
+        around += xm::DegreesToRadians(rng.uniform(-1, 1) * b.azimuthVariance[childLevel]);
+        const Vec3 radial = Add(Mul(right, std::cos(around)), Mul(up, std::sin(around)));
+        const float angle = xm::DegreesToRadians(std::clamp(b.angle[childLevel] * b.angleProfile[childLevel].evaluate(q) +
+            rng.uniform(-1, 1) * b.angleVariance[childLevel], 0.0f, 175.0f));
+        const Vec3 childDirection = Normalize(Add(Mul(parentAxis, std::cos(angle)), Mul(radial, std::sin(angle))));
+        const float inheritedScale = std::pow(scale, std::clamp(b.scaleInheritance[childLevel],0.0f,1.0f));
+        const float childScale = std::max(0.025f, inheritedScale * ShapeRatio(b.shape[childLevel], 1-q) *
+            std::max(0.025f, b.lengthProfile[childLevel].evaluate(q)));
+        GenerateOrganicBranch(o, rng, mesh, childLevel, attachment, childDirection, terminals, branchBudget, childScale);
+    }
+    if (branchBudget <= 0) mesh.stats.budgetLimited = true;
+}
+
+void AddLeafQuad(TreeMesh& mesh, Vec3 center, Vec3 normal, Vec3 tangent, float size, Vec2 uvMin, Vec2 uvMax, float aspect = 1.0f)
 {
     normal = Normalize(normal);
     tangent = Normalize(tangent);
     Vec3 bitangent = Normalize(Cross(normal, tangent));
     if (Length(bitangent) < 0.001f)
         bitangent = {0.0f, 1.0f, 0.0f};
-    const Vec3 x = Mul(tangent, size * 0.5f);
+    const Vec3 x = Mul(tangent, size * 0.5f * aspect);
     const Vec3 y = Mul(bitangent, size * 0.5f);
     const std::uint32_t base = static_cast<std::uint32_t>(mesh.leaves.vertices.size());
     const Vec3 p0 = Sub(Sub(center, x), y);
@@ -463,6 +610,45 @@ void GenerateLeaves(const TreeOptions& options, Rng& rng, TreeMesh& mesh, const 
         }
     }
 }
+
+void GenerateTwigLeaves(const TreeOptions& o, Rng& rng, TreeMesh& mesh, const std::vector<TerminalBranch>& branches)
+{
+    const auto& l = o.leaves;
+    const int columns = std::clamp(l.atlasGridX, 1, 8), rows = std::clamp(l.atlasGridY, 1, 8);
+    const int cards = std::clamp(l.cardsPerCluster, 1, 7);
+    const float start = std::clamp(l.start, 0.0f, 0.98f);
+    for (const auto& branch : branches)
+    {
+        float length = 0;
+        for (std::size_t j = 1; j < branch.centers.size(); ++j)
+            length += Length(Sub(branch.centers[j], branch.centers[j-1]));
+        const int count = std::clamp(l.density > 0 ? static_cast<int>(std::ceil(length * (1-start) * l.density)) : l.count, 0, 256);
+        for (int i = 0; i < count && mesh.leaves.vertices.size() < 400000u; ++i)
+        {
+            const float t = start + (1-start) * (i + rng.uniform(0.15f, 0.85f)) / count;
+            Vec3 axis{};
+            const Vec3 attachment = PointAlong(branch, t, axis);
+            Vec3 right{}, up{};
+            BuildFrame(axis, right, up);
+            const float size = std::max(0.01f, std::min(l.size, length * 1.4f) * (1 + rng.uniform(-1,1) * std::clamp(l.sizeVariance,0.0f,0.95f)) *
+                (1 + (std::clamp(l.tipScale,0.05f,2.0f)-1) * t));
+            const float rotation = rng.uniform(0, xm::Pi);
+            for (int card = 0; card < cards; ++card)
+            {
+                const Vec3 tangent = RotateAroundAxis(right, axis, rotation + xm::Pi * card / cards);
+                const Vec3 leafAxis = RotateAroundAxis(axis, tangent, xm::DegreesToRadians(l.angle) * rng.uniform(-1,1));
+                const Vec3 normal = Normalize(Cross(tangent, leafAxis));
+                const int x = rng.uniformInt(0,columns-1), y = rng.uniformInt(0,rows-1);
+                // Atlas bottom is the stalk: it emerges from the twig, instead of
+                // floating around an unrelated world-up cluster axis.
+                const Vec3 center = Add(attachment, Mul(leafAxis, size * 0.35f));
+                AddLeafQuad(mesh, center, normal, tangent, size,
+                    {float(x)/columns,float(y)/rows}, {float(x+1)/columns,float(y+1)/rows}, std::clamp(l.aspect,0.1f,3.0f));
+            }
+        }
+        if (mesh.leaves.vertices.size() >= 400000u) mesh.stats.budgetLimited = true;
+    }
+}
 }
 
 TreeOptions defaultTreeOptions()
@@ -502,11 +688,18 @@ TreeMesh Tree::generate() const
 
     Rng rng(options.seed);
     std::vector<TerminalBranch> terminalBranches;
+    int branchBudget = 12000;
+    auto grow = [&](Vec3 origin, Vec3 direction, float scale = 1.0f) {
+        if (options.branch.organic)
+            GenerateOrganicBranch(options, rng, mesh, 0, origin, direction, terminalBranches, branchBudget, scale);
+        else
+            GenerateBranch(options, rng, mesh, 0, origin, direction, terminalBranches, scale);
+    };
     const int trunks = std::clamp(options.branch.trunks, 1, 16);
     const float spread = xm::DegreesToRadians(std::clamp(options.branch.trunkSpread, 0.0f, 89.0f));
     if (trunks == 1 && spread == 0.0f)
     {
-        GenerateBranch(options, rng, mesh, 0, Vec3{0.0f, 0.0f, 0.0f}, Vec3{0.0f, 1.0f, 0.0f}, terminalBranches);
+        grow(Vec3{0.0f, 0.0f, 0.0f}, Vec3{0.0f, 1.0f, 0.0f});
     }
     else
     {
@@ -522,11 +715,13 @@ TreeMesh Tree::generate() const
             const Vec3 direction{outward.x * xm::Sin(lean), xm::Cos(lean), outward.z * xm::Sin(lean)};
             const Vec3 origin = trunks > 1 ? Mul(outward, std::max(0.01f, options.branch.radius[0]) * 0.8f) : Vec3{};
             const float scale = trunks > 1 ? rng.uniform(0.75f, 1.0f) : 1.0f;
-            GenerateBranch(options, rng, mesh, 0, origin, direction, terminalBranches, scale);
+            grow(origin, direction, scale);
         }
     }
     if (options.leaves.style == LeafStyle::Fronds)
         GenerateFronds(options, rng, mesh, terminalBranches);
+    else if (options.leaves.twigAligned)
+        GenerateTwigLeaves(options, rng, mesh, terminalBranches);
     else
         GenerateLeaves(options, rng, mesh, terminalBranches);
 
