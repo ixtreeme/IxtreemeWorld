@@ -455,7 +455,10 @@ ixeditor::graphics::EditorTextureHandle IXVulkanEditorAdapter::UploadPreviewText
     ixrhi::IXRHITextureDesc desc;
     desc.width = width;
     desc.height = height;
-    desc.format = ixrhi::IXRHIFormat::R8G8B8A8Unorm;
+    // CPU previews and decoded thumbnails contain display (sRGB) bytes. Decode
+    // on sampling so an sRGB UI target does not encode their colors a second time.
+    desc.format = IsSrgbFormat(m_rhi->GetMainSwapchain().ColorFormat())
+        ? ixrhi::IXRHIFormat::R8G8B8A8Srgb : ixrhi::IXRHIFormat::R8G8B8A8Unorm;
     desc.usage = ixrhi::IXRHITextureUsage::Sampled | ixrhi::IXRHITextureUsage::TransferDst;
     desc.debugName = tag ? std::string("Preview:") + tag : "Preview";
     const std::size_t bytes = static_cast<std::size_t>(width) * height * 4u;
